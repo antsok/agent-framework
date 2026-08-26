@@ -6,6 +6,7 @@ Experimental packages for cutting-edge features including benchmarking, reinforc
 
 This package contains experimental sub-packages:
 
+- `cachebench/` - Compaction vs. prompt-cache benchmark
 - `gaia/` - GAIA benchmark integration
 - `lightning/` - Lightning-based training utilities
 - `tau2/` - Tau-bench evaluation framework
