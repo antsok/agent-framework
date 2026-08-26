@@ -1,9 +1,9 @@
 # Does context compaction save money? — final report
 
-**Date:** 26 August 2026
-**Models:** `gpt-5.6-luna`, `gpt-5.4-mini`, `z-ai/glm-5.3-flash`, (`gemini-3.7-flash` excluded)
+**Date:** 27 August 2026
+**Models:** `gpt-5.6-luna`, `gpt-5.4-mini`, `z-ai/glm-5.2`, `z-ai/glm-5.3-flash`, (`gemini-3.7-flash` excluded)
 **Routes:** Azure Foundry (Responses API), OpenRouter (Chat Completions)
-**Scale:** 4 model/route combinations x 14 settings x 3 repeats, ~170 conversations
+**Scale:** 6 model/route combinations x up to 14 settings x 3 repeats, ~290 conversations
 
 ---
 
@@ -20,7 +20,7 @@ Two things needed measuring, and normally only the first gets asked:
 
 ## 2. What was done
 
-A real agent was driven through the same 16-turn conversation about 170 times, changing only
+A real agent was driven through the same 16-turn conversation about 290 times, changing only
 the compaction setting.
 
 During the conversation the agent is told **17 specific facts** it must repeat at the end.
@@ -33,9 +33,11 @@ The final question can only be answered correctly by using all 17. Then the bill
 Two things make the comparison fair, and both were added only after early runs proved
 misleading without them:
 
-- **Tool calls are pinned.** Each tool turn forces its own dedicated tool; other turns are
-  closed to tools. Without this, models gathered different numbers of facts from run to run,
-  which moves both cost and correctness for reasons that have nothing to do with compaction.
+- **Tool calls are pinned** where the route allows it. Each tool turn forces its own
+  dedicated tool; other turns are closed to tools. Without this, models gathered different
+  numbers of facts from run to run, moving both axes for reasons unrelated to compaction.
+  Both glm models reject forcing on every backend, so their runs are unpinned throughout —
+  comparable with each other, not with the pinned runs.
 - **Every setting is run 3 times** and the median is reported, with the spread between
   repeats shown. A difference smaller than the spread is not a result.
 
@@ -77,10 +79,15 @@ of 17. Full tables are in `RESULTS.md`.
 
 | Model | Route | Cache discount | Uncompacted hit rate | Cheapest setting | Its accuracy | Best accurate setting | Its cost |
 | --- | --- | ---: | ---: | --- | ---: | --- | ---: |
-| `gpt-5.6-luna` | OpenRouter | 10x | 92% | `token_budget_tools_first` −32% | 28% | `tool_result` | **+38%** |
+| `gpt-5.6-luna` | OpenRouter | 10x | 90% | `token_budget_truncate_first` −11% | 28% | `tool_result` | **+47%** |
 | `gpt-5.6-luna` | Foundry | 10x | 91% | `token_budget_tools_first` −22% | 28% | `tool_result` | **+34%** |
 | `gpt-5.4-mini` | Foundry | 9.4x | 89% | `context_window_aggressive` −13% | 28% | `tool_result` | **+63%** |
-| `glm-5.3-flash` | OpenRouter | **5x** | 85% | `truncation` **−51%** | 39% | *not measurable* | — |
+| `glm-5.2` | OpenRouter/BaseTen | 10x | 90% | `token_budget_tools_first` −22% | 6% | `tool_result` | **+24%** |
+| `glm-5.2` | OpenRouter/Crusoe | **5x** | 89% | `token_budget_tools_first` −41% | 6% | `tool_result` | **+3%** |
+| `glm-5.3-flash` | OpenRouter | **5x** | 90% | `truncation` **−44%** | *n/a* | `tool_result` | +23% |
+
+The last two rows are **the same model at two cached-read prices** and are the controlled test
+of finding 3.
 
 ### The representative table (`gpt-5.6-luna` on Foundry — the tightest measurement)
 
@@ -153,12 +160,25 @@ In plain terms — how big a cut is needed just to break even:
 | 10x | 38% | 72% |
 | **5x** | **70%** | **27%** |
 
-**This predicted the one model where compaction wins.** `glm-5.3-flash` has a 5x discount
-rather than 10x, so its break-even falls to 27%. `truncation` cut 66%, cleared it easily, and
-came out **51% cheaper** — the largest saving in the whole study.
+**This was then tested under control, not just observed across models.** OpenRouter serves
+`glm-5.2` on two backends at identical input and output prices, differing only in the
+cached-read rate — Crusoe at 5x, BaseTen at 10x. Same model, same weights. Halving the
+discount moved every strategy against compaction and none the other way:
 
-**The cost axis flips with the discount. The correctness axis does not.** That same
-`truncation` still lost 11 of 17 facts. A cheaper cache makes compaction affordable, not safe.
+| | 5x | 10x |
+| --- | ---: | ---: |
+| `tool_result` | **+3%** | **+24%** |
+| `selective_tool_call` | +2% | +22% |
+| `truncation` | −35% | −19% |
+| `summarization` | −11% | +22% |
+
+**The prediction was recorded before the second run.** From the 5x run's own tokens and hit
+rates, the formula projected `tool_result` at +17% and `truncation` at −24%. Measured: **+24%**
+and **−19%** — both inside this model's run-to-run spread.
+
+**The cost axis flips with the discount. The correctness axis does not.** Across both glm-5.2
+runs, `none` remained the only setting keeping all 17 facts, at either discount, and
+`truncation` lost 11-13 either way. A cheaper cache makes compaction affordable, not safe.
 
 ### Finding 4 — The settings that stay accurate do not fit the window
 
@@ -204,7 +224,7 @@ facts every time.
 
 ## 7. Limits
 
-**Four model/route combinations, one workload, one conversation shape.**
+**Six model/route combinations, one workload, one conversation shape.**
 
 **All runs sat at 130–170% of the configured window**, which is the regime most favourable to
 compaction. Earlier replay-mode measurements at 85–100% of a 400K window found the penalty

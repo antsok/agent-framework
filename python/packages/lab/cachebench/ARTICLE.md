@@ -8,10 +8,10 @@ six times first.*
 ## The short version
 
 Compaction — dropping or shrinking old turns so each request is smaller — is treated as an
-obvious cost saving. We measured it across four model/route combinations, about 170 real
+obvious cost saving. We measured it across six model/route combinations, about 290 real
 agent conversations, scoring both what it costs and what the agent forgets.
 
-**On three of four, compaction cost more than not compacting at all.** The settings that kept
+**On four of six, compaction cost more than not compacting at all.** The settings that kept
 the agent's information intact were 34–63% *more* expensive despite sending *fewer* tokens.
 The settings that did save money lost 10–15 of 17 planted facts.
 
@@ -35,12 +35,26 @@ You can write down exactly when it pays:
 At a 10x discount, dropping from a 91% hit rate to 78% means you must cut **39%** of your
 tokens just to break even. Our best information-preserving strategy cut 7%.
 
-**The formula is predictive, not just descriptive.** `glm-5.3-flash` prices cache reads at 5x
-rather than 10x, which drops its break-even to a **27%** cut. We predicted compaction would win
-there before running it. It did: `truncation` came out **51% cheaper** — the only clear cost
-win in the study.
+**The formula is predictive, and we tested it under control.** OpenRouter happens to serve
+`glm-5.2` on two backends at identical input and output prices that differ only in the
+cached-read rate: 5x on one, 10x on the other. Same model, same weights. That isolates the
+one variable the formula claims is decisive.
 
-So the first thing to check is not your context window. It is your model's cached-read price.
+| | 5x discount | 10x discount |
+| --- | ---: | ---: |
+| `tool_result` (keeps every fact) | **+3%** | **+24%** |
+| `selective_tool_call` (keeps every fact) | +2% | +22% |
+| `truncation` | −35% | −19% |
+| `summarization` | −11% | +22% |
+
+Halving the discount moved every strategy against compaction and none the other way. We
+recorded the prediction before the second run — from the first run's own tokens and hit
+rates the formula projected `tool_result` at +17% and `truncation` at −24%; measured **+24%**
+and **−19%**, both inside the run-to-run spread.
+
+So the first thing to check is not your context window, and not which strategy to pick. It is
+your provider's cached-read price. On the same model, the same strategy is nearly free at 5x
+and clearly expensive at 10x.
 
 ## The forgetting is a cliff, not a slope
 
@@ -52,6 +66,10 @@ Every run, on every model, split into two groups with nothing in between:
 
 - Strategies that **delete messages** lost **10–15 of 17 facts**.
 - Strategies that **only rewrite tool output**, without deleting messages, lost **none**.
+
+And the discount does not touch this axis at all. Across both glm-5.2 runs, `none` was the
+only setting keeping all 17 facts at *either* discount. A cheaper cache makes compaction
+affordable, not safe.
 
 There is no "slightly smaller, slightly lossy" setting. And 28% correct is not a marginally
 worse answer — it means the agent forgot the correction and is confidently executing the plan
