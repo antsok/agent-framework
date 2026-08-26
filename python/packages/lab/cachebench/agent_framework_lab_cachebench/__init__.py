@@ -18,6 +18,19 @@ import importlib.metadata
 from ._advise_cli import main as advise_main
 from ._advisor import ModelPricing, StrategyCost, Verdict, advise, cost_of, fetch_openrouter_pricing
 from ._cli import build_parser, main, run_benchmark
+from ._live import (
+    AGENT_KINDS,
+    LiveOutcome,
+    MeteredClient,
+    ModelCall,
+    UsageRecorder,
+    build_live_agent,
+    build_live_scenario,
+    make_lookup_tool,
+    run_live,
+    score_live,
+)
+from ._live_cli import main as live_main
 from ._metrics import common_message_prefix, percentile, serialize_message, summarize_cell, token_counts
 from ._providers import (
     PROVIDER_SPECS,
@@ -59,6 +72,7 @@ except importlib.metadata.PackageNotFoundError:
     __version__ = "0.0.0"  # Fallback for development mode
 
 __all__ = [
+    "AGENT_KINDS",
     "DEFAULT_SYSTEM_TOKENS",
     "PROVIDER_SPECS",
     "STRATEGY_BUILDERS",
@@ -70,6 +84,9 @@ __all__ = [
     "FactOutcome",
     "JointOutcome",
     "JointVerdict",
+    "LiveOutcome",
+    "MeteredClient",
+    "ModelCall",
     "ModelPricing",
     "PlantedFact",
     "ProviderCaller",
@@ -84,10 +101,13 @@ __all__ = [
     "TranscriptTurn",
     "TurnCaller",
     "TurnRecord",
+    "UsageRecorder",
     "Verdict",
     "__version__",
     "advise",
     "advise_main",
+    "build_live_agent",
+    "build_live_scenario",
     "build_parser",
     "build_preset",
     "build_provider",
@@ -97,7 +117,9 @@ __all__ = [
     "common_message_prefix",
     "cost_of",
     "fetch_openrouter_pricing",
+    "live_main",
     "main",
+    "make_lookup_tool",
     "parse_provider_selector",
     "percentile",
     "prompt_cache_key",
@@ -110,7 +132,9 @@ __all__ = [
     "resolve_context_window",
     "run_benchmark",
     "run_cell",
+    "run_live",
     "score_answer",
+    "score_live",
     "serialize_message",
     "strategy_names",
     "summarize_cell",

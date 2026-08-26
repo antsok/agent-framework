@@ -87,6 +87,7 @@ cachebench = "agent_framework_lab_cachebench:main"
 cachebench_advise = "agent_framework_lab_cachebench:advise_main"
 cachebench_recall = "agent_framework_lab_cachebench:recall_main"
 cachebench_summary = "agent_framework_lab_cachebench:summary_main"
+cachebench_live = "agent_framework_lab_cachebench:live_main"
 gaia_viewer = "agent_framework_lab_gaia:viewer_main"
 lightning = "agent_framework_lab_lightning:main"
 
