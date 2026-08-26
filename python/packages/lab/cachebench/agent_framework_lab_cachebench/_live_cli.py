@@ -175,7 +175,8 @@ def _render(
     base = verdict.baseline
     header = (
         f"{'strategy':<28}{'msgs':>9}{'tok left/peak':>16}{'calls':>7}{'in':>9}{'hit%':>6}"
-        f"{'out':>8}{'cost':>10}{'summ$':>8}{'vs none':>9}{'correct':>9}{'vs none':>9}{'flags':>8}"
+        f"{'out':>8}{'cost':>10}{'summ$':>8}{'vs none':>9}"
+        f"{'facts':>9}{'lost':>6}{'ignored':>8}{'correct':>9}{'vs none':>9}{'flags':>8}"
     )
     lines = [
         "",
@@ -207,6 +208,8 @@ def _render(
             f"{len(run.calls):>7}{run.input_tokens:>9,}{hit:>6}"
             f"{run.output_tokens:>8,}{'$' + format(outcome.cost, '.4f'):>10}"
             f"{('-' if not summ else '$' + format(summ, '.4f')):>8}{cost_delta:>9}"
+            f"{f'{outcome.score.facts_left}/{len(outcome.score.outcomes)}':>9}"
+            f"{outcome.score.lost_to_compaction:>6}{outcome.score.ignored_by_model:>8}"
             f"{outcome.correctness:>8.0%}{'*' if outcome.strategy == base.strategy else ' '}{rel:>9}"
             f"{(','.join(flags) or '-'):>8}"
         )
@@ -220,6 +223,11 @@ def _render(
         "in/out    = tokens billed across the whole run, replies included",
         "cost      = the whole conversation, cached reads discounted, summ$ included",
         "summ$     = what this strategy's own summarization calls cost, of that total",
+        "facts     = planted facts surviving compaction into the final prompt: recall's ceiling",
+        "lost      = compaction removed it, so the model could not use it  <- the damage",
+        "ignored   = still in context but unused: the model's failing, not compaction's.",
+        "            Without this split a control that simply omits facts looks like",
+        "            compaction damage, and every strategy is judged against a false baseline",
         "correct   = share of correctness checks the final answer passed (* marks the control)",
         "flags     = ERR failed turn, S<n> summarizer failures, <n>/<n>t turns completed",
         "",
