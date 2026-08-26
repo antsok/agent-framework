@@ -31,6 +31,8 @@ between runs, which moves both axes for reasons unrelated to compaction. Runs ma
 | --- | --- | --- | --- | --- | --- |
 | 1 | `openai/gpt-5.6-luna` | OpenRouter | Chat Completions | no | `none` |
 | 2 | `gpt-5.4-mini` | Azure Foundry | Responses | yes | `none` |
+| 3 | `gpt-5.6-luna` | Azure Foundry | Responses | yes | `none` |
+| 4 | `z-ai/glm-5.3-flash` | OpenRouter | Chat Completions | partly | *contaminated* |
 
 ---
 
@@ -99,6 +101,97 @@ enough that nothing is reusable, then pays for its own summary calls on top.
 
 ---
 
+### Run 3 — `gpt-5.6-luna` via Azure Foundry (pinned)
+
+Pricing $0.20/M in, $0.02/M cached (10x), $1.20/M out (6x); OpenRouter list rates used as a
+stand-in, since only the ratios affect the relative figures. `temperature` is rejected by
+this deployment and was dropped (`NO:temp` on every row, applied uniformly). Every run
+gathered 17/17 facts with 0 unfetched.
+
+**The tightest measurement in the set**: the control varied by 1% across three repeats, so
+the cost differences below are unusually trustworthy.
+
+| strategy | in | hit% | cost | +- | vs none | lost | correct |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| token_budget_tools_first | 159,921 | 65% | $0.0167 | 19% | -22% | 13 | 28% |
+| token_budget_truncate_first | 164,176 | 65% | $0.0182 | 15% | -15% | 13 | 28% |
+| **none** | **453,004** | **91%** | **$0.0215** | **1%** | — | **0** | **100%** |
+| context_window_aggressive | 123,374 | 20% | $0.0229 | 10% | +6% | 15 | 17% |
+| truncation | 261,730 | 72% | $0.0233 | 13% | +8% | 10 | 33% |
+| token_budget_window_first | 170,460 | 40% | $0.0251 | 1% | +17% | 15 | 17% |
+| context_window | 179,512 | 38% | $0.0265 | 18% | +23% | 13 | 28% |
+| token_budget_fallback | 181,009 | 39% | $0.0270 | 27% | +25% | 13 | 28% |
+| tool_result | 419,919 | 78% | $0.0288 | 33% | +34% | 0 | 100% |
+| selective_tool_call | 421,435 | 78% | $0.0306 | 14% | +42% | 0 | 100% |
+| sliding_window | 144,743 | 1% | $0.0316 | 0% | +47% | 15 | 17% |
+| token_budget_summarize | 165,895 | 48% | $0.0319 | 5% | +48% | 6 | 56% |
+| context_window_lazy | 253,705 | 25% | $0.0428 | 31% | +99% | 13 | 28% |
+| summarization | 135,247 | 1% | $0.0440 | 10% | +104% | 7 | 50% |
+
+Effective input against `none`: `tool_result` and `selective_tool_call` both **+53%** on 7%
+*fewer* tokens; `token_budget_tools_first` **-19%** on 65% fewer. Break-even needs a **39%**
+cut at 78% hit rate, **56%** at 65%, **72%** at 38%.
+
+**Same model as run 1, different route and API, and it agrees**: information-preserving
+strategies cost 34-42% more, the correctness cliff is identical, and the only cheaper options
+lose 13 of 17 facts.
+
+---
+
+### Run 4 — `z-ai/glm-5.3-flash` via OpenRouter (contaminated, partly usable)
+
+Pricing $0.075/M in, $0.015/M cached, $0.25/M out. **The cache discount here is 5x, not the
+10x of every other model tested** — which is the reason this run matters.
+
+**Do not read the full table.** Three faults make most of it meaningless:
+
+1. **Tool forcing applied to some rows and not others within one run.** 9 rows accepted a
+   pinned `tool_choice`; 3 were refused it and fell back (`NO:tool`). Identical
+   configuration, same process. OpenRouter routes a model across several backends, and they
+   do not agree on tool support, so rows differ in whether the agent chose its own tool calls.
+2. **The control scored 56%**, with 8 of 17 facts present but unused. Most other rows show 17
+   ignored and 6% correct: the model had everything in context and used almost none of it.
+   The correctness axis says more about this model's answer discipline than about compaction.
+3. **Two rows errored partway** (`context_window_lazy` 2 of 16 turns, `summarization` 14 of
+   16), and `context_window_lazy` carries a 3389% spread.
+
+The verdict line it printed — `token_budget_truncate_first` "answering at 100% of the
+control" — is an artefact: 56% of a control that itself scored 56%.
+
+**What is usable** is the three rows that were consistently unpinned, compared only with each
+other:
+
+| strategy | in | vs none | hit% | effective | vs none | lost |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| **none** | 941,346 | — | 85% | 301,231 | — | 0 |
+| truncation | 322,477 | -66% | 70% | 141,890 | **-53%** | 11 |
+| sliding_window | 247,550 | -74% | 19% | 209,922 | -30% | 15 |
+
+**This is the first model where compaction clearly wins on cost, and the break-even formula
+predicted it in advance.** At a 5x discount the threshold falls to a **27%** cut, against
+39-44% at 10x. `truncation` cut 66%, cleared it comfortably, and came out 51% cheaper —
+larger than any saving seen elsewhere.
+
+**The cost axis flips with the discount; the correctness axis does not.** `truncation` still
+lost 11 of 17 facts. A cheaper cache makes compaction affordable, not safe.
+
+---
+
+## Models that could not be measured
+
+**`google/gemini-3.7-flash` — excluded.** Its turns fail partway through a conversation
+with `Invalid thought signature.` (Google, HTTP 400). Gemini's reasoning models require the
+thought signature attached to earlier assistant turns to survive intact into later requests,
+and that is exactly what compaction rewrites. Simple calls succeed, and calls with tools
+succeed; the failure appears once a multi-turn history is replayed. Upstream rate limiting
+(HTTP 429 from Google AI Studio) was also observed on the same route.
+
+This is not a harness defect and repeats would not fix it. It is a real constraint worth
+knowing: **client-side compaction and reasoning models that sign their thoughts are not
+straightforwardly compatible.** Any strategy that rewrites or drops an assistant turn risks
+invalidating the signature chain, which fails the request outright rather than degrading the
+answer.
+
 ## Observations holding across runs
 
 **The correctness result is a cliff, not a gradient.** Strategies that never evict messages
@@ -107,6 +200,11 @@ Strategies that evict lost **4 to 15**. Nothing lands in between.
 
 **No strategy has been both cheaper and as accurate**, on any model, provider or API tested.
 The only cheaper options destroy most of what the agent was told.
+
+**The cost result depends on the cache discount, and only on that.** At the 10x discount
+shared by luna and 5.4-mini, compaction loses. At glm-5.3-flash's 5x, `truncation` saves 51%.
+The break-even formula predicts which side a model falls on before running it — the discount
+and the achieved hit rate are the only inputs it needs.
 
 **The governing quantity is the cache discount, not prompt size.** Compaction pays only when
 the volume cut exceeds the discount forfeited:
