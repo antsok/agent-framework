@@ -67,6 +67,7 @@ __all__ = [
     "build_live_agent",
     "build_live_scenario",
     "make_lookup_tool",
+    "make_scope_tools",
     "run_live",
     "score_live",
     "unretrieved_facts",
@@ -398,6 +399,71 @@ def make_lookup_tool(
     return lookup_deployment
 
 
+def _scope_tool(scope: str, result: str) -> Callable[[], str]:
+    """Return one no-argument tool that hands back a fixed result.
+
+    A closure rather than a default argument. Capturing the result as ``def tool(_result=...)``
+    puts it in the function signature, and the framework turns the signature into the tool
+    schema -- so the whole result body would be advertised to the model as a parameter it
+    could set.
+
+    Args:
+        scope: The deployment scope this tool reports on.
+        result: The text to return.
+
+    Returns:
+        A zero-argument callable named ``lookup_<scope>``.
+    """
+
+    def tool() -> str:
+        return result
+
+    tool.__name__ = f"lookup_{scope}"
+    tool.__doc__ = (
+        f"Look up the deployment facts for the {scope} deployment."
+        + chr(10)
+        + chr(10)
+        + "Returns:"
+        + chr(10)
+        + f"    The region code and fallback host for the {scope} deployment."
+        + chr(10)
+    )
+    return tool
+
+
+def make_scope_tools(
+    lookups: Mapping[str, tuple[str, str]],
+    filler_tokens: int = DEFAULT_TOOL_RESULT_TOKENS,
+) -> list[Callable[[], str]]:
+    """Build one no-argument tool per scope, so the wrong scope cannot be requested.
+
+    A single ``lookup_deployment(scope)`` tool leaves the choice of scope to the model, and
+    ``tool_choice="required"`` cannot constrain an argument -- only which function is called.
+    Measured on one model: forcing a call raised tool use from 4 to 7 calls per run but it
+    still reached only 3 of 6 scopes, calling one twice and skipping another. Splitting the
+    tool per scope makes ``required_function_name`` sufficient to pin exactly which fact the
+    turn gathers.
+
+    Args:
+        lookups: Scope label mapped to ``(region_code, fallback_host)``.
+        filler_tokens: Approximate size of each result, in tokens.
+
+    Returns:
+        One callable per scope, named ``lookup_<scope>``.
+    """
+    tools: list[Callable[[], str]] = []
+    for index, scope in enumerate(sorted(lookups)):
+        region, host = lookups[scope]
+        body = sized_text(f"[{scope} deployment notes] ", index * 31 + 7, filler_tokens, TRUE_CHARS_PER_TOKEN)
+        tools.append(
+            _scope_tool(
+                scope,
+                f"region_code={region}; fallback_host={host}; both values must appear in the final report. {body}",
+            )
+        )
+    return tools
+
+
 def build_live_agent(
     runtime: ProviderRuntime,
     *,
@@ -497,6 +563,7 @@ async def run_live(
     scenario: RecallScenario,
     agent_kind: str = "plain",
     tool_result_tokens: int = DEFAULT_TOOL_RESULT_TOKENS,
+    force_tool_calls: bool = True,
 ) -> LiveOutcome:
     """Run the scenario end to end against a real agent.
 
@@ -509,6 +576,11 @@ async def run_live(
         scenario: The scenario to drive, built with ``bulk_in_user=True``.
         agent_kind: One of :data:`AGENT_KINDS`.
         tool_result_tokens: Approximate size of each tool result, in tokens.
+        force_tool_calls: Set ``tool_choice='required'`` on the turns that ask for a
+            lookup. Without it a model that ignores the instruction gathers fewer facts
+            and carries fewer tokens, which moves both axes for reasons unrelated to
+            compaction: measured at 3 of 6 scopes reached and a 33% input swing between
+            identical runs on one model, against 6 of 6 and 8% on another.
 
     Returns:
         The outcome. A turn that fails sets ``error`` and stops the run rather than raising,
@@ -517,30 +589,32 @@ async def run_live(
     strategy = build_strategy(strategy_name, options)
     recorder = UsageRecorder()
     summarizer = options.summarizer if isinstance(options.summarizer, MeteredClient) else None
-    lookup = make_lookup_tool(scenario.tool_lookups, tool_result_tokens)
     tool_calls = 0
     scopes_called: list[str] = []
 
-    def lookup_deployment(scope: str) -> str:
-        """Look up the deployment facts for one scope of the system.
+    def _wrap(scope: str, inner: Callable[[], str]) -> Callable[[], str]:
+        def recorded() -> str:
+            nonlocal tool_calls
+            tool_calls += 1
+            scopes_called.append(scope)
+            return inner()
 
-        Args:
-            scope: Which deployment to look up. One of "early", "mid" or "late".
+        recorded.__name__ = inner.__name__
+        recorded.__doc__ = inner.__doc__
+        return recorded
 
-        Returns:
-            The region code and fallback host for that scope.
-        """
-        nonlocal tool_calls
-        tool_calls += 1
-        scopes_called.append(scope.strip().casefold())
-        return lookup(scope)
+    scope_tools = [
+        _wrap(name.removeprefix("lookup_"), fn)
+        for fn in make_scope_tools(scenario.tool_lookups, tool_result_tokens)
+        if (name := fn.__name__)
+    ]
 
     agent = build_live_agent(
         runtime,
         kind=agent_kind,
         strategy=strategy,
         tokenizer=options.tokenizer,
-        tools=[lookup_deployment],
+        tools=scope_tools,
         recorder=recorder,
         max_context_window_tokens=options.max_context_window_tokens,
         max_output_tokens=options.max_output_tokens,
@@ -553,10 +627,27 @@ async def run_live(
     completed = 0
     answer = ""
     final_mark = 0
+    forced: dict[int, str] = dict(scenario.tool_turn_scopes) if force_tool_calls else {}
     for index, turn in enumerate(turns):
         final_mark = len(recorder.calls)
+        # Per-turn options must carry the runtime's own options too: this replaces the
+        # per-call option set rather than adding to it.
+        turn_options: dict[str, Any] = dict(runtime.options)
+        if index in forced:
+            # Name the function, not just "required". Requiring *a* call still lets the model
+            # pick the scope, and it picks wrong: measured reaching 3 of 6 scopes while
+            # calling one of them twice.
+            turn_options["tool_choice"] = {
+                "mode": "required",
+                "required_function_name": f"lookup_{forced[index]}",
+            }
+        elif force_tool_calls:
+            # Every other turn is closed to tools. Pinning only the wanted calls still leaves
+            # the model free to make unwanted ones: measured at 12 calls against 6 asked for,
+            # which doubled the tokens the run carried on one repeat out of three.
+            turn_options["tool_choice"] = "none"
         try:
-            response = await agent.run(_turn_text(turn.request), session=session)
+            response = await agent.run(_turn_text(turn.request), session=session, options=turn_options)
         except Exception as exc:
             error = f"turn {index + 1}: {type(exc).__name__}: {exc}"
             break
