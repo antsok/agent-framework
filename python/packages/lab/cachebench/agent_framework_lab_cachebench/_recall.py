@@ -200,6 +200,15 @@ class RecallScenario:
     transcript: Transcript
     facts: tuple[PlantedFact, ...]
     contradictions: tuple[Contradiction, ...] = ()
+    tool_turn_scopes: Mapping[int, str] = field(default_factory=dict[int, str])
+    """Turn index mapped to the scope that turn asks for.
+
+    A live run forces that exact tool on that exact turn. Left to itself, a model may ignore
+    the instruction, or call a scope it has already looked up: measured at 3 of 6 scopes
+    reached, and one model calling the same scope twice while skipping another. Either
+    changes how many facts exist to score and how many tokens the run carries, neither of
+    which is about compaction.
+    """
     tool_lookups: Mapping[str, tuple[str, str]] = field(default_factory=dict[str, tuple[str, str]])
     """Scope label to ``(region_code, fallback_host)``, for driving a real tool.
 
@@ -268,6 +277,7 @@ def build_recall_scenario(
     facts: list[PlantedFact] = []
     turns: list[TranscriptTurn] = []
     lookups: dict[str, tuple[str, str]] = {}
+    tool_turn_scopes: dict[int, str] = {}
 
     system = Message(
         role="system",
@@ -302,6 +312,7 @@ def build_recall_scenario(
         call_id = f"call_{label}"
         region, host = tool_markers[position * 2], tool_markers[position * 2 + 1]
         lookups[label] = (region, host)
+        tool_turn_scopes[len(turns)] = label
         facts.extend((
             PlantedFact(region, "tool_result", len(turns) + 1, f"{label} region code"),
             PlantedFact(host, "tool_result", len(turns) + 1, f"{label} fallback host"),
@@ -477,6 +488,7 @@ def build_recall_scenario(
         ),
         facts=tuple(facts),
         tool_lookups=lookups,
+        tool_turn_scopes=tool_turn_scopes,
     )
 
 
