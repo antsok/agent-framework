@@ -222,6 +222,11 @@ def _render(
         rel = "-" if outcome.strategy == base.strategy else f"{relative_correctness(outcome, base):.0%}"
         hit = "n/a" if outcome.hit_rate is None else f"{outcome.hit_rate:.0%}"
         flags: list[str] = []
+        # A row that gathered a different set of facts than the control is not comparable to
+        # it on either axis: it has a different denominator for correctness and a different
+        # token volume for cost. Measured at 25% more input for runs that fetched every tool.
+        if nofetch[outcome.strategy] != nofetch[base.strategy]:
+            flags.append("FETCH")
         if run.error:
             flags.append("ERR")
         if run.summarizer_failures:
@@ -259,7 +264,9 @@ def _render(
         "            Without this split a control that simply omits facts looks like",
         "            compaction damage, and every strategy is judged against a false baseline",
         "correct   = share of correctness checks the final answer passed (* marks the control)",
-        "flags     = ERR failed turn, S<n> summarizer failures, <n>/<n>t turns completed",
+        "flags     = ERR failed turn, S<n> summarizer failures, <n>/<n>t turns completed,",
+        "            FETCH this row gathered a different set of facts than the control, so",
+        "            its cost and correctness are not comparable with it",
         "",
         f"VERDICT: {verdict.recommended}",
         verdict.rationale,
