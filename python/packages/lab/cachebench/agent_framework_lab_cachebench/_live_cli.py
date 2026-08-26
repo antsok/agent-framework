@@ -52,6 +52,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--agent", default="plain", choices=list(AGENT_KINDS), help="How to assemble the agent.")
     parser.add_argument("--filler-turns", type=int, default=6, help="Padding turns between planted facts.")
     parser.add_argument("--filler-tokens", type=int, default=4_000, help="Approximate size of each filler turn.")
+    parser.add_argument(
+        "--tool-turns",
+        type=int,
+        default=6,
+        help=(
+            "Tool-call groups to plant. Must exceed the strategies' keep_last_tool_call_groups "
+            "(4) or tool-oriented compaction never fires. Default 6."
+        ),
+    )
     parser.add_argument("--context-window", type=int, default=32_000, help="Simulated context window.")
     parser.add_argument("--max-output-tokens", type=int, default=2_048, help="Output reservation for budget math.")
     parser.add_argument("--answer-max-tokens", type=int, default=900, help="Cap on generated replies.")
@@ -248,17 +257,37 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
         raise SystemExit("The 'none' control must be included; every comparison is relative to it.")
 
     tokenizer = build_tokenizer(args.tokenizer)
+    retained = StrategyOptions(tokenizer, args.context_window, args.max_output_tokens).keep_last_tool_call_groups
+    probe = build_live_scenario(
+        salt="probe",
+        filler_turns=args.filler_turns,
+        filler_tokens=1,
+        tool_turns=args.tool_turns,
+    )
+    planted_groups = len(probe.tool_lookups)
+    # Every tool-oriented strategy keeps the last `retained` groups verbatim. With no more
+    # groups than that, it evicts nothing, changes no tokens, and scores a perfect result for
+    # having done nothing at all -- which reads as the best row in the table. Measured: at 3
+    # groups against a retention of 4, tool_result and selective_tool_call were exact no-ops
+    # while carrying 55% of the planted facts.
+    tool_strategies_inert = planted_groups <= retained
     needs_summarizer = any("summar" in name for name in strategies)
     if needs_summarizer and args.summarizer_provider is None and not args.dry_run:
         raise SystemExit("Summarization strategies require --summarizer-provider.")
 
     if args.dry_run:
-        scenario = build_live_scenario(salt="dry", filler_turns=args.filler_turns, filler_tokens=args.filler_tokens)
+        scenario = build_live_scenario(
+            salt="dry",
+            filler_turns=args.filler_turns,
+            filler_tokens=args.filler_tokens,
+            tool_turns=args.tool_turns,
+        )
         user_tokens = (
             sum(len(str(content)) for turn in scenario.transcript.turns for m in turn.request for content in m.contents)
             / 4
         )
         print(f"strategies: {len(strategies)}  turns: {len(scenario.transcript.turns)}  facts: {len(scenario.facts)}")
+        print(f"tool-call groups: {planted_groups} planted, {retained} retained by tool-oriented strategies")
         print(f"user-side prompt material: ~{user_tokens:,.0f} tokens per run, growing each turn")
         print(f"model calls: >= {len(strategies) * len(scenario.transcript.turns)} (more whenever a tool is used)")
         for name in strategies:
@@ -293,6 +322,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
             salt=f"{time.strftime('%Y%m%d-%H%M%S')}-{name}",
             filler_turns=args.filler_turns,
             filler_tokens=args.filler_tokens,
+            tool_turns=args.tool_turns,
         )
         options = StrategyOptions(
             tokenizer=tokenizer,
@@ -319,6 +349,14 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
         verdict = recommend(joint, min_correctness=args.min_correctness)
     except ValueError as error:
         raise SystemExit(f"Cannot summarize: {error}") from error
+    if tool_strategies_inert:
+        affected = ", ".join(name for name in live if "tool" in name) or "the tool-oriented strategies"
+        print()
+        print(
+            f"WARNING: {planted_groups} tool-call groups were planted but tool-oriented strategies "
+            f"retain the last {retained}, so {affected} evicted nothing. Their scores measure "
+            "a no-op, not information preservation. Raise --tool-turns above the retention."
+        )
     print(_render(verdict, live, pricing, runtime.model, args.agent, show_answers=args.show_answers))
     return 0
 
