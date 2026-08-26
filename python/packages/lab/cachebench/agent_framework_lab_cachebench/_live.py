@@ -49,6 +49,7 @@ from agent_framework._compaction import project_included_messages
 
 from ._metrics import serialize_message
 from ._recall import FactOutcome, RecallScenario, build_recall_scenario, score_answer
+from ._runner import unsupported_option
 from ._strategies import StrategyOptions, build_strategy
 from ._transcripts import TRUE_CHARS_PER_TOKEN, sized_text
 
@@ -251,6 +252,12 @@ class LiveOutcome:
     tool_calls_made: int
     turns_completed: int
     turns_total: int
+    dropped_options: tuple[str, ...] = ()
+    """Request options the provider rejected, dropped so the run could continue.
+
+    A run that dropped ``tool_choice`` is not comparable with one that kept it: the model
+    picked its own tool calls, so it gathered its own set of facts.
+    """
     scopes_called: tuple[str, ...] = ()
     """Tool scopes the agent actually asked for.
 
@@ -519,7 +526,10 @@ def build_live_agent(
             disable_file_memory=True,
             disable_web_search=True,
             middleware=[recorder],
-            default_options=dict(runtime.options),
+            # Deliberately empty: every option travels per turn instead. An option baked
+            # in here cannot be dropped when a provider rejects it without rebuilding the
+            # agent, which would discard the session the conversation lives in.
+            default_options={},
         )
 
     history = InMemoryHistoryProvider()
@@ -544,7 +554,7 @@ def build_live_agent(
         compaction_strategy=strategy,
         require_per_service_call_history_persistence=True,
         middleware=[recorder],
-        default_options=dict(runtime.options),
+        default_options={},
     )
 
 
@@ -628,28 +638,47 @@ async def run_live(
     answer = ""
     final_mark = 0
     forced: dict[int, str] = dict(scenario.tool_turn_scopes) if force_tool_calls else {}
+    dropped: list[str] = []
     for index, turn in enumerate(turns):
         final_mark = len(recorder.calls)
-        # Per-turn options must carry the runtime's own options too: this replaces the
-        # per-call option set rather than adding to it.
-        turn_options: dict[str, Any] = dict(runtime.options)
-        if index in forced:
-            # Name the function, not just "required". Requiring *a* call still lets the model
-            # pick the scope, and it picks wrong: measured reaching 3 of 6 scopes while
-            # calling one of them twice.
-            turn_options["tool_choice"] = {
-                "mode": "required",
-                "required_function_name": f"lookup_{forced[index]}",
-            }
-        elif force_tool_calls:
-            # Every other turn is closed to tools. Pinning only the wanted calls still leaves
-            # the model free to make unwanted ones: measured at 12 calls against 6 asked for,
-            # which doubled the tokens the run carried on one repeat out of three.
-            turn_options["tool_choice"] = "none"
-        try:
-            response = await agent.run(_turn_text(turn.request), session=session, options=turn_options)
-        except Exception as exc:
-            error = f"turn {index + 1}: {type(exc).__name__}: {exc}"
+        response = None
+        # Two attempts. Providers differ in which request options they accept, and one that
+        # rejects an option names it. Dropping that option and retrying is what lets a model
+        # with an unusual surface be measured at all instead of returning an empty run:
+        # measured on two of five models, one rejecting temperature and one rejecting any
+        # pinned tool choice.
+        for _ in range(2):
+            # Per-turn options carry the runtime's own options too: this replaces the
+            # per-call option set rather than adding to it.
+            turn_options: dict[str, Any] = {k: v for k, v in runtime.options.items() if k not in dropped}
+            if "tool_choice" not in dropped:
+                if index in forced:
+                    # Name the function, not just "required". Requiring *a* call still lets
+                    # the model pick the scope, and it picks wrong: measured reaching 3 of 6
+                    # scopes while calling one of them twice.
+                    turn_options["tool_choice"] = {
+                        "mode": "required",
+                        "required_function_name": f"lookup_{forced[index]}",
+                    }
+                elif force_tool_calls:
+                    # Every other turn is closed to tools. Pinning only the wanted calls
+                    # still leaves the model free to make unwanted ones: measured at 12 calls
+                    # against the 6 asked for, on one repeat in three.
+                    turn_options["tool_choice"] = "none"
+            try:
+                response = await agent.run(_turn_text(turn.request), session=session, options=turn_options)
+                break
+            except Exception as exc:
+                option = unsupported_option(exc)
+                if option is None or option in dropped:
+                    error = f"turn {index + 1}: {type(exc).__name__}: {exc}"
+                    break
+                dropped.append(option)
+                if option == "tool_choice":
+                    forced = {}
+        if response is None:
+            if error is None:
+                error = f"turn {index + 1}: no response"
             break
         completed += 1
         text = response.text or ""
@@ -670,6 +699,7 @@ async def run_live(
         tool_calls_made=tool_calls,
         turns_completed=completed,
         turns_total=len(turns),
+        dropped_options=tuple(dropped),
         scopes_called=tuple(scopes_called),
         summarizer_calls=summarizer.calls if summarizer else 0,
         summarizer_failures=summarizer.failures if summarizer else 0,

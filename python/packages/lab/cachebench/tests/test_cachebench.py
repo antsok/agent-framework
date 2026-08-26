@@ -37,7 +37,7 @@ from agent_framework_lab_cachebench import (
     write_records_jsonl,
     write_summary_csv,
 )
-from agent_framework_lab_cachebench._runner import _unsupported_option
+from agent_framework_lab_cachebench._runner import unsupported_option
 from agent_framework_lab_cachebench._strategies import StrategyOptions
 from agent_framework_lab_cachebench._types import TurnRecord
 
@@ -59,6 +59,17 @@ class StubCaller:
             cached_tokens=self.cached_tokens,
             output_tokens=5,
         )
+
+
+def test_unsupported_option_recognises_a_refused_tool_choice() -> None:
+    """A refusal that names no parameter must still map to the option it refers to.
+
+    Z.AI answers a pinned tool choice with "Tool choice must be auto", naming no field, so
+    the generic patterns miss it and every turn fails.
+    """
+    error = Exception("Error code: 400 - {'error': {'message': 'Tool choice must be auto'}}")
+
+    assert unsupported_option(error) == "tool_choice"
 
 
 def _cell(strategy: str = "none") -> CellKey:
@@ -411,12 +422,12 @@ def test_unsupported_option_is_extracted_from_a_wrapped_provider_error() -> None
         "{'error': {'message': \"Unsupported parameter: 'temperature' is not supported with "
         "this model.\", 'type': 'invalid_request_error', 'param': 'temperature'}}"
     )
-    assert _unsupported_option(wrapped) == "temperature"
+    assert unsupported_option(wrapped) == "temperature"
 
 
 def test_unsupported_option_ignores_unrelated_failures() -> None:
-    assert _unsupported_option(Exception("Error code: 429 - rate limit exceeded")) is None
-    assert _unsupported_option(Exception("Error code: 500 - internal")) is None
+    assert unsupported_option(Exception("Error code: 429 - rate limit exceeded")) is None
+    assert unsupported_option(Exception("Error code: 500 - internal")) is None
 
 
 async def test_caller_drops_a_rejected_option_and_retries() -> None:

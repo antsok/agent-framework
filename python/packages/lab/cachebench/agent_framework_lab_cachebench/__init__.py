@@ -55,7 +55,7 @@ from ._recall import (
 )
 from ._recall_cli import main as recall_main
 from ._report import render_summary_table, write_records_jsonl, write_summary_csv
-from ._runner import CallOutcome, ProviderCaller, TurnCaller, run_cell
+from ._runner import CallOutcome, ProviderCaller, TurnCaller, run_cell, unsupported_option
 from ._strategies import (
     STRATEGY_BUILDERS,
     StrategyOptions,
@@ -143,6 +143,7 @@ __all__ = [
     "summary_main",
     "token_counts",
     "unretrieved_facts",
+    "unsupported_option",
     "wants_client_side_history",
     "write_records_jsonl",
     "write_summary_csv",

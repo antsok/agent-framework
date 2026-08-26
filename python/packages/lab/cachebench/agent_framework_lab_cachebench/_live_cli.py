@@ -285,7 +285,12 @@ def _render(
     for outcome in verdict.outcomes:
         run = live[outcome.strategy]
         summ = _summarizer_cost(run, pricing)
-        cost_delta = "-" if outcome.strategy == base.strategy else f"{(outcome.cost - base.cost) / base.cost:+.0%}"
+        # The control can cost nothing when its turns all failed, and a table that divides
+        # by it crashes instead of showing which rows failed.
+        if outcome.strategy == base.strategy or base.cost <= 0:
+            cost_delta = "-"
+        else:
+            cost_delta = f"{(outcome.cost - base.cost) / base.cost:+.0%}"
         rel = "-" if outcome.strategy == base.strategy else f"{relative_correctness(outcome, base):.0%}"
         hit = "n/a" if outcome.hit_rate is None else f"{outcome.hit_rate:.0%}"
         flags: list[str] = []
@@ -294,6 +299,8 @@ def _render(
         # token volume for cost. Measured at 25% more input for runs that fetched every tool.
         if nofetch[outcome.strategy] != nofetch[base.strategy]:
             flags.append("FETCH")
+        if run.dropped_options:
+            flags.append("NO:" + ",".join(o[:4] for o in run.dropped_options))
         if run.error:
             flags.append("ERR")
         if run.summarizer_failures:
@@ -336,6 +343,9 @@ def _render(
         "            compaction damage, and every strategy is judged against a false baseline",
         "correct   = share of correctness checks the final answer passed (* marks the control)",
         "flags     = ERR failed turn, S<n> summarizer failures, <n>/<n>t turns completed,",
+        "            NO:<opt> the provider rejected that option so it was dropped. A run",
+        "            that dropped tool_choice chose its own tool calls and is not",
+        "            comparable with one that did not,",
         "            FETCH this row gathered a different set of facts than the control, so",
         "            its cost and correctness are not comparable with it",
         "",
@@ -501,6 +511,16 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
         spread[name] = _spread(repeats, pricing)
         nofetch[name] = len(unretrieved_facts(representative, chosen_scenario))
         joint.append(_to_joint(representative, chosen_scenario, pricing))
+
+    failures = [name for name, run in live.items() if run.error]
+    if len(failures) == len(live):
+        raise SystemExit(
+            f"Every strategy failed. First error: {live[failures[0]].error}"
+            + chr(10)
+            + "No comparison is possible; nothing below would mean anything."
+        )
+    if not any(outcome.cost > 0 for outcome in joint):
+        raise SystemExit("No strategy reported any billed tokens, so there is nothing to compare.")
 
     try:
         verdict = recommend(joint, min_correctness=args.min_correctness)
