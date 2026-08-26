@@ -279,6 +279,23 @@ class LiveOutcome:
         return max((call.messages_before_compaction for call in self.calls), default=0)
 
     @property
+    def prompt_tokens_final(self) -> int:
+        """Billed size of the last prompt sent.
+
+        Measured in tokens rather than messages because message counts are blind to
+        strategies that rewrite content in place. ``ToolResultCompactionStrategy`` collapses
+        tool results into summaries without excluding anything, so it leaves the message
+        count untouched while removing real tokens — by the message count alone it looks
+        like it did nothing at all.
+        """
+        return self.calls[-1].input_tokens if self.calls else 0
+
+    @property
+    def prompt_tokens_peak(self) -> int:
+        """Billed size of the largest prompt any single call carried."""
+        return max((call.input_tokens for call in self.calls), default=0)
+
+    @property
     def messages_dropped(self) -> int:
         """Messages the final call's compaction removed from the history."""
         return max(self.calls[-1].messages_before_compaction - self.calls[-1].messages_sent, 0) if self.calls else 0
