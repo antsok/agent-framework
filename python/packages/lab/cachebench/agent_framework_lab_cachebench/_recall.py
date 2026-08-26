@@ -231,6 +231,7 @@ def build_recall_scenario(
     chars_per_token: float = TRUE_CHARS_PER_TOKEN,
     bulk_in_user: bool = False,
     tool_turns: int = 3,
+    tool_result_tokens: int = 600,
 ) -> RecallScenario:
     """Build a conversation whose final question needs facts from throughout the history.
 
@@ -248,6 +249,10 @@ def build_recall_scenario(
         chars_per_token: Sizing basis for the filler.
         bulk_in_user: Put the filler in the user turns rather than the scripted replies,
             for live runs where the assistant writes its own replies.
+        tool_result_tokens: Approximate size of each tool result, **in tokens**. Sized in
+            tokens rather than characters: the earlier 600-*character* body came to about
+            76 tokens, so tool output was under 2% of the prompt and tool-oriented
+            compaction had nothing worth evicting.
         tool_turns: How many tool-call groups to plant. Must exceed a strategy's
             ``keep_last_tool_call_groups`` or tool-oriented compaction never fires and
             those strategies score a perfect result for doing nothing.
@@ -321,7 +326,8 @@ def build_recall_scenario(
                             call_id=call_id,
                             result=(
                                 f"region_code={region}; fallback_host={host}; "
-                                "both values must appear in the final report. " + filler_text(seed + 1, 600)
+                                "both values must appear in the final report. "
+                                + sized_text(f"[{label} notes] ", seed + 1, tool_result_tokens, chars_per_token)
                             ),
                         )
                     ],

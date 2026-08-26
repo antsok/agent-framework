@@ -50,6 +50,7 @@ from agent_framework._compaction import project_included_messages
 from ._metrics import serialize_message
 from ._recall import FactOutcome, RecallScenario, build_recall_scenario, score_answer
 from ._strategies import StrategyOptions, build_strategy
+from ._transcripts import TRUE_CHARS_PER_TOKEN, sized_text
 
 if TYPE_CHECKING:
     from agent_framework import CompactionStrategy, TokenizerProtocol
@@ -58,6 +59,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "AGENT_KINDS",
+    "DEFAULT_TOOL_RESULT_TOKENS",
     "LiveOutcome",
     "MeteredClient",
     "ModelCall",
@@ -76,6 +78,11 @@ __all__ = [
 #: is what production code calls, at the cost of adding its own tools and system prompt to
 #: every measured prompt.
 AGENT_KINDS: Final[tuple[str, ...]] = ("plain", "harness")
+
+#: Default size of each tool result, in tokens. Set high on purpose: in a real agent
+#: trace tool output is usually the bulk of the context, and a benchmark whose tool
+#: results are a rounding error cannot say anything about tool-oriented compaction.
+DEFAULT_TOOL_RESULT_TOKENS: Final[int] = 4_000
 
 _INSTRUCTIONS: Final[str] = (
     "You are a meticulous engineering assistant. Follow every stated requirement exactly. "
@@ -310,7 +317,10 @@ class LiveOutcome:
         return sum(call.output_tokens for call in self.calls[:-1]) if len(self.calls) > 1 else 0
 
 
-def make_lookup_tool(lookups: Mapping[str, tuple[str, str]], filler: str = "") -> Callable[[str], str]:
+def make_lookup_tool(
+    lookups: Mapping[str, tuple[str, str]],
+    filler_tokens: int = DEFAULT_TOOL_RESULT_TOKENS,
+) -> Callable[[str], str]:
     """Build the tool a live agent calls to obtain the planted tool-result facts.
 
     The replayed transcript scripts these values into a tool-result message. Live, the model
@@ -319,27 +329,37 @@ def make_lookup_tool(lookups: Mapping[str, tuple[str, str]], filler: str = "") -
 
     Args:
         lookups: Scope label mapped to ``(region_code, fallback_host)``.
-        filler: Padding appended to each result, matching the replayed result's bulk so that
-            tool-eviction strategies have something worth evicting.
+        filler_tokens: Approximate size of each result, **in tokens**. This is the only thing
+            that decides how much context tool output occupies, and therefore whether
+            tool-oriented compaction has anything worth evicting. At the ~76 tokens a
+            600-character default produced, six results came to under 2% of a 28,000-token
+            prompt and ``tool_result`` could move only 1.2% of it.
 
     Returns:
         A callable suitable for passing to ``Agent(tools=...)``.
     """
+    # Distinct text per scope: six identical results would share a prefix and let unrelated
+    # messages match by accident, inflating measured cache reuse.
+    bodies = {
+        scope: sized_text(f"[{scope} deployment notes] ", index * 31 + 7, filler_tokens, TRUE_CHARS_PER_TOKEN)
+        for index, scope in enumerate(sorted(lookups))
+    }
 
     def lookup_deployment(scope: str) -> str:
         """Look up the deployment facts for one scope of the system.
 
         Args:
-            scope: Which deployment to look up. One of "early", "mid" or "late".
+            scope: Which deployment to look up, such as "early", "mid" or "late".
 
         Returns:
             The region code and fallback host for that scope.
         """
-        entry = lookups.get(scope.strip().casefold())
+        key = scope.strip().casefold()
+        entry = lookups.get(key)
         if entry is None:
             return f"Unknown scope {scope!r}. Valid scopes are: {', '.join(sorted(lookups))}."
         region, host = entry
-        return f"region_code={region}; fallback_host={host}; both values must appear in the final report. {filler}"
+        return f"region_code={region}; fallback_host={host}; both values must appear in the final report. {bodies[key]}"
 
     return lookup_deployment
 
@@ -442,7 +462,7 @@ async def run_live(
     options: StrategyOptions,
     scenario: RecallScenario,
     agent_kind: str = "plain",
-    tool_filler: str = "",
+    tool_result_tokens: int = DEFAULT_TOOL_RESULT_TOKENS,
 ) -> LiveOutcome:
     """Run the scenario end to end against a real agent.
 
@@ -454,7 +474,7 @@ async def run_live(
         options: Budget and tokenizer parameters for the strategy.
         scenario: The scenario to drive, built with ``bulk_in_user=True``.
         agent_kind: One of :data:`AGENT_KINDS`.
-        tool_filler: Padding appended to each tool result.
+        tool_result_tokens: Approximate size of each tool result, in tokens.
 
     Returns:
         The outcome. A turn that fails sets ``error`` and stops the run rather than raising,
@@ -463,7 +483,7 @@ async def run_live(
     strategy = build_strategy(strategy_name, options)
     recorder = UsageRecorder()
     summarizer = options.summarizer if isinstance(options.summarizer, MeteredClient) else None
-    lookup = make_lookup_tool(scenario.tool_lookups, tool_filler)
+    lookup = make_lookup_tool(scenario.tool_lookups, tool_result_tokens)
     tool_calls = 0
 
     def lookup_deployment(scope: str) -> str:
