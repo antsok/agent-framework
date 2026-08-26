@@ -214,9 +214,13 @@ def _markers(salt: str, count: int, prefix: str) -> list[str]:
 
     Deriving them per cell keeps two cells from scoring against each other's markers, and
     makes it implausible that a model reproduces one from anything but the conversation.
+
+    Each marker gets its own digest rather than a slice of one shared digest. Slicing a
+    single sha256 in six-character chunks runs out after ten markers and then yields empty
+    ones, which match any text at all and silently score as recalled. A tool-heavy scenario
+    needs more markers than that.
     """
-    digest = hashlib.sha256(salt.encode("utf-8")).hexdigest()
-    return [f"{prefix}-{digest[index * 6 : index * 6 + 6].upper()}" for index in range(count)]
+    return [f"{prefix}-{hashlib.sha256(f'{salt}:{index}'.encode()).hexdigest()[:6].upper()}" for index in range(count)]
 
 
 def build_recall_scenario(
@@ -226,6 +230,7 @@ def build_recall_scenario(
     filler_tokens: int = 4_000,
     chars_per_token: float = TRUE_CHARS_PER_TOKEN,
     bulk_in_user: bool = False,
+    tool_turns: int = 3,
 ) -> RecallScenario:
     """Build a conversation whose final question needs facts from throughout the history.
 
@@ -243,13 +248,17 @@ def build_recall_scenario(
         chars_per_token: Sizing basis for the filler.
         bulk_in_user: Put the filler in the user turns rather than the scripted replies,
             for live runs where the assistant writes its own replies.
+        tool_turns: How many tool-call groups to plant. Must exceed a strategy's
+            ``keep_last_tool_call_groups`` or tool-oriented compaction never fires and
+            those strategies score a perfect result for doing nothing.
 
     Returns:
         The scenario, whose transcript's final turn is the question to be answered.
     """
     requirement_markers = _markers(salt, 3, "RQ")
     correction_marker = _markers(salt + "c", 1, "FB")[0]
-    tool_markers = _markers(salt + "t", 6, "TL")
+    tool_count = max(tool_turns, 3)
+    tool_markers = _markers(salt + "t", tool_count * 2, "TL")
 
     facts: list[PlantedFact] = []
     turns: list[TranscriptTurn] = []
@@ -366,8 +375,20 @@ def build_recall_scenario(
     # strategy, which measured nothing.
     turns.append(_tool_turn("early", 39, 0))
 
-    for index in range(filler_turns // 3):
-        turns.append(_filler_pair(index))
+    # Extra lookups beyond the early/mid/late anchors, spread through the filler so that a
+    # tool-heavy trace can be built without disturbing where the anchors land.
+    extras = [f"extra{n}" for n in range(tool_count - 3)]
+    next_position = 1
+
+    def _filler_section(base: int) -> None:
+        nonlocal next_position
+        for offset in range(filler_turns // 3):
+            turns.append(_filler_pair(base + offset))
+            if extras:
+                turns.append(_tool_turn(extras.pop(0), 50 + next_position, next_position))
+                next_position += 1
+
+    _filler_section(0)
 
     # Middle: a correction that reverses the earlier plan. Losing this is worse than losing
     # a requirement, because the agent then confidently acts on superseded information.
@@ -395,15 +416,14 @@ def build_recall_scenario(
         PlantedFact("streaming pipeline", "correction", correction_turn, "the corrected direction"),
     ]
 
-    for index in range(filler_turns // 3):
-        turns.append(_filler_pair(30 + index))
+    _filler_section(30)
 
-    turns.append(_tool_turn("mid", 41, 1))
+    mid_position, next_position = next_position, next_position + 1
+    turns.append(_tool_turn("mid", 41, mid_position))
 
-    for index in range(filler_turns // 3):
-        turns.append(_filler_pair(60 + index))
+    _filler_section(60)
 
-    turns.append(_tool_turn("late", 43, 2))
+    turns.append(_tool_turn("late", 43, next_position))
 
     # Final turn: answerable only by using every planted fact.
     turns.append(
