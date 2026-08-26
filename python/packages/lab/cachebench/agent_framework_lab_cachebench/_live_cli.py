@@ -522,6 +522,10 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
         nofetch[name] = len(unretrieved_facts(representative, chosen_scenario))
         joint.append(_to_joint(representative, chosen_scenario, pricing))
 
+    # A run that stopped early spent almost nothing and answered almost nothing. Ranking it
+    # produces "100% cheaper" for a strategy that simply died, and counts it as clearing the
+    # correctness bar because a near-zero control makes every ratio look enormous.
+    incomplete = [name for name, run in live.items() if run.turns_completed < run.turns_total]
     failures = [name for name, run in live.items() if run.error]
     if len(failures) == len(live):
         raise SystemExit(
@@ -532,8 +536,15 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
     if not any(outcome.cost > 0 for outcome in joint):
         raise SystemExit("No strategy reported any billed tokens, so there is nothing to compare.")
 
+    ranked = [outcome for outcome in joint if outcome.strategy not in incomplete]
+    if incomplete:
+        print()
+        print(f"Excluded from the verdict ({len(incomplete)} did not finish): " + ", ".join(sorted(incomplete)))
+    if not any(outcome.strategy == "none" for outcome in ranked):
+        raise SystemExit("The control did not finish, so nothing can be compared against it.")
+
     try:
-        verdict = recommend(joint, min_correctness=args.min_correctness)
+        verdict = recommend(ranked, min_correctness=args.min_correctness)
     except ValueError as error:
         raise SystemExit(f"Cannot summarize: {error}") from error
     if tool_strategies_inert:
