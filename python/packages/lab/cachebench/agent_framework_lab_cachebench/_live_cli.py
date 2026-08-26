@@ -11,13 +11,20 @@ from collections.abc import Sequence
 from typing import TYPE_CHECKING, Any, cast
 
 from ._advisor import ModelPricing, fetch_openrouter_pricing
-from ._live import AGENT_KINDS, LiveOutcome, MeteredClient, build_live_scenario, run_live, score_live
+from ._live import (
+    AGENT_KINDS,
+    DEFAULT_TOOL_RESULT_TOKENS,
+    LiveOutcome,
+    MeteredClient,
+    build_live_scenario,
+    run_live,
+    score_live,
+)
 from ._providers import build_provider, parse_provider_selector, provider_names
 from ._recall import RecallScenario, RecallScore
 from ._strategies import StrategyOptions, build_strategy, strategy_names
 from ._summary import DEFAULT_MIN_CORRECTNESS, JointOutcome, JointVerdict, recommend, relative_correctness
 from ._tokenizers import TOKENIZER_NAMES, build_tokenizer
-from ._transcripts import filler_text
 
 if TYPE_CHECKING:
     from agent_framework._clients import SupportsChatGetResponse
@@ -51,7 +58,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--strategies", default=_DEFAULT_STRATEGIES, help=f"Available: {','.join(strategy_names())}")
     parser.add_argument("--agent", default="plain", choices=list(AGENT_KINDS), help="How to assemble the agent.")
     parser.add_argument("--filler-turns", type=int, default=6, help="Padding turns between planted facts.")
-    parser.add_argument("--filler-tokens", type=int, default=4_000, help="Approximate size of each filler turn.")
+    parser.add_argument(
+        "--filler-tokens",
+        type=int,
+        default=2_000,
+        help=(
+            "Approximate size of each filler turn. Lower than the replay default so that tool "
+            "output, not padding, is the bulk of the context, as it is in a real agent trace."
+        ),
+    )
+    parser.add_argument(
+        "--tool-result-tokens",
+        type=int,
+        default=DEFAULT_TOOL_RESULT_TOKENS,
+        help=(
+            "Approximate size of each tool result, in tokens. Decides how much of the context "
+            "tool output occupies, and so whether tool-oriented compaction has anything to evict."
+        ),
+    )
     parser.add_argument(
         "--tool-turns",
         type=int,
@@ -296,6 +320,8 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
         )
         print(f"strategies: {len(strategies)}  turns: {len(scenario.transcript.turns)}  facts: {len(scenario.facts)}")
         print(f"tool-call groups: {planted_groups} planted, {retained} retained by tool-oriented strategies")
+        tool_share = planted_groups * args.tool_result_tokens
+        print(f"tool output: ~{tool_share:,} tokens total, vs ~{user_tokens:,.0f} of user-side filler")
         print(f"user-side prompt material: ~{user_tokens:,.0f} tokens per run, growing each turn")
         print(f"model calls: >= {len(strategies) * len(scenario.transcript.turns)} (more whenever a tool is used)")
         for name in strategies:
@@ -346,7 +372,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
             options=options,
             scenario=scenario,
             agent_kind=args.agent,
-            tool_filler=filler_text(7, 600),
+            tool_result_tokens=args.tool_result_tokens,
         )
         live[name] = outcome
         joint.append(_to_joint(outcome, scenario, pricing))
