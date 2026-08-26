@@ -308,7 +308,17 @@ def build_recall_scenario(
         ))
         return TranscriptTurn(
             request=(
-                Message(role="user", contents=[f"Look up the {label} deployment facts. " + filler_text(seed, 300)]),
+                Message(
+                    role="user",
+                    contents=[
+                        # Imperative and unambiguous. A softer instruction lets the model
+                        # decide it has enough context and skip the call, which changes both
+                        # how many facts exist to score and how many tokens the run carries,
+                        # in a way that has nothing to do with the strategy under test.
+                        f'Call the lookup_deployment tool with scope="{label}" now and report '
+                        "the values it returns. Do not skip the call or answer from memory. " + filler_text(seed, 300)
+                    ],
+                ),
             ),
             reply=(
                 Message(
