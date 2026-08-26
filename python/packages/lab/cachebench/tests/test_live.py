@@ -1,0 +1,583 @@
+# Copyright (c) Microsoft. All rights reserved.
+
+"""Unit tests for the live-agent compaction runner.
+
+Everything here runs offline against a stub chat client. The stub is composed from the same
+layers a real provider client uses, so the agent's middleware pipeline, its history
+persistence and the compaction hook all execute for real; only the network call is
+replaced. That matters because the questions worth testing here are all about *ordering*
+between those layers, and a hand-rolled mock that skipped them would answer none of them.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Mapping, Sequence
+from typing import Any
+
+import pytest
+from agent_framework import (
+    Agent,
+    BaseChatClient,
+    CharacterEstimatorTokenizer,
+    ChatMiddlewareLayer,
+    ChatResponse,
+    CompactionProvider,
+    Content,
+    ContextWindowCompactionStrategy,
+    FunctionInvocationLayer,
+    InMemoryHistoryProvider,
+    Message,
+    SlidingWindowStrategy,
+    TokenBudgetComposedStrategy,
+    TruncationStrategy,
+    UsageDetails,
+)
+from agent_framework_lab_cachebench import (
+    AGENT_KINDS,
+    LiveOutcome,
+    MeteredClient,
+    ModelCall,
+    ProviderRuntime,
+    StrategyOptions,
+    UsageRecorder,
+    build_live_agent,
+    build_live_scenario,
+    build_recall_scenario,
+    build_strategy,
+    make_lookup_tool,
+    run_live,
+)
+from agent_framework_lab_cachebench._advisor import ModelPricing
+from agent_framework_lab_cachebench._live_cli import _cost
+
+TOKENIZER = CharacterEstimatorTokenizer()
+
+
+class StubChatClient(FunctionInvocationLayer[Any], ChatMiddlewareLayer[Any], BaseChatClient[Any]):
+    """A chat client composed from the real layers, answering from a script.
+
+    Built the same way ``OpenAIChatClient`` is, so middleware, function invocation and the
+    compaction hook all run. ``seen`` records how many messages each request carried, which
+    is the ground truth every recorder assertion is checked against.
+    """
+
+    def __init__(self, *, tool_turns: Sequence[int] = (), usage: UsageDetails | None = None, **kwargs: Any) -> None:
+        """Create the stub.
+
+        Keyword Args:
+            tool_turns: Indices of calls that should answer with a tool call instead of text.
+            usage: Usage to report on every response.
+        """
+        super().__init__(**kwargs)
+        self.seen: list[int] = []
+        self.tool_turns = set(tool_turns)
+        self.usage = usage
+
+    def _inner_get_response(
+        self,
+        *,
+        messages: Sequence[Message],
+        stream: bool,
+        options: Mapping[str, Any],
+        **kwargs: Any,
+    ) -> Any:
+        index = len(self.seen)
+        self.seen.append(len(messages))
+
+        async def _go() -> ChatResponse[Any]:
+            if index in self.tool_turns:
+                contents: list[Any] = [
+                    Content.from_function_call(
+                        call_id=f"call_{index}",
+                        name="lookup_deployment",
+                        arguments='{"scope": "early"}',
+                    )
+                ]
+            else:
+                contents = ["a reply with some body to it"]
+            return ChatResponse(
+                messages=Message(role="assistant", contents=contents),
+                usage_details=self.usage,
+            )
+
+        return _go()
+
+    def service_url(self) -> str:
+        """Return a placeholder URL."""
+        return "stub://"
+
+
+def _agent(client: StubChatClient, strategy: Any, recorder: UsageRecorder, **kwargs: Any) -> Agent[Any]:
+    return Agent(
+        client=client,
+        name="test",
+        instructions="SYSTEM",
+        context_providers=[InMemoryHistoryProvider()],
+        compaction_strategy=strategy,
+        require_per_service_call_history_persistence=True,
+        middleware=[recorder],
+        **kwargs,
+    )
+
+
+# region recorder
+
+
+@pytest.mark.parametrize(
+    "strategy",
+    [
+        None,
+        SlidingWindowStrategy(keep_last_groups=2),
+        TruncationStrategy(max_n=40, compact_to=20, tokenizer=TOKENIZER),
+    ],
+    ids=["none", "sliding_window", "truncation"],
+)
+async def test_recorder_matches_what_the_client_received(strategy: Any) -> None:
+    """The recorded prompt must be the prompt that was actually sent.
+
+    This is the property the whole live benchmark rests on. Both ways of getting it wrong
+    were measured before it was written correctly: reading ``context.messages`` before the
+    call reports every conversation as one message, and reading it after without projecting
+    reports that every strategy preserved every fact.
+    """
+    recorder = UsageRecorder()
+    client = StubChatClient()
+    agent = _agent(client, strategy, recorder)
+    session = agent.create_session()
+    for index in range(5):
+        await agent.run(f"user message {index}", session=session)
+
+    assert [call.messages_sent for call in recorder.calls] == client.seen
+
+
+async def test_recorder_sees_loaded_history_not_only_the_new_message() -> None:
+    """The pre-compaction count must grow with the conversation.
+
+    The history is loaded by a middleware that runs inside this one and replaces
+    ``context.messages``. A reference captured before the call keeps pointing at the
+    original one-element list, which silently pins every measurement to 1.
+    """
+    recorder = UsageRecorder()
+    agent = _agent(StubChatClient(), None, recorder)
+    session = agent.create_session()
+    for index in range(4):
+        await agent.run(f"user message {index}", session=session)
+
+    counts = [call.messages_before_compaction for call in recorder.calls]
+    assert counts == sorted(counts)
+    assert counts[-1] > counts[0], "history never grew, so the stale-reference bug is back"
+
+
+async def test_recorder_shows_compaction_removing_messages() -> None:
+    """A compacting run must record fewer messages sent than the history held."""
+    recorder = UsageRecorder()
+    agent = _agent(StubChatClient(), SlidingWindowStrategy(keep_last_groups=1), recorder)
+    session = agent.create_session()
+    for index in range(5):
+        await agent.run(f"user message {index}", session=session)
+
+    last = recorder.calls[-1]
+    assert last.messages_sent < last.messages_before_compaction
+
+
+async def test_recorder_captures_usage() -> None:
+    """Reported usage must be carried through to the recorded call."""
+    usage = UsageDetails(input_token_count=900, output_token_count=40, cache_read_input_token_count=300)
+    recorder = UsageRecorder()
+    agent = _agent(StubChatClient(usage=usage), None, recorder)
+    await agent.run("hello", session=agent.create_session())
+
+    call = recorder.calls[0]
+    assert call.input_tokens == 900
+    assert call.cached_tokens == 300
+    assert call.output_tokens == 40
+    assert call.fresh_tokens == 600
+
+
+async def test_recorder_counts_every_call_in_a_tool_turn() -> None:
+    """A turn that calls a tool bills more than one prompt, so it must record more than one."""
+    recorder = UsageRecorder()
+    scenario = build_recall_scenario(salt="tool", filler_turns=3, filler_tokens=100)
+    client = StubChatClient(tool_turns=(0,))
+    agent = _agent(client, None, recorder, tools=[make_lookup_tool(scenario.tool_lookups)])
+    await agent.run("look up the early deployment facts", session=agent.create_session())
+
+    assert len(recorder.calls) > 1, "the tool round trip was not billed as its own call"
+
+
+# endregion
+# region metering
+
+
+async def test_metered_client_accumulates_usage() -> None:
+    """Summarizer calls must be counted, since the agent's middleware never sees them."""
+
+    class Inner:
+        additional_properties: dict[str, Any] = {}
+
+        async def get_response(self, *args: Any, **kwargs: Any) -> ChatResponse[Any]:
+            return ChatResponse(
+                messages=Message(role="assistant", contents=["summary"]),
+                usage_details=UsageDetails(input_token_count=500, output_token_count=80),
+            )
+
+    metered = MeteredClient(Inner())
+    await metered.get_response([])
+    await metered.get_response([])
+
+    assert metered.calls == 2
+    assert metered.input_tokens == 1_000
+    assert metered.output_tokens == 160
+    assert metered.failures == 0
+
+
+async def test_metered_client_counts_failures_and_reraises() -> None:
+    """A failing summarizer must be visible.
+
+    ``SummarizationStrategy`` catches its own errors and returns False, so a broken
+    summarizer produces a run that never compacted and therefore scores perfect recall.
+    Counting the failure here is the only thing that distinguishes that from a real win.
+    """
+
+    class Failing:
+        additional_properties: dict[str, Any] = {}
+
+        async def get_response(self, *args: Any, **kwargs: Any) -> ChatResponse[Any]:
+            raise RuntimeError("summarizer exploded")
+
+    metered = MeteredClient(Failing())
+    with pytest.raises(RuntimeError, match="exploded"):
+        await metered.get_response([])
+
+    assert metered.failures == 1
+    assert metered.calls == 1
+
+
+def test_metered_client_forwards_unknown_attributes() -> None:
+    """The proxy must behave like the client it wraps for everything it does not record."""
+
+    class Inner:
+        additional_properties = {"a": 1}
+        model_id = "inner-model"
+
+    metered = MeteredClient(Inner())
+    assert metered.model_id == "inner-model"
+    assert metered.additional_properties == {"a": 1}
+
+
+# endregion
+# region tool
+
+
+def test_lookup_tool_returns_the_planted_markers() -> None:
+    """The live tool must return the same markers the replayed transcript scripts."""
+    scenario = build_recall_scenario(salt="s", filler_turns=3, filler_tokens=100)
+    lookup = make_lookup_tool(scenario.tool_lookups)
+    region, host = scenario.tool_lookups["early"]
+
+    result = lookup("early")
+    assert region in result
+    assert host in result
+
+
+def test_lookup_tool_handles_an_unknown_scope() -> None:
+    """An unknown scope must not raise; the model picking a wrong argument is not a crash."""
+    lookup = make_lookup_tool({"early": ("R", "H")})
+    assert "Unknown scope" in lookup("nonsense")
+
+
+# endregion
+# region wiring
+
+
+def test_plain_agent_puts_the_before_phase_on_the_agent_not_the_provider() -> None:
+    """The before strategy must not be installed on the CompactionProvider.
+
+    ``CompactionProvider.before_strategy`` is a no-op under per-service-call history
+    persistence: the agent skips ``HistoryProvider.before_run``, so the provider only ever
+    sees an empty context. Installing it there compacts nothing while looking correct.
+    """
+    strategy = SlidingWindowStrategy(keep_last_groups=2)
+    agent = build_live_agent(
+        ProviderRuntime(client=StubChatClient(), model="stub"),
+        kind="plain",
+        strategy=strategy,
+        tokenizer=TOKENIZER,
+        tools=[],
+        recorder=UsageRecorder(),
+        max_context_window_tokens=8_000,
+        max_output_tokens=512,
+    )
+
+    assert agent.compaction_strategy is strategy
+    providers = [p for p in agent.context_providers if isinstance(p, CompactionProvider)]
+    assert len(providers) == 1
+    assert providers[0].before_strategy is None
+    assert providers[0].after_strategy is strategy
+
+
+def test_plain_agent_installs_no_provider_for_the_control() -> None:
+    """The uncompacted control must carry no compaction anywhere."""
+    agent = build_live_agent(
+        ProviderRuntime(client=StubChatClient(), model="stub"),
+        kind="plain",
+        strategy=None,
+        tokenizer=TOKENIZER,
+        tools=[],
+        recorder=UsageRecorder(),
+        max_context_window_tokens=8_000,
+        max_output_tokens=512,
+    )
+
+    assert agent.compaction_strategy is None
+    assert not [p for p in agent.context_providers if isinstance(p, CompactionProvider)]
+
+
+def test_unknown_agent_kind_is_rejected() -> None:
+    """An unknown agent kind must fail loudly rather than silently picking a default."""
+    with pytest.raises(ValueError, match="Unknown agent kind"):
+        build_live_agent(
+            ProviderRuntime(client=StubChatClient(), model="stub"),
+            kind="nonsense",
+            strategy=None,
+            tokenizer=TOKENIZER,
+            tools=[],
+            recorder=UsageRecorder(),
+            max_context_window_tokens=8_000,
+            max_output_tokens=512,
+        )
+
+
+def test_agent_kinds_are_the_documented_ones() -> None:
+    """The advertised kinds must match what the builder accepts."""
+    assert AGENT_KINDS == ("plain", "harness")
+
+
+# endregion
+# region strategies
+
+
+def _options(**kwargs: Any) -> StrategyOptions:
+    return StrategyOptions(tokenizer=TOKENIZER, max_context_window_tokens=32_000, max_output_tokens=2_048, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "token_budget_fallback",
+        "token_budget_tools_first",
+        "token_budget_truncate_first",
+        "token_budget_window_first",
+    ],
+)
+def test_token_budget_variants_share_one_ceiling(name: str) -> None:
+    """Every composed variant must compact to the same budget.
+
+    That shared ceiling is what makes the family comparable: holding the target size fixed
+    means any difference in what survives is attributable to the order of deletion rather
+    than to one variant simply trimming harder than another.
+    """
+    options = _options()
+    strategy = build_strategy(name, options)
+
+    assert isinstance(strategy, TokenBudgetComposedStrategy)
+    assert strategy.token_budget == options.composed_budget_tokens
+
+
+def test_token_budget_fallback_composes_nothing() -> None:
+    """The family's control must rely purely on the built-in oldest-first fallback."""
+    strategy = build_strategy("token_budget_fallback", _options())
+
+    assert isinstance(strategy, TokenBudgetComposedStrategy)
+    assert strategy.strategies == []
+
+
+def test_budget_fraction_moves_the_ceiling() -> None:
+    """The shared ceiling must follow the configured fraction of the input budget."""
+    tight = build_strategy("token_budget_tools_first", _options(token_budget_fraction=0.25))
+    loose = build_strategy("token_budget_tools_first", _options(token_budget_fraction=0.75))
+
+    assert isinstance(tight, TokenBudgetComposedStrategy)
+    assert isinstance(loose, TokenBudgetComposedStrategy)
+    assert tight.token_budget < loose.token_budget
+
+
+def test_context_window_matches_the_framework_tool_retention_default() -> None:
+    """The harness-default row must retain as many tool groups as the harness does.
+
+    ``create_harness_agent`` passes no ``keep_last_tool_call_groups``, so it inherits the
+    framework default of 4. A lab override would make this row harsher than the
+    configuration it is supposed to stand for.
+    """
+    import inspect
+
+    framework_default = (
+        inspect.signature(ContextWindowCompactionStrategy.__init__).parameters["keep_last_tool_call_groups"].default
+    )
+    assert _options().keep_last_tool_call_groups == framework_default
+
+    built = build_strategy("context_window", _options())
+    assert isinstance(built, ContextWindowCompactionStrategy)
+    assert built.tool_eviction_threshold == ContextWindowCompactionStrategy.DEFAULT_TOOL_EVICTION_THRESHOLD
+    assert built.truncation_threshold == ContextWindowCompactionStrategy.DEFAULT_TRUNCATION_THRESHOLD
+
+
+# endregion
+# region scenario
+
+
+def test_live_scenario_keeps_the_same_facts_as_replay() -> None:
+    """Live and replayed runs must score against identical planted facts."""
+    replay = build_recall_scenario(salt="x", filler_turns=6, filler_tokens=4_000)
+    live = build_live_scenario(salt="x", filler_turns=6, filler_tokens=4_000)
+
+    assert live.facts == replay.facts
+    assert live.tool_lookups == replay.tool_lookups
+    assert live.contradictions == replay.contradictions
+
+
+def test_live_scenario_moves_the_bulk_to_the_user_turns() -> None:
+    """Padding must sit on the user side when the assistant writes its own replies.
+
+    A real model will not emit thousands of filler tokens on request, so leaving the bulk in
+    the scripted reply would mean the history never grows and no strategy ever triggers.
+    """
+
+    def user_chars(scenario: Any) -> int:
+        return sum(
+            len(str(content)) for turn in scenario.transcript.turns for m in turn.request for content in m.contents
+        )
+
+    replay = build_recall_scenario(salt="x", filler_turns=6, filler_tokens=4_000)
+    live = build_live_scenario(salt="x", filler_turns=6, filler_tokens=4_000)
+
+    assert user_chars(live) > user_chars(replay) * 5
+
+
+# endregion
+# region outcome and cost
+
+
+def _call(sent: int, before: int, *, inp: int = 0, cached: int = 0, out: int = 0) -> ModelCall:
+    return ModelCall(
+        messages_sent=sent,
+        prompt_text="",
+        messages_before_compaction=before,
+        input_tokens=inp,
+        cached_tokens=cached,
+        output_tokens=out,
+    )
+
+
+def test_messages_peak_is_measured_before_compaction() -> None:
+    """The peak must say how large the history got, not how hard it was trimmed."""
+    outcome = LiveOutcome(
+        strategy="s",
+        calls=(_call(2, 5), _call(2, 9), _call(2, 7)),
+        answer="",
+        final_prompt="",
+        tool_calls_made=0,
+        turns_completed=3,
+        turns_total=3,
+    )
+
+    assert outcome.messages_peak == 9
+    assert outcome.messages_left == 2
+    assert outcome.messages_dropped == 5
+
+
+def test_cost_includes_generation_and_summarizer_charges() -> None:
+    """Live cost must price replies and the summarizer's own calls.
+
+    A live run generates real replies, and summarization bills calls the agent never sees.
+    Omitting either scores the strategy that spends most to preserve information as though
+    preserving it were free.
+    """
+    pricing = ModelPricing(input_per_million=1.0, cached_read_per_million=0.0, output_per_million=10.0)
+    base = LiveOutcome(
+        strategy="s",
+        calls=(_call(1, 1, inp=1_000_000, out=100_000),),
+        answer="",
+        final_prompt="",
+        tool_calls_made=0,
+        turns_completed=1,
+        turns_total=1,
+    )
+    with_summary = LiveOutcome(
+        strategy="s",
+        calls=(_call(1, 1, inp=1_000_000, out=100_000),),
+        answer="",
+        final_prompt="",
+        tool_calls_made=0,
+        turns_completed=1,
+        turns_total=1,
+        summarizer_input_tokens=1_000_000,
+        summarizer_output_tokens=100_000,
+    )
+
+    assert _cost(base, pricing) == pytest.approx(2.0)
+    assert _cost(with_summary, pricing) == pytest.approx(4.0)
+
+
+def test_cached_tokens_are_discounted() -> None:
+    """Cache reads must be billed at the discounted rate, not the full input rate."""
+    pricing = ModelPricing(input_per_million=10.0, cached_read_per_million=1.0, output_per_million=0.0)
+    outcome = LiveOutcome(
+        strategy="s",
+        calls=(_call(1, 1, inp=1_000_000, cached=1_000_000),),
+        answer="",
+        final_prompt="",
+        tool_calls_made=0,
+        turns_completed=1,
+        turns_total=1,
+    )
+
+    assert _cost(outcome, pricing) == pytest.approx(1.0)
+
+
+# endregion
+# region run_live
+
+
+async def test_run_live_reports_a_failed_turn_without_raising() -> None:
+    """A failing turn must return a partial result, not throw away the spend already made."""
+
+    class Exploding(StubChatClient):
+        def _inner_get_response(self, *, messages: Any, stream: Any, options: Any, **kwargs: Any) -> Any:
+            if len(self.seen) >= 2:
+                raise RuntimeError("provider fell over")
+            return super()._inner_get_response(messages=messages, stream=stream, options=options, **kwargs)
+
+    scenario = build_live_scenario(salt="fail", filler_turns=3, filler_tokens=50)
+    outcome = await run_live(
+        ProviderRuntime(client=Exploding(), model="stub"),
+        strategy_name="none",
+        options=_options(),
+        scenario=scenario,
+    )
+
+    assert outcome.error is not None
+    assert "provider fell over" in outcome.error
+    assert outcome.turns_completed < outcome.turns_total
+    assert outcome.calls, "the calls made before the failure were lost"
+
+
+async def test_run_live_drives_every_turn_and_counts_tool_use() -> None:
+    """The happy path must run the whole scenario and record the tool calls it made."""
+    scenario = build_live_scenario(salt="ok", filler_turns=3, filler_tokens=50)
+    client = StubChatClient(tool_turns=(1,), usage=UsageDetails(input_token_count=100, output_token_count=10))
+    outcome = await run_live(
+        ProviderRuntime(client=client, model="stub"),
+        strategy_name="none",
+        options=_options(),
+        scenario=scenario,
+    )
+
+    assert outcome.error is None
+    assert outcome.turns_completed == outcome.turns_total == len(scenario.transcript.turns)
+    assert outcome.tool_calls_made == 1
+    assert outcome.input_tokens > 0
+    assert len(outcome.calls) > outcome.turns_total, "the tool round trip should add a call"
+
+
+# endregion

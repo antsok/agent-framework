@@ -49,6 +49,9 @@ class ModelPricing:
 
     input_per_million: float
     cached_read_per_million: float
+    output_per_million: float = 0.0
+    """Generation rate. Zero for the replay benchmarks, which cap output at a few tokens
+    and study only the prompt side; a live run generates real replies and must price them."""
 
     @property
     def cache_discount(self) -> float:
@@ -277,5 +280,10 @@ def fetch_openrouter_pricing(model: str, *, timeout: float = 30.0) -> ModelPrici
         # models that have none, and biasing the verdict against compacting them.
         cached_raw = pricing.get("input_cache_read")
         cached_price = float(cached_raw) * 1_000_000 if cached_raw is not None else input_price
-        return ModelPricing(input_per_million=input_price, cached_read_per_million=cached_price)
+        output_price = float(pricing.get("completion") or 0.0) * 1_000_000
+        return ModelPricing(
+            input_per_million=input_price,
+            cached_read_per_million=cached_price,
+            output_per_million=output_price,
+        )
     raise KeyError(f"{model!r} is not in the OpenRouter catalogue.")

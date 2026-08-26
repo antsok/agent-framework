@@ -124,6 +124,66 @@ cachebench \
 
 Results are printed as a table and written to `--out` as per-turn JSONL plus a summary CSV.
 
+### Replayed or live
+
+The four commands above replay a scripted transcript: the assistant's replies are canned and
+the model's output is discarded, so every provider receives a byte-identical prompt. That is
+what makes their numbers comparable across providers, and it is the right mode for asking how
+a *prompt* caches.
+
+`cachebench-live` gives that up deliberately. It drives the same scenario through a real
+`Agent` that writes its own replies and calls a real tool, so the history compaction acts on
+is the history an agent would actually accumulate:
+
+```bash
+cachebench-live openrouter:openai/gpt-5.6-luna
+```
+
+Two things only exist in this mode. Replies become history, so a strategy that compacts badly
+produces a worse reply, which becomes worse history, which it compacts again — replay cannot
+show that compounding. And a turn is no longer one model call: a turn that uses a tool bills
+several prompts, each a different size.
+
+The cost is comparability. Two models write different replies, so their histories diverge from
+the first turn. **Live numbers compare strategies within one model, never models with each
+other.** Use the replay commands for cross-provider work.
+
+`--agent harness` swaps the plain agent for `create_harness_agent`, which is what production
+code actually calls. Its optional providers are switched off, because each one adds tools and
+system-prompt text to every measured prompt and would shift the trigger points without saying
+anything about compaction.
+
+### The token_budget family
+
+Every other strategy decides *when* to compact from its own trigger, so different strategies
+leave prompts of different sizes and comparing them confounds "trimmed harder" with "trimmed
+smarter". The `token_budget_*` variants all compact to one shared ceiling
+(`--budget-fraction`, default half the input budget) and differ only in the order they delete
+things, which holds size fixed and isolates the choice of what to discard:
+
+| variant | order |
+| --- | --- |
+| `token_budget_fallback` | nothing — pure oldest-first eviction, the floor the others must beat |
+| `token_budget_tools_first` | tool results, then tool-call groups, then age |
+| `token_budget_truncate_first` | age, then tool results — the mirror, to isolate ordering |
+| `token_budget_window_first` | a hard recency window, then age |
+| `token_budget_summarize` | tool results, then summarize the rest instead of dropping it |
+
+### Summarization is priced, and its failures are counted
+
+`SummarizationStrategy` calls a model of its own, so it needs `--summarizer-provider`. Those
+calls never reach the agent's middleware, and charging them at zero would score the one
+strategy that spends money to preserve information as though preserving it were free. They are
+metered and added to its cost.
+
+Prefer the same model as the one under test: summarizer tokens are priced at the tested model's
+rates, so a cheaper summarizer would be billed at the wrong price.
+
+The strategy also catches its own errors, logs a warning and returns `False`. A broken
+summarizer therefore produces a run that never compacted — and so scores *perfect* recall. Its
+failures are counted and flagged in the table (`S<n>`); a row carrying that flag is not
+evidence that summarization preserves anything.
+
 ### Controlling spend
 
 Output is capped at `--response-max-tokens 16` because answers are discarded — you are only
