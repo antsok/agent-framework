@@ -9,6 +9,14 @@ by name. ``context_window`` is the strategy the agent harness installs by defaul
 answer whether compacting early and often costs more in lost cache reads than it saves in
 prompt tokens.
 
+The ``token_budget_*`` family is different in kind from the rest. Every other entry decides
+*when* to compact from its own trigger, so different strategies leave prompts of different
+sizes and a comparison between them confounds "trimmed harder" with "trimmed smarter". The
+composed variants all compact down to one shared ceiling and differ only in the order they
+delete things, which holds size fixed and isolates the choice of what to discard.
+``token_budget_fallback`` composes nothing at all, so its removals are pure oldest-first
+eviction: the floor any ordering has to beat to be worth its complexity.
+
 Budgets are sized relative to the transcript rather than to a model's real context window.
 A 20-turn transcript never approaches a 128k window, so a real window would mean no
 strategy ever fires and the benchmark would measure nothing.
@@ -26,6 +34,7 @@ from agent_framework import (
     SelectiveToolCallCompactionStrategy,
     SlidingWindowStrategy,
     SummarizationStrategy,
+    TokenBudgetComposedStrategy,
     TokenizerProtocol,
     ToolResultCompactionStrategy,
     TruncationStrategy,
@@ -63,13 +72,24 @@ class StrategyOptions:
     max_context_window_tokens: int
     max_output_tokens: int
     keep_last_groups: int = 6
-    keep_last_tool_call_groups: int = 2
+    keep_last_tool_call_groups: int = 4
+    token_budget_fraction: float = 0.5
     summarizer: SupportsChatGetResponse[Any] | None = None
 
     @property
     def input_budget_tokens(self) -> int:
         """Tokens available for input once the output reservation is deducted."""
         return self.max_context_window_tokens - self.max_output_tokens
+
+    @property
+    def composed_budget_tokens(self) -> int:
+        """Token ceiling every ``token_budget_*`` variant compacts down to.
+
+        Shared across the variants on purpose. They differ only in the order they delete
+        things, so holding the ceiling fixed is what makes their correctness scores
+        comparable: any difference is attributable to *what* each discarded, not how much.
+        """
+        return max(int(self.input_budget_tokens * self.token_budget_fraction), 1)
 
 
 def resolve_context_window(
@@ -114,7 +134,15 @@ def _context_window(options: StrategyOptions, *, eviction: float, truncation: fl
 
 
 def _build_context_window(options: StrategyOptions) -> CompactionStrategy:
-    """Return the harness default at its shipped thresholds of 0.5 and 0.8."""
+    """Return the harness default: shipped thresholds of 0.5 and 0.8.
+
+    This row is meant to stand for what ``create_harness_agent`` actually installs, so its
+    ``keep_last_tool_call_groups`` has to match the framework's default of 4 rather than
+    being set locally. The harness passes no value, so it inherits that default; a lab
+    override would quietly make this row harsher than the configuration it claims to
+    represent, and every conclusion drawn about "the shipped default" would be about
+    something else.
+    """
     return _context_window(options, eviction=0.5, truncation=0.8)
 
 
@@ -171,6 +199,102 @@ def _build_summarization(options: StrategyOptions) -> CompactionStrategy:
     )
 
 
+def _truncation_at(options: StrategyOptions, budget: int) -> CompactionStrategy:
+    """Return truncation targeting a composed strategy's budget."""
+    return TruncationStrategy(max_n=budget, compact_to=max(int(budget * 0.8), 1), tokenizer=options.tokenizer)
+
+
+def _composed(options: StrategyOptions, parts: list[CompactionStrategy]) -> CompactionStrategy:
+    """Return an ordered composition run against the shared token ceiling.
+
+    ``TokenBudgetComposedStrategy`` runs each part in turn, re-counting tokens after every
+    one and stopping as soon as the ceiling is met. Whatever the parts fail to remove, its
+    built-in fallback removes by evicting oldest groups. That fallback is why every variant
+    lands at the same size, and why the interesting difference between them is which
+    messages they chose to spend the budget on.
+    """
+    return TokenBudgetComposedStrategy(
+        token_budget=options.composed_budget_tokens,
+        tokenizer=options.tokenizer,
+        strategies=parts,
+    )
+
+
+def _build_token_budget_fallback(options: StrategyOptions) -> CompactionStrategy:
+    """Return the composed strategy with no parts at all.
+
+    The control for the whole ``token_budget_*`` family: every removal is done by the
+    built-in oldest-first fallback. A variant that cannot beat this is contributing
+    nothing over plain age-ordered eviction at the same size.
+    """
+    return _composed(options, [])
+
+
+def _build_token_budget_tools_first(options: StrategyOptions) -> CompactionStrategy:
+    """Return a composition that sheds tool bulk before it sheds history."""
+    return _composed(
+        options,
+        [
+            ToolResultCompactionStrategy(keep_last_tool_call_groups=options.keep_last_tool_call_groups),
+            SelectiveToolCallCompactionStrategy(keep_last_tool_call_groups=options.keep_last_tool_call_groups),
+            _truncation_at(options, options.composed_budget_tokens),
+        ],
+    )
+
+
+def _build_token_budget_truncate_first(options: StrategyOptions) -> CompactionStrategy:
+    """Return a composition that sheds age before it sheds tool bulk.
+
+    The mirror of ``token_budget_tools_first``. Same parts, opposite order, same ceiling,
+    so the pair isolates whether ordering alone changes what survives.
+    """
+    return _composed(
+        options,
+        [
+            _truncation_at(options, options.composed_budget_tokens),
+            ToolResultCompactionStrategy(keep_last_tool_call_groups=options.keep_last_tool_call_groups),
+        ],
+    )
+
+
+def _build_token_budget_window_first(options: StrategyOptions) -> CompactionStrategy:
+    """Return a composition that applies a hard recency window before trimming by tokens."""
+    return _composed(
+        options,
+        [
+            SlidingWindowStrategy(keep_last_groups=options.keep_last_groups),
+            _truncation_at(options, options.composed_budget_tokens),
+        ],
+    )
+
+
+def _build_token_budget_summarize(options: StrategyOptions) -> CompactionStrategy:
+    """Return a composition that summarizes rather than deletes once tool bulk is gone.
+
+    The only variant that can carry information past the ceiling instead of dropping it,
+    and the only one that spends money to do so.
+
+    Raises:
+        ValueError: If no summarizer client was configured.
+    """
+    if options.summarizer is None:
+        raise ValueError(
+            "The 'token_budget_summarize' strategy needs a summarizer client. "
+            "Pass --summarizer-provider to select one, or drop this strategy from the run."
+        )
+    return _composed(
+        options,
+        [
+            ToolResultCompactionStrategy(keep_last_tool_call_groups=options.keep_last_tool_call_groups),
+            SummarizationStrategy(
+                client=options.summarizer,
+                target_count=options.keep_last_groups,
+                tokenizer=options.tokenizer,
+            ),
+        ],
+    )
+
+
 STRATEGY_BUILDERS: Final[dict[str, Callable[[StrategyOptions], CompactionStrategy | None]]] = {
     "none": _build_none,
     "context_window": _build_context_window,
@@ -181,6 +305,11 @@ STRATEGY_BUILDERS: Final[dict[str, Callable[[StrategyOptions], CompactionStrateg
     "tool_result": _build_tool_result,
     "selective_tool_call": _build_selective_tool_call,
     "summarization": _build_summarization,
+    "token_budget_fallback": _build_token_budget_fallback,
+    "token_budget_tools_first": _build_token_budget_tools_first,
+    "token_budget_truncate_first": _build_token_budget_truncate_first,
+    "token_budget_window_first": _build_token_budget_window_first,
+    "token_budget_summarize": _build_token_budget_summarize,
 }
 
 

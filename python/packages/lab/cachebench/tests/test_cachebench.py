@@ -353,19 +353,26 @@ def test_missing_cache_reporting_is_not_a_zero_hit_rate() -> None:
 # region strategies
 
 
+#: Strategies that call a model of their own and so cannot be built without a client.
+#: Matched by name rather than listed, so a new summarizing variant is covered the day it
+#: is registered instead of breaking this test.
+SUMMARIZING = tuple(name for name in strategy_names() if "summar" in name)
+
+
 def test_every_registered_strategy_builds() -> None:
     options = StrategyOptions(tokenizer=TOKENIZER, max_context_window_tokens=8000, max_output_tokens=512)
     for name in strategy_names():
-        if name == "summarization":
+        if name in SUMMARIZING:
             continue
         strategy = build_strategy(name, options)
         assert (strategy is None) == (name == "none")
 
 
-def test_summarization_requires_a_client() -> None:
+@pytest.mark.parametrize("name", SUMMARIZING)
+def test_summarizing_strategies_require_a_client(name: str) -> None:
     options = StrategyOptions(tokenizer=TOKENIZER, max_context_window_tokens=8000, max_output_tokens=512)
     with pytest.raises(ValueError, match="summarizer client"):
-        build_strategy("summarization", options)
+        build_strategy(name, options)
 
 
 def test_unknown_strategy_rejected() -> None:

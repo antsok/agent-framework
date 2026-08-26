@@ -27,7 +27,8 @@ compaction strategy that deleted the context.
 from __future__ import annotations
 
 import hashlib
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import Final
 
 from agent_framework import Content, Message
@@ -199,6 +200,13 @@ class RecallScenario:
     transcript: Transcript
     facts: tuple[PlantedFact, ...]
     contradictions: tuple[Contradiction, ...] = ()
+    tool_lookups: Mapping[str, tuple[str, str]] = field(default_factory=dict[str, tuple[str, str]])
+    """Scope label to ``(region_code, fallback_host)``, for driving a real tool.
+
+    The replayed transcript bakes these into scripted tool-result messages. A live agent
+    has to call a real function instead, and it must return the same markers or the two
+    modes would be scoring different conversations.
+    """
 
 
 def _markers(salt: str, count: int, prefix: str) -> list[str]:
@@ -217,6 +225,7 @@ def build_recall_scenario(
     filler_turns: int = 6,
     filler_tokens: int = 4_000,
     chars_per_token: float = TRUE_CHARS_PER_TOKEN,
+    bulk_in_user: bool = False,
 ) -> RecallScenario:
     """Build a conversation whose final question needs facts from throughout the history.
 
@@ -232,6 +241,8 @@ def build_recall_scenario(
             a longer history and more for compaction to act on.
         filler_tokens: Approximate size of each filler exchange.
         chars_per_token: Sizing basis for the filler.
+        bulk_in_user: Put the filler in the user turns rather than the scripted replies,
+            for live runs where the assistant writes its own replies.
 
     Returns:
         The scenario, whose transcript's final turn is the question to be answered.
@@ -242,24 +253,32 @@ def build_recall_scenario(
 
     facts: list[PlantedFact] = []
     turns: list[TranscriptTurn] = []
+    lookups: dict[str, tuple[str, str]] = {}
 
     system = Message(
         role="system",
         contents=["You are a meticulous engineering assistant. Follow every stated requirement exactly."],
     )
 
+    # Which side of the exchange carries the bulk. Replay scripts the assistant reply, so
+    # padding it is free and keeps user turns realistic. A live agent writes its own reply
+    # and will not produce thousands of tokens on request, so the padding has to move to
+    # the user side or the history never grows enough for any strategy to fire.
+    user_filler = filler_tokens if bulk_in_user else 200
+    reply_filler = 200 if bulk_in_user else filler_tokens
+
     def _filler_pair(index: int) -> TranscriptTurn:
         return TranscriptTurn(
             request=(
                 Message(
                     role="user",
-                    contents=[sized_text(f"[note {index}] Background: ", index * 17, 200, chars_per_token)],
+                    contents=[sized_text(f"[note {index}] Background: ", index * 17, user_filler, chars_per_token)],
                 ),
             ),
             reply=(
                 Message(
                     role="assistant",
-                    contents=[sized_text(f"[note {index}] Understood: ", index * 23, filler_tokens, chars_per_token)],
+                    contents=[sized_text(f"[note {index}] Understood: ", index * 23, reply_filler, chars_per_token)],
                 ),
             ),
         )
@@ -268,6 +287,7 @@ def build_recall_scenario(
         """Emit a lookup whose result carries two facts the final answer must repeat."""
         call_id = f"call_{label}"
         region, host = tool_markers[position * 2], tool_markers[position * 2 + 1]
+        lookups[label] = (region, host)
         facts.extend((
             PlantedFact(region, "tool_result", len(turns) + 1, f"{label} region code"),
             PlantedFact(host, "tool_result", len(turns) + 1, f"{label} fallback host"),
@@ -420,6 +440,7 @@ def build_recall_scenario(
             approx_final_prompt_tokens=0,
         ),
         facts=tuple(facts),
+        tool_lookups=lookups,
     )
 
 
