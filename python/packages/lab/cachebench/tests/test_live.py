@@ -836,6 +836,54 @@ def test_cached_tokens_are_discounted() -> None:
 # region run_live
 
 
+async def test_a_rejected_option_is_dropped_and_the_run_continues() -> None:
+    """A provider that rejects an option must not cost the whole run.
+
+    Two of five models tested reject something: one refuses ``temperature``, another refuses
+    any pinned ``tool_choice``. Before this, either produced 42 failed runs and no data.
+    """
+
+    class Picky(StubChatClient):
+        def _inner_get_response(self, *, messages: Any, stream: Any, options: Any, **kwargs: Any) -> Any:
+            if "temperature" in options:
+                raise RuntimeError("Unsupported parameter: 'temperature' is not supported with this model.")
+            return super()._inner_get_response(messages=messages, stream=stream, options=options, **kwargs)
+
+    scenario = build_live_scenario(salt="picky", filler_turns=3, filler_tokens=50, tool_turns=6)
+    runtime = ProviderRuntime(client=Picky(), model="stub", options={"temperature": 0.0, "max_tokens": 16})
+    outcome = await run_live(runtime, strategy_name="none", options=_options(), scenario=scenario)
+
+    assert outcome.error is None
+    assert outcome.dropped_options == ("temperature",)
+    assert outcome.turns_completed == outcome.turns_total
+
+
+async def test_dropping_tool_choice_also_stops_forcing() -> None:
+    """A provider that refuses pinned tool choice must fall back to letting the model decide.
+
+    Continuing to send the option after it was refused would fail every remaining turn.
+    """
+
+    class NoForcing(StubChatClient):
+        def _inner_get_response(self, *, messages: Any, stream: Any, options: Any, **kwargs: Any) -> Any:
+            if options.get("tool_choice") not in (None, "auto"):
+                raise RuntimeError("Tool choice must be auto")
+            return super()._inner_get_response(messages=messages, stream=stream, options=options, **kwargs)
+
+    scenario = build_live_scenario(salt="noforce", filler_turns=3, filler_tokens=50, tool_turns=6)
+    outcome = await run_live(
+        ProviderRuntime(client=NoForcing(), model="stub"),
+        strategy_name="none",
+        options=_options(),
+        scenario=scenario,
+        force_tool_calls=True,
+    )
+
+    assert outcome.error is None
+    assert outcome.dropped_options == ("tool_choice",)
+    assert outcome.turns_completed == outcome.turns_total
+
+
 async def test_run_live_reports_a_failed_turn_without_raising() -> None:
     """A failing turn must return a partial result, not throw away the spend already made."""
 

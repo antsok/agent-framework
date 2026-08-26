@@ -39,6 +39,7 @@ __all__ = [
     "ProviderCaller",
     "TurnCaller",
     "run_cell",
+    "unsupported_option",
 ]
 
 logger = logging.getLogger("agent_framework_lab_cachebench")
@@ -52,10 +53,14 @@ _UNSUPPORTED_PARAM_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"[Uu]nsupported parameter: '([a-z_]+)'"),
     re.compile(r"'([a-z_]+)' is not supported with this model"),
     re.compile(r"[Uu]nrecognized request argument supplied: ([a-z_]+)"),
+    # Some providers reject forcing without naming the field: Z.AI answers a pinned
+    # tool_choice with "Tool choice must be auto". Map it back to the option it refers to
+    # so the same drop-and-retry path applies.
+    re.compile(r"[Tt]ool choice must be auto()"),
 )
 
 
-def _unsupported_option(error: BaseException) -> str | None:
+def unsupported_option(error: BaseException) -> str | None:
     """Return the request option a provider rejected outright, if it named one.
 
     The framework wraps provider errors in an exception whose args are a tuple, so
@@ -66,7 +71,7 @@ def _unsupported_option(error: BaseException) -> str | None:
     text = str(error).replace("\\'", "'").replace('\\"', '"')
     for pattern in _UNSUPPORTED_PARAM_PATTERNS:
         if match := pattern.search(text):
-            return match.group(1)
+            return match.group(1) or "tool_choice"
     return None
 
 
@@ -202,7 +207,7 @@ class ProviderCaller:
                 # option the provider named and retry immediately. Without this a single
                 # reasoning model fails every turn of every one of its cells, and the run
                 # returns nothing for it.
-                if (option := _unsupported_option(exc)) and option in self.options:
+                if (option := unsupported_option(exc)) and option in self.options:
                     self.options.pop(option)
                     logger.warning("Provider rejected %r; retrying without it", option)
                     continue
