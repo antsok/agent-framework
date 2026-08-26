@@ -497,6 +497,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
                 scenario=scenario,
                 agent_kind=args.agent,
                 tool_result_tokens=args.tool_result_tokens,
+                force_tool_calls=not args.no_force_tool_calls,
             )
             repeats.append(outcome)
             if chosen_scenario is None:
