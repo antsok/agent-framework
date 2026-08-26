@@ -29,41 +29,54 @@ between runs, which moves both axes for reasons unrelated to compaction. Runs ma
 
 | # | Model | Route | API | Pinned | Verdict |
 | --- | --- | --- | --- | --- | --- |
-| 1 | `openai/gpt-5.6-luna` | OpenRouter | Chat Completions | no | `none` |
+| 1 | `openai/gpt-5.6-luna` | OpenRouter | Chat Completions | yes | `none` |
 | 2 | `gpt-5.4-mini` | Azure Foundry | Responses | yes | `none` |
 | 3 | `gpt-5.6-luna` | Azure Foundry | Responses | yes | `none` |
 | 4 | `z-ai/glm-5.3-flash` | OpenRouter | Chat Completions | partly | *contaminated* |
 
 ---
 
-### Run 1 — `openai/gpt-5.6-luna` via OpenRouter (unpinned)
+### Run 1 — `openai/gpt-5.6-luna` via OpenRouter (pinned, backend pinned)
 
-Pricing $0.20/M in, $0.02/M cached (10x), $1.20/M out (6x).
+Pricing $0.20/M in, $0.02/M cached (10x), $1.20/M out (6x). Backend pinned to OpenAI with
+`allow_fallbacks: false` — this model has **five OpenRouter backends spanning $0.100-$0.400/M
+input**, so unpinned routing can move cost 4x on its own. Every run gathered 17/17 facts with
+0 unfetched, no errors.
 
 | strategy | in | hit% | cost | +- | vs none | lost | correct |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| token_budget_tools_first | 160,488 | 53% | $0.0196 | 20% | -32% | 13 | 28% |
-| token_budget_truncate_first | 153,900 | 43% | $0.0218 | 4% | -25% | 13 | 28% |
-| context_window_aggressive | 108,154 | 8% | $0.0231 | 6% | -20% | 15 | 17% |
-| truncation | 264,292 | 69% | $0.0240 | 25% | -17% | 11 | 28% |
-| token_budget_fallback | 164,010 | 38% | $0.0243 | 10% | -16% | 13 | 28% |
-| context_window | 164,055 | 38% | $0.0244 | 11% | -16% | 13 | 28% |
-| token_budget_window_first | 164,727 | 34% | $0.0256 | 10% | -11% | 13 | 28% |
-| **none** | **710,278** | **92%** | **$0.0289** | **21%** | — | **0** | **100%** |
-| token_budget_summarize | 157,392 | 33% | $0.0320 | 11% | +10% | 9 | 39% |
-| sliding_window | 191,725 | 7% | $0.0395 | 2% | +36% | 15 | 17% |
-| selective_tool_call | 566,308 | 77% | $0.0397 | 4% | +37% | 0 | 100% |
-| tool_result | 579,677 | 78% | $0.0398 | 2% | +38% | 0 | 100% |
-| summarization | 170,878 | 9% | $0.0493 | 6% | +70% | 6 | 56% |
+| token_budget_truncate_first | 156,393 | 54% | $0.0191 | 28% | -11% | 13 | 28% |
+| token_budget_tools_first | 160,996 | 48% | $0.0212 | 23% | -2% | 15 | 17% |
+| **none** | **450,590** | **90%** | **$0.0216** | **9%** | — | **0** | **100%** |
+| context_window_aggressive | 113,571 | 9% | $0.0236 | 4% | +9% | 15 | 17% |
+| truncation | 247,146 | 65% | $0.0247 | 4% | +14% | 13 | 28% |
+| token_budget_window_first | 170,597 | 34% | $0.0268 | 14% | +24% | 15 | 17% |
+| token_budget_fallback | 169,143 | 22% | $0.0302 | 12% | +40% | 13 | 28% |
+| sliding_window | 144,408 | 1% | $0.0315 | 1% | +46% | 15 | 17% |
+| tool_result | 435,044 | 78% | $0.0319 | 12% | +47% | 0 | 100% |
+| context_window | 188,808 | 23% | $0.0332 | 16% | +54% | 13 | 28% |
+| selective_tool_call | 436,465 | 78% | $0.0333 | 15% | +54% | 0 | 100% |
+| token_budget_summarize | 158,759 | 39% | $0.0360 | 11% | +67% | 0 | 67% |
+| context_window_lazy | 245,506 | 27% | $0.0408 | 19% | +89% | 13 | 28% |
+| summarization | 135,744 | 2% | $0.0442 | 19% | +105% | 7 | 61% |
 
-Effective input (volume adjusted for the cache discount), against `none`:
-`tool_result` **+41%** on 18% fewer tokens, `selective_tool_call` **+42%** on 20% fewer.
-Break-even needed a **42%** cut at 78% hit rate; they delivered 18%.
+Effective input against `none`: `tool_result` **+51%** and `selective_tool_call` **+52%**, both
+on 3% *fewer* tokens; `token_budget_truncate_first` **-6%** on 65% fewer.
 
-*Caveat: unpinned. The agent gathered all 17 facts here, but call counts varied, which is
-part of why `none` carries a 21% spread.*
+**Same model on two routes, both pinned — an unusually direct comparison:**
 
----
+| | OpenRouter | Foundry |
+| --- | ---: | ---: |
+| `none` cost | $0.0216 | $0.0215 |
+| `none` hit rate | 90% | 91% |
+| `tool_result` vs none | +47% | +34% |
+| `context_window` vs none | +54% | +23% |
+| `context_window` hit rate | 23% | **38%** |
+
+The uncompacted baseline is the same to within 0.5%. The *compaction penalties* differ, and
+the hit-rate column says why: **Foundry's cache survives compaction better than OpenRouter's**
+(38% vs 23% under the same strategy). The direction of every conclusion is identical; the
+magnitude is route-dependent.
 
 ### Run 2 — `gpt-5.4-mini` via Azure Foundry (pinned)
 
