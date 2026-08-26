@@ -50,6 +50,14 @@ tau2 = [
   "numpy",
 ]
 
+# Compaction / prompt-cache benchmark dependencies
+cachebench = [
+  "agent-framework-openai",
+  "agent-framework-mistral",
+  "agent-framework-ollama",
+  "agent-framework-foundry",
+]
+
 # Dependencies for math-related training
 math = [
   "sympy>=1.13.0",
@@ -75,6 +83,10 @@ tau2 = [
 ]
 
 [project.scripts]
+cachebench = "agent_framework_lab_cachebench:main"
+cachebench_advise = "agent_framework_lab_cachebench:advise_main"
+cachebench_recall = "agent_framework_lab_cachebench:recall_main"
+cachebench_summary = "agent_framework_lab_cachebench:summary_main"
 gaia_viewer = "agent_framework_lab_gaia:viewer_main"
 lightning = "agent_framework_lab_lightning:main"
 
@@ -88,9 +100,11 @@ packages = [
   "agent_framework_lab_lightning",
   "agent_framework_lab_tau2",
   "agent_framework_lab_common",
+  "agent_framework_lab_cachebench",
   "agent_framework.lab.gaia",
   "agent_framework.lab.lightning",
   "agent_framework.lab.tau2",
+  "agent_framework.lab.cachebench",
 ]
 
 [tool.setuptools.package-dir]
@@ -98,14 +112,17 @@ packages = [
 "agent_framework_lab_lightning" = "lightning/agent_framework_lab_lightning"
 "agent_framework_lab_tau2" = "tau2/agent_framework_lab_tau2"
 "agent_framework_lab_common" = "common/agent_framework_lab_common"
+"agent_framework_lab_cachebench" = "cachebench/agent_framework_lab_cachebench"
 "agent_framework.lab.gaia" = "namespace/agent_framework/lab/gaia"
 "agent_framework.lab.lightning" = "namespace/agent_framework/lab/lightning"
 "agent_framework.lab.tau2" = "namespace/agent_framework/lab/tau2"
+"agent_framework.lab.cachebench" = "namespace/agent_framework/lab/cachebench"
 
 [tool.setuptools.package-data]
 agent_framework_lab_gaia = ["py.typed"]
 agent_framework_lab_lightning = ["py.typed"]
 agent_framework_lab_tau2 = ["py.typed"]
+agent_framework_lab_cachebench = ["py.typed"]
 
 [tool.ruff]
 extend = "../../pyproject.toml"
@@ -132,13 +149,14 @@ include = [
   "gaia/agent_framework_lab_gaia",
   "lightning/agent_framework_lab_lightning",
   "tau2/agent_framework_lab_tau2",
+  "cachebench/agent_framework_lab_cachebench",
 ]
 extraPaths = ["common"]
-exclude = ['gaia/tests', 'lightning/tests', 'tau2/tests', 'namespace', '**/samples']
+exclude = ['gaia/tests', 'lightning/tests', 'tau2/tests', 'cachebench/tests', 'namespace', '**/samples']
 
 [tool.bandit]
-targets = ["agent_framework_lab_gaia", "agent_framework_lab_lightning", "agent_framework_lab_tau2"]
-exclude_dirs = ["gaia/tests", "lightning/tests", "tau2/tests"]
+targets = ["agent_framework_lab_gaia", "agent_framework_lab_lightning", "agent_framework_lab_tau2", "agent_framework_lab_cachebench"]
+exclude_dirs = ["gaia/tests", "lightning/tests", "tau2/tests", "cachebench/tests"]
 
 [tool.poe]
 include = "../../shared_tasks.toml"
@@ -158,6 +176,10 @@ cmd = "pytest lightning/tests --cov=agent_framework_lab_lightning --cov-report=t
 [tool.poe.tasks.test-tau2]
 help = "Run the Tau2 lab test suite."
 cmd = "pytest tau2/tests --cov=agent_framework_lab_tau2 --cov-report=term-missing:skip-covered"
+
+[tool.poe.tasks.test-cachebench]
+help = "Run the cachebench lab test suite."
+cmd = "pytest cachebench/tests --cov=agent_framework_lab_cachebench --cov-report=term-missing:skip-covered"
 
 [tool.poe.tasks.build]
 help = "Skip build for the lab package."
