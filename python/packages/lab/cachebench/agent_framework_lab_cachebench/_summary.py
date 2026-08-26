@@ -91,6 +91,12 @@ def relative_correctness(outcome: JointOutcome, baseline: JointOutcome) -> float
     return outcome.correctness / baseline.correctness
 
 
+#: Control correctness below which the relative measure stops meaning anything.
+#: Dividing by a control that scored 6% turns a strategy scoring 17% into "300% of the
+#: control", which reads as a threefold improvement rather than as two bad answers.
+MEANINGFUL_BASELINE: Final[float] = 0.25
+
+
 def recommend(
     outcomes: list[JointOutcome],
     *,
@@ -125,6 +131,19 @@ def recommend(
         raise ValueError(f"Baseline strategy {baseline!r} is missing; measured: {sorted(by_name)}")
 
     base = by_name[baseline]
+    if base.correctness < MEANINGFUL_BASELINE:
+        return JointVerdict(
+            recommended=baseline,
+            baseline=base,
+            chosen=base,
+            outcomes=tuple(sorted(outcomes, key=lambda outcome: outcome.cost)),
+            min_correctness=min_correctness,
+            rationale=(
+                f"The uncompacted control scored only {base.correctness:.0%}, so it is not a usable "
+                "reference: every strategy would be judged against a baseline that already fails the "
+                "task. Fix the workload or the model before reading a recommendation from this run."
+            ),
+        )
     eligible = [
         outcome
         for outcome in outcomes
