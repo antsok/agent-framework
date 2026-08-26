@@ -19,6 +19,7 @@ from ._live import (
     build_live_scenario,
     run_live,
     score_live,
+    unretrieved_facts,
 )
 from ._providers import build_provider, parse_provider_selector, provider_names
 from ._recall import RecallScenario, RecallScore
@@ -189,6 +190,7 @@ def _to_joint(outcome: LiveOutcome, scenario: RecallScenario, pricing: ModelPric
 def _render(
     verdict: JointVerdict,
     live: dict[str, LiveOutcome],
+    nofetch: dict[str, int],
     pricing: ModelPricing,
     model: str,
     agent_kind: str,
@@ -200,7 +202,7 @@ def _render(
     header = (
         f"{'strategy':<28}{'msgs':>9}{'tok left/peak':>16}{'calls':>7}{'in':>9}{'hit%':>6}"
         f"{'out':>8}{'cost':>10}{'summ$':>8}{'vs none':>9}"
-        f"{'facts':>9}{'lost':>6}{'ignored':>8}{'correct':>9}{'vs none':>9}{'flags':>8}"
+        f"{'facts':>9}{'lost':>6}{'nofetch':>8}{'ignored':>8}{'correct':>9}{'vs none':>9}{'flags':>8}"
     )
     lines = [
         "",
@@ -233,7 +235,8 @@ def _render(
             f"{run.output_tokens:>8,}{'$' + format(outcome.cost, '.4f'):>10}"
             f"{('-' if not summ else '$' + format(summ, '.4f')):>8}{cost_delta:>9}"
             f"{f'{outcome.score.facts_left}/{len(outcome.score.outcomes)}':>9}"
-            f"{outcome.score.lost_to_compaction:>6}{outcome.score.ignored_by_model:>8}"
+            f"{max(outcome.score.lost_to_compaction - nofetch[outcome.strategy], 0):>6}"
+            f"{nofetch[outcome.strategy]:>8}{outcome.score.ignored_by_model:>8}"
             f"{outcome.correctness:>8.0%}{'*' if outcome.strategy == base.strategy else ' '}{rel:>9}"
             f"{(','.join(flags) or '-'):>8}"
         )
@@ -249,6 +252,9 @@ def _render(
         "summ$     = what this strategy's own summarization calls cost, of that total",
         "facts     = planted facts surviving compaction into the final prompt: recall's ceiling",
         "lost      = compaction removed it, so the model could not use it  <- the damage",
+        "nofetch   = the agent never called that tool, so the fact never entered the",
+        "            history at all. Not compaction damage: an uncompacted run shows these",
+        "            too, and counting them as lost overstates every strategy equally",
         "ignored   = still in context but unused: the model's failing, not compaction's.",
         "            Without this split a control that simply omits facts looks like",
         "            compaction damage, and every strategy is judged against a false baseline",
@@ -344,6 +350,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
         ).client
 
     live: dict[str, LiveOutcome] = {}
+    nofetch: dict[str, int] = {}
     joint: list[JointOutcome] = []
     for name in strategies:
         print(f"-> {name}", flush=True)
@@ -375,6 +382,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
             tool_result_tokens=args.tool_result_tokens,
         )
         live[name] = outcome
+        nofetch[name] = len(unretrieved_facts(outcome, scenario))
         joint.append(_to_joint(outcome, scenario, pricing))
         if outcome.error:
             print(f"   {outcome.error}", flush=True)
@@ -391,7 +399,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
             f"retain the last {retained}, so {affected} evicted nothing. Their scores measure "
             "a no-op, not information preservation. Raise --tool-turns above the retention."
         )
-    print(_render(verdict, live, pricing, runtime.model, args.agent, show_answers=args.show_answers))
+    print(_render(verdict, live, nofetch, pricing, runtime.model, args.agent, show_answers=args.show_answers))
     return 0
 
 

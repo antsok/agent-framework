@@ -46,6 +46,7 @@ from agent_framework_lab_cachebench import (
     build_strategy,
     make_lookup_tool,
     run_live,
+    unretrieved_facts,
 )
 from agent_framework_lab_cachebench._advisor import ModelPricing
 from agent_framework_lab_cachebench._live_cli import _cost, _summarizer_cost
@@ -711,6 +712,44 @@ async def test_run_live_reports_a_failed_turn_without_raising() -> None:
     assert "provider fell over" in outcome.error
     assert outcome.turns_completed < outcome.turns_total
     assert outcome.calls, "the calls made before the failure were lost"
+
+
+async def test_facts_the_agent_never_fetched_are_not_charged_to_compaction() -> None:
+    """A tool the agent never calls cannot have been evicted by compaction.
+
+    The tool result only enters the history if the model asks for it. Counting an unasked-for
+    fact as lost makes the *uncompacted* control report losing information to compaction,
+    which cannot happen, and inflates every strategy's apparent damage by the same amount.
+    """
+    scenario = build_live_scenario(salt="nf", filler_turns=3, filler_tokens=50, tool_turns=6)
+    # A client that never emits a tool call: nothing is ever fetched.
+    outcome = await run_live(
+        ProviderRuntime(client=StubChatClient(), model="stub"),
+        strategy_name="none",
+        options=_options(),
+        scenario=scenario,
+    )
+
+    assert outcome.scopes_called == ()
+    never_fetched = unretrieved_facts(outcome, scenario)
+    tool_facts = [fact for fact in scenario.facts if fact.kind == "tool_result"]
+    assert len(never_fetched) == len(tool_facts)
+
+
+async def test_fetched_scopes_are_recorded() -> None:
+    """Scopes the agent did ask for must not be counted as never fetched."""
+    scenario = build_live_scenario(salt="f", filler_turns=3, filler_tokens=50, tool_turns=6)
+    client = StubChatClient(tool_turns=(1,))
+    outcome = await run_live(
+        ProviderRuntime(client=client, model="stub"),
+        strategy_name="none",
+        options=_options(),
+        scenario=scenario,
+    )
+
+    assert "early" in outcome.scopes_called
+    never_fetched = {entry.fact.marker for entry in unretrieved_facts(outcome, scenario)}
+    assert not never_fetched.intersection(scenario.tool_lookups["early"])
 
 
 async def test_run_live_drives_every_turn_and_counts_tool_use() -> None:
