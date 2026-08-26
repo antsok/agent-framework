@@ -114,12 +114,21 @@ def _cost(outcome: LiveOutcome, pricing: ModelPricing) -> float:
         fresh * pricing.input_per_million
         + outcome.cached_tokens * pricing.cached_read_per_million
         + outcome.output_tokens * pricing.output_per_million
-    )
-    summarizer_cost = (
+    ) / 1_000_000
+    return agent_cost + _summarizer_cost(outcome, pricing)
+
+
+def _summarizer_cost(outcome: LiveOutcome, pricing: ModelPricing) -> float:
+    """Return what a strategy's own summarization calls cost.
+
+    Reported as its own column rather than folded silently into the total. A shared meter
+    once leaked one strategy's summarizer spend into every later row as a flat addition,
+    which a single total cannot show but a per-row column makes obvious.
+    """
+    return (
         outcome.summarizer_input_tokens * pricing.input_per_million
         + outcome.summarizer_output_tokens * pricing.output_per_million
-    )
-    return (agent_cost + summarizer_cost) / 1_000_000
+    ) / 1_000_000
 
 
 def _to_joint(outcome: LiveOutcome, scenario: RecallScenario, pricing: ModelPricing) -> JointOutcome:
@@ -156,8 +165,8 @@ def _render(
     """Render cost and correctness side by side, then the recommendation."""
     base = verdict.baseline
     header = (
-        f"{'strategy':<28}{'left/peak':>11}{'calls':>7}{'tools':>6}{'in':>9}{'hit%':>6}"
-        f"{'out':>8}{'cost':>10}{'vs none':>9}{'correct':>9}{'vs none':>9}{'flags':>8}"
+        f"{'strategy':<28}{'msgs':>9}{'tok left/peak':>16}{'calls':>7}{'in':>9}{'hit%':>6}"
+        f"{'out':>8}{'cost':>10}{'summ$':>8}{'vs none':>9}{'correct':>9}{'vs none':>9}{'flags':>8}"
     )
     lines = [
         "",
@@ -172,6 +181,7 @@ def _render(
     ]
     for outcome in verdict.outcomes:
         run = live[outcome.strategy]
+        summ = _summarizer_cost(run, pricing)
         cost_delta = "-" if outcome.strategy == base.strategy else f"{(outcome.cost - base.cost) / base.cost:+.0%}"
         rel = "-" if outcome.strategy == base.strategy else f"{relative_correctness(outcome, base):.0%}"
         hit = "n/a" if outcome.hit_rate is None else f"{outcome.hit_rate:.0%}"
@@ -183,18 +193,24 @@ def _render(
         if run.turns_completed < run.turns_total:
             flags.append(f"{run.turns_completed}/{run.turns_total}t")
         lines.append(
-            f"{outcome.strategy:<28}{f'{run.messages_left}/{run.messages_peak}':>11}"
-            f"{len(run.calls):>7}{run.tool_calls_made:>6}{run.input_tokens:>9,}{hit:>6}"
-            f"{run.output_tokens:>8,}{'$' + format(outcome.cost, '.4f'):>10}{cost_delta:>9}"
+            f"{outcome.strategy:<28}{f'{run.messages_left}/{run.messages_peak}':>9}"
+            f"{f'{run.prompt_tokens_final:,}/{run.prompt_tokens_peak:,}':>16}"
+            f"{len(run.calls):>7}{run.input_tokens:>9,}{hit:>6}"
+            f"{run.output_tokens:>8,}{'$' + format(outcome.cost, '.4f'):>10}"
+            f"{('-' if not summ else '$' + format(summ, '.4f')):>8}{cost_delta:>9}"
             f"{outcome.correctness:>8.0%}{'*' if outcome.strategy == base.strategy else ' '}{rel:>9}"
             f"{(','.join(flags) or '-'):>8}"
         )
     lines += [
         "",
-        "left/peak = messages in the final prompt, and the most any single call carried",
+        "msgs      = messages in the final prompt, out of the most any call carried",
+        "tok       = billed tokens in that same final prompt, and at the peak. Watch this",
+        "            rather than msgs: a strategy that rewrites content in place removes",
+        "            tokens without removing messages, and msgs cannot see it",
         "calls     = model calls, which exceed turns whenever the agent used a tool",
         "in/out    = tokens billed across the whole run, replies included",
-        "cost      = the whole conversation, cached reads discounted, summarizer calls added",
+        "cost      = the whole conversation, cached reads discounted, summ$ included",
+        "summ$     = what this strategy's own summarization calls cost, of that total",
         "correct   = share of correctness checks the final answer passed (* marks the control)",
         "flags     = ERR failed turn, S<n> summarizer failures, <n>/<n>t turns completed",
         "",
@@ -232,7 +248,6 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
         raise SystemExit("The 'none' control must be included; every comparison is relative to it.")
 
     tokenizer = build_tokenizer(args.tokenizer)
-    summarizer: MeteredClient | None = None
     needs_summarizer = any("summar" in name for name in strategies)
     if needs_summarizer and args.summarizer_provider is None and not args.dry_run:
         raise SystemExit("Summarization strategies require --summarizer-provider.")
@@ -258,16 +273,22 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
         model=model_override,
     )
     pricing = _resolve_pricing(args, provider, runtime.model)
+    summarizer_client: Any = None
     if args.summarizer_provider is not None:
         sum_provider, sum_model = parse_provider_selector(args.summarizer_provider)
-        summarizer = MeteredClient(
-            build_provider(sum_provider, temperature=0.0, response_max_tokens=1_024, model=sum_model).client
-        )
+        summarizer_client = build_provider(
+            sum_provider, temperature=0.0, response_max_tokens=1_024, model=sum_model
+        ).client
 
     live: dict[str, LiveOutcome] = {}
     joint: list[JointOutcome] = []
     for name in strategies:
         print(f"-> {name}", flush=True)
+        # A fresh meter per strategy. Sharing one accumulates every earlier strategy's
+        # summarizer spend into every later row: measured as a flat +$0.0172 on all five
+        # strategies that happened to run after 'summarization', which is invisible in a
+        # total and inverted the ranking of the whole token_budget family.
+        summarizer = MeteredClient(summarizer_client) if summarizer_client is not None else None
         scenario = build_live_scenario(
             salt=f"{time.strftime('%Y%m%d-%H%M%S')}-{name}",
             filler_turns=args.filler_turns,

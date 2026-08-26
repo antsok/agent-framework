@@ -48,7 +48,7 @@ from agent_framework_lab_cachebench import (
     run_live,
 )
 from agent_framework_lab_cachebench._advisor import ModelPricing
-from agent_framework_lab_cachebench._live_cli import _cost
+from agent_framework_lab_cachebench._live_cli import _cost, _summarizer_cost
 
 TOKENIZER = CharacterEstimatorTokenizer()
 
@@ -486,6 +486,30 @@ def test_messages_peak_is_measured_before_compaction() -> None:
     assert outcome.messages_dropped == 5
 
 
+def test_prompt_size_is_reported_in_tokens_not_only_messages() -> None:
+    """An in-place rewrite must be visible.
+
+    ``ToolResultCompactionStrategy`` collapses tool results into summaries without excluding
+    any message, so the message count is identical before and after while real tokens are
+    gone. A table that reports only message counts shows that strategy as having done
+    nothing, which is how it was nearly dropped from the comparison.
+    """
+    outcome = LiveOutcome(
+        strategy="tool_result",
+        calls=(_call(9, 9, inp=8_000), _call(9, 9, inp=5_000)),
+        answer="",
+        final_prompt="",
+        tool_calls_made=0,
+        turns_completed=2,
+        turns_total=2,
+    )
+
+    assert outcome.messages_left == outcome.messages_peak == 9
+    assert outcome.messages_dropped == 0
+    assert outcome.prompt_tokens_final == 5_000
+    assert outcome.prompt_tokens_peak == 8_000
+
+
 def test_cost_includes_generation_and_summarizer_charges() -> None:
     """Live cost must price replies and the summarizer's own calls.
 
@@ -517,6 +541,47 @@ def test_cost_includes_generation_and_summarizer_charges() -> None:
 
     assert _cost(base, pricing) == pytest.approx(2.0)
     assert _cost(with_summary, pricing) == pytest.approx(4.0)
+
+
+def test_summarizer_cost_is_zero_for_a_strategy_that_never_summarized() -> None:
+    """A non-summarizing strategy must carry no summarizer charge.
+
+    A single shared meter once accumulated one strategy's summarizer spend into every later
+    row as a flat addition, which is invisible in a total and inverted the ranking of a whole
+    family. Reporting the charge per row is what makes that visible.
+    """
+    pricing = ModelPricing(input_per_million=1.0, cached_read_per_million=0.1, output_per_million=10.0)
+    outcome = LiveOutcome(
+        strategy="truncation",
+        calls=(_call(1, 1, inp=1_000, out=100),),
+        answer="",
+        final_prompt="",
+        tool_calls_made=0,
+        turns_completed=1,
+        turns_total=1,
+    )
+
+    assert _summarizer_cost(outcome, pricing) == 0.0
+
+
+def test_total_cost_is_the_agent_plus_its_own_summarizer() -> None:
+    """The reported total must decompose exactly into the two halves shown."""
+    pricing = ModelPricing(input_per_million=1.0, cached_read_per_million=0.1, output_per_million=10.0)
+    outcome = LiveOutcome(
+        strategy="summarization",
+        calls=(_call(1, 1, inp=2_000_000, out=100_000),),
+        answer="",
+        final_prompt="",
+        tool_calls_made=0,
+        turns_completed=1,
+        turns_total=1,
+        summarizer_input_tokens=500_000,
+        summarizer_output_tokens=50_000,
+    )
+
+    agent_only = (2_000_000 * 1.0 + 100_000 * 10.0) / 1_000_000
+    assert _cost(outcome, pricing) == pytest.approx(agent_only + _summarizer_cost(outcome, pricing))
+    assert _summarizer_cost(outcome, pricing) == pytest.approx((500_000 * 1.0 + 50_000 * 10.0) / 1_000_000)
 
 
 def test_cached_tokens_are_discounted() -> None:
