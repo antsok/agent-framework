@@ -69,6 +69,7 @@ __all__ = [
     "make_lookup_tool",
     "run_live",
     "score_live",
+    "unretrieved_facts",
 ]
 
 #: How the agent under test is assembled.
@@ -248,6 +249,13 @@ class LiveOutcome:
     tool_calls_made: int
     turns_completed: int
     turns_total: int
+    scopes_called: tuple[str, ...] = ()
+    """Tool scopes the agent actually asked for.
+
+    A fact the agent never fetched never entered the history, so compaction cannot have
+    evicted it. Without this the uncompacted control reports losing facts to compaction,
+    which is not a thing that can happen.
+    """
     summarizer_calls: int = 0
     summarizer_failures: int = 0
     summarizer_input_tokens: int = 0
@@ -485,6 +493,7 @@ async def run_live(
     summarizer = options.summarizer if isinstance(options.summarizer, MeteredClient) else None
     lookup = make_lookup_tool(scenario.tool_lookups, tool_result_tokens)
     tool_calls = 0
+    scopes_called: list[str] = []
 
     def lookup_deployment(scope: str) -> str:
         """Look up the deployment facts for one scope of the system.
@@ -497,6 +506,7 @@ async def run_live(
         """
         nonlocal tool_calls
         tool_calls += 1
+        scopes_called.append(scope.strip().casefold())
         return lookup(scope)
 
     agent = build_live_agent(
@@ -543,12 +553,40 @@ async def run_live(
         tool_calls_made=tool_calls,
         turns_completed=completed,
         turns_total=len(turns),
+        scopes_called=tuple(scopes_called),
         summarizer_calls=summarizer.calls if summarizer else 0,
         summarizer_failures=summarizer.failures if summarizer else 0,
         summarizer_input_tokens=summarizer.input_tokens if summarizer else 0,
         summarizer_output_tokens=summarizer.output_tokens if summarizer else 0,
         error=error,
         replies=tuple(replies),
+    )
+
+
+def unretrieved_facts(outcome: LiveOutcome, scenario: RecallScenario) -> tuple[FactOutcome, ...]:
+    """Return the facts the agent never fetched, so compaction never had them.
+
+    Scored separately from compaction damage on purpose. A tool result only enters the
+    history if the model chooses to call that tool; if it never does, the markers it would
+    have carried were never in the conversation at all. Counting those as evicted makes the
+    uncompacted control appear to lose information, and inflates the apparent damage of every
+    strategy by the same amount.
+
+    Args:
+        outcome: The finished run.
+        scenario: The scenario it was driven from.
+
+    Returns:
+        One outcome per fact that was never retrieved.
+    """
+    called = set(outcome.scopes_called)
+    missing_markers = {
+        marker for scope, pair in scenario.tool_lookups.items() if scope.casefold() not in called for marker in pair
+    }
+    return tuple(
+        FactOutcome(fact=fact, survived=False, recalled=fact.appears_in(outcome.answer))
+        for fact in scenario.facts
+        if fact.marker in missing_markers
     )
 
 

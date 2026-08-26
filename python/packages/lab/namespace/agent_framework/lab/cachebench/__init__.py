@@ -69,6 +69,7 @@ from agent_framework_lab_cachebench import (
     summarize_cell,
     summary_main,
     token_counts,
+    unretrieved_facts,
     write_records_jsonl,
     write_summary_csv,
 )
@@ -141,6 +142,7 @@ __all__ = [
     "summarize_cell",
     "summary_main",
     "token_counts",
+    "unretrieved_facts",
     "write_records_jsonl",
     "write_summary_csv",
 ]

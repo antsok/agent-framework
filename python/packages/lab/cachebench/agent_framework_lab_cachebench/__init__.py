@@ -29,6 +29,7 @@ from ._live import (
     make_lookup_tool,
     run_live,
     score_live,
+    unretrieved_facts,
 )
 from ._live_cli import main as live_main
 from ._metrics import common_message_prefix, percentile, serialize_message, summarize_cell, token_counts
@@ -140,6 +141,7 @@ __all__ = [
     "summarize_cell",
     "summary_main",
     "token_counts",
+    "unretrieved_facts",
     "write_records_jsonl",
     "write_summary_csv",
 ]
