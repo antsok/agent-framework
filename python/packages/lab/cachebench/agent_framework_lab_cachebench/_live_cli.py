@@ -20,6 +20,7 @@ from ._live import (
     run_live,
     score_live,
     unretrieved_facts,
+    wants_client_side_history,
 )
 from ._providers import build_provider, parse_provider_selector, provider_names
 from ._recall import RecallScenario, RecallScore
@@ -116,6 +117,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--price-cached", type=float, default=None, help="Cached-read price per million tokens.")
     parser.add_argument("--price-output", type=float, default=None, help="Output price per million tokens.")
     parser.add_argument("--tokenizer", default="tiktoken", choices=list(TOKENIZER_NAMES), help="Token counter.")
+    parser.add_argument(
+        "--server-history",
+        action="store_true",
+        help=(
+            "Let the service keep the conversation server-side. Compaction then has nothing to "
+            "act on, because the agent only sends the new turn. Off by default so that what is "
+            "measured is actually compaction."
+        ),
+    )
     parser.add_argument("--no-temperature", action="store_true", help="Omit temperature for models that reject it.")
     parser.add_argument("--show-answers", action="store_true", help="Print each final answer in full.")
     parser.add_argument("--dry-run", action="store_true", help="Print the plan and its rough size, call nothing.")
@@ -411,6 +421,27 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
         model=model_override,
     )
     pricing = _resolve_pricing(args, provider, runtime.model)
+
+    # Clients on the Responses API keep the conversation server-side. When they do, the agent
+    # sends only the new turn and MAF skips HistoryProvider.before_run entirely -- the history
+    # never reaches the outgoing messages, so a compaction strategy has nothing to compact and
+    # every setting silently measures the same thing. Measured on Foundry before this was
+    # forced: a 16-turn conversation reported a one-message prompt on every row.
+    stores_by_default = bool(getattr(runtime.client, "STORES_BY_DEFAULT", False))
+    if wants_client_side_history(runtime.client, allow_server_history=args.server_history):
+        runtime.options["store"] = False
+        print(
+            f"note: {runtime.model} keeps history server-side by default. Forcing store=False so "
+            "the history is sent by the client and compaction actually applies.",
+            flush=True,
+        )
+    elif stores_by_default:
+        print(
+            "WARNING: --server-history means the service owns the conversation. The agent sends "
+            "only the new turn, so no strategy can compact anything and every row will match the "
+            "control. This measures the service, not compaction.",
+            flush=True,
+        )
     summarizer_client: Any = None
     if args.summarizer_provider is not None:
         sum_provider, sum_model = parse_provider_selector(args.summarizer_provider)
