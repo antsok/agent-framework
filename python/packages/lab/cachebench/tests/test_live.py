@@ -427,13 +427,69 @@ def test_context_window_matches_the_framework_tool_retention_default() -> None:
 
 
 def test_live_scenario_keeps_the_same_facts_as_replay() -> None:
-    """Live and replayed runs must score against identical planted facts."""
-    replay = build_recall_scenario(salt="x", filler_turns=6, filler_tokens=4_000)
-    live = build_live_scenario(salt="x", filler_turns=6, filler_tokens=4_000)
+    """At matching settings the two modes must score identical planted facts.
+
+    Compared at the same ``tool_turns`` on purpose. The live default is deliberately
+    tool-heavier than replay's, so that tool-oriented compaction has enough groups to
+    engage; what must not differ is the scoring for a given configuration.
+    """
+    replay = build_recall_scenario(salt="x", filler_turns=6, filler_tokens=4_000, tool_turns=6)
+    live = build_live_scenario(salt="x", filler_turns=6, filler_tokens=4_000, tool_turns=6)
 
     assert live.facts == replay.facts
     assert live.tool_lookups == replay.tool_lookups
     assert live.contradictions == replay.contradictions
+
+
+def test_live_defaults_are_more_tool_heavy_than_replay() -> None:
+    """The live default must plant more tool groups than the replay default."""
+    replay = build_recall_scenario(salt="x", filler_turns=6, filler_tokens=100)
+    live = build_live_scenario(salt="x", filler_turns=6, filler_tokens=100)
+
+    assert len(live.tool_lookups) > len(replay.tool_lookups)
+
+
+def test_tool_results_carry_the_majority_of_the_scored_facts() -> None:
+    """Most of what correctness scores lives in tool results.
+
+    This is why the tool-group count matters so much: a strategy that touches tool results
+    is acting on more than half the evidence the final answer is graded on.
+    """
+    scenario = build_live_scenario(salt="x", filler_turns=6, filler_tokens=100)
+    tool_facts = [fact for fact in scenario.facts if fact.kind == "tool_result"]
+
+    assert len(tool_facts) > len(scenario.facts) / 2
+
+
+def test_default_tool_turns_exceed_the_frameworks_retention() -> None:
+    """The default scenario must let tool-oriented compaction actually fire.
+
+    Those strategies keep the last ``keep_last_tool_call_groups`` groups verbatim. Plant no
+    more groups than that and they evict nothing, change no tokens, and score a perfect
+    result for doing nothing — which reads as the best row in the table. Measured at 3 groups
+    against a retention of 4: two strategies were exact no-ops while carrying 55% of the
+    planted facts.
+    """
+    retained = _options().keep_last_tool_call_groups
+    scenario = build_live_scenario(salt="x", filler_turns=6, filler_tokens=100)
+
+    assert len(scenario.tool_lookups) > retained
+
+
+@pytest.mark.parametrize("tool_turns", [3, 6, 8, 12])
+def test_markers_stay_unique_as_the_scenario_grows(tool_turns: int) -> None:
+    """Every planted fact must have a distinct, non-degenerate marker.
+
+    Markers were once six-character slices of a single sha256, which runs dry after ten and
+    then yields an empty marker. An empty marker is a substring of any answer, so it scores
+    as recalled every time and silently inflates the result.
+    """
+    scenario = build_live_scenario(salt="x", filler_turns=9, filler_tokens=100, tool_turns=tool_turns)
+    markers = [fact.marker for fact in scenario.facts]
+
+    assert len(set(markers)) == len(markers)
+    assert all(len(marker) >= 6 for marker in markers)
+    assert not any(marker.endswith("-") for marker in markers)
 
 
 def test_live_scenario_moves_the_bulk_to_the_user_turns() -> None:

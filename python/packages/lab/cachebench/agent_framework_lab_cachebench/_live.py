@@ -532,13 +532,16 @@ async def run_live(
     )
 
 
-def build_live_scenario(*, salt: str, filler_turns: int, filler_tokens: int) -> RecallScenario:
+def build_live_scenario(*, salt: str, filler_turns: int, filler_tokens: int, tool_turns: int = 6) -> RecallScenario:
     """Build the scenario in the shape a live run needs.
 
     Keyword Args:
         salt: Cell-unique string; markers and filler derive from it.
         filler_turns: Padding turns between the planted facts.
         filler_tokens: Approximate size of each filler exchange.
+        tool_turns: Tool-call groups to plant. Defaults above the framework's
+            ``keep_last_tool_call_groups`` of 4, so that tool-oriented strategies
+            actually engage instead of scoring a perfect result for doing nothing.
 
     Returns:
         A scenario whose padding sits in the user turns, because the assistant's replies are
@@ -549,6 +552,7 @@ def build_live_scenario(*, salt: str, filler_turns: int, filler_tokens: int) -> 
         filler_turns=filler_turns,
         filler_tokens=filler_tokens,
         bulk_in_user=True,
+        tool_turns=tool_turns,
     )
 
 
