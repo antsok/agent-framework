@@ -30,6 +30,7 @@ from ._live import (
     run_live,
     score_live,
     unretrieved_facts,
+    wants_client_side_history,
 )
 from ._live_cli import main as live_main
 from ._metrics import common_message_prefix, percentile, serialize_message, summarize_cell, token_counts
@@ -142,6 +143,7 @@ __all__ = [
     "summary_main",
     "token_counts",
     "unretrieved_facts",
+    "wants_client_side_history",
     "write_records_jsonl",
     "write_summary_csv",
 ]
