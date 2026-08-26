@@ -58,6 +58,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("provider", help="Provider or provider:model.")
     parser.add_argument("--strategies", default=_DEFAULT_STRATEGIES, help=f"Available: {','.join(strategy_names())}")
     parser.add_argument("--agent", default="plain", choices=list(AGENT_KINDS), help="How to assemble the agent.")
+    parser.add_argument(
+        "--repeats",
+        type=int,
+        default=1,
+        help=(
+            "Replays per strategy. Live cost was measured swinging about 20% between identical "
+            "runs, mostly from reply length, so a single sample cannot rank strategies that are "
+            "close together. 3 or more is what makes a ranking defensible."
+        ),
+    )
     parser.add_argument("--filler-turns", type=int, default=6, help="Padding turns between planted facts.")
     parser.add_argument(
         "--filler-tokens",
@@ -165,6 +175,27 @@ def _summarizer_cost(outcome: LiveOutcome, pricing: ModelPricing) -> float:
     ) / 1_000_000
 
 
+def _representative(outcomes: list[LiveOutcome], pricing: ModelPricing) -> LiveOutcome:
+    """Return the median-cost repeat.
+
+    The median run rather than a synthetic average of all of them: every column in the table
+    then describes one conversation that actually happened, so the token counts, the fact
+    counts and the cost cannot disagree with each other the way blended figures would.
+    """
+    return sorted(outcomes, key=lambda outcome: _cost(outcome, pricing))[len(outcomes) // 2]
+
+
+def _spread(outcomes: list[LiveOutcome], pricing: ModelPricing) -> float:
+    """Return the relative gap between the cheapest and dearest repeat.
+
+    Zero for a single repeat, which is exactly when nothing is known about stability, so the
+    report says so rather than showing a reassuring 0%.
+    """
+    costs = [_cost(outcome, pricing) for outcome in outcomes]
+    median = sorted(costs)[len(costs) // 2]
+    return (max(costs) - min(costs)) / median if len(costs) > 1 and median > 0 else 0.0
+
+
 def _to_joint(outcome: LiveOutcome, scenario: RecallScenario, pricing: ModelPricing) -> JointOutcome:
     """Convert a live outcome into the shape the joint verdict already understands."""
     return JointOutcome(
@@ -187,10 +218,36 @@ def _to_joint(outcome: LiveOutcome, scenario: RecallScenario, pricing: ModelPric
     )
 
 
+def _stability_note(verdict: JointVerdict, spread: dict[str, float], repeats: int) -> list[str]:
+    """Return a warning when the recommendation's margin is inside the measured noise.
+
+    A ranking is only worth reporting if the gap between the options is larger than the gap
+    between repeats of the same option. Live cost was measured swinging about 20% on
+    identical configuration, mostly from reply length, which is wider than most of the
+    differences between strategies.
+    """
+    if repeats < 2:
+        return ["", "Single repeat: nothing here measures stability. Re-run with --repeats 3."]
+    chosen, base = verdict.chosen, verdict.baseline
+    if chosen.strategy == base.strategy or base.cost <= 0:
+        return []
+    margin = abs(base.cost - chosen.cost) / base.cost
+    worst = max(spread.get(chosen.strategy, 0.0), spread.get(base.strategy, 0.0))
+    if worst > margin:
+        note = (
+            f"NOT SUPPORTED: repeats of one strategy varied by {worst:.0%}, wider than the "
+            f"{margin:.0%} gap this recommendation rests on. Treat the cost ranking as unresolved."
+        )
+        return ["", note]
+    return []
+
+
 def _render(
     verdict: JointVerdict,
     live: dict[str, LiveOutcome],
     nofetch: dict[str, int],
+    spread: dict[str, float],
+    repeats: int,
     pricing: ModelPricing,
     model: str,
     agent_kind: str,
@@ -201,7 +258,7 @@ def _render(
     base = verdict.baseline
     header = (
         f"{'strategy':<28}{'msgs':>9}{'tok left/peak':>16}{'calls':>7}{'in':>9}{'hit%':>6}"
-        f"{'out':>8}{'cost':>10}{'summ$':>8}{'vs none':>9}"
+        f"{'out':>8}{'cost':>10}{'+-':>6}{'summ$':>8}{'vs none':>9}"
         f"{'facts':>9}{'lost':>6}{'nofetch':>8}{'ignored':>8}{'correct':>9}{'vs none':>9}{'flags':>8}"
     )
     lines = [
@@ -238,6 +295,7 @@ def _render(
             f"{f'{run.prompt_tokens_final:,}/{run.prompt_tokens_peak:,}':>16}"
             f"{len(run.calls):>7}{run.input_tokens:>9,}{hit:>6}"
             f"{run.output_tokens:>8,}{'$' + format(outcome.cost, '.4f'):>10}"
+            f"{(f'{spread[outcome.strategy]:.0%}' if repeats > 1 else 'n/a'):>6}"
             f"{('-' if not summ else '$' + format(summ, '.4f')):>8}{cost_delta:>9}"
             f"{f'{outcome.score.facts_left}/{len(outcome.score.outcomes)}':>9}"
             f"{max(outcome.score.lost_to_compaction - nofetch[outcome.strategy], 0):>6}"
@@ -253,7 +311,10 @@ def _render(
         "            tokens without removing messages, and msgs cannot see it",
         "calls     = model calls, which exceed turns whenever the agent used a tool",
         "in/out    = tokens billed across the whole run, replies included",
-        "cost      = the whole conversation, cached reads discounted, summ$ included",
+        "cost      = median repeat. Every column describes that one real conversation,",
+        "            so the tokens, facts and cost cannot disagree with each other",
+        "+-        = spread between the cheapest and dearest repeat. A gap smaller than",
+        "            this is not a result. n/a means one repeat, so stability is unknown",
         "summ$     = what this strategy's own summarization calls cost, of that total",
         "facts     = planted facts surviving compaction into the final prompt: recall's ceiling",
         "lost      = compaction removed it, so the model could not use it  <- the damage",
@@ -270,6 +331,7 @@ def _render(
         "",
         f"VERDICT: {verdict.recommended}",
         verdict.rationale,
+        *_stability_note(verdict, spread, repeats),
     ]
     failed = [name for name, run in live.items() if run.summarizer_failures]
     if failed:
@@ -358,6 +420,8 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
 
     live: dict[str, LiveOutcome] = {}
     nofetch: dict[str, int] = {}
+    spread: dict[str, float] = {}
+    scenarios: dict[int, RecallScenario] = {}
     joint: list[JointOutcome] = []
     for name in strategies:
         print(f"-> {name}", flush=True)
@@ -365,34 +429,47 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
         # summarizer spend into every later row: measured as a flat +$0.0172 on all five
         # strategies that happened to run after 'summarization', which is invisible in a
         # total and inverted the ranking of the whole token_budget family.
-        summarizer = MeteredClient(summarizer_client) if summarizer_client is not None else None
-        scenario = build_live_scenario(
-            salt=f"{time.strftime('%Y%m%d-%H%M%S')}-{name}",
-            filler_turns=args.filler_turns,
-            filler_tokens=args.filler_tokens,
-            tool_turns=args.tool_turns,
-        )
-        options = StrategyOptions(
-            tokenizer=tokenizer,
-            max_context_window_tokens=args.context_window,
-            max_output_tokens=args.max_output_tokens,
-            token_budget_fraction=args.budget_fraction,
-            # A recording proxy, not a client: see MeteredClient for why it is cast.
-            summarizer=cast("SupportsChatGetResponse[Any] | None", summarizer),
-        )
-        outcome = await run_live(
-            runtime,
-            strategy_name=name,
-            options=options,
-            scenario=scenario,
-            agent_kind=args.agent,
-            tool_result_tokens=args.tool_result_tokens,
-        )
-        live[name] = outcome
-        nofetch[name] = len(unretrieved_facts(outcome, scenario))
-        joint.append(_to_joint(outcome, scenario, pricing))
-        if outcome.error:
-            print(f"   {outcome.error}", flush=True)
+        repeats: list[LiveOutcome] = []
+        chosen_scenario: RecallScenario | None = None
+        for repeat in range(1, args.repeats + 1):
+            if args.repeats > 1:
+                print(f"   repeat {repeat}/{args.repeats}", flush=True)
+            summarizer = MeteredClient(summarizer_client) if summarizer_client is not None else None
+            scenario = build_live_scenario(
+                salt=f"{time.strftime('%Y%m%d-%H%M%S')}-{name}-{repeat}",
+                filler_turns=args.filler_turns,
+                filler_tokens=args.filler_tokens,
+                tool_turns=args.tool_turns,
+            )
+            options = StrategyOptions(
+                tokenizer=tokenizer,
+                max_context_window_tokens=args.context_window,
+                max_output_tokens=args.max_output_tokens,
+                token_budget_fraction=args.budget_fraction,
+                # A recording proxy, not a client: see MeteredClient for why it is cast.
+                summarizer=cast("SupportsChatGetResponse[Any] | None", summarizer),
+            )
+            outcome = await run_live(
+                runtime,
+                strategy_name=name,
+                options=options,
+                scenario=scenario,
+                agent_kind=args.agent,
+                tool_result_tokens=args.tool_result_tokens,
+            )
+            repeats.append(outcome)
+            if chosen_scenario is None:
+                chosen_scenario = scenario
+            scenarios[id(outcome)] = scenario
+            if outcome.error:
+                print(f"   {outcome.error}", flush=True)
+
+        representative = _representative(repeats, pricing)
+        chosen_scenario = scenarios[id(representative)]
+        live[name] = representative
+        spread[name] = _spread(repeats, pricing)
+        nofetch[name] = len(unretrieved_facts(representative, chosen_scenario))
+        joint.append(_to_joint(representative, chosen_scenario, pricing))
 
     try:
         verdict = recommend(joint, min_correctness=args.min_correctness)
@@ -406,7 +483,19 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
             f"retain the last {retained}, so {affected} evicted nothing. Their scores measure "
             "a no-op, not information preservation. Raise --tool-turns above the retention."
         )
-    print(_render(verdict, live, nofetch, pricing, runtime.model, args.agent, show_answers=args.show_answers))
+    print(
+        _render(
+            verdict,
+            live,
+            nofetch,
+            spread,
+            args.repeats,
+            pricing,
+            runtime.model,
+            args.agent,
+            show_answers=args.show_answers,
+        )
+    )
     return 0
 
 
