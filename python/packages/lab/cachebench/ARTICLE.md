@@ -1,7 +1,7 @@
 # We measured context compaction against prompt caching. It usually costs more.
 
 *Lessons from building a benchmark for Microsoft Agent Framework, and from getting it wrong
-six times first.*
+eight times first.*
 
 ---
 
@@ -11,9 +11,11 @@ Compaction — dropping or shrinking old turns so each request is smaller — is
 obvious cost saving. We measured it across six model/route combinations, about 290 real
 agent conversations, scoring both what it costs and what the agent forgets.
 
-**On four of six, compaction cost more than not compacting at all.** The settings that kept
-the agent's information intact were 34–63% *more* expensive despite sending *fewer* tokens.
-The settings that did save money lost 10–15 of 17 planted facts.
+**On four of six, compaction cost more than not compacting at all.** Wherever the provider
+discounted cached reads 10x — which was five of the six — the settings that kept the agent's
+information intact were **24–63% more expensive despite sending fewer tokens**. The settings
+that did save money lost 10–15 of 17 planted facts. Where the discount was only 5x, the
+picture reversed on cost and stayed identical on forgetting.
 
 The mechanism is prompt caching, and once you see it the result stops being surprising.
 
@@ -76,8 +78,9 @@ worse answer — it means the agent forgot the correction and is confidently exe
 the user cancelled.
 
 Worth noting for anyone tuning thresholds: `ContextWindowCompactionStrategy` at its shipped
-0.5/0.8 defaults cost **more** than not compacting in three of four runs, while losing 13 of
-17 facts in each.
+0.5/0.8 defaults cost **more** than not compacting in three of the five runs where it
+completed (+54%, +41%, +23%), and lost **13 of 17 facts in all five** — including the two
+where it did save money.
 
 ## Five framework things worth knowing
 
@@ -122,9 +125,8 @@ compaction and thought-signing reasoning models are not straightforwardly compat
 
 ## The part that generalises: how easy it is to measure nothing
 
-Ten measurement rounds. **Six found a fault in the instrument rather than an answer.** Every
-one made compaction look better or worse than it was. Not one produced an error or a failing
-test.
+Thirteen measurement rounds. **Eight found a fault in the instrument rather than an answer.**
+Every one biased the result. Not one produced an error or a failing test.
 
 - Tool-oriented strategies scored **100% correct** — because the scenario had 3 tool groups
   and they retain the last 4, so they evicted nothing. A perfect score for doing nothing.
@@ -137,8 +139,13 @@ test.
 - One model **ignored explicit instructions to call tools**, gathering different facts each
   run and swinging costs 121%.
 - And the server-side history issue above, which made every row measure the same thing.
+- A verdict was produced recommending a strategy that completed **0 of 16 turns**: it died
+  before spending anything, which the table read as "100% cheaper", and a control scoring 6%
+  made every ratio look enormous, so all 13 strategies were reported as passing.
+- A command-line flag was **read but never declared**. ruff, pyright and 147 tests passed;
+  two live runs died on their first call.
 
-What caught all six was the same habit: **look at the control row first and ask whether it is
+What caught nearly all of them was the same habit: **look at the control row first and ask whether it is
 physically possible.** An uncompacted run cannot lose information to compaction. A strategy
 that changed no tokens cannot have compacted. A 16-turn conversation is not one message. The
 test suite was green throughout; arithmetic that refused to reconcile was the only signal.
