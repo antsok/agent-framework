@@ -280,6 +280,36 @@ def test_lookup_tool_returns_the_planted_markers() -> None:
     assert host in result
 
 
+def test_tool_results_are_sized_in_tokens_not_characters() -> None:
+    """Tool output must be as large as asked for, in tokens.
+
+    The size was once a character count: a 600-character body is about 76 tokens, so six
+    results came to under 2% of a 28,000-token prompt and every tool-oriented strategy had
+    essentially nothing to evict. Getting the unit wrong made those strategies look inert.
+    """
+    scenario = build_live_scenario(salt="x", filler_turns=6, filler_tokens=500)
+    lookup = make_lookup_tool(scenario.tool_lookups, 4_000)
+
+    approx_tokens = len(lookup("early")) / 7.9
+    assert 3_000 < approx_tokens < 5_000
+
+
+def test_tool_results_differ_between_scopes() -> None:
+    """Each scope must return distinct text.
+
+    Identical results would share a long prefix, letting unrelated messages match by accident
+    and inflating measured cache reuse.
+    """
+    scenario = build_live_scenario(salt="x", filler_turns=6, filler_tokens=500)
+    lookup = make_lookup_tool(scenario.tool_lookups, 500)
+    results = {scope: lookup(scope) for scope in scenario.tool_lookups}
+
+    assert len(set(results.values())) == len(results)
+    for scope, (region, host) in scenario.tool_lookups.items():
+        assert region in results[scope]
+        assert host in results[scope]
+
+
 def test_lookup_tool_handles_an_unknown_scope() -> None:
     """An unknown scope must not raise; the model picking a wrong argument is not a crash."""
     lookup = make_lookup_tool({"early": ("R", "H")})
