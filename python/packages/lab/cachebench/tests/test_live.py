@@ -47,6 +47,7 @@ from agent_framework_lab_cachebench import (
     make_lookup_tool,
     run_live,
     unretrieved_facts,
+    wants_client_side_history,
 )
 from agent_framework_lab_cachebench._advisor import ModelPricing
 from agent_framework_lab_cachebench._live_cli import _cost, _representative, _spread, _summarizer_cost
@@ -382,6 +383,39 @@ def test_unknown_agent_kind_is_rejected() -> None:
 def test_agent_kinds_are_the_documented_ones() -> None:
     """The advertised kinds must match what the builder accepts."""
     assert AGENT_KINDS == ("plain", "harness")
+
+
+def test_server_side_history_is_overridden_by_default() -> None:
+    """A client that keeps history server-side must be forced to send it.
+
+    Otherwise MAF skips history loading, the agent sends only the new turn, and no strategy
+    can compact anything: every row silently measures the same conversation. Measured on
+    Foundry, where a 16-turn run reported a one-message prompt on every row.
+    """
+
+    class Stateful:
+        STORES_BY_DEFAULT = True
+
+    assert wants_client_side_history(Stateful()) is True
+
+
+def test_stateless_clients_are_left_alone() -> None:
+    """A client that already sends history needs no override."""
+
+    class Stateless:
+        STORES_BY_DEFAULT = False
+
+    assert wants_client_side_history(Stateless()) is False
+    assert wants_client_side_history(object()) is False
+
+
+def test_server_history_can_be_opted_into() -> None:
+    """Opting in must be possible, since measuring the service is a valid question."""
+
+    class Stateful:
+        STORES_BY_DEFAULT = True
+
+    assert wants_client_side_history(Stateful(), allow_server_history=True) is False
 
 
 # endregion

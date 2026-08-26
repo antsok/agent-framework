@@ -70,6 +70,7 @@ __all__ = [
     "run_live",
     "score_live",
     "unretrieved_facts",
+    "wants_client_side_history",
 ]
 
 #: How the agent under test is assembled.
@@ -323,6 +324,31 @@ class LiveOutcome:
         had to pay to resend, or that compaction had to decide whether to keep.
         """
         return sum(call.output_tokens for call in self.calls[:-1]) if len(self.calls) > 1 else 0
+
+
+def wants_client_side_history(client: Any, *, allow_server_history: bool = False) -> bool:
+    """Return whether ``store=False`` must be forced so compaction can act.
+
+    Clients on the Responses API keep the conversation server-side. When they do, MAF skips
+    ``HistoryProvider.before_run`` entirely -- the comment in the framework is explicit that
+    "the service owns loading; the providers are write-only sinks" -- and the agent sends
+    only the new turn. A compaction strategy then has nothing to compact, and every setting
+    silently measures the same thing.
+
+    Measured on Foundry before this was forced: a 16-turn conversation reported a one-message
+    prompt on every row, while the service billed 82,708 input tokens for history the client
+    never sent.
+
+    Args:
+        client: The chat client under test.
+
+    Keyword Args:
+        allow_server_history: Leave the service in charge, accepting that no compaction runs.
+
+    Returns:
+        True when ``store=False`` should be forced.
+    """
+    return bool(getattr(client, "STORES_BY_DEFAULT", False)) and not allow_server_history
 
 
 def make_lookup_tool(
