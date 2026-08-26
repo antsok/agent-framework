@@ -118,6 +118,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--price-output", type=float, default=None, help="Output price per million tokens.")
     parser.add_argument("--tokenizer", default="tiktoken", choices=list(TOKENIZER_NAMES), help="Token counter.")
     parser.add_argument(
+        "--no-force-tool-calls",
+        action="store_true",
+        help=(
+            "Let the model decide its own tool calls. Needed for routes that reject a pinned "
+            "tool_choice, and it must then be set for the whole run: a run where some rows were "
+            "pinned and others were not is comparing different conversations."
+        ),
+    )
+    parser.add_argument(
         "--server-history",
         action="store_true",
         help=(

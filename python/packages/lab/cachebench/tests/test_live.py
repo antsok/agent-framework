@@ -51,7 +51,7 @@ from agent_framework_lab_cachebench import (
 )
 from agent_framework_lab_cachebench._advisor import ModelPricing
 from agent_framework_lab_cachebench._live import make_scope_tools
-from agent_framework_lab_cachebench._live_cli import _cost, _representative, _spread, _summarizer_cost
+from agent_framework_lab_cachebench._live_cli import _cost, _representative, _spread, _summarizer_cost, build_parser
 
 TOKENIZER = CharacterEstimatorTokenizer()
 
@@ -488,6 +488,38 @@ def test_server_history_can_be_opted_into() -> None:
         STORES_BY_DEFAULT = True
 
     assert wants_client_side_history(Stateful(), allow_server_history=True) is False
+
+
+def test_every_argument_the_runner_reads_is_defined() -> None:
+    """Parsing must produce every attribute the run function reads.
+
+    A flag referenced but never declared raises AttributeError only once a live run is
+    already under way. That happened: two full runs died on the first call because an
+    `add_argument` edit silently failed to apply while the code using it did not.
+    """
+    args = build_parser().parse_args(["openrouter:some/model"])
+    for name in (
+        "strategies",
+        "agent",
+        "repeats",
+        "filler_turns",
+        "filler_tokens",
+        "tool_turns",
+        "tool_result_tokens",
+        "context_window",
+        "max_output_tokens",
+        "answer_max_tokens",
+        "budget_fraction",
+        "min_correctness",
+        "summarizer_provider",
+        "no_force_tool_calls",
+        "server_history",
+        "no_temperature",
+        "tokenizer",
+        "show_answers",
+        "dry_run",
+    ):
+        assert hasattr(args, name), f"--{name.replace('_', '-')} is read by the runner but not declared"
 
 
 # endregion
