@@ -83,3 +83,22 @@ def test_threshold_is_configurable() -> None:
 def test_missing_control_is_an_error() -> None:
     with pytest.raises(ValueError, match="Baseline"):
         recommend([_outcome("truncation", cost=1.0, recalled=10)])
+
+
+def test_verdict_is_withheld_when_the_control_itself_fails() -> None:
+    """A control that already fails the task cannot be a reference.
+
+    Dividing by a control that scored 6% turns a strategy scoring 17% into "300% of the
+    control", which reads as a threefold improvement rather than as two bad answers. Measured
+    on a model that ignored most of its context: every one of 13 strategies was reported as
+    clearing the correctness bar.
+    """
+    outcomes = [
+        _outcome("none", cost=1.0, recalled=0),
+        _outcome("truncation", cost=0.5, recalled=1),
+    ]
+
+    verdict = recommend(outcomes)
+
+    assert verdict.recommended == "none"
+    assert "not a usable reference" in verdict.rationale
