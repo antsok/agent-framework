@@ -49,7 +49,7 @@ from agent_framework_lab_cachebench import (
     unretrieved_facts,
 )
 from agent_framework_lab_cachebench._advisor import ModelPricing
-from agent_framework_lab_cachebench._live_cli import _cost, _summarizer_cost
+from agent_framework_lab_cachebench._live_cli import _cost, _representative, _spread, _summarizer_cost
 
 TOKENIZER = CharacterEstimatorTokenizer()
 
@@ -669,6 +669,45 @@ def test_total_cost_is_the_agent_plus_its_own_summarizer() -> None:
     agent_only = (2_000_000 * 1.0 + 100_000 * 10.0) / 1_000_000
     assert _cost(outcome, pricing) == pytest.approx(agent_only + _summarizer_cost(outcome, pricing))
     assert _summarizer_cost(outcome, pricing) == pytest.approx((500_000 * 1.0 + 50_000 * 10.0) / 1_000_000)
+
+
+def _priced(strategy: str, inp: int) -> LiveOutcome:
+    return LiveOutcome(
+        strategy=strategy,
+        calls=(_call(1, 1, inp=inp),),
+        answer="",
+        final_prompt="",
+        tool_calls_made=0,
+        turns_completed=1,
+        turns_total=1,
+    )
+
+
+def test_representative_repeat_is_the_median_not_an_average() -> None:
+    """The reported row must be one conversation that actually happened.
+
+    Blending repeats would let the columns contradict each other: an averaged cost against a
+    token count from a different run, and a fact count from a third.
+    """
+    pricing = ModelPricing(input_per_million=1.0, cached_read_per_million=0.1, output_per_million=1.0)
+    repeats = [_priced("s", 1_000), _priced("s", 9_000), _priced("s", 5_000)]
+
+    assert _representative(repeats, pricing).input_tokens == 5_000
+
+
+def test_spread_reports_the_gap_between_repeats() -> None:
+    """Spread must show how far repeats of one strategy disagree."""
+    pricing = ModelPricing(input_per_million=1.0, cached_read_per_million=0.1, output_per_million=1.0)
+    repeats = [_priced("s", 8_000), _priced("s", 10_000), _priced("s", 12_000)]
+
+    assert _spread(repeats, pricing) == pytest.approx(0.4)
+
+
+def test_spread_is_zero_for_a_single_repeat() -> None:
+    """One repeat measures nothing about stability, and must not imply otherwise."""
+    pricing = ModelPricing(input_per_million=1.0, cached_read_per_million=0.1, output_per_million=1.0)
+
+    assert _spread([_priced("s", 5_000)], pricing) == 0.0
 
 
 def test_cached_tokens_are_discounted() -> None:
