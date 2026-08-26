@@ -50,6 +50,7 @@ from agent_framework_lab_cachebench import (
     wants_client_side_history,
 )
 from agent_framework_lab_cachebench._advisor import ModelPricing
+from agent_framework_lab_cachebench._live import make_scope_tools
 from agent_framework_lab_cachebench._live_cli import _cost, _representative, _spread, _summarizer_cost
 
 TOKENIZER = CharacterEstimatorTokenizer()
@@ -72,6 +73,7 @@ class StubChatClient(FunctionInvocationLayer[Any], ChatMiddlewareLayer[Any], Bas
         """
         super().__init__(**kwargs)
         self.seen: list[int] = []
+        self.options_seen: list[dict[str, Any]] = []
         self.tool_turns = set(tool_turns)
         self.usage = usage
 
@@ -85,14 +87,17 @@ class StubChatClient(FunctionInvocationLayer[Any], ChatMiddlewareLayer[Any], Bas
     ) -> Any:
         index = len(self.seen)
         self.seen.append(len(messages))
+        self.options_seen.append(dict(options))
 
         async def _go() -> ChatResponse[Any]:
             if index in self.tool_turns:
                 contents: list[Any] = [
                     Content.from_function_call(
                         call_id=f"call_{index}",
-                        name="lookup_deployment",
-                        arguments='{"scope": "early"}',
+                        # One no-argument tool per scope: the turn's scope is pinned by which
+                        # function is called, not by an argument the model chooses.
+                        name="lookup_early",
+                        arguments="{}",
                     )
                 ]
             else:
@@ -201,7 +206,7 @@ async def test_recorder_counts_every_call_in_a_tool_turn() -> None:
     recorder = UsageRecorder()
     scenario = build_recall_scenario(salt="tool", filler_turns=3, filler_tokens=100)
     client = StubChatClient(tool_turns=(0,))
-    agent = _agent(client, None, recorder, tools=[make_lookup_tool(scenario.tool_lookups)])
+    agent = _agent(client, None, recorder, tools=make_scope_tools(scenario.tool_lookups, 100))
     await agent.run("look up the early deployment facts", session=agent.create_session())
 
     assert len(recorder.calls) > 1, "the tool round trip was not billed as its own call"
@@ -310,6 +315,73 @@ def test_tool_results_differ_between_scopes() -> None:
     for scope, (region, host) in scenario.tool_lookups.items():
         assert region in results[scope]
         assert host in results[scope]
+
+
+def test_scope_tools_are_one_per_scope_and_take_no_arguments() -> None:
+    """Splitting the tool per scope is what makes forcing deterministic.
+
+    ``tool_choice`` can name the function to call but cannot constrain its arguments, so a
+    single ``lookup_deployment(scope)`` leaves the choice of scope to the model. Measured:
+    forcing a call raised tool use from 4 to 7 per run yet still reached only 3 of 6 scopes,
+    one of them called twice.
+    """
+    import inspect
+
+    scenario = build_live_scenario(salt="s", filler_turns=3, filler_tokens=100, tool_turns=6)
+    tools = make_scope_tools(scenario.tool_lookups, 100)
+
+    assert sorted(tool.__name__ for tool in tools) == sorted(f"lookup_{s}" for s in scenario.tool_lookups)
+    for tool in tools:
+        assert not inspect.signature(tool).parameters, "a scope argument would let the model choose"
+    for scope, (region, host) in scenario.tool_lookups.items():
+        result = next(tool for tool in tools if tool.__name__ == f"lookup_{scope}")()
+        assert region in result
+        assert host in result
+
+
+async def test_forcing_pins_the_exact_tool_per_turn_and_closes_the_rest() -> None:
+    """Each tool turn must require its own function, and other turns must allow none.
+
+    Requiring a call only on the wanted turns still lets the model make unwanted ones
+    elsewhere: measured at 12 calls against the 6 asked for, doubling the tokens carried on
+    one repeat in three.
+    """
+    scenario = build_live_scenario(salt="pin", filler_turns=3, filler_tokens=50, tool_turns=6)
+    client = StubChatClient()
+    await run_live(
+        ProviderRuntime(client=client, model="stub"),
+        strategy_name="none",
+        options=_options(),
+        scenario=scenario,
+        force_tool_calls=True,
+    )
+
+    required = [
+        options["tool_choice"]["required_function_name"]
+        for options in client.options_seen
+        if isinstance(options.get("tool_choice"), dict)
+    ]
+    assert sorted(set(required)) == sorted(f"lookup_{s}" for s in scenario.tool_lookups)
+    assert any(options.get("tool_choice") == "none" for options in client.options_seen)
+
+
+async def test_forcing_can_be_turned_off() -> None:
+    """Leaving the model to decide must remain possible, since that is real agent behaviour."""
+    scenario = build_live_scenario(salt="free", filler_turns=3, filler_tokens=50, tool_turns=6)
+    client = StubChatClient()
+    await run_live(
+        ProviderRuntime(client=client, model="stub"),
+        strategy_name="none",
+        options=_options(),
+        scenario=scenario,
+        force_tool_calls=False,
+    )
+
+    # The framework supplies its own tool_choice default when tools are present; what must be
+    # absent is *forcing* -- a named function, or closing a turn to tools entirely.
+    choices = [options.get("tool_choice") for options in client.options_seen]
+    assert not any(isinstance(choice, dict) for choice in choices)
+    assert "none" not in choices
 
 
 def test_lookup_tool_handles_an_unknown_scope() -> None:
