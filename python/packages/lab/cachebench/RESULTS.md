@@ -32,7 +32,9 @@ between runs, which moves both axes for reasons unrelated to compaction. Runs ma
 | 1 | `openai/gpt-5.6-luna` | OpenRouter | Chat Completions | yes | `none` |
 | 2 | `gpt-5.4-mini` | Azure Foundry | Responses | yes | `none` |
 | 3 | `gpt-5.6-luna` | Azure Foundry | Responses | yes | `none` |
-| 4 | `z-ai/glm-5.3-flash` | OpenRouter | Chat Completions | partly | *contaminated* |
+| 4 | `z-ai/glm-5.3-flash` | OpenRouter | Chat Completions | no | *partly usable* |
+| 5 | `z-ai/glm-5.2` | OpenRouter / Crusoe | Chat Completions | no | `none` (5x discount) |
+| 6 | `z-ai/glm-5.2` | OpenRouter / BaseTen | Chat Completions | no | `none` (10x discount) |
 
 ---
 
@@ -151,42 +153,72 @@ lose 13 of 17 facts.
 
 ---
 
-### Run 4 — `z-ai/glm-5.3-flash` via OpenRouter (contaminated, partly usable)
+### Run 4 — `z-ai/glm-5.3-flash` via OpenRouter, Z.AI pinned (cost axis only)
 
-Pricing $0.075/M in, $0.015/M cached, $0.25/M out. **The cache discount here is 5x, not the
-10x of every other model tested** — which is the reason this run matters.
+Pricing $0.075/M in, $0.015/M cached (**5x**), $0.25/M out. Forcing is unavailable: every
+backend returns 404 for any `tool_choice` other than `auto`, despite all six advertising
+`tool_choice` support. So the run is unpinned throughout, which at least makes its rows
+comparable with each other.
 
-**Do not read the full table.** Three faults make most of it meaningless:
+**Only six of fourteen strategies completed.** Every strategy built on
+`TokenBudgetComposedStrategy` — all `token_budget_*` and all three `context_window*` — failed
+at turn 2 with a 400. This is not a provider fault: Z.AI, Novita and GMICloud all reject it,
+with different error text. At small scale the same strategies succeed, and their projected
+message shapes and annotations are byte-identical to `truncation`, which works. Unresolved.
 
-1. **Tool forcing applied to some rows and not others within one run.** 9 rows accepted a
-   pinned `tool_choice`; 3 were refused it and fell back (`NO:tool`). Identical
-   configuration, same process. OpenRouter routes a model across several backends, and they
-   do not agree on tool support, so rows differ in whether the agent chose its own tool calls.
-2. **The control scored 56%**, with 8 of 17 facts present but unused. Most other rows show 17
-   ignored and 6% correct: the model had everything in context and used almost none of it.
-   The correctness axis says more about this model's answer discipline than about compaction.
-3. **Two rows errored partway** (`context_window_lazy` 2 of 16 turns, `summarization` 14 of
-   16), and `context_window_lazy` carries a 3389% spread.
+**The correctness axis is unusable.** The control scored 6%, with all 17 facts present and
+unused. That is this model's answer discipline, not compaction.
 
-The verdict line it printed — `token_budget_truncate_first` "answering at 100% of the
-control" — is an artefact: 56% of a control that itself scored 56%.
+The cost axis, for the six that completed:
 
-**What is usable** is the three rows that were consistently unpinned, compared only with each
-other:
+| strategy | in | hit% | cost | vs none | lost |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| truncation | 322,640 | 70% | $0.0118 | **-44%** | 3 |
+| sliding_window | 245,614 | 15% | $0.0171 | -19% | 15 |
+| **none** | 947,039 | 90% | $0.0210 | — | 0 |
+| selective_tool_call | 686,993 | 69% | $0.0241 | +15% | 0 |
+| tool_result | 740,922 | 70% | $0.0258 | +23% | 0 |
+| summarization | 220,588 | 17% | $0.0313 | +49% | 3 |
 
-| strategy | in | vs none | hit% | effective | vs none | lost |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| **none** | 941,346 | — | 85% | 301,231 | — | 0 |
-| truncation | 322,477 | -66% | 70% | 141,890 | **-53%** | 11 |
-| sliding_window | 247,550 | -74% | 19% | 209,922 | -30% | 15 |
+---
 
-**This is the first model where compaction clearly wins on cost, and the break-even formula
-predicted it in advance.** At a 5x discount the threshold falls to a **27%** cut, against
-39-44% at 10x. `truncation` cut 66%, cleared it comfortably, and came out 51% cheaper —
-larger than any saving seen elsewhere.
+### Runs 5 and 6 — `z-ai/glm-5.2`: the discount tested under control
 
-**The cost axis flips with the discount; the correctness axis does not.** `truncation` still
-lost 11 of 17 facts. A cheaper cache makes compaction affordable, not safe.
+Every other run confounds the cache discount with the model. This pair does not.
+**OpenRouter serves glm-5.2 on two backends at the same $1.40/M input and $4.40/M output,
+differing only in the cached-read price**: Crusoe at $0.26 (5x) and BaseTen at $0.14 (10x).
+Same model, same weights, same input and output rates. The discount is the only variable.
+
+Both runs: 0 errors, 17/17 facts, control 100% correct, control spread 1% and 10%. Unpinned
+tools (glm-5.2 also returns 404 for forcing), 10 strategies.
+
+| strategy | 5x (Crusoe) | 10x (BaseTen) | lost |
+| --- | ---: | ---: | ---: |
+| token_budget_tools_first | -41% | -22% | 13 |
+| context_window_aggressive | -41% | -19% | 13 |
+| truncation | -35% | -19% | 11-13 |
+| context_window | -35% | -7% | 13 |
+| token_budget_fallback | -23% | +0% | 13 |
+| sliding_window | -21% | +9% | 15 |
+| summarization | -11% | +22% | 13 |
+| **none** | — | — | **0** |
+| selective_tool_call | **+2%** | **+22%** | 0 |
+| tool_result | **+3%** | **+24%** | 0 |
+
+**Halving the discount moved every strategy against compaction, and none moved the other
+way.** The information-preserving pair goes from roughly free (+2%, +3%) to clearly expensive
+(+22%, +24%). `truncation`'s saving halves.
+
+**The prediction was made before the second run.** From the 5x run's own token counts and hit
+rates, the formula projected `tool_result` at +17% and `truncation` at -24% under a 10x
+discount. Measured: **+24%** and **-19%**. Both errors sit inside the run-to-run spread this
+model shows (2-26%), and every strategy moved in the predicted direction.
+
+This is the strongest evidence in the set that **the cached-read price, not the strategy and
+not the model, decides whether compaction pays.**
+
+Note also that `none` remained the *only* setting keeping all 17 facts in both runs, at both
+discounts. The discount moves the cost axis. It does not touch the correctness axis.
 
 ---
 
