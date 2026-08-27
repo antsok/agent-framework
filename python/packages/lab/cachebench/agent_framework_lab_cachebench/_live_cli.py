@@ -101,6 +101,16 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--max-output-tokens", type=int, default=2_048, help="Output reservation for budget math.")
     parser.add_argument("--answer-max-tokens", type=int, default=900, help="Cap on generated replies.")
     parser.add_argument(
+        "--keep-last-tool-groups",
+        type=int,
+        default=4,
+        help=(
+            "Tool-call groups the tool-oriented strategies retain verbatim. The framework "
+            "default is 4; with fewer groups than that in the scenario they collapse nothing "
+            "at all. Lower it to make them do real work."
+        ),
+    )
+    parser.add_argument(
         "--budget-fraction",
         type=float,
         default=0.5,
@@ -393,7 +403,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
         raise SystemExit("The 'none' control must be included; every comparison is relative to it.")
 
     tokenizer = build_tokenizer(args.tokenizer)
-    retained = StrategyOptions(tokenizer, args.context_window, args.max_output_tokens).keep_last_tool_call_groups
+    retained = args.keep_last_tool_groups
     probe = build_live_scenario(
         salt="probe",
         filler_turns=args.filler_turns,
@@ -496,6 +506,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
                 max_context_window_tokens=args.context_window,
                 max_output_tokens=args.max_output_tokens,
                 token_budget_fraction=args.budget_fraction,
+                keep_last_tool_call_groups=args.keep_last_tool_groups,
                 # A recording proxy, not a client: see MeteredClient for why it is cast.
                 summarizer=cast("SupportsChatGetResponse[Any] | None", summarizer),
             )
