@@ -1,0 +1,112 @@
+note: gpt-5.4-mini keeps history server-side by default. Forcing store=False so the history is sent by the client and compaction actually applies.
+-> none
+   repeat 1/3
+   repeat 2/3
+   repeat 3/3
+-> truncation
+   repeat 1/3
+   repeat 2/3
+   repeat 3/3
+-> sliding_window
+   repeat 1/3
+   repeat 2/3
+   repeat 3/3
+-> tool_result
+   repeat 1/3
+   repeat 2/3
+   repeat 3/3
+-> selective_tool_call
+   repeat 1/3
+   repeat 2/3
+   repeat 3/3
+-> context_window
+   repeat 1/3
+   repeat 2/3
+   repeat 3/3
+-> context_window_aggressive
+   repeat 1/3
+   repeat 2/3
+   repeat 3/3
+-> context_window_lazy
+   repeat 1/3
+   repeat 2/3
+   repeat 3/3
+-> summarization
+   repeat 1/3
+   repeat 2/3
+   repeat 3/3
+-> token_budget_fallback
+   repeat 1/3
+   repeat 2/3
+   repeat 3/3
+-> token_budget_tools_first
+   repeat 1/3
+   repeat 2/3
+   repeat 3/3
+-> token_budget_truncate_first
+   repeat 1/3
+   repeat 2/3
+   repeat 3/3
+-> token_budget_window_first
+   repeat 1/3
+   repeat 2/3
+   repeat 3/3
+-> token_budget_summarize
+   repeat 1/3
+   repeat 2/3
+   repeat 3/3
+
+Model: gpt-5.4-mini   agent: harness
+Pricing: $0.66/M in, $0.070/M cached, $3.96/M out
+
+strategy                         msgs   tok left/peak  calls       in  hit%     out      cost    +-   summ$  vs none    facts  lost nofetch ignored  correct  vs none   flags
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+context_window_aggressive       22/55   33,574/33,574     28  761,131   69%   2,337   $0.2006    1%       -     -33%    16/53    37       0       0     31%       31%       -
+token_budget_truncate_first     22/55   33,567/57,655     281,013,942   75%   3,321   $0.2328    6%       -     -23%    19/53    34       0       8     22%       22%       -
+token_budget_tools_first        22/57   33,621/64,953     29  951,341   71%   2,940   $0.2406    4%       -     -20%    16/53    37       0      16      2%        2%       -
+token_budget_window_first       28/55   57,967/58,272     281,133,946   77%   2,966   $0.2443    0%       -     -19%    24/53    29       0      24      2%        2%       -
+truncation                      28/55   58,656/91,456     281,513,282   83%   3,634   $0.2690    2%       -     -11%    29/53    24       0       8     41%       41%       -
+none                            55/55 150,112/150,112     282,498,779   93%   4,058   $0.3009    7%       -        -    53/53     0       0       0    100%*        -       -
+context_window                  28/55   58,205/58,541     281,287,983   69%   3,742   $0.3421   36%       -     +14%    27/53    26       0       8     37%       37%       -
+sliding_window                   6/55      617/41,014     28  553,299    6%   2,417   $0.3557    6%       -     +18%     0/53    45       0       0     17%       17%       -
+selective_tool_call             51/55 117,970/117,970     282,182,901   85%   4,191   $0.3670    4%       -     +22%    53/53     0       0      16     70%       70%       -
+tool_result                     53/57 118,114/118,114     282,168,925   84%   3,124   $0.3681    5%       -     +22%    53/53     0       0       0    100%      100%       -
+token_budget_fallback           28/57   57,871/58,075     291,318,701   62%   2,803   $0.3966   17%       -     +32%    25/53    28       0       9     31%       31%       -
+token_budget_summarize          27/62   58,244/58,423     281,287,404   60%   3,631   $0.4267   35% $0.0176     +42%    21/53    32       0       0     41%       41%       -
+context_window_lazy             32/55   75,405/75,529     281,608,395   67%   4,115   $0.4401   11%       -     +46%    35/53    18       0       0     67%       67%       -
+summarization                   48/74 132,022/132,022     282,105,284   51%   2,775   $0.7972   59% $0.0357    +165%    47/53     6       0       5     80%       80%       -
+
+msgs      = messages in the final prompt, out of the most any call carried
+tok       = billed tokens in that same final prompt, and at the peak. Watch this
+            rather than msgs: a strategy that rewrites content in place removes
+            tokens without removing messages, and msgs cannot see it
+calls     = model calls, which exceed turns whenever the agent used a tool
+in/out    = tokens billed across the whole run, replies included
+cost      = median repeat. Every column describes that one real conversation,
+            so the tokens, facts and cost cannot disagree with each other
++-        = spread between the cheapest and dearest repeat. A gap smaller than
+            this is not a result. n/a means one repeat, so stability is unknown
+summ$     = what this strategy's own summarization calls cost, of that total
+facts     = planted facts surviving compaction into the final prompt: recall's ceiling
+lost      = compaction removed it, so the model could not use it  <- the damage
+nofetch   = the agent never called that tool, so the fact never entered the
+            history at all. Not compaction damage: an uncompacted run shows these
+            too, and counting them as lost overstates every strategy equally
+ignored   = still in context but unused: the model's failing, not compaction's.
+            Without this split a control that simply omits facts looks like
+            compaction damage, and every strategy is judged against a false baseline
+correct   = share of correctness checks the final answer passed (* marks the control)
+flags     = ERR failed turn, S<n> summarizer failures, <n>/<n>t turns completed,
+            NO:<opt> the provider rejected that option so it was dropped. A run
+            that dropped tool_choice chose its own tool calls and is not
+            comparable with one that did not,
+            FETCH this row gathered a different set of facts than the control, so
+            its cost and correctness are not comparable with it
+
+VERDICT: none
+Every strategy that keeps the answer intact also costs more than not compacting. Leave it off unless the conversation would overflow the window.
+Unclosed client session
+client_session: <aiohttp.client.ClientSession object at 0x000001A09ECA6120>
+Unclosed client session
+client_session: <aiohttp.client.ClientSession object at 0x000001A0A79B4F50>
+EXIT=0
