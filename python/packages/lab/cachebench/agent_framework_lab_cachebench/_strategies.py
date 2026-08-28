@@ -40,6 +40,8 @@ from agent_framework import (
     TruncationStrategy,
 )
 
+from ._anchored import AnchoredCompactionStrategy
+
 if TYPE_CHECKING:
     from agent_framework._clients import SupportsChatGetResponse
 
@@ -73,6 +75,8 @@ class StrategyOptions:
     max_output_tokens: int
     keep_last_groups: int = 6
     keep_last_tool_call_groups: int = 4
+    keep_head_groups: int = 3
+    keep_tail_groups: int = 4
     token_budget_fraction: float = 0.5
     summarizer: SupportsChatGetResponse[Any] | None = None
 
@@ -154,6 +158,39 @@ def _build_context_window_aggressive(options: StrategyOptions) -> CompactionStra
 def _build_context_window_lazy(options: StrategyOptions) -> CompactionStrategy:
     """Return the harness default compacting late, at 0.7 and 0.95 of the input budget."""
     return _context_window(options, eviction=0.7, truncation=0.95)
+
+
+def _build_anchored(options: StrategyOptions) -> CompactionStrategy:
+    """Return the lab's own strategy, designed against what the other rows measured.
+
+    Its ceiling is the full input budget rather than a fraction of it, because unlike the
+    threshold-driven strategies it does not need headroom to trip: it collapses the middle
+    band from the first turn there is one, and only removes groups outright when shortening
+    has not brought the prompt under. See :mod:`._anchored`.
+    """
+    return AnchoredCompactionStrategy(
+        max_input_tokens=options.input_budget_tokens,
+        tokenizer=options.tokenizer,
+        keep_head_groups=options.keep_head_groups,
+        keep_tail_groups=options.keep_tail_groups,
+    )
+
+
+def _build_anchored_no_assistant(options: StrategyOptions) -> CompactionStrategy:
+    """Return the anchored strategy forbidden from touching assistant narration.
+
+    Pairs with ``anchored`` to isolate the last-resort step. With the harness's default
+    instructions the model restates tool values in its prose, so that prose can be the only
+    surviving copy of a result that has already been shortened; this row measures what
+    dropping it costs.
+    """
+    return AnchoredCompactionStrategy(
+        max_input_tokens=options.input_budget_tokens,
+        tokenizer=options.tokenizer,
+        keep_head_groups=options.keep_head_groups,
+        keep_tail_groups=options.keep_tail_groups,
+        collapse_assistant_text=False,
+    )
 
 
 def _build_truncation(options: StrategyOptions) -> CompactionStrategy:
@@ -301,6 +338,8 @@ STRATEGY_BUILDERS: Final[dict[str, Callable[[StrategyOptions], CompactionStrateg
     "context_window_aggressive": _build_context_window_aggressive,
     "context_window_lazy": _build_context_window_lazy,
     "truncation": _build_truncation,
+    "anchored": _build_anchored,
+    "anchored_no_assistant": _build_anchored_no_assistant,
     "sliding_window": _build_sliding_window,
     "tool_result": _build_tool_result,
     "selective_tool_call": _build_selective_tool_call,
