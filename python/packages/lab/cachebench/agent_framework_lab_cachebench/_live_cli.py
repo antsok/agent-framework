@@ -104,8 +104,9 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Drop the clause telling the model to quote every identifier it is asked for. "
             "Measures how much of the closing answer is the model's willingness to enumerate "
-            "rather than what compaction left behind. Off by default: without the clause the "
-            "control was bimodal, and a control that unstable cannot rank anything."
+            "rather than what compaction left behind. Off by default. Note that dropping it "
+            "is only safe with an adequate --answer-max-tokens: at 900 the control scored "
+            "33% without the clause and 100% with it, which measures the cap, not retrieval."
         ),
     )
     parser.add_argument(
@@ -113,8 +114,8 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help=(
             "Close with one question demanding every code at once, instead of several "
-            "targeted ones. Measures willingness to enumerate rather than retrieval: "
-            "identical runs returned 42 of 53 and 5 of 53 under it."
+            "targeted ones. Needs a large --answer-max-tokens: enumerating 53 codes is "
+            "~640 tokens before prose, and a truncated answer is scored as lost facts."
         ),
     )
     parser.add_argument(
