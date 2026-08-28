@@ -236,3 +236,31 @@ def test_perfect_score_requires_every_check() -> None:
     )
     assert score.correctness_score == 1.0
     assert score.is_correct is True
+
+
+def test_closing_questions_state_how_many_codes_to_expect() -> None:
+    """A question that does not say how many codes it wants measures interpretation.
+
+    "Quote every code returned by the X lookup" leaves the model to decide how many there
+    were. Identical repeats of the uncompacted control then swung 78 percentage points,
+    because some read all eight codes per result and some read only the first. Naming the
+    count removes the ambiguity without supplying any of the answer: a code that compaction
+    removed is still absent, and the model is told to say so.
+    """
+    scenario = build_recall_scenario(tool_turns=6, markers_per_tool=8, subset_questions=True, salt="count")
+    closing = [str(turn.request[0].contents[0]) for turn in scenario.transcript.turns[-scenario.answer_turn_count :]]
+
+    per_scope = [text for text in closing if "deployment lookup returned" in text]
+    assert len(per_scope) == 6
+    assert all("returned 8 codes" in text and "Quote all 8" in text for text in per_scope)
+    # The escape hatch matters as much as the count: without it a model told to produce eight
+    # codes will invent the ones compaction removed, and an invented code scores as recall.
+    assert all("no longer in this conversation" in text for text in closing)
+
+
+def test_the_expected_count_follows_the_markers_actually_planted() -> None:
+    """A hard-coded count would lie the moment --markers-per-tool changed."""
+    scenario = build_recall_scenario(tool_turns=6, markers_per_tool=3, subset_questions=True, salt="count")
+    closing = [str(turn.request[0].contents[0]) for turn in scenario.transcript.turns[-scenario.answer_turn_count :]]
+
+    assert all("returned 3 codes" in text for text in closing if "deployment lookup returned" in text)
