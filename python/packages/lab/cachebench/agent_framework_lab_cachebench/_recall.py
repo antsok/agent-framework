@@ -43,6 +43,7 @@ __all__ = [
     "RecallScenario",
     "RecallScore",
     "build_recall_scenario",
+    "render_code",
     "render_codes",
     "score_answer",
 ]
@@ -243,7 +244,20 @@ def render_codes(codes: tuple[str, ...]) -> str:
     Returns:
         A semicolon-separated list of labelled codes.
     """
-    return "; ".join(f"code_{index + 1}={code}" for index, code in enumerate(codes))
+    return "; ".join(render_code(index, code) for index, code in enumerate(codes))
+
+
+def render_code(index: int, code: str) -> str:
+    """Render one labelled code, as it appears wherever a tool result carries it.
+
+    Args:
+        index: Zero-based position of the code within its tool result.
+        code: The verifiable code itself.
+
+    Returns:
+        A single ``code_N=VALUE`` pair.
+    """
+    return f"code_{index + 1}={code}"
 
 
 def _markers(salt: str, count: int, prefix: str) -> list[str]:

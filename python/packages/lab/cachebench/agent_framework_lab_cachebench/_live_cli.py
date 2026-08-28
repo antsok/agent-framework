@@ -99,6 +99,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--fact-placement",
+        default="spread",
+        choices=["spread", "head"],
+        help=(
+            "Where the verifiable codes sit inside each tool result. 'head' puts them all at "
+            "the front, inside the 4,096 characters ToolResultCompactionStrategy keeps when it "
+            "collapses a group, so every tool-oriented strategy preserves them for free no "
+            "matter how large the result is. 'spread' distributes them, which is how a real "
+            "result behaves. Default spread; 'head' reproduces runs 7 to 9."
+        ),
+    )
+    parser.add_argument(
         "--no-retrieval-guidance",
         action="store_true",
         help=(
@@ -589,6 +601,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
                 force_tool_calls=not args.no_force_tool_calls,
                 narration=args.narration,
                 retrieval_guidance=not args.no_retrieval_guidance,
+                fact_placement=args.fact_placement,
             )
             repeats.append(outcome)
             if chosen_scenario is None:
