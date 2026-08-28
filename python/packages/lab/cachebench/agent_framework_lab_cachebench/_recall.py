@@ -43,6 +43,7 @@ __all__ = [
     "RecallScenario",
     "RecallScore",
     "build_recall_scenario",
+    "render_codes",
     "score_answer",
 ]
 
@@ -209,13 +210,28 @@ class RecallScenario:
     changes how many facts exist to score and how many tokens the run carries, neither of
     which is about compaction.
     """
-    tool_lookups: Mapping[str, tuple[str, str]] = field(default_factory=dict[str, tuple[str, str]])
+    tool_lookups: Mapping[str, tuple[str, ...]] = field(default_factory=dict[str, tuple[str, ...]])
     """Scope label to ``(region_code, fallback_host)``, for driving a real tool.
 
     The replayed transcript bakes these into scripted tool-result messages. A live agent
     has to call a real function instead, and it must return the same markers or the two
     modes would be scoring different conversations.
     """
+
+
+def render_codes(codes: tuple[str, ...]) -> str:
+    """Render a tool result's codes as ``code_N=VALUE`` pairs.
+
+    Shared by the replayed transcript and the live tool so both modes hand the model exactly
+    the same text, and the scorer looks for exactly the same markers.
+
+    Args:
+        codes: The verifiable codes this tool result carries.
+
+    Returns:
+        A semicolon-separated list of labelled codes.
+    """
+    return "; ".join(f"code_{index + 1}={code}" for index, code in enumerate(codes))
 
 
 def _markers(salt: str, count: int, prefix: str) -> list[str]:
@@ -241,6 +257,8 @@ def build_recall_scenario(
     bulk_in_user: bool = False,
     tool_turns: int = 3,
     tool_result_tokens: int = 600,
+    narration: str = "prompted",
+    markers_per_tool: int = 2,
 ) -> RecallScenario:
     """Build a conversation whose final question needs facts from throughout the history.
 
@@ -258,6 +276,15 @@ def build_recall_scenario(
         chars_per_token: Sizing basis for the filler.
         bulk_in_user: Put the filler in the user turns rather than the scripted replies,
             for live runs where the assistant writes its own replies.
+        markers_per_tool: Verifiable codes each tool result carries. Two is easy for a model
+            to echo into its reply, which lets narration preserve everything a strategy
+            discards. More codes raise the resolution of the accuracy measure and make
+            narration a weaker substitute for keeping the result.
+        narration: How hard the scenario pushes the model to restate tool values.
+            ``"prompted"`` asks for them, ``"neutral"`` says nothing either way -- the
+            configuration a typical caller gets -- and ``"suppressed"`` forbids it. The
+            middle one is the only setting under which the framework's own guidance is
+            the sole driver of narration.
         tool_result_tokens: Approximate size of each tool result, **in tokens**. Sized in
             tokens rather than characters: the earlier 600-*character* body came to about
             76 tokens, so tool output was under 2% of the prompt and tool-oriented
@@ -272,11 +299,12 @@ def build_recall_scenario(
     requirement_markers = _markers(salt, 3, "RQ")
     correction_marker = _markers(salt + "c", 1, "FB")[0]
     tool_count = max(tool_turns, 3)
-    tool_markers = _markers(salt + "t", tool_count * 2, "TL")
+    per_tool = max(markers_per_tool, 1)
+    tool_markers = _markers(salt + "t", tool_count * per_tool, "TL")
 
     facts: list[PlantedFact] = []
     turns: list[TranscriptTurn] = []
-    lookups: dict[str, tuple[str, str]] = {}
+    lookups: dict[str, tuple[str, ...]] = {}
     tool_turn_scopes: dict[int, str] = {}
 
     system = Message(
@@ -310,13 +338,13 @@ def build_recall_scenario(
     def _tool_turn(label: str, seed: int, position: int) -> TranscriptTurn:
         """Emit a lookup whose result carries two facts the final answer must repeat."""
         call_id = f"call_{label}"
-        region, host = tool_markers[position * 2], tool_markers[position * 2 + 1]
-        lookups[label] = (region, host)
+        codes = tuple(tool_markers[position * per_tool : (position + 1) * per_tool])
+        lookups[label] = codes
         tool_turn_scopes[len(turns)] = label
-        facts.extend((
-            PlantedFact(region, "tool_result", len(turns) + 1, f"{label} region code"),
-            PlantedFact(host, "tool_result", len(turns) + 1, f"{label} fallback host"),
-        ))
+        facts.extend(
+            PlantedFact(code, "tool_result", len(turns) + 1, f"{label} code {index + 1}")
+            for index, code in enumerate(codes)
+        )
         return TranscriptTurn(
             request=(
                 Message(
@@ -326,8 +354,16 @@ def build_recall_scenario(
                         # decide it has enough context and skip the call, which changes both
                         # how many facts exist to score and how many tokens the run carries,
                         # in a way that has nothing to do with the strategy under test.
-                        f'Call the lookup_deployment tool with scope="{label}" now and report '
-                        "the values it returns. Do not skip the call or answer from memory. " + filler_text(seed, 300)
+                        (
+                            f'Call the lookup_deployment tool with scope="{label}" now. '
+                            "Acknowledge in three words or fewer and do not restate anything it returns. "
+                            if narration == "suppressed"
+                            else f'Call the lookup_deployment tool with scope="{label}" now. '
+                            if narration == "neutral"
+                            else f'Call the lookup_deployment tool with scope="{label}" now and report '
+                            "the values it returns. Do not skip the call or answer from memory. "
+                        )
+                        + filler_text(seed, 300)
                     ],
                 ),
             ),
@@ -346,8 +382,8 @@ def build_recall_scenario(
                         Content.from_function_result(
                             call_id=call_id,
                             result=(
-                                f"region_code={region}; fallback_host={host}; "
-                                "both values must appear in the final report. "
+                                render_codes(codes) + "; "
+                                "all of these values must appear in the final report. "
                                 + sized_text(f"[{label} notes] ", seed + 1, tool_result_tokens, chars_per_token)
                             ),
                         )

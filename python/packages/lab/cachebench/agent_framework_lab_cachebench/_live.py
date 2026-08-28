@@ -48,7 +48,7 @@ from agent_framework import (
 from agent_framework._compaction import project_included_messages
 
 from ._metrics import serialize_message
-from ._recall import FactOutcome, RecallScenario, build_recall_scenario, score_answer
+from ._recall import FactOutcome, RecallScenario, build_recall_scenario, render_codes, score_answer
 from ._runner import unsupported_option
 from ._strategies import StrategyOptions, build_strategy
 from ._transcripts import TRUE_CHARS_PER_TOKEN, sized_text
@@ -61,6 +61,8 @@ if TYPE_CHECKING:
 __all__ = [
     "AGENT_KINDS",
     "DEFAULT_TOOL_RESULT_TOKENS",
+    "NEUTRAL_INSTRUCTIONS",
+    "TERSE_INSTRUCTIONS",
     "LiveOutcome",
     "MeteredClient",
     "ModelCall",
@@ -87,6 +89,31 @@ AGENT_KINDS: Final[tuple[str, ...]] = ("plain", "harness")
 #: trace tool output is usually the bulk of the context, and a benchmark whose tool
 #: results are a rounding error cannot say anything about tool-oriented compaction.
 DEFAULT_TOOL_RESULT_TOKENS: Final[int] = 4_000
+
+TERSE_INSTRUCTIONS: Final[str] = (
+    "You are a meticulous engineering assistant. Follow every stated requirement exactly. "
+    "When the user asks for a deployment lookup, call the matching tool. "
+    "Acknowledge each tool result in three words or fewer, and do not restate its values in "
+    "that acknowledgement. This applies only to acknowledgements: when you are asked for the "
+    "final report, include every value you were asked for, in full."
+)
+"""Instructions that stop the model narrating tool results back into the conversation.
+
+Separates a strategy's contribution from the model's. When the model restates every value, a
+strategy can discard the tool results entirely and still appear to preserve them. The
+final-report exemption is load-bearing: without it the model applies the rule to its answer
+too, and the recall score measures the instruction rather than the compaction.
+"""
+
+NEUTRAL_INSTRUCTIONS: Final[str] = (
+    "You are a meticulous engineering assistant. Follow every stated requirement exactly."
+)
+"""Agent instructions that say nothing about narrating tool results.
+
+Paired with ``narration="neutral"`` and the harness, this is the configuration a typical
+caller gets: the framework's own ``DEFAULT_HARNESS_INSTRUCTIONS`` are then the only thing
+telling the model to explain what it learned between tool calls.
+"""
 
 _INSTRUCTIONS: Final[str] = (
     "You are a meticulous engineering assistant. Follow every stated requirement exactly. "
@@ -360,7 +387,7 @@ def wants_client_side_history(client: Any, *, allow_server_history: bool = False
 
 
 def make_lookup_tool(
-    lookups: Mapping[str, tuple[str, str]],
+    lookups: Mapping[str, tuple[str, ...]],
     filler_tokens: int = DEFAULT_TOOL_RESULT_TOKENS,
 ) -> Callable[[str], str]:
     """Build the tool a live agent calls to obtain the planted tool-result facts.
@@ -370,7 +397,7 @@ def make_lookup_tool(
     modes would be scoring different conversations.
 
     Args:
-        lookups: Scope label mapped to ``(region_code, fallback_host)``.
+        lookups: Scope label mapped to the verifiable codes it carries.
         filler_tokens: Approximate size of each result, **in tokens**. This is the only thing
             that decides how much context tool output occupies, and therefore whether
             tool-oriented compaction has anything worth evicting. At the ~76 tokens a
@@ -400,8 +427,7 @@ def make_lookup_tool(
         entry = lookups.get(key)
         if entry is None:
             return f"Unknown scope {scope!r}. Valid scopes are: {', '.join(sorted(lookups))}."
-        region, host = entry
-        return f"region_code={region}; fallback_host={host}; both values must appear in the final report. {bodies[key]}"
+        return f"{render_codes(entry)}; all of these values must appear in the final report. {bodies[key]}"
 
     return lookup_deployment
 
@@ -439,8 +465,9 @@ def _scope_tool(scope: str, result: str) -> Callable[[], str]:
 
 
 def make_scope_tools(
-    lookups: Mapping[str, tuple[str, str]],
+    lookups: Mapping[str, tuple[str, ...]],
     filler_tokens: int = DEFAULT_TOOL_RESULT_TOKENS,
+    narration: str = "prompted",
 ) -> list[Callable[[], str]]:
     """Build one no-argument tool per scope, so the wrong scope cannot be requested.
 
@@ -452,20 +479,26 @@ def make_scope_tools(
     turn gathers.
 
     Args:
-        lookups: Scope label mapped to ``(region_code, fallback_host)``.
+        lookups: Scope label mapped to the verifiable codes it carries.
         filler_tokens: Approximate size of each result, in tokens.
+        narration: Whether the result text asks the model to restate its values.
 
     Returns:
         One callable per scope, named ``lookup_<scope>``.
     """
     tools: list[Callable[[], str]] = []
     for index, scope in enumerate(sorted(lookups)):
-        region, host = lookups[scope]
+        codes = lookups[scope]
         body = sized_text(f"[{scope} deployment notes] ", index * 31 + 7, filler_tokens, TRUE_CHARS_PER_TOKEN)
         tools.append(
             _scope_tool(
                 scope,
-                f"region_code={region}; fallback_host={host}; both values must appear in the final report. {body}",
+                # This trailing instruction is what makes the model restate the values in
+                # its own reply. Dropping it leaves the facts only in the tool result.
+                render_codes(codes)
+                + "; "
+                + ("" if narration != "prompted" else "all of these values must appear in the final report. ")
+                + body,
             )
         )
     return tools
@@ -479,6 +512,7 @@ def build_live_agent(
     tokenizer: TokenizerProtocol,
     tools: Sequence[Callable[..., Any]],
     recorder: UsageRecorder,
+    instructions: str = _INSTRUCTIONS,
     max_context_window_tokens: int,
     max_output_tokens: int,
 ) -> Agent[Any]:
@@ -493,6 +527,7 @@ def build_live_agent(
         tokenizer: Token counter shared with the strategy.
         tools: Tools the agent may call.
         recorder: Middleware capturing prompts and usage.
+        instructions: System instructions for the agent.
         max_context_window_tokens: Window the harness variant sizes its default against.
         max_output_tokens: Output reservation.
 
@@ -513,7 +548,7 @@ def build_live_agent(
         return create_harness_agent(
             runtime.client,
             name="cachebench",
-            agent_instructions=_INSTRUCTIONS,
+            agent_instructions=instructions,
             tools=list(tools),
             max_context_window_tokens=max_context_window_tokens,
             max_output_tokens=max_output_tokens,
@@ -548,7 +583,7 @@ def build_live_agent(
     return Agent(
         client=runtime.client,
         name="cachebench",
-        instructions=_INSTRUCTIONS,
+        instructions=instructions,
         tools=list(tools),
         context_providers=providers,
         compaction_strategy=strategy,
@@ -574,6 +609,7 @@ async def run_live(
     agent_kind: str = "plain",
     tool_result_tokens: int = DEFAULT_TOOL_RESULT_TOKENS,
     force_tool_calls: bool = True,
+    narration: str = "prompted",
 ) -> LiveOutcome:
     """Run the scenario end to end against a real agent.
 
@@ -586,6 +622,8 @@ async def run_live(
         scenario: The scenario to drive, built with ``bulk_in_user=True``.
         agent_kind: One of :data:`AGENT_KINDS`.
         tool_result_tokens: Approximate size of each tool result, in tokens.
+        narration: How hard the scenario and instructions push the model to restate tool
+            values. See :data:`_INSTRUCTIONS_BY_NARRATION`.
         force_tool_calls: Set ``tool_choice='required'`` on the turns that ask for a
             lookup. Without it a model that ignores the instruction gathers fewer facts
             and carries fewer tokens, which moves both axes for reasons unrelated to
@@ -615,7 +653,7 @@ async def run_live(
 
     scope_tools = [
         _wrap(name.removeprefix("lookup_"), fn)
-        for fn in make_scope_tools(scenario.tool_lookups, tool_result_tokens)
+        for fn in make_scope_tools(scenario.tool_lookups, tool_result_tokens, narration=narration)
         if (name := fn.__name__)
     ]
 
@@ -626,6 +664,7 @@ async def run_live(
         tokenizer=options.tokenizer,
         tools=scope_tools,
         recorder=recorder,
+        instructions=_INSTRUCTIONS_BY_NARRATION[narration],
         max_context_window_tokens=options.max_context_window_tokens,
         max_output_tokens=options.max_output_tokens,
     )
@@ -737,7 +776,15 @@ def unretrieved_facts(outcome: LiveOutcome, scenario: RecallScenario) -> tuple[F
     )
 
 
-def build_live_scenario(*, salt: str, filler_turns: int, filler_tokens: int, tool_turns: int = 6) -> RecallScenario:
+def build_live_scenario(
+    *,
+    salt: str,
+    filler_turns: int,
+    filler_tokens: int,
+    tool_turns: int = 6,
+    narration: str = "prompted",
+    markers_per_tool: int = 2,
+) -> RecallScenario:
     """Build the scenario in the shape a live run needs.
 
     Keyword Args:
@@ -747,6 +794,8 @@ def build_live_scenario(*, salt: str, filler_turns: int, filler_tokens: int, too
         tool_turns: Tool-call groups to plant. Defaults above the framework's
             ``keep_last_tool_call_groups`` of 4, so that tool-oriented strategies
             actually engage instead of scoring a perfect result for doing nothing.
+        narration: How hard the scenario pushes the model to restate tool values.
+        markers_per_tool: Verifiable codes each tool result carries.
 
     Returns:
         A scenario whose padding sits in the user turns, because the assistant's replies are
@@ -758,6 +807,8 @@ def build_live_scenario(*, salt: str, filler_turns: int, filler_tokens: int, too
         filler_tokens=filler_tokens,
         bulk_in_user=True,
         tool_turns=tool_turns,
+        narration=narration,
+        markers_per_tool=markers_per_tool,
     )
 
 
@@ -772,3 +823,10 @@ def score_live(outcome: LiveOutcome, scenario: RecallScenario) -> tuple[FactOutc
         One outcome per planted fact.
     """
     return score_answer(outcome.answer, scenario.facts, outcome.final_prompt)
+
+
+_INSTRUCTIONS_BY_NARRATION: Final[dict[str, str]] = {
+    "prompted": _INSTRUCTIONS,
+    "neutral": NEUTRAL_INSTRUCTIONS,
+    "suppressed": TERSE_INSTRUCTIONS,
+}
