@@ -566,8 +566,14 @@ def _spread_codes(codes: Sequence[str], body: str) -> str:
     for index, code in enumerate(codes):
         start = index * step
         end = (index + 1) * step if index + 1 < len(codes) else len(words)
-        parts.append(f"{render_code(index, code)}; {' '.join(words[start:end])}")
-    return " ".join(parts)
+        segment = " ".join(words[start:end])
+        # Each code gets its own labelled line. Spreading them through running prose instead
+        # made them unfindable rather than merely late: with codes inline, two separate
+        # controls read the first code of each result and none of the rest, scoring exactly
+        # 11 of 53 both times. That measures whether a model can spot a needle in filler,
+        # which is not what this benchmark is for.
+        parts.append(f"\n[record {index + 1}] {render_code(index, code)}\n{segment}")
+    return "".join(parts)
 
 
 def build_live_agent(
