@@ -351,6 +351,7 @@ def _render(
     live: dict[str, LiveOutcome],
     nofetch: dict[str, int],
     spread: dict[str, float],
+    correctness_range: dict[str, float],
     repeats: int,
     pricing: ModelPricing,
     model: str,
@@ -363,7 +364,7 @@ def _render(
     header = (
         f"{'strategy':<28}{'msgs':>9}{'tok left/peak':>16}{'calls':>7}{'in':>9}{'hit%':>6}"
         f"{'out':>8}{'cost':>10}{'+-':>6}{'summ$':>8}{'vs none':>9}"
-        f"{'facts':>9}{'lost':>6}{'nofetch':>8}{'ignored':>8}{'correct':>9}{'vs none':>9}{'flags':>8}"
+        f"{'facts':>9}{'lost':>6}{'nofetch':>8}{'ignored':>8}{'correct':>9}{'c+-':>6}{'vs none':>9}{'flags':>8}"
     )
     lines = [
         "",
@@ -411,7 +412,8 @@ def _render(
             f"{f'{outcome.score.facts_left}/{len(outcome.score.outcomes)}':>9}"
             f"{max(outcome.score.lost_to_compaction - nofetch[outcome.strategy], 0):>6}"
             f"{nofetch[outcome.strategy]:>8}{outcome.score.ignored_by_model:>8}"
-            f"{outcome.correctness:>8.0%}{'*' if outcome.strategy == base.strategy else ' '}{rel:>9}"
+            f"{outcome.correctness:>8.0%}{'*' if outcome.strategy == base.strategy else ' '}"
+            f"{(f'{correctness_range[outcome.strategy]:.0f}pp' if repeats > 1 else 'n/a'):>6}{rel:>9}"
             f"{(','.join(flags) or '-'):>8}"
         )
     lines += [
@@ -436,6 +438,11 @@ def _render(
         "            Without this split a control that simply omits facts looks like",
         "            compaction damage, and every strategy is judged against a false baseline",
         "correct   = share of correctness checks the final answer passed (* marks the control)",
+        "c+-       = points between the least and most correct repeat. The correct column is",
+        "            taken from the median-cost repeat, so without this a strategy whose three",
+        "            runs scored 100, 22 and 22 reads identically to one that scored 22 three",
+        "            times. A wide gap here means the accuracy ranking is not usable, exactly",
+        "            as a wide +- means the cost ranking is not",
         "flags     = ERR failed turn, S<n> summarizer failures, <n>/<n>t turns completed,",
         "            NO:<opt> the provider rejected that option so it was dropped. A run",
         "            that dropped tool_choice chose its own tool calls and is not",
@@ -559,6 +566,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
     live: dict[str, LiveOutcome] = {}
     nofetch: dict[str, int] = {}
     spread: dict[str, float] = {}
+    correctness_range: dict[str, float] = {}
     scenarios: dict[int, RecallScenario] = {}
     joint: list[JointOutcome] = []
     for name in strategies:
@@ -614,6 +622,8 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
         chosen_scenario = scenarios[id(representative)]
         live[name] = representative
         spread[name] = _spread(repeats, pricing)
+        scores = [item.correctness for item in repeats]
+        correctness_range[name] = (max(scores) - min(scores)) * 100 if len(scores) > 1 else 0.0
         nofetch[name] = len(unretrieved_facts(representative, chosen_scenario))
         joint.append(_to_joint(representative, chosen_scenario, pricing))
 
@@ -656,6 +666,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
             live,
             nofetch,
             spread,
+            correctness_range,
             args.repeats,
             pricing,
             runtime.model,
