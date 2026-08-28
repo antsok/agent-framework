@@ -42,10 +42,14 @@ between runs, which moves both axes for reasons unrelated to compaction. Runs ma
 | 6 | `z-ai/glm-5.2` | OpenRouter / BaseTen | Chat Completions | no | `none` (10x discount) |
 | 7 | `gpt-5.4-mini` | Azure Foundry | Responses | yes | `none` (60K window, harness) |
 | 8 | `gpt-5.4-mini` | Azure Foundry | Responses | yes | `none` (120K window, harness) |
+| 9a | `gpt-5.4-mini` | Azure Foundry | Responses | yes | *aborted — 400K window does not exist* |
+| 9 | `gpt-5.4-mini` | Azure Foundry | Responses | yes | `none` (272K real limit, 86% full) |
 
-Runs 7 and 8 are a **separate experiment** on the harness agent at wider windows, with 53
+Runs 7 to 9 are a **separate experiment** on the harness agent at wider windows, with 53
 planted facts instead of 17. The shared configuration above does not describe them; their own
-section below does.
+section below does. Runs 7 and 8 hold the conversation at ~165% of the budget so that
+compaction is forced to fire; Run 9 is the opposite regime, with the conversation fitting
+inside the window.
 
 ---
 
@@ -457,17 +461,27 @@ was configured with `--context-window 400000` and material sized to about 85% of
 **Four of the fourteen strategies died with HTTP 400 `context_length_exceeded`,** and which
 four is the whole finding:
 
-| strategy | compaction trigger | failed at |
+| strategy | first threshold at a 397,952 budget | failed at |
 | --- | ---: | --- |
 | `none` | never compacts | turn 13, all 3 repeats |
-| `truncation` | 318,361 | turn 13, 13, 12 |
-| `context_window_lazy` | 378,054 | turn 13, all 3 repeats |
-| `summarization` | rewrites from the start | turn 15, all 3 repeats |
+| `truncation` | `max_n` = 0.8 -> **318,361** | turn 13, 13, 12 |
+| `context_window_lazy` | tool eviction 0.7 -> **278,566** | turn 13, all 3 repeats |
+| `summarization` | none — keeps the last N *groups* | turn 15, all 3 repeats |
 
-`truncation` failed at **the same turn as `none`**. That is the proof that it never compacted
-once: its trigger sits at 80% of a 397,952-token budget, and the service refused the request
-long before the local count reached it. The other ten strategies, all of which trigger at or
-below 50% of the budget or ignore tokens entirely, completed normally.
+**The three token-driven failures are exactly the strategies whose first threshold exceeds
+272,000.** Everything that fires at or below 50% of the budget survived, including the shipped
+`context_window`, whose tool eviction runs at 0.5 -> 198,976. `context_window_lazy` differs
+from it only in thresholds, and that difference is the whole distance between working and
+failing.
+
+`truncation` failed at **the same turn as `none`**, which is the proof it never compacted
+once: the service refused the request long before the local count reached its trigger.
+
+`summarization` is the exception that is not about thresholds. `SummarizationStrategy` is
+count-based — it keeps the last N message groups with no token target at all — so it fired
+every turn and still could not get under the limit, because at this scale two surviving tool
+results are 50,000 tokens on their own. It failed two turns later than the rest, which is what
+compaction that runs but cannot keep up looks like.
 
 Local token counts for the conversation, which the failures bracket precisely:
 
@@ -493,17 +507,22 @@ reach this model.
 `max_context_window_tokens=400_000` — the number on the model card, the obvious value to pass
 — puts every token threshold above the hard input limit:
 
-| strategy | threshold at a 400,000 window | reachable? |
+| strategy | first threshold at a 400,000 window | reachable under 272,000? |
 | --- | ---: | --- |
-| `ContextWindowCompactionStrategy` (shipped 0.8) | 318,361 | **no** |
-| `TruncationStrategy` (0.8) | 318,361 | **no** |
-| `context_window_lazy` (0.95) | 378,054 | **no** |
+| `TruncationStrategy` (`max_n` 0.8) | 318,361 | **no** |
+| `ContextWindowCompactionStrategy` at 0.7 | 278,566 | **no** |
+| `ContextWindowCompactionStrategy` shipped (0.5) | 198,976 | yes |
 
 The agent then fails with a provider error *before its own compaction can fire*. Compaction
 configured against the advertised window is not merely too lax — it is unreachable, and the
 symptom is an HTTP 400 rather than a large bill. This is the same class of problem as the
 harness silently installing no strategy when the token arguments are omitted, except that here
 the operator did supply a value and supplied a defensible one.
+
+The shipped default survives this by luck rather than design: its tool eviction happens to sit
+at half the window, which stays under 272,000 even when the window is overstated by 47%. Raise
+the threshold to 0.7 — a change that reads as a mild tuning choice — and the agent stops
+working entirely.
 
 Note also what is *not* at fault. The bundled `tiktoken` counter agreed with the service to
 within **6 tokens on a 270,294-token prompt** (0.002%), so local counting is sound; the error
@@ -519,6 +538,67 @@ The corrected run configures the real input limit instead:
 which puts the material at ~228,400 tokens and the peak prompt at ~233,000, or **86% of the
 272,000 limit** — the 80-90% band the sweep was asking for, measured against the window the
 model actually has.
+
+### Run 9 — 86% of the real limit, the conversation fitting inside the window
+
+Wall clock 1 h 45 min, no failed turns, no dropped options. **Control: 53/53 facts, 100%
+correct, 0 unfetched, +-0%** — the tightest control in the series, and its 94% hit rate is
+the highest.
+
+This is the regime Runs 1-8 never covered. There the conversation ran at ~165% of the budget,
+so compaction was forced to fire and the only question was what it cost. Here it **fits**:
+window set to the model's true 272,000-token input limit, peak prompt 232,748.
+
+| strategy | peak tok | hit% | in | cost | +- | vs none | facts | lost | ignored | correct |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| token_budget_window_first | 128,262 | 87% | 2,310,063 | $0.3483 | 1% | **-19%** | 26/53 | 27 | 0 | 50% |
+| **none** | **232,748** | **94%** | **3,875,490** | **$0.4317** | **0%** | — | **53/53** | **0** | **0** | **100%** |
+| truncation | 207,338 | 89% | 3,057,321 | $0.4365 | 3% | +1% | 37/53 | 16 | 0 | 70% |
+| token_budget_truncate_first | 129,314 | 80% | 2,310,122 | $0.4498 | 0% | +4% | 29/53 | 24 | 24 | 11% |
+| token_budget_tools_first | 129,766 | 80% | 2,322,751 | $0.4568 | 6% | +6% | 29/53 | 24 | 8 | 41% |
+| sliding_window | 64,503 | 9% | 858,120 | $0.5322 | 13% | +23% | 0/53 | 45 | 0 | 17% |
+| context_window_aggressive | 78,184 | 61% | 1,780,463 | $0.5500 | 0% | +27% | 23/53 | 30 | 2 | 41% |
+| tool_result | 183,119 | 84% | 3,372,103 | $0.5632 | 2% | +30% | 53/53 | 0 | 0 | 100% |
+| selective_tool_call | 182,732 | 84% | 3,379,748 | $0.5667 | 4% | +31% | 53/53 | 0 | 0 | 100% |
+| context_window_lazy | 183,299 | 84% | 3,400,267 | $0.5815 | 41% | +35% | 53/53 | 0 | 0 | 100% |
+| context_window | 129,745 | 76% | 2,684,893 | $0.5841 | 2% | +35% | 37/53 | 16 | 8 | 56% |
+| token_budget_fallback | 130,746 | 76% | 2,708,528 | $0.5956 | 43% | +38% | 37/53 | 16 | 32 | 11% |
+| token_budget_summarize | 129,363 | 67% | 2,679,770 | $0.7354 | 1% | +70% | 37/53 | 16 | 32 | 11% |
+| summarization | 206,143 | 46% | 3,286,712 | $1.3286 | 10% | +208% | 53/53 | 0 | 0 | 100% |
+
+**Thirteen of fourteen strategies cost more than not compacting.** The single exception,
+`token_budget_window_first` at -19% (+-1%, so the gap is real), loses 27 of 53 facts and scores
+50%. There is no setting on this table that is both cheaper and correct.
+
+Only `context_window_lazy` (+-41%) and `token_budget_fallback` (+-43%) are disqualified by
+spread; every other row is a real difference.
+
+**This is the most realistic configuration tested and the starkest result.** The reason is
+visible in one column: at 232,748 tokens the control reaches a **94% hit rate**, the highest
+anywhere in this work. The longer the conversation, the more of it is discounted, and the more
+a mutation to its prefix costs. Compaction here cuts 20-40% of tokens and pays for it with 5-18
+points of hit rate, which at a 9.4x discount is a losing trade almost every time.
+
+**Do not read Run 9 as a fourth point on the Run 7-8 curve.** Those two held the conversation
+at ~165% of budget and varied the window; this one changes the regime. Grouped properly:
+
+| regime | window | `tool_result` vs none | cheapest that keeps 53/53 |
+| --- | ---: | ---: | ---: |
+| overflowing, 165% of budget | 60,000 | +28% | +22% (`selective_tool_call`) |
+| overflowing, 165% of budget | 120,000 | +22% | +22% (`selective_tool_call`) |
+| **fitting, 86% of the limit** | **272,000** | **+30%** | **+30% (`tool_result`)** |
+
+The penalty falls with window size while the conversation overflows, and comes back when it
+fits — because a conversation that fits has a nearly perfect cache to lose.
+
+**The shipped default is the worst of both.** `context_window` at its 0.5/0.8 thresholds cost
+**+35%** and lost 16 of 53 facts, scoring 56%. It is beaten on cost by seven settings and on
+accuracy by four. This is now the fourth run in which the shipped default costs more than no
+compaction at all.
+
+**`summarization` bought correctness at 3x the price.** It is the only deleting-class strategy
+to keep all 53 facts at 100%, and it cost **+208%**. At this size its own summary calls are
+almost free ($0.0474 of $1.3286); the bill is the 46% hit rate.
 
 ---
 
