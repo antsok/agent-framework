@@ -65,6 +65,7 @@ from ._strategies import (
 )
 from ._summary import JointOutcome, JointVerdict, recommend, relative_correctness
 from ._summary_cli import main as summary_main
+from ._tokenizers import TOKENIZER_NAMES, build_tokenizer
 from ._transcripts import DEFAULT_SYSTEM_TOKENS, TRANSCRIPT_PRESETS, TranscriptPreset, build_preset, build_transcript
 from ._types import CellKey, CellSummary, Transcript, TranscriptTurn, TurnRecord
 
@@ -78,6 +79,7 @@ __all__ = [
     "DEFAULT_SYSTEM_TOKENS",
     "PROVIDER_SPECS",
     "STRATEGY_BUILDERS",
+    "TOKENIZER_NAMES",
     "TRANSCRIPT_PRESETS",
     "CallOutcome",
     "CellKey",
@@ -115,6 +117,7 @@ __all__ = [
     "build_provider",
     "build_recall_scenario",
     "build_strategy",
+    "build_tokenizer",
     "build_transcript",
     "common_message_prefix",
     "cost_of",

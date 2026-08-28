@@ -1162,3 +1162,35 @@ def test_an_unstable_control_disables_the_accuracy_ranking() -> None:
     # One repeat measures no stability at all; the cost warning already says so, and a second
     # warning saying the same thing would just be noise.
     assert single == []
+
+
+def test_narration_probe_declares_every_flag_it_reads() -> None:
+    """A sample that reads an undeclared flag passes every check and dies on first use.
+
+    That has happened twice in this package: once for --no-force-tool-calls, once for an
+    attribute assumed to exist on LiveOutcome. Both cost a live run to discover. The probe
+    is a calibration tool people will point at a new model, so its arguments are pinned.
+    """
+    from samples.probe_narration import build_parser as narration_parser
+
+    args = narration_parser().parse_args(["foundry:some-model"])
+    for flag in (
+        "narrations",
+        "placements",
+        "repeats",
+        "agent",
+        "context_window",
+        "max_output_tokens",
+        "answer_max_tokens",
+        "markers_per_tool",
+        "tool_turns",
+        "filler_turns",
+        "filler_tokens",
+        "tool_result_tokens",
+        "no_force_tool_calls",
+        "no_temperature",
+    ):
+        assert hasattr(args, flag), flag
+    # The defaults must name real modes, or the probe fails on its own first run.
+    assert set(args.narrations.split(",")) <= {"neutral", "prompted", "suppressed"}
+    assert set(args.placements.split(",")) <= {"spread", "buried", "head"}
