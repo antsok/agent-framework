@@ -127,7 +127,18 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument("--context-window", type=int, default=32_000, help="Simulated context window.")
-    parser.add_argument("--max-output-tokens", type=int, default=2_048, help="Output reservation for budget math.")
+    parser.add_argument(
+        "--max-output-tokens",
+        type=int,
+        default=2_048,
+        help=(
+            "The model's maximum output tokens per response, which is subtracted from "
+            "--context-window to give the input budget every threshold is a fraction of. "
+            "This is the model's ceiling, not the size of reply you want: setting it too low "
+            "inflates the budget and can push a strategy's trigger above what the service "
+            "will accept, which disables compaction with no warning."
+        ),
+    )
     parser.add_argument("--answer-max-tokens", type=int, default=900, help="Cap on generated replies.")
     parser.add_argument(
         "--keep-last-tool-groups",

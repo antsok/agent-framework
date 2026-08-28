@@ -503,26 +503,48 @@ So the advertised 400,000 is **total** context: **272,000 input + 128,000 output
 documented GPT-5-class split. There is no configuration in which 400,000 tokens of history
 reach this model.
 
-**The consequence for anyone wiring up MAF is concrete.** Passing
-`max_context_window_tokens=400_000` — the number on the model card, the obvious value to pass
-— puts every token threshold above the hard input limit:
+**The real cause was the output reservation, and it is worth being precise about it.** Every
+threshold in MAF is a fraction of an *input budget*, and both layers compute that budget the
+same way:
 
-| strategy | first threshold at a 400,000 window | reachable under 272,000? |
-| --- | ---: | --- |
-| `TruncationStrategy` (`max_n` 0.8) | 318,361 | **no** |
-| `ContextWindowCompactionStrategy` at 0.7 | 278,566 | **no** |
-| `ContextWindowCompactionStrategy` shipped (0.5) | 198,976 | yes |
+```python
+# agent_framework/_compaction.py, ContextWindowCompactionStrategy.__init__
+input_budget         = max_context_window_tokens - max_output_tokens
+tool_eviction_tokens = int(input_budget * tool_eviction_threshold)   # default 0.5
+truncation_tokens    = int(input_budget * truncation_threshold)      # default 0.8
+```
 
-The agent then fails with a provider error *before its own compaction can fire*. Compaction
-configured against the advertised window is not merely too lax — it is unreachable, and the
-symptom is an HTTP 400 rather than a large bill. This is the same class of problem as the
-harness silently installing no strategy when the token arguments are omitted, except that here
-the operator did supply a value and supplied a defensible one.
+This run passed `max_context_window_tokens=400_000` with `max_output_tokens=2_048`, giving an
+input budget of **397,952** — 46% above what the service will accept. Had it passed the
+model's real output cap instead, the arithmetic would have landed exactly on the limit:
 
-The shipped default survives this by luck rather than design: its tool eviction happens to sit
-at half the window, which stays under 272,000 even when the window is overstated by 47%. Raise
-the threshold to 0.7 — a change that reads as a mild tuning choice — and the agent stops
-working entirely.
+| configuration | input budget | eviction (0.5) | truncation (0.8) |
+| --- | ---: | ---: | ---: |
+| 400,000 window, **2,048** reservation | 397,952 | 198,976 | **318,361 — unreachable** |
+| 400,000 window, **128,000** cap | **272,000** | 136,000 | 217,600 — reachable |
+
+`400,000 - 128,000 = 272,000` is the measured limit to the token. **MAF's formula is correct;
+the argument it was given was not.** `max_output_tokens` is documented as *"Maximum output
+tokens per response"* — the model's ceiling — not the size of reply you intend to ask for.
+Under-setting it inflates the input budget by the difference, and on a GPT-5-class model that
+difference is 126,000 tokens, which is enough to push `TruncationStrategy` and any
+`ContextWindowCompactionStrategy` above 0.68 out of reach.
+
+The failure mode is still worth knowing, because nothing reports it: the agent runs, compacts
+nothing, and dies of an HTTP 400 rather than a large bill. It belongs with the harness
+installing no strategy at all when the token arguments are omitted — same class, in that a
+plausible configuration silently produces no compaction.
+
+Note which rows survived: everything triggering at or below 0.5 of the inflated budget, which
+is why the shipped `context_window` completed and `context_window_lazy` at 0.7 did not. That
+is not a defence of the shipped thresholds so much as a demonstration of how much headroom a
+wrong reservation eats.
+
+Runs 7, 8 and 9 are unaffected. They set a deliberately *simulated* window with the same
+2,048 reservation, and their budgets — 57,952, 117,952 and 269,952 — all sit far below the
+272,000 hard limit, so every threshold was reachable. Run 9 is in fact equivalent to the
+correctly configured real-world case: its 232,748-token peak is 86% of its 269,952 budget and
+86% of the model's true 272,000 input limit alike.
 
 Note also what is *not* at fault. The bundled `tiktoken` counter agreed with the service to
 within **6 tokens on a 270,294-token prompt** (0.002%), so local counting is sound; the error
