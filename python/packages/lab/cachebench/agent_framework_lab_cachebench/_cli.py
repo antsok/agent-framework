@@ -103,7 +103,18 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Simulated context window driving compaction budgets. Defaults to 60%% of each transcript's size.",
     )
-    parser.add_argument("--max-output-tokens", type=int, default=512, help="Output reservation for budget math.")
+    parser.add_argument(
+        "--max-output-tokens",
+        type=int,
+        default=512,
+        help=(
+            "The model's maximum output tokens per response, which is subtracted from "
+            "--context-window to give the input budget every threshold is a fraction of. "
+            "This is the model's ceiling, not the size of reply you want: setting it too low "
+            "inflates the budget and can push a strategy's trigger above what the service "
+            "will accept, which disables compaction with no warning."
+        ),
+    )
     parser.add_argument(
         "--tokenizer",
         default="estimator",
