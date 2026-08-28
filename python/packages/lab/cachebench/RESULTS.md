@@ -448,6 +448,78 @@ With 16,000-token tool results, collapsing an old tool-call group removes enough
 context that codes still present in the prompt stop being attributable to a deployment. It is
 the clearest single demonstration that the `facts` column is a ceiling and not a prediction.
 
+### Run 9a — aborted: `gpt-5.4-mini` does not have a 400,000-token input window
+
+The intent was to measure the regime Runs 7 and 8 do not cover: the conversation staying
+*inside* the window rather than overflowing it. The model card says 400,000 tokens, so the run
+was configured with `--context-window 400000` and material sized to about 85% of it.
+
+**Four of the fourteen strategies died with HTTP 400 `context_length_exceeded`,** and which
+four is the whole finding:
+
+| strategy | compaction trigger | failed at |
+| --- | ---: | --- |
+| `none` | never compacts | turn 13, all 3 repeats |
+| `truncation` | 318,361 | turn 13, 13, 12 |
+| `context_window_lazy` | 378,054 | turn 13, all 3 repeats |
+| `summarization` | rewrites from the start | turn 15, all 3 repeats |
+
+`truncation` failed at **the same turn as `none`**. That is the proof that it never compacted
+once: its trigger sits at 80% of a 397,952-token budget, and the service refused the request
+long before the local count reached it. The other ten strategies, all of which trigger at or
+below 50% of the budget or ignore tokens entirely, completed normally.
+
+Local token counts for the conversation, which the failures bracket precisely:
+
+| turn | cumulative prompt | outcome |
+| ---: | ---: | --- |
+| 12 | 253,266 | accepted |
+| 13 | 271,291 | **rejected** |
+
+A direct probe on the same deployment, one prompt per size, pins it:
+
+| prompt | result |
+| ---: | --- |
+| 260,278 | accepted — service counted 260,284 |
+| 270,288 | accepted — service counted 270,294 |
+| 275,292 | **`context_length_exceeded`** |
+| 290,309 | **`context_length_exceeded`** |
+
+So the advertised 400,000 is **total** context: **272,000 input + 128,000 output**, the
+documented GPT-5-class split. There is no configuration in which 400,000 tokens of history
+reach this model.
+
+**The consequence for anyone wiring up MAF is concrete.** Passing
+`max_context_window_tokens=400_000` — the number on the model card, the obvious value to pass
+— puts every token threshold above the hard input limit:
+
+| strategy | threshold at a 400,000 window | reachable? |
+| --- | ---: | --- |
+| `ContextWindowCompactionStrategy` (shipped 0.8) | 318,361 | **no** |
+| `TruncationStrategy` (0.8) | 318,361 | **no** |
+| `context_window_lazy` (0.95) | 378,054 | **no** |
+
+The agent then fails with a provider error *before its own compaction can fire*. Compaction
+configured against the advertised window is not merely too lax — it is unreachable, and the
+symptom is an HTTP 400 rather than a large bill. This is the same class of problem as the
+harness silently installing no strategy when the token arguments are omitted, except that here
+the operator did supply a value and supplied a defensible one.
+
+Note also what is *not* at fault. The bundled `tiktoken` counter agreed with the service to
+within **6 tokens on a 270,294-token prompt** (0.002%), so local counting is sound; the error
+was entirely in the assumed window.
+
+The corrected run configures the real input limit instead:
+
+```sh
+  --context-window 272000 --max-output-tokens 2048 \
+  --filler-tokens 12600 --tool-result-tokens 25200
+```
+
+which puts the material at ~228,400 tokens and the peak prompt at ~233,000, or **86% of the
+272,000 limit** — the 80-90% band the sweep was asking for, measured against the window the
+model actually has.
+
 ---
 
 ## Models that could not be measured
