@@ -56,6 +56,7 @@ from agent_framework_lab_cachebench._live import (
     resolve_instructions,
 )
 from agent_framework_lab_cachebench._live_cli import (
+    _accuracy_note,
     _correctness_range,
     _cost,
     _representative,
@@ -1139,3 +1140,25 @@ def test_correctness_range_reads_the_scored_outcome_not_the_raw_run() -> None:
     assert spread > 0
     # A single repeat says nothing about stability, and must not claim to.
     assert _correctness_range([perfect], {id(perfect): scenario}, pricing) == 0.0
+
+
+def test_an_unstable_control_disables_the_accuracy_ranking() -> None:
+    """A baseline that swings cannot be compared against, and the table must say so.
+
+    Cost has been policed by a spread warning since the beginning. Accuracy was not, and
+    three matrices were produced and believed before the gap was noticed: the `correct`
+    column shows the median-*cost* repeat, so a control scoring 100, 22 and 22 prints an
+    unremarkable 100.
+    """
+    stable = _accuracy_note({"none": 9.0}, "none", repeats=3)
+    unstable = _accuracy_note({"none": 78.0}, "none", repeats=3)
+    single = _accuracy_note({"none": 78.0}, "none", repeats=1)
+
+    assert stable == []
+    assert any("ACCURACY NOT RANKABLE" in line for line in unstable)
+    assert any("78 points" in line for line in unstable)
+    # The cost axis survives an unstable accuracy axis and the warning must say which is which.
+    assert any("cost columns are unaffected" in line for line in unstable)
+    # One repeat measures no stability at all; the cost warning already says so, and a second
+    # warning saying the same thing would just be noise.
+    assert single == []

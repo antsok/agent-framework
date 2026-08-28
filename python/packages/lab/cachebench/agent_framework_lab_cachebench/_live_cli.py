@@ -8,7 +8,7 @@ import argparse
 import asyncio
 import time
 from collections.abc import Sequence
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, Final, cast
 
 from ._advisor import ModelPricing, fetch_openrouter_pricing
 from ._live import (
@@ -347,6 +347,44 @@ def _to_joint(outcome: LiveOutcome, scenario: RecallScenario, pricing: ModelPric
     )
 
 
+#: Correctness range, in points, above which the accuracy column cannot rank anything.
+#: Measured on the uncompacted control at 60,000 tokens: 78 points under the harness's own
+#: default narration guidance, 9 with narration suppressed and 15 with it demanded. A control
+#: that swings by more than this is choosing between two behaviours, not measuring one.
+MAX_USABLE_CORRECTNESS_RANGE: Final[float] = 20.0
+
+
+def _accuracy_note(correctness_range: dict[str, float], control: str, repeats: int) -> list[str]:
+    """Return a warning when the control's own correctness is too unstable to rank against.
+
+    The cost axis has been policed by :func:`_stability_note` since the beginning; the
+    accuracy axis was not, and it silently produced three unusable matrices. The `correct`
+    column shows the median-*cost* repeat, so a control scoring 100, 22 and 22 prints an
+    unremarkable 100 unless something says otherwise.
+
+    Args:
+        correctness_range: Points between the least and most correct repeat, per strategy.
+        control: Name of the uncompacted baseline.
+        repeats: Repeats per strategy.
+
+    Returns:
+        Zero or two lines, matching the shape of the cost warning.
+    """
+    if repeats < 2:
+        return []
+    swing = correctness_range.get(control, 0.0)
+    if swing <= MAX_USABLE_CORRECTNESS_RANGE:
+        return []
+    return [
+        "",
+        (
+            f"ACCURACY NOT RANKABLE: repeats of the uncompacted control varied by {swing:.0f} "
+            f"points, over the {MAX_USABLE_CORRECTNESS_RANGE:.0f}-point limit. Nothing can be "
+            "compared against a baseline that unstable. The cost columns are unaffected."
+        ),
+    ]
+
+
 def _stability_note(verdict: JointVerdict, spread: dict[str, float], repeats: int) -> list[str]:
     """Return a warning when the recommendation's margin is inside the measured noise.
 
@@ -478,6 +516,7 @@ def _render(
         f"VERDICT: {verdict.recommended}",
         verdict.rationale,
         *_stability_note(verdict, spread, repeats),
+        *_accuracy_note(correctness_range, verdict.baseline.strategy, repeats),
     ]
     failed = [name for name, run in live.items() if run.summarizer_failures]
     if failed:
