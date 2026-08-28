@@ -15,6 +15,7 @@ they are copied, not recomputed.
 | `run-07-60k.*` | 7 | 60,000 | harness | 53 | 54 min |
 | `run-08-120k.*` | 8 | 120,000 | harness | 53 | 1 h 34 min |
 | `run-09a-400k-aborted.*` | 9a | 400,000 | harness | 53 | 57 min, **failed** |
+| `run-09-272k.*` | 9 | 272,000 | harness | 53 | 1 h 45 min |
 
 **The aborted run is kept on purpose.** It exits 1 with no table, because four strategies
 died of `context_length_exceeded` and one of them was the control. It is the evidence for the
