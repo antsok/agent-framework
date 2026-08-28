@@ -89,6 +89,26 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--narration",
+        default="neutral",
+        choices=["prompted", "neutral", "suppressed"],
+        help=(
+            "How hard the scenario pushes the model to restate tool values. 'neutral' says "
+            "nothing either way, leaving the framework's own guidance as the only driver -- "
+            "the configuration a typical caller gets. Default neutral."
+        ),
+    )
+    parser.add_argument(
+        "--markers-per-tool",
+        type=int,
+        default=2,
+        help=(
+            "Verifiable codes each tool result carries. Two is easy for a model to echo into "
+            "its reply, which lets narration preserve what a strategy discards. More codes "
+            "raise the resolution of the accuracy measure and make narration a weaker substitute."
+        ),
+    )
+    parser.add_argument(
         "--tool-turns",
         type=int,
         default=6,
@@ -427,6 +447,8 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
             filler_turns=args.filler_turns,
             filler_tokens=args.filler_tokens,
             tool_turns=args.tool_turns,
+            markers_per_tool=args.markers_per_tool,
+            narration=args.narration,
         )
         user_tokens = (
             sum(len(str(content)) for turn in scenario.transcript.turns for m in turn.request for content in m.contents)
@@ -500,6 +522,8 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
                 filler_turns=args.filler_turns,
                 filler_tokens=args.filler_tokens,
                 tool_turns=args.tool_turns,
+                markers_per_tool=args.markers_per_tool,
+                narration=args.narration,
             )
             options = StrategyOptions(
                 tokenizer=tokenizer,
@@ -518,6 +542,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
                 agent_kind=args.agent,
                 tool_result_tokens=args.tool_result_tokens,
                 force_tool_calls=not args.no_force_tool_calls,
+                narration=args.narration,
             )
             repeats.append(outcome)
             if chosen_scenario is None:

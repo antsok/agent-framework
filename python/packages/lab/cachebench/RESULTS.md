@@ -237,6 +237,26 @@ straightforwardly compatible.** Any strategy that rewrites or drops an assistant
 invalidating the signature chain, which fails the request outright rather than degrading the
 answer.
 
+## Known gap: every planted fact sits at the head of its tool result
+
+`ToolResultCompactionStrategy` collapses an old tool-call group by **head-truncating its
+result at 4,096 characters** — it does not extract, summarise or select. Our markers sit in
+the first ~100 characters of each result, so they survive that cut unconditionally.
+
+**So "tool_result kept 17 of 17 facts" is a fact about our data layout, not about the
+strategy.** The same strategy on a workload whose salient content trails its filler would
+score zero, and every table here would look identical while measuring the opposite thing.
+
+Planned test: return 6,000-8,000 token results from some tool calls with their facts at the
+**end**, keeping others head-placed, so one run measures both. At 4,096 characters the
+truncation keeps roughly the first 6-8% of such a result, so the tail-placed facts should be
+destroyed while the head-placed ones survive — a strategy that currently scores 100% should
+land near 50%. If it does not, the mechanism is not what this note claims.
+
+This is also the argument for content-aware extraction over positional truncation: the
+information a strategy keeps should not depend on where in the payload a tool happened to put
+it.
+
 ## Observations holding across runs
 
 **The correctness result is a cliff, not a gradient.** Strategies that never evict messages
