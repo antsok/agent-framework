@@ -1045,3 +1045,32 @@ def test_retrieval_guidance_is_appended_to_narration_modes_that_lack_it() -> Non
     for mode in ("prompted", "neutral", "suppressed"):
         assert RETRIEVAL_GUIDANCE in resolve_instructions(mode, retrieval_guidance=True)
         assert RETRIEVAL_GUIDANCE not in resolve_instructions(mode, retrieval_guidance=False)
+
+
+def test_spread_placement_puts_codes_beyond_a_head_truncation() -> None:
+    """Spread codes must not all survive the 4,096 characters a collapsed result keeps.
+
+    ``ToolResultCompactionStrategy`` head-truncates, so head-placed codes survive it
+    unconditionally and every tool-oriented strategy scores a perfect result for free. That
+    made the accuracy column say more about where the scenario put its markers than about
+    what compaction preserves.
+    """
+    codes = tuple(f"AA-{index:04d}" for index in range(8))
+    lookups = {"early": codes}
+
+    head = make_scope_tools(lookups, 8_000, narration="neutral", placement="head")[0]()
+    spread = make_scope_tools(lookups, 8_000, narration="neutral", placement="spread")[0]()
+
+    assert all(head.index(code) < 4_096 for code in codes)
+    assert sum(1 for code in codes if spread.index(code) < 4_096) <= 2
+    # Both carry every code, so the two placements differ in position only and the accuracy
+    # ceiling before compaction is identical.
+    assert all(code in spread for code in codes)
+
+
+def test_spread_placement_does_not_change_the_result_size() -> None:
+    """Placement must not move the cost axis, or the two arms are not comparable."""
+    lookups = {"early": tuple(f"AA-{index:04d}" for index in range(8))}
+    head = make_scope_tools(lookups, 8_000, narration="neutral", placement="head")[0]()
+    spread = make_scope_tools(lookups, 8_000, narration="neutral", placement="spread")[0]()
+    assert abs(len(head) - len(spread)) < 0.01 * len(head)

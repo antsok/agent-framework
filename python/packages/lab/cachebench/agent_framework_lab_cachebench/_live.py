@@ -48,7 +48,7 @@ from agent_framework import (
 from agent_framework._compaction import project_included_messages
 
 from ._metrics import serialize_message
-from ._recall import FactOutcome, RecallScenario, build_recall_scenario, render_codes, score_answer
+from ._recall import FactOutcome, RecallScenario, build_recall_scenario, render_code, render_codes, score_answer
 from ._runner import unsupported_option
 from ._strategies import StrategyOptions, build_strategy
 from ._transcripts import TRUE_CHARS_PER_TOKEN, sized_text
@@ -498,6 +498,7 @@ def make_scope_tools(
     lookups: Mapping[str, tuple[str, ...]],
     filler_tokens: int = DEFAULT_TOOL_RESULT_TOKENS,
     narration: str = "prompted",
+    placement: str = "spread",
 ) -> list[Callable[[], str]]:
     """Build one no-argument tool per scope, so the wrong scope cannot be requested.
 
@@ -512,6 +513,9 @@ def make_scope_tools(
         lookups: Scope label mapped to the verifiable codes it carries.
         filler_tokens: Approximate size of each result, in tokens.
         narration: Whether the result text asks the model to restate its values.
+        placement: ``"spread"`` distributes the codes through the result; ``"head"`` puts
+            them all at the front, which is what earlier runs used and what lets a
+            head-truncating strategy preserve every fact for free.
 
     Returns:
         One callable per scope, named ``lookup_<scope>``.
@@ -520,18 +524,50 @@ def make_scope_tools(
     for index, scope in enumerate(sorted(lookups)):
         codes = lookups[scope]
         body = sized_text(f"[{scope} deployment notes] ", index * 31 + 7, filler_tokens, TRUE_CHARS_PER_TOKEN)
-        tools.append(
-            _scope_tool(
-                scope,
-                # This trailing instruction is what makes the model restate the values in
-                # its own reply. Dropping it leaves the facts only in the tool result.
-                render_codes(codes)
-                + "; "
-                + ("" if narration != "prompted" else "all of these values must appear in the final report. ")
-                + body,
-            )
-        )
+        # This trailing instruction is what makes the model restate the values in its own
+        # reply. Dropping it leaves the facts only in the tool result.
+        preamble = "" if narration != "prompted" else "all of these values must appear in the final report. "
+        if placement == "head":
+            result = f"{render_codes(codes)}; {preamble}{body}"
+        else:
+            result = f"{preamble}{_spread_codes(codes, body)}"
+        tools.append(_scope_tool(scope, result))
     return tools
+
+
+def _spread_codes(codes: Sequence[str], body: str) -> str:
+    """Distribute labelled codes evenly through a tool result instead of heading it.
+
+    Placement decides what a size-reducing strategy can destroy.
+    ``ToolResultCompactionStrategy`` head-truncates a collapsed result at 4,096 characters,
+    so codes sitting at the front survive that cut unconditionally no matter how large the
+    result is. That flatters every tool-oriented strategy, and the flattery grows with the
+    result size: at 25,200 tokens a head-placed code set is 0.6% of the text and 100% of the
+    scored content.
+
+    Spreading them makes the result behave like a real one, where the useful line is as
+    likely to be in the middle as at the top.
+
+    Args:
+        codes: The verifiable codes this tool result carries.
+        body: Filler text to distribute them through.
+
+    Returns:
+        The body with one code inserted before each of ``len(codes)`` evenly spaced
+        segments, at a word boundary so no code is glued to a partial word.
+    """
+    if not codes:
+        return body
+    words = body.split(" ")
+    # One segment per code, so the first code stays near the front and the last sits near the
+    # end. Anything less even would leave a head-heavy result and reproduce the problem.
+    step = max(len(words) // len(codes), 1)
+    parts: list[str] = []
+    for index, code in enumerate(codes):
+        start = index * step
+        end = (index + 1) * step if index + 1 < len(codes) else len(words)
+        parts.append(f"{render_code(index, code)}; {' '.join(words[start:end])}")
+    return " ".join(parts)
 
 
 def build_live_agent(
@@ -641,6 +677,7 @@ async def run_live(
     force_tool_calls: bool = True,
     narration: str = "prompted",
     retrieval_guidance: bool = True,
+    fact_placement: str = "spread",
 ) -> LiveOutcome:
     """Run the scenario end to end against a real agent.
 
@@ -663,6 +700,10 @@ async def run_live(
         retrieval_guidance: Append the clause telling the model to quote every identifier it
             is asked for. Dropping it measures the model's own willingness to enumerate,
             which is a different thing from what compaction left behind.
+        fact_placement: Where the verifiable codes sit inside each tool result. ``"spread"``
+            distributes them; ``"head"`` reproduces the earlier runs, in which every code sat
+            inside the first 4,096 characters and so survived head-truncating compaction
+            unconditionally.
 
     Returns:
         The outcome. A turn that fails sets ``error`` and stops the run rather than raising,
@@ -687,7 +728,9 @@ async def run_live(
 
     scope_tools = [
         _wrap(name.removeprefix("lookup_"), fn)
-        for fn in make_scope_tools(scenario.tool_lookups, tool_result_tokens, narration=narration)
+        for fn in make_scope_tools(
+            scenario.tool_lookups, tool_result_tokens, narration=narration, placement=fact_placement
+        )
         if (name := fn.__name__)
     ]
 
