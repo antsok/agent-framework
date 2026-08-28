@@ -14,6 +14,13 @@ they are copied, not recomputed.
 | --- | --- | ---: | --- | ---: | ---: |
 | `run-07-60k.*` | 7 | 60,000 | harness | 53 | 54 min |
 | `run-08-120k.*` | 8 | 120,000 | harness | 53 | 1 h 34 min |
+| `run-09a-400k-aborted.*` | 9a | 400,000 | harness | 53 | 57 min, **failed** |
+
+**The aborted run is kept on purpose.** It exits 1 with no table, because four strategies
+died of `context_length_exceeded` and one of them was the control. It is the evidence for the
+finding that `gpt-5.4-mini` has a 272,000-token *input* limit rather than the advertised
+400,000 window, and that a strategy configured against the advertised number can never fire.
+A run that produces no table is not the same as a run that produces nothing.
 
 ## Columns the analysis omits
 
