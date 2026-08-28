@@ -513,9 +513,10 @@ def make_scope_tools(
         lookups: Scope label mapped to the verifiable codes it carries.
         filler_tokens: Approximate size of each result, in tokens.
         narration: Whether the result text asks the model to restate its values.
-        placement: ``"spread"`` distributes the codes through the result; ``"head"`` puts
-            them all at the front, which is what earlier runs used and what lets a
-            head-truncating strategy preserve every fact for free.
+        placement: ``"spread"`` distributes the codes on their own labelled lines;
+            ``"buried"`` distributes them inline in prose, where finding them is itself part
+            of the task; ``"head"`` puts them all at the front, which lets a head-truncating
+            strategy preserve every fact for free.
 
     Returns:
         One callable per scope, named ``lookup_<scope>``.
@@ -530,12 +531,12 @@ def make_scope_tools(
         if placement == "head":
             result = f"{render_codes(codes)}; {preamble}{body}"
         else:
-            result = f"{preamble}{_spread_codes(codes, body)}"
+            result = f"{preamble}{_spread_codes(codes, body, labelled=placement == 'spread')}"
         tools.append(_scope_tool(scope, result))
     return tools
 
 
-def _spread_codes(codes: Sequence[str], body: str) -> str:
+def _spread_codes(codes: Sequence[str], body: str, *, labelled: bool) -> str:
     """Distribute labelled codes evenly through a tool result instead of heading it.
 
     Placement decides what a size-reducing strategy can destroy.
@@ -552,6 +553,12 @@ def _spread_codes(codes: Sequence[str], body: str) -> str:
         codes: The verifiable codes this tool result carries.
         body: Filler text to distribute them through.
 
+    Keyword Args:
+        labelled: Give each code its own line with a ``[record N]`` prefix. Unlabelled, the
+            codes go inline in running prose, which is a materially harder task: two
+            independent controls read the first code of each tool result and none of the
+            other seven, scoring exactly 11 of 53 both times.
+
     Returns:
         The body with one code inserted before each of ``len(codes)`` evenly spaced
         segments, at a word boundary so no code is glued to a partial word.
@@ -567,12 +574,10 @@ def _spread_codes(codes: Sequence[str], body: str) -> str:
         start = index * step
         end = (index + 1) * step if index + 1 < len(codes) else len(words)
         segment = " ".join(words[start:end])
-        # Each code gets its own labelled line. Spreading them through running prose instead
-        # made them unfindable rather than merely late: with codes inline, two separate
-        # controls read the first code of each result and none of the rest, scoring exactly
-        # 11 of 53 both times. That measures whether a model can spot a needle in filler,
-        # which is not what this benchmark is for.
-        parts.append(f"\n[record {index + 1}] {render_code(index, code)}\n{segment}")
+        if labelled:
+            parts.append(f"\n[record {index + 1}] {render_code(index, code)}\n{segment}")
+        else:
+            parts.append(f"{render_code(index, code)}; {segment} ")
     return "".join(parts)
 
 

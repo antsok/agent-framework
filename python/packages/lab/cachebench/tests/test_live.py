@@ -55,7 +55,14 @@ from agent_framework_lab_cachebench._live import (
     make_scope_tools,
     resolve_instructions,
 )
-from agent_framework_lab_cachebench._live_cli import _cost, _representative, _spread, _summarizer_cost, build_parser
+from agent_framework_lab_cachebench._live_cli import (
+    _correctness_range,
+    _cost,
+    _representative,
+    _spread,
+    _summarizer_cost,
+    build_parser,
+)
 
 TOKENIZER = CharacterEstimatorTokenizer()
 
@@ -1074,3 +1081,61 @@ def test_spread_placement_does_not_change_the_result_size() -> None:
     head = make_scope_tools(lookups, 8_000, narration="neutral", placement="head")[0]()
     spread = make_scope_tools(lookups, 8_000, narration="neutral", placement="spread")[0]()
     assert abs(len(head) - len(spread)) < 0.01 * len(head)
+
+
+def test_buried_placement_hides_codes_in_prose() -> None:
+    """The buried arm must be genuinely harder, or it measures nothing the spread arm does not.
+
+    It is not a broken variant of spread. Retrieval under noise is a real property of a real
+    agent, and it is the arm where compaction can score *above* the uncompacted control by
+    deleting the haystack the codes were hiding in. Measured on the control: 11 of 53 buried
+    against 53 of 53 head-placed.
+    """
+    codes = tuple(f"AA-{index:04d}" for index in range(8))
+    lookups = {"early": codes}
+
+    buried = make_scope_tools(lookups, 8_000, narration="neutral", placement="buried")[0]()
+    spread = make_scope_tools(lookups, 8_000, narration="neutral", placement="spread")[0]()
+
+    # Same positions, so the two arms differ in findability alone and not in what a
+    # head-truncating strategy would keep.
+    assert sum(1 for code in codes if buried.index(code) < 4_096) == 1
+    assert sum(1 for code in codes if spread.index(code) < 4_096) == 1
+    # Only the spread arm gives each code a line of its own.
+    assert sum(1 for line in spread.split("\n") if line.startswith("[record ")) == 8
+    assert sum(1 for line in buried.split("\n") if line.startswith("[record ")) == 0
+    assert all(code in buried for code in codes)
+
+
+def test_correctness_range_reads_the_scored_outcome_not_the_raw_run() -> None:
+    """Regression: correctness is not an attribute of ``LiveOutcome``.
+
+    Reading it from the raw run passes ruff, pyright and the whole suite, then raises
+    ``AttributeError`` on the first live call -- after the run has already been paid for.
+    That is the second time a change has died that way, so the computation is a function
+    with a test rather than a line inside the run loop.
+    """
+    scenario = build_live_scenario(salt="range", filler_turns=1, filler_tokens=10, tool_turns=6, markers_per_tool=2)
+    codes = [fact.marker for fact in scenario.facts]
+    pricing = ModelPricing(input_per_million=1.0, cached_read_per_million=0.1, output_per_million=2.0)
+
+    def outcome_with(answer: str) -> LiveOutcome:
+        return LiveOutcome(
+            strategy="none",
+            calls=(_call(2, 2, inp=100),),
+            answer=answer,
+            final_prompt=" ".join(codes),
+            tool_calls_made=0,
+            turns_completed=1,
+            turns_total=1,
+        )
+
+    perfect = outcome_with(" ".join(codes))
+    partial = outcome_with(" ".join(codes[: len(codes) // 4]))
+    scenarios = {id(perfect): scenario, id(partial): scenario}
+
+    assert not hasattr(perfect, "correctness")
+    spread = _correctness_range([perfect, partial], scenarios, pricing)
+    assert spread > 0
+    # A single repeat says nothing about stability, and must not claim to.
+    assert _correctness_range([perfect], {id(perfect): scenario}, pricing) == 0.0
