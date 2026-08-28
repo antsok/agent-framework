@@ -50,7 +50,11 @@ from agent_framework_lab_cachebench import (
     wants_client_side_history,
 )
 from agent_framework_lab_cachebench._advisor import ModelPricing
-from agent_framework_lab_cachebench._live import make_scope_tools
+from agent_framework_lab_cachebench._live import (
+    RETRIEVAL_GUIDANCE,
+    make_scope_tools,
+    resolve_instructions,
+)
 from agent_framework_lab_cachebench._live_cli import _cost, _representative, _spread, _summarizer_cost, build_parser
 
 TOKENIZER = CharacterEstimatorTokenizer()
@@ -1017,3 +1021,27 @@ async def test_run_live_drives_every_turn_and_counts_tool_use() -> None:
 
 
 # endregion
+
+
+def test_retrieval_guidance_can_be_switched_off() -> None:
+    """The guidance clause must be removable, or its contribution cannot be measured.
+
+    It is the only sentence suspected of holding the closing answer stable, and the run that
+    would settle whether it or the reply cap caused the earlier bimodality needs an arm
+    without it.
+    """
+    with_guidance = resolve_instructions("neutral", retrieval_guidance=True)
+    without = resolve_instructions("neutral", retrieval_guidance=False)
+
+    assert RETRIEVAL_GUIDANCE in with_guidance
+    assert RETRIEVAL_GUIDANCE not in without
+    # The rest of the instructions must survive: an arm that also changed the persona would
+    # not isolate the clause.
+    assert without and without in with_guidance
+
+
+def test_retrieval_guidance_is_appended_to_narration_modes_that_lack_it() -> None:
+    """Every narration mode gains the clause when asked, not just the neutral one."""
+    for mode in ("prompted", "neutral", "suppressed"):
+        assert RETRIEVAL_GUIDANCE in resolve_instructions(mode, retrieval_guidance=True)
+        assert RETRIEVAL_GUIDANCE not in resolve_instructions(mode, retrieval_guidance=False)

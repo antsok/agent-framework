@@ -62,6 +62,7 @@ __all__ = [
     "AGENT_KINDS",
     "DEFAULT_TOOL_RESULT_TOKENS",
     "NEUTRAL_INSTRUCTIONS",
+    "RETRIEVAL_GUIDANCE",
     "TERSE_INSTRUCTIONS",
     "LiveOutcome",
     "MeteredClient",
@@ -71,6 +72,7 @@ __all__ = [
     "build_live_scenario",
     "make_lookup_tool",
     "make_scope_tools",
+    "resolve_instructions",
     "run_live",
     "score_live",
     "unretrieved_facts",
@@ -105,11 +107,20 @@ final-report exemption is load-bearing: without it the model applies the rule to
 too, and the recall score measures the instruction rather than the compaction.
 """
 
-NEUTRAL_INSTRUCTIONS: Final[str] = (
-    "You are a meticulous engineering assistant. Follow every stated requirement exactly. "
+RETRIEVAL_GUIDANCE: Final[str] = (
     "When asked for codes or identifiers, quote them exactly as they appear earlier in this "
     "conversation, and list every one you are asked for. If a value is not present in the "
     "conversation, say so plainly for that item instead of guessing or inventing one."
+)
+"""The retrieval clause, isolated so a run can measure what it is worth.
+
+Kept separate from the instructions it is appended to because it is the only sentence
+suspected of holding the closing answer stable, and a suspicion that cannot be switched off
+cannot be tested.
+"""
+
+NEUTRAL_INSTRUCTIONS: Final[str] = (
+    "You are a meticulous engineering assistant. Follow every stated requirement exactly. " + RETRIEVAL_GUIDANCE
 )
 """Agent instructions that say nothing about narrating tool results.
 
@@ -626,6 +637,7 @@ async def run_live(
     tool_result_tokens: int = DEFAULT_TOOL_RESULT_TOKENS,
     force_tool_calls: bool = True,
     narration: str = "prompted",
+    retrieval_guidance: bool = True,
 ) -> LiveOutcome:
     """Run the scenario end to end against a real agent.
 
@@ -645,6 +657,9 @@ async def run_live(
             and carries fewer tokens, which moves both axes for reasons unrelated to
             compaction: measured at 3 of 6 scopes reached and a 33% input swing between
             identical runs on one model, against 6 of 6 and 8% on another.
+        retrieval_guidance: Append the clause telling the model to quote every identifier it
+            is asked for. Dropping it measures the model's own willingness to enumerate,
+            which is a different thing from what compaction left behind.
 
     Returns:
         The outcome. A turn that fails sets ``error`` and stops the run rather than raising,
@@ -680,7 +695,7 @@ async def run_live(
         tokenizer=options.tokenizer,
         tools=scope_tools,
         recorder=recorder,
-        instructions=_INSTRUCTIONS_BY_NARRATION[narration],
+        instructions=resolve_instructions(narration, retrieval_guidance=retrieval_guidance),
         max_context_window_tokens=options.max_context_window_tokens,
         max_output_tokens=options.max_output_tokens,
     )
@@ -855,3 +870,27 @@ _INSTRUCTIONS_BY_NARRATION: Final[dict[str, str]] = {
     "neutral": NEUTRAL_INSTRUCTIONS,
     "suppressed": TERSE_INSTRUCTIONS,
 }
+
+
+def resolve_instructions(narration: str, *, retrieval_guidance: bool = True) -> str:
+    """Return the agent instructions for a narration mode.
+
+    Args:
+        narration: One of the keys of :data:`_INSTRUCTIONS_BY_NARRATION`.
+
+    Keyword Args:
+        retrieval_guidance: Append :data:`RETRIEVAL_GUIDANCE`, which tells the model to quote
+            every identifier it is asked for. Dropping it measures how much of the closing
+            answer is the model's own willingness to enumerate rather than what compaction
+            left behind.
+
+    Returns:
+        The instructions to install on the agent.
+
+    Raises:
+        KeyError: If ``narration`` is not a known mode.
+    """
+    base = _INSTRUCTIONS_BY_NARRATION[narration]
+    if retrieval_guidance:
+        return base if RETRIEVAL_GUIDANCE in base else f"{base} {RETRIEVAL_GUIDANCE}"
+    return base.replace(RETRIEVAL_GUIDANCE, "").strip()

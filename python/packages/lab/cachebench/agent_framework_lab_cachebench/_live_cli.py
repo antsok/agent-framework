@@ -99,6 +99,16 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--no-retrieval-guidance",
+        action="store_true",
+        help=(
+            "Drop the clause telling the model to quote every identifier it is asked for. "
+            "Measures how much of the closing answer is the model's willingness to enumerate "
+            "rather than what compaction left behind. Off by default: without the clause the "
+            "control was bimodal, and a control that unstable cannot rank anything."
+        ),
+    )
+    parser.add_argument(
         "--sweeping-question",
         action="store_true",
         help=(
@@ -577,6 +587,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
                 tool_result_tokens=args.tool_result_tokens,
                 force_tool_calls=not args.no_force_tool_calls,
                 narration=args.narration,
+                retrieval_guidance=not args.no_retrieval_guidance,
             )
             repeats.append(outcome)
             if chosen_scenario is None:
