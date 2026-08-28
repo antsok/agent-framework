@@ -101,13 +101,15 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--fact-placement",
         default="spread",
-        choices=["spread", "head"],
+        choices=["spread", "buried", "head"],
         help=(
-            "Where the verifiable codes sit inside each tool result. 'head' puts them all at "
-            "the front, inside the 4,096 characters ToolResultCompactionStrategy keeps when it "
-            "collapses a group, so every tool-oriented strategy preserves them for free no "
-            "matter how large the result is. 'spread' distributes them, which is how a real "
-            "result behaves. Default spread; 'head' reproduces runs 7 to 9."
+            "Where the verifiable codes sit inside each tool result, which decides what is "
+            "being measured. 'spread' puts each on its own labelled line, so the score is how "
+            "much compaction preserved. 'buried' puts them inline in prose, so the score is "
+            "retrieval under noise as well -- a real property, and one where compaction can "
+            "score above the uncompacted control by deleting the haystack. 'head' puts them "
+            "all at the front, inside the 4,096 characters a collapsed tool result keeps, so "
+            "every tool-oriented strategy preserves them for free; it reproduces runs 7 to 9."
         ),
     )
     parser.add_argument(
@@ -287,6 +289,29 @@ def _representative(outcomes: list[LiveOutcome], pricing: ModelPricing) -> LiveO
     counts and the cost cannot disagree with each other the way blended figures would.
     """
     return sorted(outcomes, key=lambda outcome: _cost(outcome, pricing))[len(outcomes) // 2]
+
+
+def _correctness_range(
+    outcomes: list[LiveOutcome], scenarios: dict[int, RecallScenario], pricing: ModelPricing
+) -> float:
+    """Return the points between the least and most correct repeat.
+
+    Correctness lives on the *scored* outcome, not on the raw run, and each repeat has to be
+    scored against the scenario it was actually driven from: markers are salted per repeat, so
+    scoring one repeat's answer against another's facts finds nothing at all.
+
+    Args:
+        outcomes: Every repeat of one strategy.
+        scenarios: Scenario per repeat, keyed by ``id(outcome)``.
+        pricing: Rates, needed only to build the scored outcome.
+
+    Returns:
+        The gap in percentage points, or 0.0 for a single repeat, where nothing is known.
+    """
+    if len(outcomes) < 2:
+        return 0.0
+    scores = [_to_joint(outcome, scenarios[id(outcome)], pricing).correctness for outcome in outcomes]
+    return (max(scores) - min(scores)) * 100
 
 
 def _spread(outcomes: list[LiveOutcome], pricing: ModelPricing) -> float:
@@ -622,8 +647,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
         chosen_scenario = scenarios[id(representative)]
         live[name] = representative
         spread[name] = _spread(repeats, pricing)
-        scores = [item.correctness for item in repeats]
-        correctness_range[name] = (max(scores) - min(scores)) * 100 if len(scores) > 1 else 0.0
+        correctness_range[name] = _correctness_range(repeats, scenarios, pricing)
         nofetch[name] = len(unretrieved_facts(representative, chosen_scenario))
         joint.append(_to_joint(representative, chosen_scenario, pricing))
 
