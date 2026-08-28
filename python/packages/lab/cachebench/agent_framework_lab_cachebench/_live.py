@@ -106,13 +106,29 @@ too, and the recall score measures the instruction rather than the compaction.
 """
 
 NEUTRAL_INSTRUCTIONS: Final[str] = (
-    "You are a meticulous engineering assistant. Follow every stated requirement exactly."
+    "You are a meticulous engineering assistant. Follow every stated requirement exactly. "
+    "When asked for codes or identifiers, quote them exactly as they appear earlier in this "
+    "conversation, and list every one you are asked for. If a value is not present in the "
+    "conversation, say so plainly for that item instead of guessing or inventing one."
 )
 """Agent instructions that say nothing about narrating tool results.
 
 Paired with ``narration="neutral"`` and the harness, this is the configuration a typical
 caller gets: the framework's own ``DEFAULT_HARNESS_INSTRUCTIONS`` are then the only thing
 telling the model to explain what it learned between tool calls.
+
+The retrieval guidance is deliberate, and it is a different kind of instruction from the
+narration guidance. Narration changes *where the information is*, copying tool output into
+assistant prose, which lets a strategy delete the original and still appear lossless.
+Retrieval guidance only changes *whether the model looks* for what is already there; it
+cannot resurrect a fact compaction removed. Only the first kind can mask damage.
+
+It also earns its place empirically: without it, the closing answer was bimodal -- identical
+runs recalled 42 of 53 and 5 of 53 -- because the model chose between enumerating and
+summarising. That variance was wider than the differences being measured.
+
+The "say so plainly" clause guards the other direction: a model that invents a plausible
+code would score as recall without the fact ever being in context.
 """
 
 _INSTRUCTIONS: Final[str] = (
@@ -671,6 +687,10 @@ async def run_live(
     session = agent.create_session()
 
     turns = scenario.transcript.turns
+    # Every closing turn is scored. With several targeted questions the answer is their union,
+    # and survival is judged against the union of the prompts that carried them.
+    first_answer_turn = len(turns) - max(scenario.answer_turn_count, 1)
+    answer_parts: list[str] = []
     replies: list[str] = []
     error: str | None = None
     completed = 0
@@ -722,13 +742,14 @@ async def run_live(
         completed += 1
         text = response.text or ""
         replies.append(text)
-        if index == len(turns) - 1:
-            answer = text
+        if index >= first_answer_turn:
+            answer_parts.append(text)
 
     # Survival is judged against every prompt sent during the final turn, not just the last
     # one. A turn that calls a tool sends several, and a fact the model saw in any of them
     # was available to it when it wrote the answer.
     final_prompt = "\n".join(call.prompt_text for call in recorder.calls[final_mark:])
+    answer = chr(10).join(answer_parts)
 
     return LiveOutcome(
         strategy=strategy_name,
@@ -784,6 +805,7 @@ def build_live_scenario(
     tool_turns: int = 6,
     narration: str = "prompted",
     markers_per_tool: int = 2,
+    subset_questions: bool = True,
 ) -> RecallScenario:
     """Build the scenario in the shape a live run needs.
 
@@ -796,6 +818,8 @@ def build_live_scenario(
             actually engage instead of scoring a perfect result for doing nothing.
         narration: How hard the scenario pushes the model to restate tool values.
         markers_per_tool: Verifiable codes each tool result carries.
+        subset_questions: Close with several targeted questions rather than one sweeping
+            one. On by default: the sweeping form measures stamina, not retrieval.
 
     Returns:
         A scenario whose padding sits in the user turns, because the assistant's replies are
@@ -809,6 +833,7 @@ def build_live_scenario(
         tool_turns=tool_turns,
         narration=narration,
         markers_per_tool=markers_per_tool,
+        subset_questions=subset_questions,
     )
 
 

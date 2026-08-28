@@ -99,6 +99,15 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--sweeping-question",
+        action="store_true",
+        help=(
+            "Close with one question demanding every code at once, instead of several "
+            "targeted ones. Measures willingness to enumerate rather than retrieval: "
+            "identical runs returned 42 of 53 and 5 of 53 under it."
+        ),
+    )
+    parser.add_argument(
         "--markers-per-tool",
         type=int,
         default=2,
@@ -449,6 +458,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
             tool_turns=args.tool_turns,
             markers_per_tool=args.markers_per_tool,
             narration=args.narration,
+            subset_questions=not args.sweeping_question,
         )
         user_tokens = (
             sum(len(str(content)) for turn in scenario.transcript.turns for m in turn.request for content in m.contents)
@@ -524,6 +534,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
                 tool_turns=args.tool_turns,
                 markers_per_tool=args.markers_per_tool,
                 narration=args.narration,
+                subset_questions=not args.sweeping_question,
             )
             options = StrategyOptions(
                 tokenizer=tokenizer,
