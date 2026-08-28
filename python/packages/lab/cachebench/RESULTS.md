@@ -4,6 +4,11 @@ Live-agent runs (`cachebench-live`). Each row of each table is the **median of 3
 the `+-` column is the spread between cheapest and dearest repeat, and a ranking is only
 meaningful where the gap between strategies exceeds it.
 
+**Source data.** Runs 7 onward keep their verbatim output and exact invocation in
+[`runs/`](runs/), one pair of files per run. The tables below are a selection of those
+columns, copied rather than recomputed, so any figure here can be checked against the log of
+the same run number. Runs 1-6 predate that practice and exist only as the tables below.
+
 ## Shared configuration
 
 Unless a run says otherwise:
@@ -35,6 +40,12 @@ between runs, which moves both axes for reasons unrelated to compaction. Runs ma
 | 4 | `z-ai/glm-5.3-flash` | OpenRouter | Chat Completions | no | *partly usable* |
 | 5 | `z-ai/glm-5.2` | OpenRouter / Crusoe | Chat Completions | no | `none` (5x discount) |
 | 6 | `z-ai/glm-5.2` | OpenRouter / BaseTen | Chat Completions | no | `none` (10x discount) |
+| 7 | `gpt-5.4-mini` | Azure Foundry | Responses | yes | `none` (60K window, harness) |
+| 8 | `gpt-5.4-mini` | Azure Foundry | Responses | yes | `none` (120K window, harness) |
+
+Runs 7 and 8 are a **separate experiment** on the harness agent at wider windows, with 53
+planted facts instead of 17. The shared configuration above does not describe them; their own
+section below does.
 
 ---
 
@@ -219,6 +230,223 @@ not the model, decides whether compaction pays.**
 
 Note also that `none` remained the *only* setting keeping all 17 facts in both runs, at both
 discounts. The discount moves the cost axis. It does not touch the correctness axis.
+
+---
+
+## Window sweep on the harness agent (Runs 7 and 8)
+
+Runs 1-6 all used the `plain` agent at a 32,000-token window with 17 planted facts. Runs 7
+and 8 re-ask the question on the **harness** agent — `create_harness_agent`, the wiring a
+typical caller gets, including the framework's own narration guidance — at wider windows and
+with a much finer accuracy measure.
+
+**Everything below differs from Runs 1-6 except the model and the route**, so these are a
+separate experiment, not two more rows in the cross-model table:
+
+| | Runs 1-6 | Runs 7-8 |
+| --- | --- | --- |
+| Agent | `plain` | **`harness`** |
+| Planted facts | 17 | **53** (8 codes per tool result) |
+| Turns | 16 | **22** |
+| Closing question | one sweeping question | **7 targeted questions**, union covers all 53 |
+| System prompt | no retrieval guidance | **retrieval guidance added** |
+
+The last two rows are why this experiment exists. Under the single sweeping question and no
+retrieval guidance, identical repeats of the *uncompacted control* returned 42 of 53 and 5 of
+53 — a control that unstable makes every accuracy number in the table meaningless. Adding the
+retrieval guidance fixed it; splitting the question did not (both forms score 53/53 once the
+guidance is present). The targeted form is kept anyway as insurance at larger fact counts.
+`--sweeping-question` restores the old behaviour.
+
+**Material is scaled with the window on purpose.** Holding the conversation fixed while
+widening the window would leave every strategy inert — nothing to evict, and a tool-oriented
+strategy that evicts nothing scores a perfect result for doing nothing, which is a fault this
+harness has already produced once. Both runs therefore hold the *pressure* constant at the
+same ~165% of budget as Runs 1-6, and vary only the absolute window.
+
+| | Run 7 | Run 8 |
+| --- | ---: | ---: |
+| Window / reply reservation | 60,000 / 2,048 | 120,000 / 2,048 |
+| Working budget | 57,952 | 117,952 |
+| Filler per padding turn | 4,000 | 8,000 |
+| Tool result size | 8,000 | 16,000 |
+| Material (tool share) | ~96,600 (50%) | ~192,000 (50%) |
+| Material vs budget | 167% | 163% |
+
+Exact invocation, Run 7. Run 8 differs only in the three sizing flags above.
+
+```sh
+export FOUNDRY_PROJECT_ENDPOINT="https://<resource>.services.ai.azure.com/api/projects/<project>"
+export FOUNDRY_MODEL="gpt-5.4-mini"
+
+cachebench_live foundry:gpt-5.4-mini \
+  --agent harness \
+  --strategies none,truncation,sliding_window,tool_result,selective_tool_call,context_window,context_window_aggressive,context_window_lazy,summarization,token_budget_fallback,token_budget_tools_first,token_budget_truncate_first,token_budget_window_first,token_budget_summarize \
+  --summarizer-provider foundry:gpt-5.4-mini \
+  --repeats 3 \
+  --context-window 60000 --max-output-tokens 2048 \
+  --markers-per-tool 8 --tool-turns 6 \
+  --filler-tokens 4000 --tool-result-tokens 8000 \
+  --price-input 0.66 --price-cached 0.07 --price-output 3.96
+```
+
+Authentication is `DefaultAzureCredential` against an `az login` session, and the deployment
+is `gpt-5.4-mini` on GlobalStandard. Prices are the same EUR rates as Run 2 — 0.66/M in,
+0.07/M cached (9.4x), 3.96/M out — so the costs are on the same scale as Run 2's even though
+the conversations are not the same.
+
+### Run 7 — 60,000-token window, harness agent
+
+Wall clock 54 minutes for the full 14x3 matrix. **Control: 53/53 facts, 100% correct, 0
+unfetched, +-5%.** This is the first run in the series whose accuracy baseline is stable
+enough to rank against.
+
+| strategy | peak tok | hit% | in | cost | +- | vs none | facts | lost | ignored | correct |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| truncation | 42,855 | 83% | 713,463 | $0.1352 | 26% | -17% | 29/53 | 24 | 24 | 11% |
+| context_window_aggressive | 17,301 | 56% | 388,128 | $0.1385 | 2% | -15% | 8/53 | 45 | 0 | 17% |
+| token_budget_tools_first | 25,613 | 67% | 523,828 | $0.1459 | 13% | -10% | 16/53 | 37 | 16 | 2% |
+| token_budget_window_first | 32,927 | 66% | 505,106 | $0.1495 | 6% | -8% | 16/53 | 37 | 0 | 31% |
+| token_budget_truncate_first | 25,823 | 67% | 528,565 | $0.1512 | 3% | -7% | 16/53 | 37 | 8 | 17% |
+| **none** | **78,307** | **93%** | **1,309,273** | **$0.1621** | **5%** | — | **53/53** | **0** | **0** | **100%** |
+| sliding_window | 21,233 | 7% | 289,092 | $0.1880 | 6% | +16% | 0/53 | 53 | 0 | 2% |
+| token_budget_fallback | 25,802 | 62% | 600,575 | $0.1885 | 10% | +16% | 16/53 | 37 | 0 | 31% |
+| token_budget_summarize | 26,411 | 59% | 462,546 | $0.1925 | 5% | +19% | 34/53 | 19 | 0 | 65% |
+| context_window | 26,937 | 60% | 597,304 | $0.1963 | 7% | +21% | 21/53 | 32 | 0 | 41% |
+| selective_tool_call | 61,330 | 84% | 1,129,087 | $0.1978 | 58% | +22% | 53/53 | 0 | 0 | 100% |
+| tool_result | 63,274 | 84% | 1,156,724 | $0.2076 | 28% | +28% | 53/53 | 0 | 0 | 100% |
+| context_window_lazy | 39,574 | 67% | 836,137 | $0.2368 | 1% | +46% | 24/53 | 29 | 0 | 46% |
+| summarization | 17,236 | 0% | 268,482 | $0.2514 | 4% | +55% | 26/53 | 27 | 0 | 50% |
+
+Verdict `none`, for the seventh time: the only two settings that keep the answer intact both
+cost more than not compacting.
+
+**Four rows are not rankable on cost.** A gap smaller than the spread is not a result, and
+here that disqualifies `truncation` (-17% at +-26%), `token_budget_tools_first` (-10% at
++-13%), `selective_tool_call` (+22% at +-58%) and `tool_result` (+28% at +-28%). Note *which*
+rows those are: the two accuracy-preserving strategies are precisely the two whose cost cannot
+be pinned down. They behaved the same way on this model at 32,000 (+-68% and +-34% in Run 2),
+so it is a property of `gpt-5.4-mini` on this route rather than a fluke. Rows that are safely
+rankable: `context_window_aggressive` (-15%, +-2%), `token_budget_truncate_first` (-7%,
++-3%), `context_window_lazy` (+46%, +-1%), `summarization` (+55%, +-4%).
+
+**The break-even formula predicted the cost column before it was read.** Using
+`d = 0.070/0.66 = 0.106` with each row's own hit rate and token count:
+
+| strategy | tokens vs none | hit rate | predicted | measured |
+| --- | ---: | ---: | ---: | ---: |
+| `truncation` | -45% | 93% -> 83% | -17% | **-17%** |
+| `tool_result` | -12% | 93% -> 84% | +30% | **+28%** |
+| `selective_tool_call` | -14% | 93% -> 84% | +27% | +22% |
+
+At 93% -> 84% the cut required to break even is **32%**; `tool_result` cut 12%. This is the
+third independent confirmation of the formula, and the first at a window other than 32,000.
+
+**New finding: surviving compaction is not the same as being usable.** The `facts` column
+counts planted codes still present in the closing prompts, and it has been read as the ceiling
+on accuracy. Run 7 shows the ceiling is not tight:
+
+| strategy | facts surviving | ignored | correct |
+| --- | ---: | ---: | ---: |
+| `truncation` | 29/53 | **24** | 11% |
+| `token_budget_tools_first` | 16/53 | **16** | 2% |
+| `token_budget_summarize` | 34/53 | 0 | 65% |
+
+`truncation` left 29 codes in front of the model and the model used none of them. The codes
+survive as strings while the surrounding turns saying *which deployment each belongs to* are
+deleted, so a question about the staging deployment cannot be answered from a bare list of
+identifiers. `token_budget_summarize` keeps 13 more facts than `context_window` and scores 24
+points better, for the same reason in reverse: a summary preserves the labelling.
+
+The practical consequence is that **fact-survival counts overstate what message-deleting
+strategies preserve**, and the two axes have to be measured separately. Earlier runs could not
+show this, because their controls were never stable enough to trust the accuracy column.
+
+### Run 8 — 120,000-token window, harness agent
+
+Wall clock 1 h 34 min. Same instrument as Run 7, with the material doubled so the pressure on
+the window is unchanged. **Control: 53/53 facts, 100% correct, 0 unfetched, +-7%**, peak
+prompt 150,112 tokens — still well inside this model's real 400,000-token limit, so `none`
+is a genuinely available option here and not an artefact of a small target.
+
+| strategy | peak tok | hit% | in | cost | +- | vs none | facts | lost | ignored | correct |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| context_window_aggressive | 33,574 | 69% | 761,131 | $0.2006 | 1% | -33% | 16/53 | 37 | 0 | 31% |
+| token_budget_truncate_first | 57,655 | 75% | 1,013,942 | $0.2328 | 6% | -23% | 19/53 | 34 | 8 | 22% |
+| token_budget_tools_first | 64,953 | 71% | 951,341 | $0.2406 | 4% | -20% | 16/53 | 37 | 16 | 2% |
+| token_budget_window_first | 58,272 | 77% | 1,133,946 | $0.2443 | 0% | -19% | 24/53 | 29 | 24 | 2% |
+| truncation | 91,456 | 83% | 1,513,282 | $0.2690 | 2% | -11% | 29/53 | 24 | 8 | 41% |
+| **none** | **150,112** | **93%** | **2,498,779** | **$0.3009** | **7%** | — | **53/53** | **0** | **0** | **100%** |
+| context_window | 58,541 | 69% | 1,287,983 | $0.3421 | 36% | +14% | 27/53 | 26 | 8 | 37% |
+| sliding_window | 41,014 | 6% | 553,299 | $0.3557 | 6% | +18% | 0/53 | 45 | 0 | 17% |
+| selective_tool_call | 117,970 | 85% | 2,182,901 | $0.3670 | 4% | +22% | 53/53 | 0 | 16 | 70% |
+| tool_result | 118,114 | 84% | 2,168,925 | $0.3681 | 5% | +22% | 53/53 | 0 | 0 | 100% |
+| token_budget_fallback | 58,075 | 62% | 1,318,701 | $0.3966 | 17% | +32% | 25/53 | 28 | 9 | 31% |
+| token_budget_summarize | 58,423 | 60% | 1,287,404 | $0.4267 | 35% | +42% | 21/53 | 32 | 0 | 41% |
+| context_window_lazy | 75,529 | 67% | 1,608,395 | $0.4401 | 11% | +46% | 35/53 | 18 | 0 | 67% |
+| summarization | 132,022 | 51% | 2,105,284 | $0.7972 | 59% | +165% | 47/53 | 6 | 5 | 80% |
+
+Verdict `none` again. Only four settings score 70% or better, and three of them cost more:
+`tool_result` (+22%, 100%), `selective_tool_call` (+22%, 70%), `summarization` (+165%, 80%).
+
+**The measurement is much tighter here than at 60,000.** Only `context_window` (+14% at
++-36%), `token_budget_summarize` (+42% at +-35%) and `summarization` (+165% at +-59%) are
+disqualified by spread. In particular `tool_result` lands at +-5% and `selective_tool_call` at
++-4%, where at 60,000 they were +-28% and +-58% — so this run, unlike Run 7, can actually
+rank the accuracy-preserving strategies on cost.
+
+**Formula check, second window.** Same `d = 0.106`:
+
+| strategy | tokens vs none | hit rate | predicted | measured |
+| --- | ---: | ---: | ---: | ---: |
+| `context_window_aggressive` | -70% | 93% -> 69% | -31% | **-33%** |
+| `truncation` | -39% | 93% -> 83% | -7% | -11% |
+| `tool_result` | -13% | 93% -> 84% | +28% | +22% |
+| `selective_tool_call` | -13% | 93% -> 85% | +24% | **+22%** |
+| `context_window_lazy` | -36% | 93% -> 67% | +53% | +46% |
+| `summarization` | -16% | 93% -> 51% | +172% | **+165%** |
+
+Every prediction is within 7 points and **all six err in the same direction**, which is
+explained rather than hand-waved: the formula models input tokens only, and every compacting
+strategy also generates fewer output tokens than `none` (2,775-4,191 against 4,058) at 6x the
+input price. The residual is the output term the formula omits.
+
+### What the two windows say together
+
+Runs 7 and 8 differ only in window size and a proportional material scale, so they can be
+compared directly with each other. Run 2 is shown for context but used a different agent,
+fact count and question format, so its column is not a clean third point.
+
+| | Run 2 — 32K *(plain, 17 facts)* | Run 7 — 60K | Run 8 — 120K |
+| --- | ---: | ---: | ---: |
+| `none` peak prompt | 39,870 | 78,307 | 150,112 |
+| `none` hit rate | 89% | 93% | 93% |
+| `tool_result` vs none | +63% *(+-68%)* | +28% *(+-28%)* | **+22%** *(+-5%)* |
+| `truncation` vs none | +22% | -17% *(+-26%)* | **-11%** *(+-2%)* |
+| cheapest setting | -13% | -15% | **-33%** |
+| best accuracy under `none` | 100% (`tool_result`) | 100% (`tool_result`) | 100% (`tool_result`) |
+
+Two things move with the window, in opposite directions:
+
+- **Keeping the answer intact gets cheaper.** The `tool_result` penalty falls from +63% to
+  +22%. Its hit rate barely moves (71% -> 84%), but the prefix it preserves is a larger share
+  of a larger prompt, so less is re-billed.
+- **Throwing the answer away gets much cheaper.** The cheapest setting improves from -13% to
+  -33%, because at 120,000 there is far more absolute volume to delete.
+
+So the **gap between "cheap and wrong" and "correct and expensive" widens with scale**: at
+32,000 the two ends of the table were 76 points apart, at 120,000 they are 55 points apart on
+cost but the accuracy difference is 69 points (31% against 100%). Bigger windows do not make
+compaction safer; they make the wrong choice cheaper and therefore more tempting.
+
+The conclusion does not change at any window tested: **no setting beat `none` on both axes.**
+
+**`selective_tool_call` regressed on accuracy at scale** — 53/53 facts surviving but 70%
+correct, with 16 ignored, where at 60,000 the same strategy scored 100%. This is the
+survives-but-unused effect from Run 7 appearing in a strategy that deletes no messages at all.
+With 16,000-token tool results, collapsing an old tool-call group removes enough surrounding
+context that codes still present in the prompt stop being attributable to a deployment. It is
+the clearest single demonstration that the `facts` column is a ceiling and not a prediction.
 
 ---
 
