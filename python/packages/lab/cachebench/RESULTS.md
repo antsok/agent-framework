@@ -47,9 +47,9 @@ between runs, which moves both axes for reasons unrelated to compaction. Runs ma
 
 Runs 7 to 9 are a **separate experiment** on the harness agent at wider windows, with 53
 planted facts instead of 17. The shared configuration above does not describe them; their own
-section below does. Runs 7 and 8 hold the conversation at ~165% of the budget so that
-compaction is forced to fire; Run 9 is the opposite regime, with the conversation fitting
-inside the window.
+section below does. Runs 7 and 8 overflow the budget, by 135% and 127% of it measured at
+the uncompacted peak, so compaction is forced to fire; Run 9 is the opposite regime, with
+the conversation fitting inside the window at 86%.
 
 ---
 
@@ -287,7 +287,10 @@ direct evidence that no answer was truncated. The default cap is now 4,000 regar
 widening the window would leave every strategy inert — nothing to evict, and a tool-oriented
 strategy that evicts nothing scores a perfect result for doing nothing, which is a fault this
 harness has already produced once. Both runs therefore hold the *pressure* constant at the
-same ~165% of budget as Runs 1-6, and vary only the absolute window.
+sizing rule as Runs 1-6, and vary only the absolute window. Measured on the uncompacted
+peak, that came out at 135% of budget for Run 7 and 127% for Run 8; the estimates in the
+table below are the planning figures, which overstate the real prompt by about 25% because
+they count characters rather than tokens for the user-side material.
 
 | | Run 7 | Run 8 |
 | --- | ---: | ---: |
@@ -296,7 +299,8 @@ same ~165% of budget as Runs 1-6, and vary only the absolute window.
 | Filler per padding turn | 4,000 | 8,000 |
 | Tool result size | 8,000 | 16,000 |
 | Material (tool share) | ~96,600 (50%) | ~192,000 (50%) |
-| Material vs budget | 167% | 163% |
+| Planning estimate vs budget | 167% | 163% |
+| **Measured peak vs budget** | **135%** | **127%** |
 
 Exact invocation, Run 7. Run 8 differs only in the three sizing flags above.
 
@@ -658,7 +662,7 @@ Wall clock 1 h 45 min, no failed turns, no dropped options. **Control: 53/53 fac
 correct, 0 unfetched, +-0%** — the tightest control in the series, and its 94% hit rate is
 the highest.
 
-This is the regime Runs 1-8 never covered. There the conversation ran at ~165% of the budget,
+This is the regime Runs 1-8 never covered. There the conversation overflowed the budget,
 so compaction was forced to fire and the only question was what it cost. Here it **fits**:
 window set to the model's true 272,000-token input limit, peak prompt 232,748.
 
@@ -693,12 +697,12 @@ a mutation to its prefix costs. Compaction here cuts 20-40% of tokens and pays f
 points of hit rate, which at a 9.4x discount is a losing trade almost every time.
 
 **Do not read Run 9 as a fourth point on the Run 7-8 curve.** Those two held the conversation
-at ~165% of budget and varied the window; this one changes the regime. Grouped properly:
+over the budget and varied the window; this one changes the regime. Grouped properly:
 
 | regime | window | `tool_result` vs none | cheapest that keeps 53/53 |
 | --- | ---: | ---: | ---: |
-| overflowing, 165% of budget | 60,000 | +28% | +22% (`selective_tool_call`) |
-| overflowing, 165% of budget | 120,000 | +22% | +22% (`selective_tool_call`) |
+| overflowing, 135% of budget | 60,000 | +28% | +22% (`selective_tool_call`) |
+| overflowing, 127% of budget | 120,000 | +22% | +22% (`selective_tool_call`) |
 | **fitting, 86% of the limit** | **272,000** | **+30%** | **+30% (`tool_result`)** |
 
 The penalty falls with window size while the conversation overflows, and comes back when it
