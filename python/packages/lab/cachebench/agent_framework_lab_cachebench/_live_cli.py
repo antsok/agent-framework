@@ -139,7 +139,19 @@ def build_parser() -> argparse.ArgumentParser:
             "will accept, which disables compaction with no warning."
         ),
     )
-    parser.add_argument("--answer-max-tokens", type=int, default=900, help="Cap on generated replies.")
+    parser.add_argument(
+        "--answer-max-tokens",
+        type=int,
+        default=4_000,
+        help=(
+            "Cap sent as max_tokens on every request, which the provider honours exactly. "
+            "Must comfortably exceed the longest closing answer: at roughly 12 tokens per "
+            "labelled code, enumerating 53 of them costs ~640 tokens before any prose, and a "
+            "truncated answer is scored as lost facts and reads as compaction damage. Raising "
+            "it is nearly free, since replies average ~150 tokens and models do not pad to "
+            "the cap."
+        ),
+    )
     parser.add_argument(
         "--keep-last-tool-groups",
         type=int,

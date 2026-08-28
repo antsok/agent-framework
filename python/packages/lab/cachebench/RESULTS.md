@@ -503,6 +503,33 @@ So the advertised 400,000 is **total** context: **272,000 input + 128,000 output
 documented GPT-5-class split. There is no configuration in which 400,000 tokens of history
 reach this model.
 
+**The error names the offending parameter.** HTTP 400,
+`{"type": "invalid_request_error", "code": "context_length_exceeded", "param": "input",
+"message": "Your input exceeds the context window of this model."}` — `param: input`, not the
+request as a whole.
+
+**And the two limits are independent, not a pool you can allocate between.** Every probe above
+ran with `max_tokens=16`, so a tiny output cap was already in force when 275,292 tokens of
+input were refused. Varying the cap at fixed input changes nothing:
+
+| input | `max_tokens` | result |
+| ---: | ---: | --- |
+| 270,293 | 16 | accepted |
+| 270,293 | 100,000 | accepted |
+| 270,293 | 128,000 | accepted |
+| ~280,000 | 16 | **`context_length_exceeded`** |
+
+A large output cap does not consume input allowance, and a tiny one does not buy any. The
+service also does not range-check `max_tokens` — 200,000 is accepted without complaint on a
+short prompt — so it is a generation cap, not a reservation.
+
+**This matters for how MAF's budget is configured.** `input_budget =
+max_context_window_tokens - max_output_tokens` models a *shared* pool, and this model does not
+have one. Passing the advertised 400,000 is therefore wrong regardless of what the output
+argument is set to. The correct value for `max_context_window_tokens` is **the model's input
+limit**, 272,000, whenever a provider states input and output ceilings separately; the
+subtraction then just adds a safety margin for the reply.
+
 **The real cause was the output reservation, and it is worth being precise about it.** Every
 threshold in MAF is a fraction of an *input budget*, and both layers compute that budget the
 same way:
