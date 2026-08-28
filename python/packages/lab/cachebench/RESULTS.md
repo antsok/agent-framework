@@ -255,12 +255,33 @@ separate experiment, not two more rows in the cross-model table:
 | Closing question | one sweeping question | **7 targeted questions**, union covers all 53 |
 | System prompt | no retrieval guidance | **retrieval guidance added** |
 
-The last two rows are why this experiment exists. Under the single sweeping question and no
-retrieval guidance, identical repeats of the *uncompacted control* returned 42 of 53 and 5 of
-53 — a control that unstable makes every accuracy number in the table meaningless. Adding the
-retrieval guidance fixed it; splitting the question did not (both forms score 53/53 once the
-guidance is present). The targeted form is kept anyway as insurance at larger fact counts.
-`--sweeping-question` restores the old behaviour.
+The last two rows exist because identical repeats of the *uncompacted control* once returned
+42 of 53 and 5 of 53, and a control that unstable makes every accuracy number meaningless.
+Both changes were made in response, and both appeared to work.
+
+**Neither was the cause.** A later 2x2 on the control settled it — the reply cap was:
+
+| retrieval guidance | `--answer-max-tokens` | correct | facts present but unlisted | spread |
+| --- | ---: | ---: | ---: | ---: |
+| on | 900 | 100% | 0 | 10% |
+| **off** | **900** | **33%** | **36** | **43%** |
+| on | 4,000 | 100% | 0 | 34% |
+| **off** | **4,000** | **100%** | **0** | **3%** |
+
+Enumerating 53 labelled codes costs roughly 640 tokens before any prose, so a 900-token cap
+truncated the answer, and the scorer counted the missing tail as facts the model ignored. The
+retrieval guidance worked by pushing codes ahead of prose so more of them fit inside the
+truncation; the targeted questions worked by never asking for more than about eight at a time.
+Both were compensating for a cap, and at 4,000 tokens neither is needed.
+
+The instrument lesson is general: **a reply cap converts silently into apparent accuracy
+loss**, and it looks exactly like compaction damage — facts present in context, absent from
+the answer. The `ignored` column is what distinguishes them only if the control is checked at
+the same cap.
+
+Runs 7 to 9 are unaffected. They ran the targeted format at the 900-token cap, where each
+answer lists about eight codes, and their controls scored 53/53 with 0 ignored — which is the
+direct evidence that no answer was truncated. The default cap is now 4,000 regardless.
 
 **Material is scaled with the window on purpose.** Holding the conversation fixed while
 widening the window would leave every strategy inert — nothing to evict, and a tool-oriented

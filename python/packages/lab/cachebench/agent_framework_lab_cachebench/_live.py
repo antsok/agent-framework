@@ -134,9 +134,12 @@ assistant prose, which lets a strategy delete the original and still appear loss
 Retrieval guidance only changes *whether the model looks* for what is already there; it
 cannot resurrect a fact compaction removed. Only the first kind can mask damage.
 
-It also earns its place empirically: without it, the closing answer was bimodal -- identical
-runs recalled 42 of 53 and 5 of 53 -- because the model chose between enumerating and
-summarising. That variance was wider than the differences being measured.
+It is not, however, what made the closing answer stable. That was the reply cap. Measured on
+the uncompacted control asking for all 53 codes at once: without this clause a 900-token cap
+scored 33% with 36 facts present but unlisted, and raising the cap to 4,000 scored 100% with
+no clause at all. The guidance had been compensating for a truncated answer by pushing codes
+ahead of prose. At an adequate cap it changes nothing here, and it is kept for continuity with
+the runs already measured rather than because it is doing work.
 
 The "say so plainly" clause guards the other direction: a model that invents a plausible
 code would score as recall without the fact ever being in context.

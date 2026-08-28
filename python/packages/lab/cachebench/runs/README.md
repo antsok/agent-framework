@@ -16,6 +16,11 @@ they are copied, not recomputed.
 | `run-08-120k.*` | 8 | 120,000 | harness | 53 | 1 h 34 min |
 | `run-09a-400k-aborted.*` | 9a | 400,000 | harness | 53 | 57 min, **failed** |
 | `run-09-272k.*` | 9 | 272,000 | harness | 53 | 1 h 45 min |
+| `probe-reply-cap.*` | — | 60,000 | harness | 53 | 14 min |
+
+`probe-reply-cap` is a 2x2 on the control alone, crossing the retrieval-guidance clause with
+the reply cap. It is the evidence that the earlier accuracy instability was truncation rather
+than retrieval, and it is why `--answer-max-tokens` now defaults to 4,000.
 
 **The aborted run is kept on purpose.** It exits 1 with no table, because four strategies
 died of `context_length_exceeded` and one of them was the control. It is the evidence for the
