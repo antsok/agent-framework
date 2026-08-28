@@ -546,6 +546,49 @@ Runs 7, 8 and 9 are unaffected. They set a deliberately *simulated* window with 
 correctly configured real-world case: its 232,748-token peak is 86% of its 269,952 budget and
 86% of the model's true 272,000 input limit alike.
 
+#### The reservation is arithmetic; the cap is a request option, and they are separate
+
+`max_output_tokens` on a compaction strategy only subtracts. Whether the model is actually
+held to it depends on a different value reaching the request. Measured on this deployment,
+one prompt asking for a long essay:
+
+| request | output produced |
+| --- | ---: |
+| `max_tokens=32` | exactly 32 |
+| `max_tokens=200` | exactly 200 |
+| **omitted** | **1,444** |
+
+So the cap works and is honoured exactly — and **there is no modest default**. Omit it and the
+model generates whatever it likes, bounded only by its 128,000-token output ceiling.
+
+`create_harness_agent` connects the two, but weakly:
+
+```python
+# agent_framework/_harness/_agent.py:633
+if max_output_tokens is not None:
+    default_opts.setdefault("max_tokens", max_output_tokens)
+```
+
+`setdefault`, so a caller who supplies their own `max_tokens` — in `default_options` or in
+per-run options — silently keeps the reservation and the cap out of step. **A hand-built
+`Agent` carrying a `ContextWindowCompactionStrategy` gets no cap at all**, and then the
+reservation is fiction: the strategy compacts to leave room for 2,048 tokens of reply and the
+model is free to emit 40,000, overflowing the window the strategy exists to protect.
+
+These runs sit on the safe side of that. The reservation was 2,048 while the request cap was
+900 (`--answer-max-tokens`, applied in `_providers.py:93` and travelling per turn), so more
+was reserved than could ever be used. The 1,148-token gap understates the input budget by 2%
+at 60,000 and 0.4% at 272,000, which changes nothing. Replies averaged ~147 tokens against
+that 900-token cap, so nothing was truncated — the control scoring 53/53 is the proof.
+
+**One caveat this raises about earlier work.** The withdrawn *sweeping question* variant asked
+for all 53 codes in a single reply. At roughly 12 tokens per labelled code that is ~640 tokens
+before any prose, against a 900-token cap — close enough that truncation is a live alternative
+explanation for the 42/53 and 5/53 results previously attributed solely to missing retrieval
+guidance. The two cannot be separated from the data already collected. Re-running that variant
+with a raised cap would settle it, and the targeted-question format now in use is nowhere near
+the cap either way.
+
 Note also what is *not* at fault. The bundled `tiktoken` counter agreed with the service to
 within **6 tokens on a 270,294-token prompt** (0.002%), so local counting is sound; the error
 was entirely in the assumed window.
