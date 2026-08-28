@@ -47,6 +47,16 @@ __all__ = [
     "score_answer",
 ]
 
+_FIRST_QUESTION: Final[str] = (
+    "Quote verbatim every requirement code you were given, the change-of-direction "
+    "reference, and which pipeline we settled on. List them plainly, no preamble."
+)
+_SWEEPING_QUESTION: Final[str] = (
+    "Write the final report summary now. It must contain, verbatim: every requireme"
+    "nt code you were given; the change-of-direction reference and which pipeline w"
+    "e settled on; and every code returned by the lookups. List them plainly, no preamble."
+)
+
 #: Kinds of planted fact, in the order they appear in the conversation.
 FACT_KINDS: Final[tuple[str, ...]] = ("requirement", "correction", "tool_result")
 
@@ -201,6 +211,8 @@ class RecallScenario:
     transcript: Transcript
     facts: tuple[PlantedFact, ...]
     contradictions: tuple[Contradiction, ...] = ()
+    answer_turn_count: int = 1
+    """Closing turns whose replies are scored, counted from the end of the transcript."""
     tool_turn_scopes: Mapping[int, str] = field(default_factory=dict[int, str])
     """Turn index mapped to the scope that turn asks for.
 
@@ -259,6 +271,7 @@ def build_recall_scenario(
     tool_result_tokens: int = 600,
     narration: str = "prompted",
     markers_per_tool: int = 2,
+    subset_questions: bool = False,
 ) -> RecallScenario:
     """Build a conversation whose final question needs facts from throughout the history.
 
@@ -276,6 +289,9 @@ def build_recall_scenario(
         chars_per_token: Sizing basis for the filler.
         bulk_in_user: Put the filler in the user turns rather than the scripted replies,
             for live runs where the assistant writes its own replies.
+        subset_questions: Close with several targeted questions instead of one sweeping
+            one. Their union covers every planted fact, but each asks for a handful of
+            codes, which measures retrieval rather than willingness to enumerate.
         markers_per_tool: Verifiable codes each tool result carries. Two is easy for a model
             to echo into its reply, which lets narration preserve everything a strategy
             discards. More codes raise the resolution of the accuracy measure and make
@@ -488,25 +504,44 @@ def build_recall_scenario(
 
     turns.append(_tool_turn("late", 43, next_position))
 
-    # Final turn: answerable only by using every planted fact.
-    turns.append(
-        TranscriptTurn(
-            request=(
-                Message(
-                    role="user",
-                    contents=[
-                        (
-                            "Write the final report summary now. It must contain, verbatim: every "
-                            "requirement code you were given; the change-of-direction reference and which "
-                            "pipeline we settled on; and both region codes and both fallback hosts from "
-                            "the lookups. List them plainly, no preamble."
-                        )
-                    ],
-                ),
-            ),
-            reply=(),
+    # Closing questions. One sweeping question demanding every code at once measures the
+    # model's willingness to enumerate rather than whether the information survived:
+    # identical runs returned 42 of 53 and 5 of 53. Splitting the same coverage across
+    # several targeted questions asks for a handful of codes at a time, which is retrieval
+    # rather than stamina, and their union still covers every planted fact.
+    if subset_questions:
+        turns.append(
+            TranscriptTurn(
+                request=(Message(role="user", contents=[_FIRST_QUESTION]),),
+                reply=(),
+            )
         )
-    )
+        for label in lookups:
+            turns.append(
+                TranscriptTurn(
+                    request=(
+                        Message(
+                            role="user",
+                            contents=[
+                                (
+                                    "Next question. Quote verbatim every code returned by the "
+                                    f"{label} deployment lookup. List them plainly, no preamble."
+                                )
+                            ],
+                        ),
+                    ),
+                    reply=(),
+                )
+            )
+        answer_turns = 1 + len(lookups)
+    else:
+        turns.append(
+            TranscriptTurn(
+                request=(Message(role="user", contents=[_SWEEPING_QUESTION]),),
+                reply=(),
+            )
+        )
+        answer_turns = 1
 
     return RecallScenario(
         contradictions=(
@@ -525,6 +560,7 @@ def build_recall_scenario(
         facts=tuple(facts),
         tool_lookups=lookups,
         tool_turn_scopes=tool_turn_scopes,
+        answer_turn_count=answer_turns,
     )
 
 

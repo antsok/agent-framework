@@ -916,6 +916,27 @@ async def test_dropping_tool_choice_also_stops_forcing() -> None:
     assert outcome.turns_completed == outcome.turns_total
 
 
+async def test_every_closing_answer_reaches_the_score() -> None:
+    """The scored answer must contain what the model said in every closing turn.
+
+    With several targeted closing questions the answer is their union. Collecting the parts
+    but never joining them leaves the answer empty, and every fact scores as ignored -- a
+    control that recalls nothing looks like a stable measurement rather than a broken one.
+    """
+    scenario = build_live_scenario(salt="join", filler_turns=3, filler_tokens=50, tool_turns=6)
+    assert scenario.answer_turn_count > 1, "the default scenario should close with several questions"
+
+    outcome = await run_live(
+        ProviderRuntime(client=StubChatClient(), model="stub"),
+        strategy_name="none",
+        options=_options(),
+        scenario=scenario,
+    )
+
+    assert outcome.answer, "no closing answer reached the scorer"
+    assert outcome.answer.count("a reply with some body to it") == scenario.answer_turn_count
+
+
 async def test_run_live_reports_a_failed_turn_without_raising() -> None:
     """A failing turn must return a partial result, not throw away the spend already made."""
 
