@@ -51,6 +51,7 @@ from ._metrics import serialize_message
 from ._recall import FactOutcome, RecallScenario, build_recall_scenario, render_code, render_codes, score_answer
 from ._runner import unsupported_option
 from ._strategies import StrategyOptions, build_strategy
+from ._toolsummary import RECALL_TOOL_NAME, ToolResultAnchoredSummarizationCompactionStrategy
 from ._transcripts import TRUE_CHARS_PER_TOKEN, sized_text
 
 if TYPE_CHECKING:
@@ -71,6 +72,7 @@ __all__ = [
     "build_live_agent",
     "build_live_scenario",
     "make_lookup_tool",
+    "make_recall_tool",
     "make_scope_tools",
     "resolve_instructions",
     "run_live",
@@ -494,6 +496,31 @@ def _scope_tool(scope: str, result: str) -> Callable[[], str]:
     return tool
 
 
+def make_recall_tool() -> Callable[[str], str]:
+    """Build the tool ``ToolResultAnchoredSummarizationCompactionStrategy`` asks the agent to call.
+
+    It echoes what it is given straight back. That is the whole point: the value of the call
+    is not what the tool computes but that the model's own recollection ends up in the
+    transcript as a tool result, which the provider issued and which survives strategies that
+    shed assistant prose.
+
+    Returns:
+        A callable named :data:`RECALL_TOOL_NAME`.
+    """
+
+    def tool(values: str) -> str:
+        return f"Recorded. These values remain available after the earlier results are removed:\n{values}"
+
+    tool.__name__ = RECALL_TOOL_NAME
+    tool.__doc__ = (
+        "Record identifiers and values seen in earlier tool results, so they survive when "
+        "those results are removed from the conversation to save space.\n\n"
+        "Args:\n    values: Every identifier, code and concrete value, verbatim, grouped by "
+        "the tool that returned it."
+    )
+    return tool
+
+
 def make_scope_tools(
     lookups: Mapping[str, tuple[str, ...]],
     filler_tokens: int = DEFAULT_TOOL_RESULT_TOKENS,
@@ -752,6 +779,13 @@ async def run_live(
         )
         if (name := fn.__name__)
     ]
+
+    # The recall tool is registered only for the strategy that asks the model to call it.
+    # Adding it to every row would put an extra tool in every prompt and give unrelated
+    # strategies something new to call, which is a difference between rows that has nothing
+    # to do with compaction.
+    if isinstance(strategy, ToolResultAnchoredSummarizationCompactionStrategy):
+        scope_tools = [*scope_tools, make_recall_tool()]
 
     agent = build_live_agent(
         runtime,
