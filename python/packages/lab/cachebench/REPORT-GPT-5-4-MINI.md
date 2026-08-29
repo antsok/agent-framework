@@ -172,7 +172,8 @@ limit, not the advertised window.
 
 ## 6. What to do
 
-**Size your tool results before choosing a strategy.** Below roughly 10,000 tokens per result,
+**Size your tool results before choosing a strategy** -- provisionally, since section 7
+notes the measurement cannot yet separate per-result size from total tool output. Below roughly 10,000 tokens per result,
 having the model record the values and dropping the originals is both cheapest and lossless.
 Above that, keep a fixed proportion of each result and do not trust a summary.
 
@@ -189,7 +190,37 @@ unless the request says so.
 **Read the spread, not the median.** A strategy with a 78-point accuracy spread is not
 "usually fine".
 
-## 7. Limits
+## 7. What to try next
+
+**Summarise each tool result on its own, not all of them in one call.** The record thins as
+there is more to record, and the current design asks for one record covering every result in
+the band -- so at 272,000 the model is asked to recall values from 151,200 tokens of material
+in a single answer. Summarising one result at a time bounds that work to roughly 8,000 tokens
+per call whatever the window size, which is the regime where the record scored 53 of 53.
+
+Design notes for whoever builds it:
+
+- **Summarise when a result ages into the band, not when it arrives.** Compressing on
+  ingestion means the full result never reaches the model on any later turn, which is a
+  different product decision from compaction. Ageing keeps the result intact while it is
+  recent and the model is still working with it.
+- **Cost is the obvious trade.** One forced call per result instead of one per conversation,
+  so a six-tool run pays six extra agent turns. Against that, each call is small and reads a
+  cached prefix, and the current single-call design already costs one extra turn.
+- **Cache behaviour should be no worse and may be better.** Each record is created once,
+  frozen, and covers one group, so mutations still march forward and never revisit. Records
+  accumulate rather than being rewritten, which is the property that gave this family its
+  86-90% hit rates.
+- **It gives the fallback something better to do.** With per-result records, a thin or missing
+  record loses that result rather than everything the band held.
+
+**And settle which axis the degradation follows.** The window series scaled per-result size
+and total tool output together -- 8,000 to 25,200 and 48,000 to 151,200 -- so the two cannot
+be told apart from it. Sixteen 8,000-token results reaching a comparable total is what
+separates them, and until that is done the recommendation in section 6 is provisional on this
+point.
+
+## 8. Limits
 
 **One model, one route, one conversation shape.** The mechanisms generalise; the crossover
 point almost certainly does not.
