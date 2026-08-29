@@ -24,6 +24,19 @@ they are copied, not recomputed.
 | `run-14-272k-spread.*` | 14 | 272,000 | harness | 53 | 1 h 30 min |
 | `run-15-272k-anchored-scaled.*` | 15 | 272,000 | harness | 53 | 25 min |
 | `run-probe-calibration.*` | — | 60,000 | harness | 53 | 25 min |
+| `run-16-60k-final.*` | 16 | 60,000 | harness | 53 | 47 min |
+| `run-17-120k-final.*` | 17 | 120,000 | harness | 53 | 1 h 10 min |
+| `run-18-272k-final.*` | 18 | 272,000 | harness | 53 | 2 h |
+| `run-x-unpinned-void.*` | — | 60,000 | harness | 53 | **void** |
+
+Runs 16 to 18 are the final configuration: five repeats, pinned, values spread on labelled
+lines, a 12,000-token reply cap, per-scope scoring and a combined closing question. They are
+the three points of the window series and the only runs whose numbers appear in
+`REPORT-GPT-5-4-MINI.md`.
+
+`run-x-unpinned-void` is kept as evidence, not as data. It is the unpinned matrix whose
+uncompacted control varied 102% in cost across five repeats while the strategy row gathered
+eight fewer facts than the control, and it is why every later run is pinned.
 
 Runs 10 to 12 are the **buried** arm: codes inline in prose, so the score covers retrieval as
 well as preservation. Their controls read 11 of 53, which is the five non-tool facts plus the
