@@ -66,6 +66,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "AGENT_KINDS",
+    "COMPACTION_GUIDANCE",
     "DEFAULT_TOOL_RESULT_TOKENS",
     "NEUTRAL_INSTRUCTIONS",
     "RETRIEVAL_GUIDANCE",
@@ -115,10 +116,30 @@ final-report exemption is load-bearing: without it the model applies the rule to
 too, and the recall score measures the instruction rather than the compaction.
 """
 
+COMPACTION_GUIDANCE: Final[str] = (
+    "Earlier tool results may have been shortened, summarised or replaced by a compaction "
+    "record. Treat values in such a record as authoritative for the tool it names, and treat "
+    "information as absent only if it appears nowhere, including there."
+)
+"""How to read what compaction left behind.
+
+Given to *every* row, including the uncompacted control, which is what keeps it a measurement
+device rather than an advantage for the strategies that leave artefacts. Without it a strategy
+that removed the original results is scored by a question naming a tool whose result it
+deleted, against an instruction inviting the answer "no longer present" -- so the score partly
+measures whether the model thought to look at the record rather than whether the record
+preserved anything.
+
+Legitimate by the same test applied to the narration guidance: it changes *whether the model
+looks*, not *where the information is*, and cannot resurrect a value the record does not
+contain. It is inert for the control, which has no artefacts to interpret, and that asymmetry
+belongs in any report of the numbers.
+"""
+
 RETRIEVAL_GUIDANCE: Final[str] = (
     "When asked for codes or identifiers, quote them exactly as they appear earlier in this "
     "conversation, and list every one you are asked for. If a value is not present in the "
-    "conversation, say so plainly for that item instead of guessing or inventing one."
+    "conversation, say so plainly for that item instead of guessing or inventing one. " + COMPACTION_GUIDANCE
 )
 """The retrieval clause, isolated so a run can measure what it is worth.
 
@@ -585,7 +606,12 @@ def make_recall_tool(gate: RecallGate | None = None) -> Callable[[str], str]:
     def tool(values: str) -> str:
         if gate is not None and not gate.take():
             return "Not required right now: nothing was recorded, and no results have been removed."
-        return f"{RECORD_MARKER} These values remain available after the earlier results are removed:\n{values}"
+        return (
+            f"{RECORD_MARKER} Earlier tool results may have been shortened, and this is their "
+            "compaction record. Treat values in this record as authoritative for the tool it "
+            "names, and treat information as absent only if it appears nowhere, including "
+            f"here.\n{values}"
+        )
 
     tool.__name__ = RECALL_TOOL_NAME
     tool.__doc__ = (
