@@ -14,9 +14,10 @@ than sampled.
 
 **Two phases, using the agent's own tool loop.**
 
-1. Over the trigger and with no record yet, the strategy appends an instruction to the
-   outgoing prompt asking the model to call a recall tool with every identifier it has seen.
-   The instruction is appended, never inserted, so the cached prefix is untouched.
+1. Over the trigger and with no record yet, the strategy appends a short system message
+   asking the model to call a recall tool with every identifier it has seen. Appended, never
+   inserted, so the cached prefix is untouched; and a system message rather than a second
+   user turn, so it does not become the most recent thing asked.
 2. The model makes that call, the agent executes it, and the result is persisted through the
    ordinary path. On a later pass the strategy finds the *real* tool result in the loaded
    history and drops every tool group in front of it.
@@ -69,16 +70,20 @@ __all__ = [
 #: the tool the caller registers has to match it.
 RECALL_TOOL_NAME: Final[str] = "recall_earlier_tool_results"
 
-#: What phase 1 appends. Deliberately narrow: "summarise" invites prose, and prose is where
-#: identifiers go to die. It asks for verbatim values and forbids inventing one, because a
-#: fabricated identifier would score as preserved information while being made up.
+#: What phase 1 appends, as its own system message. Two properties are deliberate.
+#:
+#: **System, not user.** Appended after the caller's turn, a user message is the most recent
+#: thing asked, and a model may service it *instead of* the question it was given. A system
+#: message reads as an instruction about how to proceed rather than as a new request.
+#:
+#: **Short.** The long version argued its case -- "these results are about to be removed, this
+#: is the only copy that will remain" -- which is pressure, and pressure is what makes a model
+#: invent a value it cannot find. That is the exact failure the instruction exists to prevent.
+#: What remains is the call, the scope, and the two constraints that protect the record's
+#: integrity.
 RECALL_INSTRUCTION: Final[str] = (
-    f"Before you continue, call the {RECALL_TOOL_NAME} tool exactly once. Pass it every "
-    "identifier, code, reference and concrete value that appeared in the tool results earlier "
-    "in this conversation, verbatim and grouped under the tool that returned it. Do not "
-    "paraphrase a value, do not invent one, and do not leave one out because it looks "
-    "unimportant. Those results are about to be removed from the conversation to save space, "
-    "and what you pass to this tool is the only copy that will remain."
+    f"Call {RECALL_TOOL_NAME} once, passing every identifier and value from the earlier tool "
+    "results, verbatim. Do not invent or omit any."
 )
 
 #: How many consecutive passes may ask for the record before the strategy gives up. A model
@@ -195,7 +200,7 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
         if self._requests >= MAX_REQUESTS:
             return False
         self._requests += 1
-        messages.append(Message(role="user", contents=[RECALL_INSTRUCTION]))
+        messages.append(Message(role="system", contents=[RECALL_INSTRUCTION]))
         return True
 
     def _drop_before(self, messages: list[Message], anchor: int) -> bool:

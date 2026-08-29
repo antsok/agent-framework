@@ -103,6 +103,9 @@ async def test_the_request_is_appended_not_inserted() -> None:
 
     assert messages[: len(before)] == before
     assert RECALL_INSTRUCTION in str(messages[-1].contents[0])
+    # System, not user. Appended after the caller's turn, a user message is the most recent
+    # thing asked and a model may answer it instead of the question it was given.
+    assert messages[-1].role == "system"
 
 
 async def test_phase_two_drops_only_what_precedes_the_record() -> None:
