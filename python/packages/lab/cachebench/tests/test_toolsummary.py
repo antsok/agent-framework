@@ -15,10 +15,10 @@ import pytest
 from agent_framework import CharacterEstimatorTokenizer, Message
 from agent_framework._compaction import project_included_messages
 from agent_framework_lab_cachebench._toolsummary import (
-    MAX_REQUESTS,
-    RECALL_INSTRUCTION,
     RECALL_TOOL_NAME,
     ToolResultAnchoredSummarizationCompactionStrategy,
+    ToolResultRecallMiddleware,
+    find_record_index,
 )
 
 TOKENIZER = CharacterEstimatorTokenizer()
@@ -87,35 +87,6 @@ def _strategy(**kwargs: Any) -> ToolResultAnchoredSummarizationCompactionStrateg
     return ToolResultAnchoredSummarizationCompactionStrategy(tokenizer=TOKENIZER, **kwargs)
 
 
-async def test_phase_one_appends_the_request_and_drops_nothing() -> None:
-    """Nothing may be removed before a record exists, or the values are simply gone."""
-    strategy = _strategy()
-    messages = _conversation(tool_turns=8)
-
-    assert await strategy(messages) is True
-    rendered = _rendered(messages)
-
-    assert RECALL_INSTRUCTION in rendered
-    assert "CODE-0" in rendered, "phase 1 must not drop anything"
-    assert strategy.requests_made == 1
-    assert strategy.records_found == 0
-
-
-async def test_the_request_is_appended_not_inserted() -> None:
-    """Appending leaves the cached prefix intact; inserting re-bills everything after it."""
-    strategy = _strategy()
-    messages = _conversation(tool_turns=8)
-    before = list(messages)
-
-    await strategy(messages)
-
-    assert messages[: len(before)] == before
-    assert RECALL_INSTRUCTION in str(messages[-1].contents[0])
-    # System, not user. Appended after the caller's turn, a user message is the most recent
-    # thing asked and a model may answer it instead of the question it was given.
-    assert messages[-1].role == "system"
-
-
 async def test_phase_two_drops_only_what_precedes_the_record() -> None:
     """The record is what those results were reduced to; everything after it is untouched."""
     strategy = _strategy()
@@ -153,23 +124,13 @@ async def test_a_client_invented_record_is_not_trusted() -> None:
     assert "CODE-0 " in _rendered(messages), "nothing dropped on the strength of a bare result"
 
 
-async def test_the_request_is_not_repeated_forever() -> None:
-    """A model that will not call the tool would otherwise grow every prompt for the whole run."""
-    strategy = _strategy()
-
-    for _ in range(MAX_REQUESTS):
-        assert await strategy(_conversation(tool_turns=8)) is True
-    assert await strategy(_conversation(tool_turns=8)) is False
-    assert strategy.requests_made == MAX_REQUESTS
-
-
 async def test_nothing_happens_below_the_trigger() -> None:
     """A record that is not needed costs an agent turn and buys nothing."""
     strategy = ToolResultAnchoredSummarizationCompactionStrategy(max_input_tokens=10_000_000, tokenizer=TOKENIZER)
     messages = _conversation(tool_turns=8)
 
     assert await strategy(messages) is False
-    assert strategy.requests_made == 0
+    assert strategy.fallbacks_used == 0
 
 
 @pytest.mark.parametrize(
@@ -201,28 +162,9 @@ async def test_the_fallback_fires_when_the_record_never_arrives() -> None:
     assert await strategy(messages) is True
     assert strategy.fallbacks_used == 1
     assert strategy.records_found == 0
-    # It compacted rather than merely asking again.
-    assert RECALL_INSTRUCTION not in _rendered(messages)
+    # It compacted rather than waiting further.
+    assert "CODE-0" not in _rendered(messages), "the oldest results are gone"
     assert "EU-WEST-1" in _rendered(messages), "the fallback keeps the head anchor too"
-
-
-async def test_the_request_comes_before_the_fallback() -> None:
-    """Phase 1 must have room to run, or the recording step never happens at all.
-
-    Between the two thresholds the strategy asks and waits. Only above the higher one does it
-    give up. A fallback at or below the trigger would truncate on the first pass and the
-    model would never get a chance to answer.
-    """
-    strategy = ToolResultAnchoredSummarizationCompactionStrategy(
-        max_input_tokens=100_000, tokenizer=TOKENIZER, trigger_fraction=0.01, fallback_fraction=0.99
-    )
-    messages = _conversation(tool_turns=8)
-
-    assert await strategy(messages) is True
-    assert strategy.requests_made == 1
-    assert strategy.fallbacks_used == 0
-    assert RECALL_INSTRUCTION in _rendered(messages)
-    assert "CODE-0" in _rendered(messages), "nothing dropped while still waiting"
 
 
 async def test_thresholds_the_wrong_way_around_are_rejected() -> None:
@@ -244,3 +186,69 @@ async def test_a_record_that_does_not_free_enough_still_falls_back() -> None:
 
     assert await strategy(messages) is True
     assert strategy.records_found == 1
+
+
+class _Recorder:
+    """Stands in for the rest of the pipeline, capturing the options a call went out with."""
+
+    def __init__(self, messages: list[Message]) -> None:
+        self.messages = messages
+        self.seen: list[dict[str, Any]] = []
+
+    async def __call__(self) -> None:
+        self.seen.append(dict(self.context.options or {}))
+        self.context.messages = self.messages
+
+
+async def _run(middleware: ToolResultRecallMiddleware, messages: list[Message]) -> dict[str, Any]:
+    """Drive one middleware pass and return the options the call went out with."""
+    from agent_framework import ChatContext
+
+    context = ChatContext(client=None, messages=[Message(role="user", contents=["q"])], options={"temperature": 0})
+    recorder = _Recorder(messages)
+    recorder.context = context
+    await middleware.process(context, recorder)
+    return recorder.seen[0]
+
+
+async def test_the_middleware_forces_the_call_and_sends_no_message() -> None:
+    """Phase 1 must leave no trace in the prompt, only in the options.
+
+    A message appended here carries no history provider's source tag, so per-service-call
+    persistence would treat it as new input and store it -- and an instruction of ours would
+    then appear in the conversation the application replays to its user.
+    """
+    middleware = ToolResultRecallMiddleware(max_input_tokens=1_000, tokenizer=TOKENIZER, trigger_fraction=0.1)
+    big = _conversation(tool_turns=8)
+
+    first = await _run(middleware, big)
+    assert "tool_choice" not in first, "nothing is known about history size before the first call"
+
+    second = await _run(middleware, big)
+    assert second["tool_choice"] == {"mode": "required", "required_function_name": RECALL_TOOL_NAME}
+    assert middleware.forced_calls == 1
+    # The prompt is untouched: no instruction, no extra turn.
+    assert all("recall" not in str(m.contents[0]).lower() for m in [Message(role="user", contents=["q"])])
+
+
+async def test_the_middleware_stops_once_a_record_exists() -> None:
+    """Forcing a second record would re-drop what the first already covered."""
+    middleware = ToolResultRecallMiddleware(max_input_tokens=1_000, tokenizer=TOKENIZER, trigger_fraction=0.1)
+
+    await _run(middleware, _conversation(tool_turns=8))
+    await _run(middleware, _conversation(tool_turns=8, record="CODE-0"))
+    after = await _run(middleware, _conversation(tool_turns=8, record="CODE-0"))
+
+    assert "tool_choice" not in after
+    assert find_record_index(_conversation(tool_turns=8, record="CODE-0")) is not None
+
+
+async def test_the_middleware_leaves_small_conversations_alone() -> None:
+    """Below the trigger there is nothing to record and nothing to drop."""
+    middleware = ToolResultRecallMiddleware(max_input_tokens=10_000_000, tokenizer=TOKENIZER)
+
+    await _run(middleware, _conversation(tool_turns=8))
+    after = await _run(middleware, _conversation(tool_turns=8))
+
+    assert "tool_choice" not in after
+    assert middleware.forced_calls == 0

@@ -12,19 +12,21 @@ Truncation preserves *positions*. What is needed is something that preserves *in
 after which the bulk it came from is genuinely redundant and can be dropped outright rather
 than sampled.
 
-**Two phases, using the agent's own tool loop.**
+**Two phases, split across a middleware and this strategy.**
 
-1. Over the trigger and with no record yet, the strategy appends a short system message
-   asking the model to call a recall tool with every identifier it has seen. Appended, never
-   inserted, so the cached prefix is untouched; and a system message rather than a second
-   user turn, so it does not become the most recent thing asked.
-2. The model makes that call, the agent executes it, and the result is persisted through the
-   ordinary path. On a later pass the strategy finds the *real* tool result in the loaded
+1. :class:`ToolResultRecallMiddleware` forces ``tool_choice`` to the recall tool on one call.
+   It sends no message at all: the tool's own description already says what to pass, and the
+   schema travels on every request anyway. Nothing is added to the prompt, and nothing extra
+   reaches the caller's stored history.
+2. The model makes the call, the agent executes it, and the result is persisted through the
+   ordinary path. On a later pass this strategy finds that real tool result in the loaded
    history and drops every tool group in front of it.
 
-The working copy the strategy mutates is discarded after each call, so phase 1 cannot leave
-itself a note -- but it does not need to. What persists is the tool call the model made, which
-the agent stored like any other.
+Sending no message matters for more than tokens. A message appended here carries no history
+provider's source tag, so the per-service-call persistence would treat it as new input and
+store it -- and an instruction of ours would show up in the conversation the application
+replays to its user. Forcing the option leaves no such trace. The tool call and its result do
+appear, which is correct: they are a real record of what the agent did.
 
 **Why not synthesise the tool call directly.** A ``call_id`` invented by the client is only
 safe when the client owns the conversation. Responses-API routes with ``store=True`` track
@@ -37,17 +39,19 @@ is the first thing a size-pressed strategy sheds -- this package's own anchored 
 it as a last resort -- so a record written as narration would be eligible for exactly the step
 that destroys it.
 
-**What this costs to measure.** The model has to *choose* to call the recall tool, so a run
-using this strategy cannot pin ``tool_choice``. Pinning is what makes rows comparable, so a
-matrix containing this strategy must be unpinned throughout and is comparable within itself
-only.
+**Why forcing beats asking.** Asking required the model to choose, which meant the benchmark
+could not pin ``tool_choice`` -- and unpinned, the uncompacted control's cost varied by 102%
+between identical runs while the strategy's row gathered eight fewer facts than the control.
+Forcing the call keeps every other turn pinned, so the comparison stays measurable, and makes
+phase 1 deterministic rather than a compliance rate to be estimated.
 """
 
 from __future__ import annotations
 
+from collections.abc import Awaitable, Callable, Sequence
 from typing import TYPE_CHECKING, Final
 
-from agent_framework import Message
+from agent_framework import ChatContext, ChatMiddleware, Message
 from agent_framework._compaction import (
     EXCLUDED_KEY,
     annotate_message_groups,
@@ -63,35 +67,49 @@ if TYPE_CHECKING:
     from agent_framework import CompactionStrategy, TokenizerProtocol
 
 __all__ = [
-    "RECALL_INSTRUCTION",
     "RECALL_TOOL_NAME",
     "ToolResultAnchoredSummarizationCompactionStrategy",
+    "ToolResultRecallMiddleware",
+    "find_record_index",
 ]
 
 #: Name of the tool the agent must call. The strategy looks for this name in the history, so
 #: the tool the caller registers has to match it.
 RECALL_TOOL_NAME: Final[str] = "recall_earlier_tool_results"
 
-#: What phase 1 appends, as its own system message. Two properties are deliberate.
-#:
-#: **System, not user.** Appended after the caller's turn, a user message is the most recent
-#: thing asked, and a model may service it *instead of* the question it was given. A system
-#: message reads as an instruction about how to proceed rather than as a new request.
-#:
-#: **Short.** The long version argued its case -- "these results are about to be removed, this
-#: is the only copy that will remain" -- which is pressure, and pressure is what makes a model
-#: invent a value it cannot find. That is the exact failure the instruction exists to prevent.
-#: What remains is the call, the scope, and the two constraints that protect the record's
-#: integrity.
-RECALL_INSTRUCTION: Final[str] = (
-    f"Call {RECALL_TOOL_NAME} once, passing every identifier and value from the earlier tool "
-    "results, verbatim. Do not invent or omit any."
-)
 
-#: How many consecutive passes may ask for the record before the strategy gives up. A model
-#: that will not call the tool would otherwise have the instruction appended to every prompt
-#: for the rest of the run, growing it rather than shrinking it.
-MAX_REQUESTS: Final[int] = 3
+def find_record_index(messages: Sequence[Message]) -> int | None:
+    """Return the index of the newest recall tool result, if one exists.
+
+    Shared by the strategy and the middleware so the two halves cannot disagree about whether
+    a record exists -- otherwise one would force a call that was already made, or drop results
+    a record never covered.
+
+    The call and its result are matched by ``call_id`` rather than by adjacency, because a
+    provider is free to order or batch them differently. A result whose call is absent does not
+    count: that is the shape a client-synthesised pair produces, and exactly what breaks on
+    routes that track tool calls server-side.
+
+    Args:
+        messages: The conversation to search.
+
+    Returns:
+        The index of the result message, or None when no complete record exists.
+    """
+    recall_ids = {
+        content.call_id
+        for message in messages
+        for content in message.contents
+        if content.type == "function_call" and content.name == RECALL_TOOL_NAME and content.call_id
+    }
+    if not recall_ids:
+        return None
+    newest: int | None = None
+    for index, message in enumerate(messages):
+        for content in message.contents:
+            if content.type == "function_result" and content.call_id in recall_ids:
+                newest = index
+    return newest
 
 
 class ToolResultAnchoredSummarizationCompactionStrategy:
@@ -150,14 +168,8 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
             keep_head_groups=keep_head_groups,
             keep_tail_groups=keep_tail_groups,
         )
-        self._requests = 0
         self._records = 0
         self._fallbacks = 0
-
-    @property
-    def requests_made(self) -> int:
-        """Passes that asked the model to record. Compare with ``records_found``."""
-        return self._requests
 
     @property
     def fallbacks_used(self) -> int:
@@ -189,7 +201,7 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
         if used <= int(self.max_input_tokens * self.trigger_fraction):
             return False
 
-        anchor = self._anchor_index(messages)
+        anchor = find_record_index(messages)
         if anchor is not None:
             self._records = max(self._records, 1)
             changed = self._drop_before(messages, anchor)
@@ -200,52 +212,15 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
             return changed
 
         if used < int(self.max_input_tokens * self.fallback_fraction):
-            return self._request_record(messages)
+            # Still waiting for the middleware's forced call to come back. Nothing may be
+            # dropped yet: the record is the only thing that would replace it.
+            return False
 
         # Out of room to keep waiting. A model that has not answered by now may never answer,
         # and the alternative to compacting without a record is a provider error. The tool
         # results are lost either way at this point; at least the conversation survives.
         self._fallbacks += 1
         return await self.fallback(messages)
-
-    def _anchor_index(self, messages: list[Message]) -> int | None:
-        """Return the index of the newest recall tool result, if the model has made one.
-
-        The call and its result are matched by ``call_id`` rather than by adjacency, because
-        a provider is free to order or batch them differently.
-
-        Returns:
-            The index of the result message, or None when no complete record exists.
-        """
-        recall_ids = {
-            content.call_id
-            for message in messages
-            for content in message.contents
-            if content.type == "function_call" and content.name == RECALL_TOOL_NAME and content.call_id
-        }
-        if not recall_ids:
-            return None
-        newest: int | None = None
-        for index, message in enumerate(messages):
-            for content in message.contents:
-                if content.type == "function_result" and content.call_id in recall_ids:
-                    newest = index
-        return newest
-
-    def _request_record(self, messages: list[Message]) -> bool:
-        """Append the instruction that makes the model produce a record.
-
-        Appended rather than inserted: adding to the end leaves the cached prefix intact,
-        while inserting anywhere earlier would re-bill everything after the insertion point.
-
-        Returns:
-            True if an instruction was added.
-        """
-        if self._requests >= MAX_REQUESTS:
-            return False
-        self._requests += 1
-        messages.append(Message(role="system", contents=[RECALL_INSTRUCTION]))
-        return True
 
     def _drop_before(self, messages: list[Message], anchor: int) -> bool:
         """Exclude every tool group that ends before the record.
@@ -271,3 +246,75 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
     def _excluded(self, messages: list[Message]) -> int:
         """Return how many messages are currently excluded, for tests and diagnostics."""
         return sum(1 for message in messages if message.additional_properties.get(EXCLUDED_KEY, False))
+
+
+class ToolResultRecallMiddleware(ChatMiddleware):
+    """Force the recall call once, so phase 2 has something to anchor on.
+
+    Args:
+        max_input_tokens: Ceiling the prompt must stay under, matching the strategy's.
+        tokenizer: Token counter, matching the strategy's.
+
+    Keyword Args:
+        trigger_fraction: Fraction of the ceiling at which the record is forced. Comfortably
+            below the strategy's fallback threshold, because the decision is made one call
+            late -- see :meth:`process`.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_input_tokens: int,
+        tokenizer: TokenizerProtocol,
+        trigger_fraction: float = 0.6,
+    ) -> None:
+        """Validate and store the configuration.
+
+        Raises:
+            ValueError: If a bound is out of range.
+        """
+        if max_input_tokens <= 0:
+            raise ValueError("max_input_tokens must be positive.")
+        if not 0.0 < trigger_fraction <= 1.0:
+            raise ValueError("trigger_fraction must be in (0.0, 1.0].")
+        self.max_input_tokens = max_input_tokens
+        self.tokenizer = tokenizer
+        self.trigger_fraction = trigger_fraction
+        self._force_next = False
+        self._forced = 0
+
+    @property
+    def forced_calls(self) -> int:
+        """How many times the recall tool was forced. Zero means phase 1 never fired."""
+        return self._forced
+
+    async def process(self, context: ChatContext, call_next: Callable[[], Awaitable[None]]) -> None:
+        """Force the recall tool when the last call showed the conversation is large enough.
+
+        The decision is made *after* ``call_next`` and applied on the *following* call, which
+        is not a convenience. Before the pipeline runs, ``context.messages`` holds only the new
+        turn: the history middleware sits deeper and replaces it with the loaded conversation
+        during the call. There is no earlier point at which the size of the history can be
+        known, so the check reads it on the way out and the option is set on the way in next
+        time. The trigger sits well below the strategy's fallback threshold to absorb that
+        one-call delay.
+        """
+        if self._force_next:
+            # Replaced rather than mutated: options may be shared with the caller's own dict,
+            # and pinning a tool choice into it would outlive this call.
+            context.options = {
+                **dict(context.options or {}),
+                "tool_choice": {"mode": "required", "required_function_name": RECALL_TOOL_NAME},
+            }
+            self._force_next = False
+            self._forced += 1
+
+        await call_next()
+
+        messages = list(context.messages)
+        if not messages or find_record_index(messages) is not None:
+            self._force_next = False
+            return
+        annotate_message_groups(messages)
+        annotate_token_counts(messages, tokenizer=self.tokenizer)
+        self._force_next = included_token_count(messages) > int(self.max_input_tokens * self.trigger_fraction)
