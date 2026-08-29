@@ -824,10 +824,12 @@ async def run_live(
     # to do with compaction.
     recall_middleware: ToolResultRecallMiddleware | None = None
     if isinstance(strategy, ToolResultAnchoredSummarizationCompactionStrategy):
-        scope_tools = [*scope_tools, make_recall_tool()]
+        # Not added to scope_tools: the middleware offers it on the one call it forces, so the
+        # model never sees a tool it might call on its own initiative.
         recall_middleware = ToolResultRecallMiddleware(
             max_input_tokens=strategy.max_input_tokens,
             tokenizer=options.tokenizer,
+            recall_tool=make_recall_tool(),
             trigger_fraction=strategy.trigger_fraction,
         )
 

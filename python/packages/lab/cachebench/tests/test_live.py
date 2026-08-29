@@ -54,6 +54,7 @@ from agent_framework_lab_cachebench import (
 from agent_framework_lab_cachebench._advisor import ModelPricing
 from agent_framework_lab_cachebench._live import (
     RETRIEVAL_GUIDANCE,
+    make_recall_tool,
     make_scope_tools,
     resolve_instructions,
 )
@@ -1260,7 +1261,7 @@ async def test_the_recall_middleware_forces_the_call_inside_the_real_pipeline() 
     that: what matters is whether the middleware sees the loaded history at the point it
     looks, and the history is only assembled inside the pipeline.
     """
-    from agent_framework_lab_cachebench._live import build_live_agent, make_recall_tool
+    from agent_framework_lab_cachebench._live import build_live_agent
     from agent_framework_lab_cachebench._toolsummary import (
         RECALL_TOOL_NAME,
         ToolResultAnchoredSummarizationCompactionStrategy,
@@ -1271,7 +1272,9 @@ async def test_the_recall_middleware_forces_the_call_inside_the_real_pipeline() 
     strategy = ToolResultAnchoredSummarizationCompactionStrategy(
         max_input_tokens=ceiling, tokenizer=TOKENIZER, trigger_fraction=0.1, fallback_fraction=0.99
     )
-    middleware = ToolResultRecallMiddleware(max_input_tokens=ceiling, tokenizer=TOKENIZER, trigger_fraction=0.1)
+    middleware = ToolResultRecallMiddleware(
+        max_input_tokens=ceiling, tokenizer=TOKENIZER, recall_tool=make_recall_tool(), trigger_fraction=0.1
+    )
     client = StubChatClient()
     recorder = UsageRecorder()
     agent = build_live_agent(
@@ -1279,7 +1282,7 @@ async def test_the_recall_middleware_forces_the_call_inside_the_real_pipeline() 
         kind="harness",
         strategy=strategy,
         tokenizer=TOKENIZER,
-        tools=[make_recall_tool()],
+        tools=[],
         recorder=recorder,
         extra_middleware=[middleware],
         max_context_window_tokens=ceiling,
