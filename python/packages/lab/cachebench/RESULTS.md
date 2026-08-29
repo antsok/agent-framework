@@ -44,6 +44,10 @@ between runs, which moves both axes for reasons unrelated to compaction. Runs ma
 | 8 | `gpt-5.4-mini` | Azure Foundry | Responses | yes | `none` (120K window, harness) |
 | 9a | `gpt-5.4-mini` | Azure Foundry | Responses | yes | *aborted — 400K window does not exist* |
 | 9 | `gpt-5.4-mini` | Azure Foundry | Responses | yes | `none` (272K real limit, 86% full) |
+| 10-12 | `gpt-5.4-mini` | Azure Foundry | Responses | yes | *buried arm — retrieval under noise* |
+| 13 | `gpt-5.4-mini` | Azure Foundry | Responses | yes | `none` (60K, 16 strategies, spread) |
+| 14 | `gpt-5.4-mini` | Azure Foundry | Responses | yes | `none` (272K, focused, spread) |
+| 15 | `gpt-5.4-mini` | Azure Foundry | Responses | yes | `none` (anchored, scaled retention) |
 
 Runs 7 to 9 are a **separate experiment** on the harness agent at wider windows, with 53
 planted facts instead of 17. The shared configuration above does not describe them; their own
@@ -716,6 +720,129 @@ compaction at all.
 **`summarization` bought correctness at 3x the price.** It is the only deleting-class strategy
 to keep all 53 facts at 100%, and it cost **+208%**. At this size its own summary calls are
 almost free ($0.0474 of $1.3286); the bill is the 46% hit rate.
+
+---
+
+## Runs 10 to 15 — the instrument rebuilt, and a strategy of our own
+
+Runs 7 to 9 put every planted code at the **head** of its tool result, inside the 4,096
+characters a collapsed result keeps, so tool-oriented strategies preserved all of them for
+free. Runs 10 onward fix that and three other faults, and add `anchored`, a strategy designed
+against what the earlier runs measured.
+
+### What changed, and why each mattered
+
+| change | why |
+| --- | --- |
+| Codes **spread** through each result, on labelled lines | Head placement made `tool_result` keep 53/53 for nothing. Spread, it keeps 46/53 at 120,000 — the free pass is gone |
+| Reply cap 900 -> **4,000** | 53 labelled codes cost ~640 tokens to enumerate; the answer was being truncated and scored as lost facts |
+| Closing questions **state the expected count** | "Every code returned by the X lookup" left the model to guess how many. Repeats swung 78 points on that guess |
+| A **`c+-` column** and an `ACCURACY NOT RANKABLE` guard | The `correct` column shows the median-*cost* repeat, so 100/22/22 printed as an unremarkable 100 |
+
+### Calibration first
+
+Before spending on a matrix, `samples/probe_narration.py` runs the uncompacted control alone,
+five repeats per configuration, and reports which hold still. On this model:
+
+| narration | median | range | recalled |
+| --- | ---: | ---: | --- |
+| `neutral` — the harness's own guidance is the only driver | 98% | 6pp | 52/49/52/52/51 |
+| `prompted` — every value demanded in the final report | 100% | 0pp | 53/53/53/53/53 |
+| `suppressed` — restating forbidden | 98% | 4pp | 52/50/52/52/52 |
+
+All three are usable. The matrices below use **`neutral`** rather than the perfectly stable
+`prompted`, because `prompted` copies tool values into assistant prose and lets a strategy
+delete the tool results while still scoring well: it is the most stable configuration and the
+least informative one. Stability is a precondition, not the goal.
+
+**The first calibration attempt was invalid and is worth recording.** It called `run_live`
+directly without forcing `store=False`, so the Foundry client kept the conversation
+server-side and the model answered from a history the client had never compacted. Every mode
+came back stable — 6, 0 and 7 points against the 78 measured properly on the same model an
+hour earlier. `run_live` now forces it itself rather than leaving it to callers.
+
+### Run 13 — 60,000-token window, 16 strategies
+
+Control 53/53 facts, 98% correct, **6pp** — matching calibration exactly.
+
+| strategy | cost | vs none | +- | hit% | facts | correct | c+- |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| anchored_no_assistant | $0.1193 | **-24%** | 5% | 82% | 46/53 | 22% | 78pp |
+| **anchored** | **$0.1210** | **-23%** | 2% | **82%** | 32/53 | 61% | 39pp |
+| truncation | $0.1339 | -14% | 19% | 83% | 29/53 | 56% | 44pp |
+| token_budget_tools_first | $0.1413 | -10% | 5% | 70% | 24/53 | 46% | 43pp |
+| context_window_aggressive | $0.1435 | -8% | 2% | 52% | 16/53 | 19% | 2pp |
+| token_budget_window_first | $0.1440 | -8% | 7% | 68% | 16/53 | 31% | 26pp |
+| token_budget_truncate_first | $0.1488 | -5% | 9% | 66% | 12/53 | 2% | 17pp |
+| **none** | **$0.1562** | — | 13% | **93%** | **53/53** | **98%** | **6pp** |
+| sliding_window | $0.1864 | +19% | 8% | 9% | 0/53 | 2% | 0pp |
+| token_budget_summarize | $0.1916 | +23% | 4% | 59% | 18/53 | 11% | 30pp |
+| context_window | $0.1945 | +25% | 11% | 60% | 17/53 | 33% | 30pp |
+| token_budget_fallback | $0.1989 | +27% | 8% | 60% | 19/53 | 24% | 22pp |
+| tool_result | $0.2041 | +31% | 16% | 84% | 53/53 | 100% | 67pp |
+| selective_tool_call | $0.2049 | +31% | 9% | 84% | 53/53 | 100% | 26pp |
+| context_window_lazy | $0.2338 | +50% | 2% | 67% | 29/53 | 56% | 33pp |
+| summarization | $0.2456 | +57% | 1% | **0%** | 0/53 | 11% | 15pp |
+
+### Run 14 — 86% of the real 272,000-token input limit
+
+| strategy | cost | vs none | +- | hit% | facts | correct | c+- |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **anchored** | $0.3047 | **-30%** | 3% | **82%** | 11/53 | 22% | **0pp** |
+| anchored_no_assistant | $0.3053 | -30% | 2% | 82% | 11/53 | 22% | 26pp |
+| **none** | **$0.4346** | — | 2% | **94%** | **53/53** | **100%** | 15pp |
+| truncation | $0.4355 | +0% | 1% | 89% | 30/53 | 11% | 0pp |
+| selective_tool_call | $0.5555 | +28% | 6% | 84% | 39/53 | 31% | 41pp |
+| tool_result | $0.5655 | +30% | 4% | 84% | 39/53 | 48% | 52pp |
+| context_window | $0.5820 | +34% | 1% | 76% | 30/53 | 11% | 15pp |
+
+### What `anchored` achieved, and what it did not
+
+It was built on three measurements: decisions must not depend on current size, mutations must
+march forward, and *what* is shed matters more than how much. Two of its goals were met.
+
+**Cache retention is best in class.** 82% at both windows while cutting 54-62% of tokens.
+Every other strategy saving comparable volume sits at 52-76%. Position-only decisions keep
+the prefix byte-identical, which is exactly what it was for.
+
+**It is the only strategy whose answer is reproducible.** 0pp accuracy range at 272,000, where
+`tool_result` swings 52 and `selective_tool_call` 41. Frozen decisions produce the same prompt
+every run, so they produce the same answer.
+
+**It did not escape the trade-off.** At 272,000 it kept 11 of 53 facts — exactly the five
+non-tool facts plus the one code per result falling inside the surviving head fragment,
+because `keep_chars` was a fixed 600 characters against results that scale with the window:
+1.9% of an 8,000-token result, 0.6% of a 25,200-token one. The design worked as specified;
+the specification did not scale.
+
+### Run 15 — the same strategy with retention scaled to the window
+
+The collapsed band now takes a share of the ceiling divided between its tool results: 30% of
+each result at 60,000 and 45% at 272,000.
+
+| | keep per result | vs none | hit% | facts | correct |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `anchored`, fixed 600 chars | 0.6% | **-30%** | 82% | 11/53 | 22% |
+| `anchored`, scaled retention | 45% | **-3%** | 88% | 25/53 | 48% |
+| `none` | — | — | 94% | 53/53 | 80% |
+
+**The dial moves the trade-off; it does not remove it.** Keeping 75x more of each result
+recovered 14 facts and gave back 27 points of cost saving. At neither setting does `anchored`
+beat `none` on both axes, and the verdict in both matrices remains `none` — now for the ninth
+and tenth time.
+
+That is the honest result for a strategy designed specifically to win: **the constraint is not
+which messages you choose to drop, it is that dropping any of them forfeits a discount worth
+more than the tokens saved.** What a better design buys is a more favourable *shape* — higher
+hit rate for the same cut, and reproducibility — not an escape.
+
+### The accuracy guard is still not sufficient
+
+`ACCURACY NOT RANKABLE` checks the control, and in Run 13 the control was excellent at 6pp.
+But individual strategy rows reached 78, 67 and 52 points. **A stable baseline does not
+certify a stable comparison**: compaction changes the replies, which become the history, which
+compacts differently. Rows whose `c+-` exceeds 20 points should be read as unresolved on
+accuracy regardless of how steady the control was.
 
 ---
 

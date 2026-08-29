@@ -1,0 +1,127 @@
+note: gpt-5.4-mini keeps history server-side by default. Forcing store=False so the history is sent by the client and compaction actually applies.
+-> none
+   repeat 1/3
+   repeat 2/3
+   repeat 3/3
+-> truncation
+   repeat 1/3
+   repeat 2/3
+   repeat 3/3
+-> sliding_window
+   repeat 1/3
+   repeat 2/3
+   repeat 3/3
+-> tool_result
+   repeat 1/3
+   repeat 2/3
+   repeat 3/3
+-> selective_tool_call
+   repeat 1/3
+   repeat 2/3
+   repeat 3/3
+-> context_window
+   repeat 1/3
+   repeat 2/3
+   repeat 3/3
+-> context_window_aggressive
+   repeat 1/3
+   repeat 2/3
+   repeat 3/3
+-> context_window_lazy
+   repeat 1/3
+   repeat 2/3
+   repeat 3/3
+-> summarization
+   repeat 1/3
+   repeat 2/3
+   repeat 3/3
+-> token_budget_fallback
+   repeat 1/3
+   repeat 2/3
+   repeat 3/3
+-> token_budget_tools_first
+   repeat 1/3
+   repeat 2/3
+   repeat 3/3
+-> token_budget_truncate_first
+   repeat 1/3
+   repeat 2/3
+   repeat 3/3
+-> token_budget_window_first
+   repeat 1/3
+   repeat 2/3
+   repeat 3/3
+-> token_budget_summarize
+   repeat 1/3
+   repeat 2/3
+   repeat 3/3
+-> anchored
+   repeat 1/3
+   repeat 2/3
+   repeat 3/3
+-> anchored_no_assistant
+   repeat 1/3
+   repeat 2/3
+   repeat 3/3
+
+Model: gpt-5.4-mini   agent: harness
+Pricing: $0.66/M in, $0.070/M cached, $3.96/M out
+
+strategy                         msgs   tok left/peak  calls       in  hit%     out      cost    +-   summ$  vs none    facts  lost nofetch ignored  correct   c+-  vs none   flags
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+anchored_no_assistant           55/55   30,108/37,663     28  593,792   82%   3,888   $0.1193    5%       -     -24%    46/53     7       0      35     22%   78pp      23%       -
+anchored                        55/55   30,334/37,772     28  595,238   82%   4,139   $0.1210    2%       -     -23%    32/53    21       0       0     61%   39pp      62%       -
+truncation                      28/55   30,601/42,677     28  713,835   83%   3,061   $0.1339   19%       -     -14%    29/53    24       0       0     56%   44pp      57%       -
+token_budget_tools_first        22/55   17,885/27,221     28  518,051   70%   3,620   $0.1413    5%       -     -10%    24/53    29       0       0     46%   43pp      47%       -
+context_window_aggressive       20/55   13,512/17,275     28  382,945   52%   2,026   $0.1435    2%       -      -8%    16/53    37       0       7     19%    2pp      19%       -
+token_budget_window_first       24/55   25,619/26,604     28  521,596   68%   2,185   $0.1440    7%       -      -8%    16/53    37       0       0     31%   26pp      32%       -
+token_budget_truncate_first     22/55   17,539/26,791     28  510,759   66%   2,626   $0.1488    9%       -      -5%    12/53    41       0      12      2%   17pp       2%       -
+none                            55/55   77,846/77,846     281,295,063   93%   3,410   $0.1562   13%       -        -    53/53     0       0       1     98%*   6pp        -       -
+sliding_window                   6/55      651/21,208     28  290,617    9%   2,418   $0.1864    8%       -     +19%     0/53    53       0       0      2%    0pp       2%       -
+token_budget_summarize          22/59   17,889/26,705     28  463,345   59%   2,993   $0.1916    4% $0.0343     +23%    18/53    35       0      13     11%   30pp      11%       -
+context_window                  26/55   26,166/26,551     28  596,581   60%   3,021   $0.1945   11%       -     +25%    17/53    36       0       0     33%   30pp      34%       -
+token_budget_fallback           26/55   26,131/27,312     28  602,741   60%   3,793   $0.1989    8%       -     +27%    19/53    34       0       7     24%   22pp      25%       -
+tool_result                     53/57   63,225/63,225     281,153,779   84%   4,051   $0.2041   16%       -     +31%    53/53     0       0       0    100%   67pp     102%       -
+selective_tool_call             51/55   62,170/62,170     281,146,047   84%   4,088   $0.2049    9%       -     +31%    53/53     0       0       0    100%   26pp     102%       -
+context_window_lazy             32/55   39,020/39,252     28  832,810   67%   3,230   $0.2338    2%       -     +50%    29/53    24       0       0     56%   33pp      57%       -
+summarization                    8/73      853/17,286     28  268,923    0%   2,633   $0.2456    1% $0.0577     +57%     0/53    48       0       0     11%   15pp      11%       -
+
+msgs      = messages in the final prompt, out of the most any call carried
+tok       = billed tokens in that same final prompt, and at the peak. Watch this
+            rather than msgs: a strategy that rewrites content in place removes
+            tokens without removing messages, and msgs cannot see it
+calls     = model calls, which exceed turns whenever the agent used a tool
+in/out    = tokens billed across the whole run, replies included
+cost      = median repeat. Every column describes that one real conversation,
+            so the tokens, facts and cost cannot disagree with each other
++-        = spread between the cheapest and dearest repeat. A gap smaller than
+            this is not a result. n/a means one repeat, so stability is unknown
+summ$     = what this strategy's own summarization calls cost, of that total
+facts     = planted facts surviving compaction into the final prompt: recall's ceiling
+lost      = compaction removed it, so the model could not use it  <- the damage
+nofetch   = the agent never called that tool, so the fact never entered the
+            history at all. Not compaction damage: an uncompacted run shows these
+            too, and counting them as lost overstates every strategy equally
+ignored   = still in context but unused: the model's failing, not compaction's.
+            Without this split a control that simply omits facts looks like
+            compaction damage, and every strategy is judged against a false baseline
+correct   = share of correctness checks the final answer passed (* marks the control)
+c+-       = points between the least and most correct repeat. The correct column is
+            taken from the median-cost repeat, so without this a strategy whose three
+            runs scored 100, 22 and 22 reads identically to one that scored 22 three
+            times. A wide gap here means the accuracy ranking is not usable, exactly
+            as a wide +- means the cost ranking is not
+flags     = ERR failed turn, S<n> summarizer failures, <n>/<n>t turns completed,
+            NO:<opt> the provider rejected that option so it was dropped. A run
+            that dropped tool_choice chose its own tool calls and is not
+            comparable with one that did not,
+            FETCH this row gathered a different set of facts than the control, so
+            its cost and correctness are not comparable with it
+
+VERDICT: none
+Every strategy that keeps the answer intact also costs more than not compacting. Leave it off unless the conversation would overflow the window.
+Unclosed client session
+client_session: <aiohttp.client.ClientSession object at 0x000001F6AB12A270>
+Unclosed client session
+client_session: <aiohttp.client.ClientSession object at 0x000001F6B0AFBD90>
+EXIT=0
