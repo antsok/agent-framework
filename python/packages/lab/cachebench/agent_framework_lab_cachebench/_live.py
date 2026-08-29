@@ -51,7 +51,11 @@ from ._metrics import serialize_message
 from ._recall import FactOutcome, RecallScenario, build_recall_scenario, render_code, render_codes, score_answer
 from ._runner import unsupported_option
 from ._strategies import StrategyOptions, build_strategy
-from ._toolsummary import RECALL_TOOL_NAME, ToolResultAnchoredSummarizationCompactionStrategy
+from ._toolsummary import (
+    RECALL_TOOL_NAME,
+    ToolResultAnchoredSummarizationCompactionStrategy,
+    ToolResultRecallMiddleware,
+)
 from ._transcripts import TRUE_CHARS_PER_TOKEN, sized_text
 
 if TYPE_CHECKING:
@@ -411,7 +415,7 @@ def _strategy_notes(strategy: Any) -> tuple[str, ...]:
         Short tokens for the flags column.
     """
     notes: list[str] = []
-    for attribute, label in (("records_found", "REC"), ("fallbacks_used", "FALLBACK"), ("requests_made", "ASK")):
+    for attribute, label in (("records_found", "REC"), ("fallbacks_used", "FALLBACK"), ("forced_calls", "FORCED")):
         value = getattr(strategy, attribute, None)
         if isinstance(value, int) and value:
             notes.append(f"{label}:{value}")
@@ -641,6 +645,7 @@ def build_live_agent(
     tokenizer: TokenizerProtocol,
     tools: Sequence[Callable[..., Any]],
     recorder: UsageRecorder,
+    extra_middleware: Sequence[Any] = (),
     instructions: str = _INSTRUCTIONS,
     max_context_window_tokens: int,
     max_output_tokens: int,
@@ -656,6 +661,8 @@ def build_live_agent(
         tokenizer: Token counter shared with the strategy.
         tools: Tools the agent may call.
         recorder: Middleware capturing prompts and usage.
+        extra_middleware: Further middleware a strategy needs, such as the one that forces the
+            recall call. Installed after the recorder so the recorder still sees every call.
         instructions: System instructions for the agent.
         max_context_window_tokens: Window the harness variant sizes its default against.
         max_output_tokens: Output reservation.
@@ -689,7 +696,7 @@ def build_live_agent(
             disable_mode=True,
             disable_file_memory=True,
             disable_web_search=True,
-            middleware=[recorder],
+            middleware=[recorder, *extra_middleware],
             # Deliberately empty: every option travels per turn instead. An option baked
             # in here cannot be dropped when a provider rejects it without rebuilding the
             # agent, which would discard the session the conversation lives in.
@@ -717,7 +724,7 @@ def build_live_agent(
         context_providers=providers,
         compaction_strategy=strategy,
         require_per_service_call_history_persistence=True,
-        middleware=[recorder],
+        middleware=[recorder, *extra_middleware],
         default_options={},
     )
 
@@ -809,8 +816,14 @@ async def run_live(
     # Adding it to every row would put an extra tool in every prompt and give unrelated
     # strategies something new to call, which is a difference between rows that has nothing
     # to do with compaction.
+    recall_middleware: ToolResultRecallMiddleware | None = None
     if isinstance(strategy, ToolResultAnchoredSummarizationCompactionStrategy):
         scope_tools = [*scope_tools, make_recall_tool()]
+        recall_middleware = ToolResultRecallMiddleware(
+            max_input_tokens=strategy.max_input_tokens,
+            tokenizer=options.tokenizer,
+            trigger_fraction=strategy.trigger_fraction,
+        )
 
     agent = build_live_agent(
         runtime,
@@ -819,6 +832,7 @@ async def run_live(
         tokenizer=options.tokenizer,
         tools=scope_tools,
         recorder=recorder,
+        extra_middleware=[recall_middleware] if recall_middleware else [],
         instructions=resolve_instructions(narration, retrieval_guidance=retrieval_guidance),
         max_context_window_tokens=options.max_context_window_tokens,
         max_output_tokens=options.max_output_tokens,
@@ -902,7 +916,7 @@ async def run_live(
         scopes_called=tuple(scopes_called),
         summarizer_calls=summarizer.calls if summarizer else 0,
         summarizer_failures=summarizer.failures if summarizer else 0,
-        strategy_notes=_strategy_notes(strategy),
+        strategy_notes=_strategy_notes(strategy) + _strategy_notes(recall_middleware),
         summarizer_input_tokens=summarizer.input_tokens if summarizer else 0,
         summarizer_output_tokens=summarizer.output_tokens if summarizer else 0,
         error=error,
