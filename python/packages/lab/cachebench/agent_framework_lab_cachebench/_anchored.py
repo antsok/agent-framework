@@ -54,31 +54,35 @@ from agent_framework._compaction import (
 if TYPE_CHECKING:
     from agent_framework import TokenizerProtocol
 
-__all__ = ["DEFAULT_KEEP_CHARS", "MARKER_ID_PREFIX", "REMOVAL_MARKER", "AnchoredCompactionStrategy"]
+__all__ = ["DEFAULT_KEEP_TOKENS", "MARKER_ID_PREFIX", "REMOVAL_MARKER", "AnchoredCompactionStrategy"]
 
 #: Reason recorded on every message this strategy excludes, so a caller inspecting the
 #: history can tell our removals apart from the framework's.
 EXCLUDE_REASON: Final[str] = "anchored_compaction"
 
-#: Characters of a collapsed tool result that survive, taken from the head and the tail in
-#: equal measure. Head-only retention is what the framework does; keeping both ends is a
-#: better general policy for logs and documents, where the conclusion is as often at the
-#: bottom as the top. It is *not* enough to preserve values scattered through the middle, and
-#: no retention budget of this size would be.
-DEFAULT_KEEP_CHARS: Final[int] = 600
+#: Tokens of a collapsed tool result that survive, taken from the head and the tail in equal
+#: measure. Head-only retention is what the framework does; keeping both ends is a better
+#: general policy for logs and documents, where the conclusion is as often at the bottom as
+#: the top.
+#:
+#: It is *not* enough to preserve values scattered through the middle, and arithmetic says so
+#: rather than taste: n values spread evenly through a result sit 1/n apart, so a head slice
+#: of f/2 captures the second one only when f exceeds 2/n. With 8 values that means retaining
+#: over 25% of the result to keep more than one of them. Head-and-tail retention cannot
+#: preserve uniformly distributed information at any budget worth calling compaction.
+DEFAULT_KEEP_TOKENS: Final[int] = 150
 
 #: Fraction of the ceiling the collapsed middle band may occupy, shared between its tool
 #: results. A fixed per-result budget cannot work: measured at a 60,000-token window a
-#: 600-character retention is 1.9% of an 8,000-token result, and at 272,000 it is 0.6% of a
-#: 25,200-token one. The strategy scored 32 of 53 facts in the first case and 11 in the
-#: second -- 11 being exactly the five non-tool facts plus the one code per result that fell
-#: inside the surviving head fragment.
+#: 600-character retention is 0.9% of the result, and at 272,000 it is 0.3%. The strategy
+#: scored 32 of 53 facts in the first case and 11 in the second -- 11 being exactly the five
+#: non-tool facts plus the one code per result that fell inside the surviving head fragment.
 DEFAULT_BAND_SHARE: Final[float] = 0.25
 
-#: Characters per token, for turning a token budget into the character budget the shortener
-#: works in. Deliberately conservative: overestimating tokens keeps the result under the
-#: ceiling, which is the direction that matters.
-_CHARS_PER_TOKEN: Final[int] = 4
+#: Refinement passes when converting a token budget into a character offset. Two is enough:
+#: the first estimate uses the text's own measured ratio, so it is already close, and each
+#: pass only shrinks. Bounded because the tokenizer is called on large strings.
+_FIT_PASSES: Final[int] = 2
 
 #: Marks where a tool result was cut. It serves two purposes: a model shown a truncated
 #: document with no sign of truncation answers as though it had seen all of it, and the
@@ -115,9 +119,12 @@ class AnchoredCompactionStrategy:
         keep_tail_groups: Recent groups kept verbatim. The working set: too small and the
             model loses the thread of what it is doing, too large and each new turn shifts a
             large block and re-bills it.
-        keep_chars: Characters of a collapsed tool result to retain, split between its head
-            and its tail. ``None`` derives it from ``band_share``, which is what makes the
+        keep_tokens: Tokens of a collapsed tool result to retain, split between its head and
+            its tail. ``None`` derives it from ``band_share``, which is what makes the
             retention scale with the window instead of shrinking to nothing as results grow.
+            Counted with the tokenizer rather than converted from characters: a fixed
+            characters-per-token guess was wrong by a factor of two on this workload, which
+            both wasted budget and made the reported retention wrong.
         band_share: Fraction of ``max_input_tokens`` the whole collapsed band may occupy,
             divided evenly between the tool results in it. Raising it keeps more of each
             result and saves less.
@@ -133,7 +140,7 @@ class AnchoredCompactionStrategy:
         tokenizer: TokenizerProtocol,
         keep_head_groups: int = 3,
         keep_tail_groups: int = 4,
-        keep_chars: int | None = None,
+        keep_tokens: int | None = None,
         band_share: float = DEFAULT_BAND_SHARE,
         collapse_assistant_text: bool = True,
     ) -> None:
@@ -146,15 +153,15 @@ class AnchoredCompactionStrategy:
             raise ValueError("max_input_tokens must be positive.")
         if keep_head_groups < 0 or keep_tail_groups < 0:
             raise ValueError("keep_head_groups and keep_tail_groups must be >= 0.")
-        if keep_chars is not None and keep_chars < 0:
-            raise ValueError("keep_chars must be >= 0.")
+        if keep_tokens is not None and keep_tokens < 0:
+            raise ValueError("keep_tokens must be >= 0.")
         if not 0.0 < band_share <= 1.0:
             raise ValueError("band_share must be in (0.0, 1.0].")
         self.max_input_tokens = max_input_tokens
         self.tokenizer = tokenizer
         self.keep_head_groups = keep_head_groups
         self.keep_tail_groups = keep_tail_groups
-        self.keep_chars = keep_chars
+        self.keep_tokens = keep_tokens
         self.band_share = band_share
         self.collapse_assistant_text = collapse_assistant_text
 
@@ -236,7 +243,7 @@ class AnchoredCompactionStrategy:
         Returns:
             True if any result was shortened.
         """
-        budget = self._keep_chars_for(band)
+        budget = self._keep_tokens_for(band)
         changed = False
         for group in band:
             if group.get("kind") != "tool_call":
@@ -254,10 +261,10 @@ class AnchoredCompactionStrategy:
                         changed = True
         return changed
 
-    def _keep_chars_for(self, band: list[dict[str, Any]]) -> int:
+    def _keep_tokens_for(self, band: list[dict[str, Any]]) -> int:
         """Return how many characters each collapsed tool result may keep.
 
-        An explicit ``keep_chars`` is honoured verbatim. Otherwise the band as a whole gets
+        An explicit ``keep_tokens`` is honoured verbatim. Otherwise the band as a whole gets
         ``band_share`` of the ceiling and the tool results in it divide that evenly, so the
         retention grows with the window rather than becoming a rounding error against it.
 
@@ -265,19 +272,23 @@ class AnchoredCompactionStrategy:
             band: The middle groups, as returned by :meth:`_middle_band`.
 
         Returns:
-            A character budget per collapsed result, never below a floor that still carries a
+            A token budget per collapsed result, never below a floor that still carries a
             recognisable fragment.
         """
-        if self.keep_chars is not None:
-            return self.keep_chars
+        if self.keep_tokens is not None:
+            return self.keep_tokens
         tool_groups = sum(1 for group in band if group.get("kind") == "tool_call")
         if tool_groups == 0:
-            return DEFAULT_KEEP_CHARS
-        share_tokens = self.max_input_tokens * self.band_share / tool_groups
-        return max(int(share_tokens * _CHARS_PER_TOKEN), DEFAULT_KEEP_CHARS)
+            return DEFAULT_KEEP_TOKENS
+        share = self.max_input_tokens * self.band_share / tool_groups
+        return max(int(share), DEFAULT_KEEP_TOKENS)
 
     def _shorten(self, text: str, budget: int) -> str:
-        """Return ``text`` reduced to ``budget`` characters, taken from both ends.
+        """Return ``text`` reduced to about ``budget`` tokens, taken from both ends.
+
+        Args:
+            text: The tool result to shorten.
+            budget: Tokens the result may keep in total, split between its two ends.
 
         Returns:
             The text unchanged when it already fits, otherwise its head and tail joined by a
@@ -285,15 +296,49 @@ class AnchoredCompactionStrategy:
             truncated document with no sign of truncation will answer as though it saw all
             of it.
         """
-        # The marker check is what makes this idempotent. The replacement is longer than
-        # keep_chars by the width of the marker itself, so a second pass would shorten it
-        # again and a third again -- each one a fresh mutation at the same position, which is
-        # precisely the cache behaviour this strategy exists to avoid.
-        if len(text) <= budget or REMOVAL_MARKER in text:
+        # The marker check is what makes this idempotent. The replacement carries the marker's
+        # own tokens on top of the budget, so a second pass would shorten it again and a third
+        # again -- each one a fresh mutation at the same position, which is precisely the cache
+        # behaviour this strategy exists to avoid.
+        if REMOVAL_MARKER in text or self.tokenizer.count_tokens(text) <= budget:
             return text
-        half = budget // 2
-        removed = len(text) - 2 * half
-        return f"{text[:half]}\n[{REMOVAL_MARKER}: {removed:,} characters]\n{text[-half:]}"
+        half = max(budget // 2, 1)
+        head_chars = self._fit(text, half, from_end=False)
+        tail_chars = self._fit(text, half, from_end=True)
+        head, tail = text[:head_chars], text[len(text) - tail_chars :]
+        removed = len(text) - head_chars - tail_chars
+        return f"{head}\n[{REMOVAL_MARKER}: {removed:,} characters]\n{tail}"
+
+    def _fit(self, text: str, tokens: int, *, from_end: bool) -> int:
+        """Return how many characters from one end of ``text`` are worth about ``tokens``.
+
+        The tokenizer counts but cannot slice, so the offset has to be measured. Starting from
+        the text's own characters-per-token ratio lands within a few percent immediately. A
+        fixed ratio does not: using 4 where the real value was 7.9 made the strategy keep half
+        the budget it was entitled to, and made every retention figure reported from it wrong
+        by the same factor.
+
+        Args:
+            text: The text to measure into.
+            tokens: Target token count for the slice.
+
+        Keyword Args:
+            from_end: Measure a suffix rather than a prefix.
+
+        Returns:
+            A character count whose slice is at or just under ``tokens``.
+        """
+        total = max(self.tokenizer.count_tokens(text), 1)
+        chars = min(int(len(text) * tokens / total), len(text))
+        for _ in range(_FIT_PASSES):
+            if chars <= 0:
+                return 0
+            piece = text[-chars:] if from_end else text[:chars]
+            counted = self.tokenizer.count_tokens(piece)
+            if counted <= tokens:
+                return chars
+            chars = int(chars * tokens / max(counted, 1))
+        return max(chars, 0)
 
     def _shed(self, messages: list[Message], kind: str, note: str) -> bool:
         """Exclude whole groups of one kind from the band, oldest first, until the ceiling is met.
