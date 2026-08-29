@@ -54,6 +54,7 @@ from agent_framework_lab_cachebench import (
 from agent_framework_lab_cachebench._advisor import ModelPricing
 from agent_framework_lab_cachebench._live import (
     RETRIEVAL_GUIDANCE,
+    RecallGate,
     make_recall_tool,
     make_scope_tools,
     resolve_instructions,
@@ -66,6 +67,11 @@ from agent_framework_lab_cachebench._live_cli import (
     _spread,
     _summarizer_cost,
     build_parser,
+)
+from agent_framework_lab_cachebench._toolsummary import (
+    RECALL_TOOL_NAME,
+    RECORD_MARKER,
+    find_record_index,
 )
 
 TOKENIZER = CharacterEstimatorTokenizer()
@@ -1273,7 +1279,7 @@ async def test_the_recall_middleware_forces_the_call_inside_the_real_pipeline() 
         max_input_tokens=ceiling, tokenizer=TOKENIZER, trigger_fraction=0.1, fallback_fraction=0.99
     )
     middleware = ToolResultRecallMiddleware(
-        max_input_tokens=ceiling, tokenizer=TOKENIZER, recall_tool=make_recall_tool(), trigger_fraction=0.1
+        max_input_tokens=ceiling, tokenizer=TOKENIZER, arm=lambda: None, trigger_fraction=0.1
     )
     client = StubChatClient()
     recorder = UsageRecorder()
@@ -1282,7 +1288,7 @@ async def test_the_recall_middleware_forces_the_call_inside_the_real_pipeline() 
         kind="harness",
         strategy=strategy,
         tokenizer=TOKENIZER,
-        tools=[],
+        tools=[make_recall_tool()],
         recorder=recorder,
         extra_middleware=[middleware],
         max_context_window_tokens=ceiling,
@@ -1334,3 +1340,40 @@ async def test_a_pinned_tool_choice_does_not_survive_the_follow_up_call() -> Non
     assert len(pins) >= 2, "a tool turn makes at least two calls"
     assert pins[0] is not None, "the first call carries the pin"
     assert pins[1] is None, "the follow-up call does not, so the model may call anything"
+
+
+def test_the_recall_tool_records_only_while_armed() -> None:
+    """The tool cannot be hidden, so it has to be inert instead.
+
+    MAF requires it to be registered with the harness: FunctionInvocationLayer wraps the
+    middleware layer and builds its tool map first, so a tool supplied through per-call
+    options reaches the model but never the executor, and the model's call goes unanswered.
+    A registered tool is advertised on every request, and this one was called uninvited on
+    every unpinned follow-up call. Permission is therefore separated from visibility.
+    """
+    gate = RecallGate()
+    tool = make_recall_tool(gate)
+
+    uninvited = tool("AA-1")
+    gate.arm()
+    armed = tool("AA-1")
+    reused = tool("AA-2")
+
+    assert RECORD_MARKER not in uninvited
+    assert RECORD_MARKER in armed
+    assert RECORD_MARKER not in reused, "one arming cannot licence a second record"
+    # The scorer must agree, or an uninvited call would look like a record and the strategy
+    # would drop results that nothing had preserved.
+    assert find_record_index(_recall_exchange(uninvited)) is None
+    assert find_record_index(_recall_exchange(armed)) is not None
+
+
+def _recall_exchange(result: str) -> list[Message]:
+    """Return a matched recall call and result carrying ``result``."""
+    return [
+        Message(
+            role="assistant",
+            contents=[{"type": "function_call", "call_id": "r", "name": RECALL_TOOL_NAME, "arguments": "{}"}],
+        ),
+        Message(role="tool", contents=[{"type": "function_result", "call_id": "r", "result": result}]),
+    ]

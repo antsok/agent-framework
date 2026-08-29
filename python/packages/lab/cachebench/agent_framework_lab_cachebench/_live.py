@@ -53,6 +53,7 @@ from ._runner import unsupported_option
 from ._strategies import StrategyOptions, build_strategy
 from ._toolsummary import (
     RECALL_TOOL_NAME,
+    RECORD_MARKER,
     ToolResultAnchoredSummarizationCompactionStrategy,
     ToolResultRecallMiddleware,
 )
@@ -72,6 +73,7 @@ __all__ = [
     "LiveOutcome",
     "MeteredClient",
     "ModelCall",
+    "RecallGate",
     "UsageRecorder",
     "build_live_agent",
     "build_live_scenario",
@@ -531,20 +533,59 @@ def _scope_tool(scope: str, result: str) -> Callable[[], str]:
     return tool
 
 
-def make_recall_tool() -> Callable[[str], str]:
-    """Build the tool ``ToolResultAnchoredSummarizationCompactionStrategy`` asks the agent to call.
+class RecallGate:
+    """One-shot permission for the recall tool.
+
+    The tool cannot be hidden from the model. It has to be registered with the harness for
+    ``FunctionInvocationLayer`` to execute it, and that layer wraps the middleware layer, so a
+    tool supplied per call reaches the model but never the executor: measured, the model's
+    call simply went unanswered. A registered tool is advertised on every request, and this
+    one was called uninvited on the unpinned follow-up call in every run.
+
+    Permission is therefore separated from visibility. The middleware arms the gate
+    immediately before the request it forces, and the tool records only while armed. An
+    uninvited call still runs and still answers honestly; it just produces no record.
+    """
+
+    def __init__(self) -> None:
+        """Start disarmed, so nothing is recorded until something asks for it."""
+        self._armed = False
+
+    def arm(self) -> None:
+        """Permit the next call to record."""
+        self._armed = True
+
+    def take(self) -> bool:
+        """Consume the permission.
+
+        Returns:
+            True if this call may record. One-shot: a single arming cannot licence a second
+            record, which would drop results the first had already replaced.
+        """
+        armed, self._armed = self._armed, False
+        return armed
+
+
+def make_recall_tool(gate: RecallGate | None = None) -> Callable[[str], str]:
+    """Build the tool ``ToolResultAnchoredSummarizationCompactionStrategy`` anchors on.
 
     It echoes what it is given straight back. That is the whole point: the value of the call
     is not what the tool computes but that the model's own recollection ends up in the
     transcript as a tool result, which the provider issued and which survives strategies that
     shed assistant prose.
 
+    Args:
+        gate: Permission to record. Without one the tool always records, which is only right
+            for a caller driving it deliberately.
+
     Returns:
         A callable named :data:`RECALL_TOOL_NAME`.
     """
 
     def tool(values: str) -> str:
-        return f"Recorded. These values remain available after the earlier results are removed:\n{values}"
+        if gate is not None and not gate.take():
+            return "Not required right now: nothing was recorded, and no results have been removed."
+        return f"{RECORD_MARKER} These values remain available after the earlier results are removed:\n{values}"
 
     tool.__name__ = RECALL_TOOL_NAME
     tool.__doc__ = (
@@ -824,12 +865,14 @@ async def run_live(
     # to do with compaction.
     recall_middleware: ToolResultRecallMiddleware | None = None
     if isinstance(strategy, ToolResultAnchoredSummarizationCompactionStrategy):
-        # Not added to scope_tools: the middleware offers it on the one call it forces, so the
-        # model never sees a tool it might call on its own initiative.
+        gate = RecallGate()
+        # Registered like any other tool, because the harness must know it to run it, and
+        # inert until the middleware arms it, because it cannot be hidden from the model.
+        scope_tools = [*scope_tools, make_recall_tool(gate)]
         recall_middleware = ToolResultRecallMiddleware(
             max_input_tokens=strategy.max_input_tokens,
             tokenizer=options.tokenizer,
-            recall_tool=make_recall_tool(),
+            arm=gate.arm,
             trigger_fraction=strategy.trigger_fraction,
         )
 
