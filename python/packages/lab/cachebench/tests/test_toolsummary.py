@@ -252,3 +252,20 @@ async def test_the_middleware_leaves_small_conversations_alone() -> None:
 
     assert "tool_choice" not in after
     assert middleware.forced_calls == 0
+
+
+async def test_a_single_record_is_attributed_exactly_once() -> None:
+    """The transition must be tracked on the instance, not re-read from each prompt.
+
+    Before the pipeline runs, context.messages holds only the new turn, so a pre-call check
+    reports "no record" every time and every later call counts as another one. That produced
+    RECVOLUNTEERED:18 for a single record in a live run, which turned an attribution into
+    noise at exactly the moment it was needed.
+    """
+    middleware = ToolResultRecallMiddleware(max_input_tokens=1_000, tokenizer=TOKENIZER, trigger_fraction=0.1)
+    with_record = _conversation(tool_turns=8, record="CODE-0")
+
+    for _ in range(5):
+        await _run(middleware, with_record)
+
+    assert middleware.records_forced + middleware.records_volunteered == 1

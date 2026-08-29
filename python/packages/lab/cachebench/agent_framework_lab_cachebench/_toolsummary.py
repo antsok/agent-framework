@@ -284,6 +284,7 @@ class ToolResultRecallMiddleware(ChatMiddleware):
         self._forced = 0
         self._records_forced = 0
         self._records_volunteered = 0
+        self._seen_record = False
 
     @property
     def forced_calls(self) -> int:
@@ -329,7 +330,6 @@ class ToolResultRecallMiddleware(ChatMiddleware):
             self._force_next = False
             self._forced += 1
 
-        had_record = find_record_index(list(context.messages)) is not None
         await call_next()
 
         messages = list(context.messages)
@@ -337,7 +337,12 @@ class ToolResultRecallMiddleware(ChatMiddleware):
             self._force_next = False
             return
         if find_record_index(messages) is not None:
-            if not had_record:
+            # The transition is tracked on the instance, not read from the messages on the way
+            # in. Before the pipeline runs, context.messages holds only the new turn, so a
+            # pre-call check reports "no record" on every call and every later call counts as
+            # a fresh one -- which is how an 18 appeared here for a single record.
+            if not self._seen_record:
+                self._seen_record = True
                 # Attributed, not merely counted. A record that arrived unpinned came from the
                 # model volunteering on a follow-up call, and that is a different claim.
                 if forced_this_call:
