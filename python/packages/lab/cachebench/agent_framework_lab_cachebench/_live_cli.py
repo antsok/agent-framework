@@ -463,6 +463,7 @@ def _render(
             flags.append("ERR")
         if run.summarizer_failures:
             flags.append(f"S{run.summarizer_failures}")
+        flags.extend(run.strategy_notes)
         if run.turns_completed < run.turns_total:
             flags.append(f"{run.turns_completed}/{run.turns_total}t")
         lines.append(
@@ -507,6 +508,9 @@ def _render(
         "            times. A wide gap here means the accuracy ranking is not usable, exactly",
         "            as a wide +- means the cost ranking is not",
         "flags     = ERR failed turn, S<n> summarizer failures, <n>/<n>t turns completed,",
+        "            REC:<n> records the strategy found, ASK:<n> times it asked for one, and",
+        "            FALLBACK:<n> times it gave up and compacted another way. A row with",
+        "            FALLBACK is measuring that other strategy, not the one named,",
         "            NO:<opt> the provider rejected that option so it was dropped. A run",
         "            that dropped tool_choice chose its own tool calls and is not",
         "            comparable with one that did not,",

@@ -326,6 +326,10 @@ class LiveOutcome:
     """
     summarizer_calls: int = 0
     summarizer_failures: int = 0
+    #: Free-form notes a strategy chose to report about its own run, shown in the flags
+    #: column. A strategy that can silently degrade into a different one has to say so:
+    #: this package has twice read a row that scored well for having done nothing.
+    strategy_notes: tuple[str, ...] = ()
     summarizer_input_tokens: int = 0
     summarizer_output_tokens: int = 0
     error: str | None = None
@@ -391,6 +395,27 @@ class LiveOutcome:
         had to pay to resend, or that compaction had to decide whether to keep.
         """
         return sum(call.output_tokens for call in self.calls[:-1]) if len(self.calls) > 1 else 0
+
+
+def _strategy_notes(strategy: Any) -> tuple[str, ...]:
+    """Return what a strategy reports about its own run, if it reports anything.
+
+    Read by duck typing rather than by isinstance so a strategy from outside this package can
+    surface its own diagnostics without the runner knowing about it. Only counts that are
+    non-zero are reported, so a clean run adds no noise to the flags column.
+
+    Args:
+        strategy: The strategy that was installed, or None for the control.
+
+    Returns:
+        Short tokens for the flags column.
+    """
+    notes: list[str] = []
+    for attribute, label in (("records_found", "REC"), ("fallbacks_used", "FALLBACK"), ("requests_made", "ASK")):
+        value = getattr(strategy, attribute, None)
+        if isinstance(value, int) and value:
+            notes.append(f"{label}:{value}")
+    return tuple(notes)
 
 
 def wants_client_side_history(client: Any, *, allow_server_history: bool = False) -> bool:
@@ -877,6 +902,7 @@ async def run_live(
         scopes_called=tuple(scopes_called),
         summarizer_calls=summarizer.calls if summarizer else 0,
         summarizer_failures=summarizer.failures if summarizer else 0,
+        strategy_notes=_strategy_notes(strategy),
         summarizer_input_tokens=summarizer.input_tokens if summarizer else 0,
         summarizer_output_tokens=summarizer.output_tokens if summarizer else 0,
         error=error,
