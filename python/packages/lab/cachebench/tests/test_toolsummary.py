@@ -75,8 +75,16 @@ def _rendered(messages: list[Message]) -> str:
     return "\n".join(parts)
 
 
+#: A ceiling that puts the eight-turn conversation between the two thresholds, so the default
+#: strategy asks and waits rather than giving up. Chosen from the fixture's own size: the
+#: conversation is about 16,000 tokens, which is 73% of this, between the 60% trigger and the
+#: 90% fallback.
+_WAITING_CEILING = 22_000
+
+
 def _strategy(**kwargs: Any) -> ToolResultAnchoredSummarizationCompactionStrategy:
-    return ToolResultAnchoredSummarizationCompactionStrategy(max_input_tokens=1_000, tokenizer=TOKENIZER, **kwargs)
+    kwargs.setdefault("max_input_tokens", _WAITING_CEILING)
+    return ToolResultAnchoredSummarizationCompactionStrategy(tokenizer=TOKENIZER, **kwargs)
 
 
 async def test_phase_one_appends_the_request_and_drops_nothing() -> None:
@@ -176,3 +184,63 @@ def test_invalid_configuration_is_rejected(kwargs: dict[str, Any], match: str) -
     """A silently accepted bad bound produces a plausible-looking wrong measurement."""
     with pytest.raises(ValueError, match=match):
         ToolResultAnchoredSummarizationCompactionStrategy(tokenizer=TOKENIZER, **kwargs)
+
+
+async def test_the_fallback_fires_when_the_record_never_arrives() -> None:
+    """Waiting forever means overflowing the window, which is worse than truncating.
+
+    The model may never call the tool. Past the fallback threshold the strategy stops asking
+    and compacts without a record: the tool results are lost either way at that point, and
+    the alternative is a provider error that loses the whole conversation.
+    """
+    strategy = ToolResultAnchoredSummarizationCompactionStrategy(
+        max_input_tokens=1_000, tokenizer=TOKENIZER, trigger_fraction=0.1, fallback_fraction=0.2
+    )
+    messages = _conversation(tool_turns=8)
+
+    assert await strategy(messages) is True
+    assert strategy.fallbacks_used == 1
+    assert strategy.records_found == 0
+    # It compacted rather than merely asking again.
+    assert RECALL_INSTRUCTION not in _rendered(messages)
+    assert "EU-WEST-1" in _rendered(messages), "the fallback keeps the head anchor too"
+
+
+async def test_the_request_comes_before_the_fallback() -> None:
+    """Phase 1 must have room to run, or the recording step never happens at all.
+
+    Between the two thresholds the strategy asks and waits. Only above the higher one does it
+    give up. A fallback at or below the trigger would truncate on the first pass and the
+    model would never get a chance to answer.
+    """
+    strategy = ToolResultAnchoredSummarizationCompactionStrategy(
+        max_input_tokens=100_000, tokenizer=TOKENIZER, trigger_fraction=0.01, fallback_fraction=0.99
+    )
+    messages = _conversation(tool_turns=8)
+
+    assert await strategy(messages) is True
+    assert strategy.requests_made == 1
+    assert strategy.fallbacks_used == 0
+    assert RECALL_INSTRUCTION in _rendered(messages)
+    assert "CODE-0" in _rendered(messages), "nothing dropped while still waiting"
+
+
+async def test_thresholds_the_wrong_way_around_are_rejected() -> None:
+    """A fallback at or below the trigger silently disables the whole design."""
+    with pytest.raises(ValueError, match="fallback_fraction"):
+        ToolResultAnchoredSummarizationCompactionStrategy(
+            max_input_tokens=1_000, tokenizer=TOKENIZER, trigger_fraction=0.8, fallback_fraction=0.8
+        )
+
+
+async def test_a_record_that_does_not_free_enough_still_falls_back() -> None:
+    """The groups after the record are untouched by design and can exceed the ceiling alone."""
+    strategy = ToolResultAnchoredSummarizationCompactionStrategy(
+        max_input_tokens=500, tokenizer=TOKENIZER, trigger_fraction=0.1, fallback_fraction=0.9
+    )
+    # The record sits early, so most of the bulk is behind it and survives phase 2.
+    messages = _conversation(tool_turns=2, record="CODE-0")
+    messages += _conversation(tool_turns=6)[3:]
+
+    assert await strategy(messages) is True
+    assert strategy.records_found == 1
