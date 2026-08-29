@@ -49,7 +49,7 @@ phase 1 deterministic rather than a compliance rate to be estimated.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Sequence
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
 from agent_framework import ChatContext, ChatMiddleware, Message
 from agent_framework._compaction import (
@@ -256,6 +256,9 @@ class ToolResultRecallMiddleware(ChatMiddleware):
         tokenizer: Token counter, matching the strategy's.
 
     Keyword Args:
+        recall_tool: The tool to offer, named :data:`RECALL_TOOL_NAME`. Deliberately passed
+            here rather than registered on the agent: a registered tool is advertised on every
+            request, and this one was called unprompted.
         trigger_fraction: Fraction of the ceiling at which the record is forced. Comfortably
             below the strategy's fallback threshold, because the decision is made one call
             late -- see :meth:`process`.
@@ -266,6 +269,7 @@ class ToolResultRecallMiddleware(ChatMiddleware):
         *,
         max_input_tokens: int,
         tokenizer: TokenizerProtocol,
+        recall_tool: Callable[..., Any],
         trigger_fraction: float = 0.6,
     ) -> None:
         """Validate and store the configuration.
@@ -279,6 +283,7 @@ class ToolResultRecallMiddleware(ChatMiddleware):
             raise ValueError("trigger_fraction must be in (0.0, 1.0].")
         self.max_input_tokens = max_input_tokens
         self.tokenizer = tokenizer
+        self.recall_tool = recall_tool
         self.trigger_fraction = trigger_fraction
         self._force_next = False
         self._forced = 0
@@ -323,8 +328,16 @@ class ToolResultRecallMiddleware(ChatMiddleware):
         if forced_this_call:
             # Replaced rather than mutated: options may be shared with the caller's own dict,
             # and pinning a tool choice into it would outlive this call.
+            # The tool is offered on this call and no other. Registering it on the agent
+            # would put its schema in every request, and its description reads as sensible
+            # hygiene right after a lookup -- which is exactly what happened: the model called
+            # it unprompted on the unpinned follow-up call, and the run then measured the
+            # model's initiative rather than this middleware. Options replace the tool list
+            # rather than adding to it, so offering it here also hides everything else, which
+            # is harmless on a call whose only purpose is to make this one call.
             context.options = {
                 **dict(context.options or {}),
+                "tools": [self.recall_tool],
                 "tool_choice": {"mode": "required", "required_function_name": RECALL_TOOL_NAME},
             }
             self._force_next = False
