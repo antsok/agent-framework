@@ -282,11 +282,30 @@ class ToolResultRecallMiddleware(ChatMiddleware):
         self.trigger_fraction = trigger_fraction
         self._force_next = False
         self._forced = 0
+        self._records_forced = 0
+        self._records_volunteered = 0
 
     @property
     def forced_calls(self) -> int:
         """How many times the recall tool was forced. Zero means phase 1 never fired."""
         return self._forced
+
+    @property
+    def records_forced(self) -> int:
+        """Records that appeared on a call this middleware pinned."""
+        return self._records_forced
+
+    @property
+    def records_volunteered(self) -> int:
+        """Records the model produced without being pinned.
+
+        Not a success. A turn's pinned ``tool_choice`` applies only to its first call, so on
+        the follow-up after a tool result the model may call any registered tool. A record
+        arriving that way is the model choosing to, which is not something a strategy can rely
+        on, and reporting it as though the design had worked would be the difference between a
+        mechanism and a coincidence.
+        """
+        return self._records_volunteered
 
     async def process(self, context: ChatContext, call_next: Callable[[], Awaitable[None]]) -> None:
         """Force the recall tool when the last call showed the conversation is large enough.
@@ -299,7 +318,8 @@ class ToolResultRecallMiddleware(ChatMiddleware):
         time. The trigger sits well below the strategy's fallback threshold to absorb that
         one-call delay.
         """
-        if self._force_next:
+        forced_this_call = self._force_next
+        if forced_this_call:
             # Replaced rather than mutated: options may be shared with the caller's own dict,
             # and pinning a tool choice into it would outlive this call.
             context.options = {
@@ -309,10 +329,21 @@ class ToolResultRecallMiddleware(ChatMiddleware):
             self._force_next = False
             self._forced += 1
 
+        had_record = find_record_index(list(context.messages)) is not None
         await call_next()
 
         messages = list(context.messages)
-        if not messages or find_record_index(messages) is not None:
+        if not messages:
+            self._force_next = False
+            return
+        if find_record_index(messages) is not None:
+            if not had_record:
+                # Attributed, not merely counted. A record that arrived unpinned came from the
+                # model volunteering on a follow-up call, and that is a different claim.
+                if forced_this_call:
+                    self._records_forced += 1
+                else:
+                    self._records_volunteered += 1
             self._force_next = False
             return
         annotate_message_groups(messages)
