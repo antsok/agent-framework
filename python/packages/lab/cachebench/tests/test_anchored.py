@@ -215,3 +215,42 @@ async def test_the_ceiling_is_best_effort_when_the_anchors_alone_exceed_it() -> 
     assert "[compacted: an earlier assistant reply]" in rendered
     # What it was not allowed to touch is untouched.
     assert "EU-WEST-1" in rendered
+
+
+async def test_retention_scales_with_the_ceiling() -> None:
+    """A fixed retention becomes a rounding error as tool results grow.
+
+    Measured: a 600-character retention is 1.9% of an 8,000-token result and 0.6% of a
+    25,200-token one. The strategy scored 32 of 53 planted facts at the first size and 11 at
+    the second, and 11 was exactly the five non-tool facts plus the single code that fell
+    inside each surviving head fragment. The band budget now scales with the window instead.
+    """
+    small = AnchoredCompactionStrategy(max_input_tokens=57_952, tokenizer=TOKENIZER)
+    large = AnchoredCompactionStrategy(max_input_tokens=269_952, tokenizer=TOKENIZER)
+    band = [
+        {"kind": "tool_call", "group_id": f"g{index}", "start_index": index, "end_index": index} for index in range(6)
+    ]
+
+    assert large._keep_chars_for(band) > 4 * small._keep_chars_for(band)
+    # And an explicit value still wins, so a caller can pin it for a comparison.
+    pinned = AnchoredCompactionStrategy(max_input_tokens=269_952, tokenizer=TOKENIZER, keep_chars=600)
+    assert pinned._keep_chars_for(band) == 600
+
+
+async def test_a_wider_band_share_keeps_more_of_each_result() -> None:
+    """The knob has to move the trade-off, or it is decoration."""
+    narrow = AnchoredCompactionStrategy(max_input_tokens=269_952, tokenizer=TOKENIZER, band_share=0.05)
+    wide = AnchoredCompactionStrategy(max_input_tokens=269_952, tokenizer=TOKENIZER, band_share=0.5)
+    band = [
+        {"kind": "tool_call", "group_id": f"g{index}", "start_index": index, "end_index": index} for index in range(6)
+    ]
+
+    assert wide._keep_chars_for(band) > narrow._keep_chars_for(band)
+
+
+def test_band_share_is_validated() -> None:
+    """A share outside (0, 1] would silently produce a nonsensical budget."""
+    with pytest.raises(ValueError, match="band_share"):
+        AnchoredCompactionStrategy(max_input_tokens=1_000, tokenizer=TOKENIZER, band_share=0.0)
+    with pytest.raises(ValueError, match="band_share"):
+        AnchoredCompactionStrategy(max_input_tokens=1_000, tokenizer=TOKENIZER, band_share=1.5)

@@ -67,6 +67,19 @@ EXCLUDE_REASON: Final[str] = "anchored_compaction"
 #: no retention budget of this size would be.
 DEFAULT_KEEP_CHARS: Final[int] = 600
 
+#: Fraction of the ceiling the collapsed middle band may occupy, shared between its tool
+#: results. A fixed per-result budget cannot work: measured at a 60,000-token window a
+#: 600-character retention is 1.9% of an 8,000-token result, and at 272,000 it is 0.6% of a
+#: 25,200-token one. The strategy scored 32 of 53 facts in the first case and 11 in the
+#: second -- 11 being exactly the five non-tool facts plus the one code per result that fell
+#: inside the surviving head fragment.
+DEFAULT_BAND_SHARE: Final[float] = 0.25
+
+#: Characters per token, for turning a token budget into the character budget the shortener
+#: works in. Deliberately conservative: overestimating tokens keeps the result under the
+#: ceiling, which is the direction that matters.
+_CHARS_PER_TOKEN: Final[int] = 4
+
 #: Marks where a tool result was cut. It serves two purposes: a model shown a truncated
 #: document with no sign of truncation answers as though it had seen all of it, and the
 #: marker is how a later pass recognises its own earlier work and leaves it alone.
@@ -103,7 +116,11 @@ class AnchoredCompactionStrategy:
             model loses the thread of what it is doing, too large and each new turn shifts a
             large block and re-bills it.
         keep_chars: Characters of a collapsed tool result to retain, split between its head
-            and its tail.
+            and its tail. ``None`` derives it from ``band_share``, which is what makes the
+            retention scale with the window instead of shrinking to nothing as results grow.
+        band_share: Fraction of ``max_input_tokens`` the whole collapsed band may occupy,
+            divided evenly between the tool results in it. Raising it keeps more of each
+            result and saves less.
         collapse_assistant_text: Allow assistant narration in the middle band to be dropped
             when tool shedding is not enough. Last resort, because narration is often where
             a tool's values ended up after the model restated them.
@@ -116,7 +133,8 @@ class AnchoredCompactionStrategy:
         tokenizer: TokenizerProtocol,
         keep_head_groups: int = 3,
         keep_tail_groups: int = 4,
-        keep_chars: int = DEFAULT_KEEP_CHARS,
+        keep_chars: int | None = None,
+        band_share: float = DEFAULT_BAND_SHARE,
         collapse_assistant_text: bool = True,
     ) -> None:
         """Validate and store the configuration.
@@ -128,13 +146,16 @@ class AnchoredCompactionStrategy:
             raise ValueError("max_input_tokens must be positive.")
         if keep_head_groups < 0 or keep_tail_groups < 0:
             raise ValueError("keep_head_groups and keep_tail_groups must be >= 0.")
-        if keep_chars < 0:
+        if keep_chars is not None and keep_chars < 0:
             raise ValueError("keep_chars must be >= 0.")
+        if not 0.0 < band_share <= 1.0:
+            raise ValueError("band_share must be in (0.0, 1.0].")
         self.max_input_tokens = max_input_tokens
         self.tokenizer = tokenizer
         self.keep_head_groups = keep_head_groups
         self.keep_tail_groups = keep_tail_groups
         self.keep_chars = keep_chars
+        self.band_share = band_share
         self.collapse_assistant_text = collapse_assistant_text
 
     async def __call__(self, messages: list[Message]) -> bool:
@@ -215,6 +236,7 @@ class AnchoredCompactionStrategy:
         Returns:
             True if any result was shortened.
         """
+        budget = self._keep_chars_for(band)
         changed = False
         for group in band:
             if group.get("kind") != "tool_call":
@@ -226,14 +248,36 @@ class AnchoredCompactionStrategy:
                     if content.type != "function_result":
                         continue
                     text = content.result if isinstance(content.result, str) else str(content.result)
-                    shortened = self._shorten(text)
+                    shortened = self._shorten(text, budget)
                     if shortened != text:
                         content.result = shortened
                         changed = True
         return changed
 
-    def _shorten(self, text: str) -> str:
-        """Return ``text`` reduced to ``keep_chars``, taken from both ends.
+    def _keep_chars_for(self, band: list[dict[str, Any]]) -> int:
+        """Return how many characters each collapsed tool result may keep.
+
+        An explicit ``keep_chars`` is honoured verbatim. Otherwise the band as a whole gets
+        ``band_share`` of the ceiling and the tool results in it divide that evenly, so the
+        retention grows with the window rather than becoming a rounding error against it.
+
+        Args:
+            band: The middle groups, as returned by :meth:`_middle_band`.
+
+        Returns:
+            A character budget per collapsed result, never below a floor that still carries a
+            recognisable fragment.
+        """
+        if self.keep_chars is not None:
+            return self.keep_chars
+        tool_groups = sum(1 for group in band if group.get("kind") == "tool_call")
+        if tool_groups == 0:
+            return DEFAULT_KEEP_CHARS
+        share_tokens = self.max_input_tokens * self.band_share / tool_groups
+        return max(int(share_tokens * _CHARS_PER_TOKEN), DEFAULT_KEEP_CHARS)
+
+    def _shorten(self, text: str, budget: int) -> str:
+        """Return ``text`` reduced to ``budget`` characters, taken from both ends.
 
         Returns:
             The text unchanged when it already fits, otherwise its head and tail joined by a
@@ -245,9 +289,9 @@ class AnchoredCompactionStrategy:
         # keep_chars by the width of the marker itself, so a second pass would shorten it
         # again and a third again -- each one a fresh mutation at the same position, which is
         # precisely the cache behaviour this strategy exists to avoid.
-        if len(text) <= self.keep_chars or REMOVAL_MARKER in text:
+        if len(text) <= budget or REMOVAL_MARKER in text:
             return text
-        half = self.keep_chars // 2
+        half = budget // 2
         removed = len(text) - 2 * half
         return f"{text[:half]}\n[{REMOVAL_MARKER}: {removed:,} characters]\n{text[-half:]}"
 
