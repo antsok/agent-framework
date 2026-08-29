@@ -51,7 +51,7 @@ __all__ = [
 _FIRST_QUESTION: Final[str] = (
     "Quote verbatim every requirement code you were given, the change-of-direction "
     "reference, and which pipeline we settled on. List them plainly, one per line, no "
-    "preamble. If any of them is no longer in this conversation, say so for that one."
+    "preamble. If any of them appears nowhere in this conversation, say so for that one."
 )
 _SWEEPING_QUESTION: Final[str] = (
     "Write the final report summary now. It must contain, verbatim: every requireme"
@@ -541,8 +541,8 @@ def build_recall_scenario(
                                 (
                                     f"Next question. The {label} deployment lookup returned "
                                     f"{len(lookups[label])} codes. Quote all {len(lookups[label])} "
-                                    "verbatim, one per line, no preamble. If any of them is no "
-                                    "longer in this conversation, say so for that one."
+                                    "verbatim, one per line, no preamble. If any of them appears "
+                                    "nowhere in this conversation, say so for that one."
                                 )
                             ],
                         ),

@@ -255,7 +255,9 @@ def test_closing_questions_state_how_many_codes_to_expect() -> None:
     assert all("returned 8 codes" in text and "Quote all 8" in text for text in per_scope)
     # The escape hatch matters as much as the count: without it a model told to produce eight
     # codes will invent the ones compaction removed, and an invented code scores as recall.
-    assert all("no longer in this conversation" in text for text in closing)
+    # "appears nowhere" rather than "no longer here": the latter presumes the original
+    # location and invites "not present" for a value sitting in a compaction record.
+    assert all("appears nowhere in this conversation" in text for text in closing)
 
 
 def test_the_expected_count_follows_the_markers_actually_planted() -> None:
