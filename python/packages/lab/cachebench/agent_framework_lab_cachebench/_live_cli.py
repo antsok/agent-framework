@@ -607,6 +607,8 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
     # forced: a 16-turn conversation reported a one-message prompt on every row.
     stores_by_default = bool(getattr(runtime.client, "STORES_BY_DEFAULT", False))
     if wants_client_side_history(runtime.client, allow_server_history=args.server_history):
+        # run_live forces this itself; setting it here too keeps the note honest about what
+        # the run will actually do.
         runtime.options["store"] = False
         print(
             f"note: {runtime.model} keeps history server-side by default. Forcing store=False so "

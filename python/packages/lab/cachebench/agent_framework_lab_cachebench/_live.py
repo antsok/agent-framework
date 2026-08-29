@@ -689,6 +689,7 @@ async def run_live(
     narration: str = "prompted",
     retrieval_guidance: bool = True,
     fact_placement: str = "spread",
+    allow_server_history: bool = False,
 ) -> LiveOutcome:
     """Run the scenario end to end against a real agent.
 
@@ -715,11 +716,18 @@ async def run_live(
             distributes them; ``"head"`` reproduces the earlier runs, in which every code sat
             inside the first 4,096 characters and so survived head-truncating compaction
             unconditionally.
+        allow_server_history: Leave a Responses-API client in charge of the conversation,
+            accepting that no compaction runs. Off by default, and forced here rather than
+            left to the caller: a calibration probe that forgot it reported every narration
+            mode as stable, because the service was feeding the model a history the client
+            had never compacted.
 
     Returns:
         The outcome. A turn that fails sets ``error`` and stops the run rather than raising,
         so a partial result is still reported instead of losing the spend already made.
     """
+    if wants_client_side_history(runtime.client, allow_server_history=allow_server_history):
+        runtime.options["store"] = False
     strategy = build_strategy(strategy_name, options)
     recorder = UsageRecorder()
     summarizer = options.summarizer if isinstance(options.summarizer, MeteredClient) else None
