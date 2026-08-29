@@ -57,6 +57,7 @@ from ._recall_cli import main as recall_main
 from ._report import render_summary_table, write_records_jsonl, write_summary_csv
 from ._runner import CallOutcome, ProviderCaller, TurnCaller, run_cell, unsupported_option
 from ._strategies import (
+    STRATEGIES_NEEDING_SUMMARIZER,
     STRATEGY_BUILDERS,
     StrategyOptions,
     build_strategy,
@@ -78,6 +79,7 @@ __all__ = [
     "AGENT_KINDS",
     "DEFAULT_SYSTEM_TOKENS",
     "PROVIDER_SPECS",
+    "STRATEGIES_NEEDING_SUMMARIZER",
     "STRATEGY_BUILDERS",
     "TOKENIZER_NAMES",
     "TRANSCRIPT_PRESETS",

@@ -24,7 +24,7 @@ from ._live import (
 )
 from ._providers import build_provider, parse_provider_selector, provider_names
 from ._recall import RecallScenario, RecallScore
-from ._strategies import StrategyOptions, build_strategy, strategy_names
+from ._strategies import StrategyOptions, build_strategy, needs_summarizer, strategy_names
 from ._summary import DEFAULT_MIN_CORRECTNESS, JointOutcome, JointVerdict, recommend, relative_correctness
 from ._tokenizers import TOKENIZER_NAMES, build_tokenizer
 
@@ -563,8 +563,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
     # groups against a retention of 4, tool_result and selective_tool_call were exact no-ops
     # while carrying 55% of the planted facts.
     tool_strategies_inert = planted_groups <= retained
-    needs_summarizer = any("summar" in name for name in strategies)
-    if needs_summarizer and args.summarizer_provider is None and not args.dry_run:
+    if needs_summarizer(strategies) and args.summarizer_provider is None and not args.dry_run:
         raise SystemExit("Summarization strategies require --summarizer-provider.")
 
     if args.dry_run:

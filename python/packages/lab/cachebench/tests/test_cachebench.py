@@ -38,7 +38,7 @@ from agent_framework_lab_cachebench import (
     write_summary_csv,
 )
 from agent_framework_lab_cachebench._runner import unsupported_option
-from agent_framework_lab_cachebench._strategies import StrategyOptions
+from agent_framework_lab_cachebench._strategies import STRATEGIES_NEEDING_SUMMARIZER, StrategyOptions
 from agent_framework_lab_cachebench._types import TurnRecord
 
 TOKENIZER = CharacterEstimatorTokenizer()
@@ -367,7 +367,7 @@ def test_missing_cache_reporting_is_not_a_zero_hit_rate() -> None:
 #: Strategies that call a model of their own and so cannot be built without a client.
 #: Matched by name rather than listed, so a new summarizing variant is covered the day it
 #: is registered instead of breaking this test.
-SUMMARIZING = tuple(name for name in strategy_names() if "summar" in name)
+SUMMARIZING = tuple(sorted(STRATEGIES_NEEDING_SUMMARIZER))
 
 
 def test_every_registered_strategy_builds() -> None:

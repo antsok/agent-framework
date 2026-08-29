@@ -24,7 +24,7 @@ strategy ever fires and the benchmark would measure nothing.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final
 
@@ -195,22 +195,16 @@ def _build_anchored_no_assistant(options: StrategyOptions) -> CompactionStrategy
 
 
 def _build_tool_summary_anchored(options: StrategyOptions) -> CompactionStrategy:
-    """Return the extract-then-drop strategy.
+    """Return the record-then-drop strategy.
 
-    Raises:
-        ValueError: If no summarizer client was configured.
+    Needs no summarizer client of its own: the recording is done by the agent's own model
+    through a tool call the provider issues. That is also why a run using it cannot pin
+    ``tool_choice`` -- the model has to be free to choose the recall tool.
     """
-    if options.summarizer is None:
-        raise ValueError(
-            "The 'tool_summary_anchored' strategy needs a summarizer client for its extraction call. "
-            "Pass --summarizer-provider to select one, or drop this strategy from the run."
-        )
     return ToolResultAnchoredSummarizationCompactionStrategy(
-        client=options.summarizer,
         max_input_tokens=options.input_budget_tokens,
         tokenizer=options.tokenizer,
         keep_head_groups=options.keep_head_groups,
-        keep_tail_groups=options.keep_tail_groups,
     )
 
 
@@ -372,6 +366,25 @@ STRATEGY_BUILDERS: Final[dict[str, Callable[[StrategyOptions], CompactionStrateg
     "token_budget_window_first": _build_token_budget_window_first,
     "token_budget_summarize": _build_token_budget_summarize,
 }
+
+
+#: Strategies that cannot be built without a summarizer client. Named explicitly rather than
+#: detected by looking for "summar" in the name: that convention silently required a client
+#: for a strategy that does its recording through the agent's own tool loop, and would just as
+#: silently fail to require one for a summarizing strategy named otherwise.
+STRATEGIES_NEEDING_SUMMARIZER: Final[frozenset[str]] = frozenset({"summarization", "token_budget_summarize"})
+
+
+def needs_summarizer(names: Iterable[str]) -> bool:
+    """Return whether any of ``names`` requires a summarizer client.
+
+    Args:
+        names: Strategy names selected for a run.
+
+    Returns:
+        True when at least one needs a client.
+    """
+    return any(name in STRATEGIES_NEEDING_SUMMARIZER for name in names)
 
 
 def strategy_names() -> list[str]:

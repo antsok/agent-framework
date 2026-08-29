@@ -1,12 +1,10 @@
 # Copyright (c) Microsoft. All rights reserved.
 
-"""Tests for the extract-then-drop strategy.
+"""Tests for the record-then-drop strategy.
 
-The property that decides whether it is worth anything is not that it shrinks the prompt.
-It is that the extract it produces is generated once and re-emitted byte-identically
-afterwards. A strategy that re-derives its summary on every model call mutates the prefix
-every turn and forfeits the cache, which is what the framework's own SummarizationStrategy
-measured at 0% to 59% hit rate against a 93% control.
+Two phases, and the tests separate them: phase 1 must ask without inserting anything into the
+cached prefix, and phase 2 must act only on a record the *provider* issued -- never on one the
+client invented, which is unsafe on routes that track tool calls server-side.
 """
 
 from __future__ import annotations
@@ -16,34 +14,18 @@ from typing import Any
 import pytest
 from agent_framework import CharacterEstimatorTokenizer, Message
 from agent_framework._compaction import project_included_messages
-from agent_framework_lab_cachebench._toolsummary import ToolResultAnchoredSummarizationCompactionStrategy
+from agent_framework_lab_cachebench._toolsummary import (
+    MAX_REQUESTS,
+    RECALL_INSTRUCTION,
+    RECALL_TOOL_NAME,
+    ToolResultAnchoredSummarizationCompactionStrategy,
+)
 
 TOKENIZER = CharacterEstimatorTokenizer()
 
 
-class StubExtractor:
-    """A client whose extract text changes on every call, so re-derivation is detectable."""
-
-    def __init__(self, *, fail: bool = False, text: str | None = None) -> None:
-        self.calls = 0
-        self.fail = fail
-        self.text = text
-        self.seen: list[str] = []
-
-    async def get_response(self, messages: list[Message], **kwargs: Any) -> Any:
-        self.calls += 1
-        if self.fail:
-            raise RuntimeError("extraction unavailable")
-        self.seen.append("".join(str(c) for m in messages for c in m.contents))
-
-        class _Response:
-            text = self.text if self.text is not None else f"EXTRACT-{self.calls}"
-
-        return _Response()
-
-
-def _conversation(tool_turns: int, payload_chars: int = 8_000) -> list[Message]:
-    """Return a conversation with a stable head and ``tool_turns`` tool groups."""
+def _conversation(tool_turns: int, payload_chars: int = 8_000, *, record: str | None = None) -> list[Message]:
+    """Return a conversation, optionally with a recall record the agent already made."""
     messages = [
         Message(role="system", contents=["You are an assistant."], message_id="sys"),
         Message(role="user", contents=["Requirement: region is EU-WEST-1."], message_id="u0"),
@@ -65,7 +47,19 @@ def _conversation(tool_turns: int, payload_chars: int = 8_000) -> list[Message]:
                 ],
                 message_id=f"t_res_{index}",
             ),
-            Message(role="assistant", contents=[f"Looked up {index}."], message_id=f"a_txt_{index}"),
+        ]
+    if record is not None:
+        messages += [
+            Message(
+                role="assistant",
+                contents=[{"type": "function_call", "call_id": "rec", "name": RECALL_TOOL_NAME, "arguments": "{}"}],
+                message_id="rec_call",
+            ),
+            Message(
+                role="tool",
+                contents=[{"type": "function_result", "call_id": "rec", "result": record}],
+                message_id="rec_res",
+            ),
         ]
     return messages
 
@@ -81,119 +75,90 @@ def _rendered(messages: list[Message]) -> str:
     return "\n".join(parts)
 
 
-def _strategy(client: StubExtractor, **kwargs: Any) -> ToolResultAnchoredSummarizationCompactionStrategy:
-    return ToolResultAnchoredSummarizationCompactionStrategy(
-        client=client, max_input_tokens=1_000, tokenizer=TOKENIZER, **kwargs
-    )
+def _strategy(**kwargs: Any) -> ToolResultAnchoredSummarizationCompactionStrategy:
+    return ToolResultAnchoredSummarizationCompactionStrategy(max_input_tokens=1_000, tokenizer=TOKENIZER, **kwargs)
 
 
-async def test_the_extract_replaces_the_results_it_covers() -> None:
-    """The bulk goes, the values stay, and the model is told the swap happened."""
-    client = StubExtractor()
-    strategy = _strategy(client)
+async def test_phase_one_appends_the_request_and_drops_nothing() -> None:
+    """Nothing may be removed before a record exists, or the values are simply gone."""
+    strategy = _strategy()
     messages = _conversation(tool_turns=8)
 
     assert await strategy(messages) is True
     rendered = _rendered(messages)
 
-    assert "EXTRACT-1" in rendered
-    assert "removed from this conversation" in rendered
-    # The head anchor survives, and so does the most recent result: only the band is dropped.
-    assert "EU-WEST-1" in rendered
-    assert "CODE-7" in rendered
-    assert "CODE-0" not in rendered
+    assert RECALL_INSTRUCTION in rendered
+    assert "CODE-0" in rendered, "phase 1 must not drop anything"
+    assert strategy.requests_made == 1
+    assert strategy.records_found == 0
 
 
-async def test_the_extract_is_generated_once_and_reused_verbatim() -> None:
-    """The whole design rests on this: one call, then the same bytes forever.
+async def test_the_request_is_appended_not_inserted() -> None:
+    """Appending leaves the cached prefix intact; inserting re-bills everything after it."""
+    strategy = _strategy()
+    messages = _conversation(tool_turns=8)
+    before = list(messages)
 
-    The stub returns different text on every call, so a strategy that re-derived its extract
-    would show EXTRACT-2 on the second pass and mutate the prefix. Caching is not an
-    optimisation here, it is the reason the strategy can be cheaper than not compacting.
+    await strategy(messages)
+
+    assert messages[: len(before)] == before
+    assert RECALL_INSTRUCTION in str(messages[-1].contents[0])
+
+
+async def test_phase_two_drops_only_what_precedes_the_record() -> None:
+    """The record is what those results were reduced to; everything after it is untouched."""
+    strategy = _strategy()
+    messages = _conversation(tool_turns=8, record="CODE-0 CODE-1 CODE-2")
+
+    assert await strategy(messages) is True
+    rendered = _rendered(messages)
+
+    assert "CODE-0 CODE-1 CODE-2" in rendered, "the record itself survives"
+    assert "x" * 100 not in rendered, "the bulk behind it is gone"
+    assert "EU-WEST-1" in rendered, "the head anchor is never touched"
+    assert strategy.records_found == 1
+
+
+async def test_a_client_invented_record_is_not_trusted() -> None:
+    """Only a result whose call the provider issued counts.
+
+    A tool result with no matching call is what synthesising the pair client-side produces,
+    and it is exactly what breaks on routes that track tool calls server-side. The strategy
+    must not treat one as a record.
     """
-    client = StubExtractor()
-    strategy = _strategy(client)
-
-    first = _conversation(tool_turns=8)
-    await strategy(first)
-    later = _conversation(tool_turns=10)
-    await strategy(later)
-
-    # Extracts accumulate rather than being rewritten: the first is still there, verbatim,
-    # alongside a second covering the groups that newly aged into the band. That is the
-    # property that matters -- an extract, once made, is never regenerated, so the prefix
-    # holding it stays byte-identical while the conversation grows past it.
-    assert "EXTRACT-1" in _rendered(later)
-    assert "EXTRACT-2" in _rendered(later)
-    assert client.calls == 2
-
-    # Growing again must not touch either of them.
-    later_still = _conversation(tool_turns=12)
-    await strategy(later_still)
-    rendered = _rendered(later_still)
-    assert "EXTRACT-1" in rendered and "EXTRACT-2" in rendered
-    assert client.calls == 3, "one new extract for the newly aged groups, none re-derived"
-
-
-async def test_a_failed_extraction_keeps_the_tool_results() -> None:
-    """Losing the results *and* the extract is strictly worse than not compacting."""
-    client = StubExtractor(fail=True)
-    strategy = _strategy(client)
+    strategy = _strategy()
     messages = _conversation(tool_turns=8)
+    messages.append(
+        Message(
+            role="tool",
+            contents=[{"type": "function_result", "call_id": "invented", "result": "CODE-0"}],
+            message_id="fake",
+        )
+    )
 
-    assert await strategy(messages) is False
-    assert "CODE-0" in _rendered(messages)
-    assert strategy.failures == 1
+    await strategy(messages)
+
+    assert strategy.records_found == 0
+    assert "CODE-0 " in _rendered(messages), "nothing dropped on the strength of a bare result"
 
 
-async def test_an_empty_extraction_counts_as_a_failure() -> None:
-    """A blank extract would drop the results and replace them with nothing at all."""
-    client = StubExtractor(text="   ")
-    strategy = _strategy(client)
-    messages = _conversation(tool_turns=8)
+async def test_the_request_is_not_repeated_forever() -> None:
+    """A model that will not call the tool would otherwise grow every prompt for the whole run."""
+    strategy = _strategy()
 
-    assert await strategy(messages) is False
-    assert "CODE-0" in _rendered(messages)
-    assert strategy.failures == 1
+    for _ in range(MAX_REQUESTS):
+        assert await strategy(_conversation(tool_turns=8)) is True
+    assert await strategy(_conversation(tool_turns=8)) is False
+    assert strategy.requests_made == MAX_REQUESTS
 
 
 async def test_nothing_happens_below_the_trigger() -> None:
-    """An extract that is not needed is a model call spent and a prefix mutated for nothing."""
-    client = StubExtractor()
-    strategy = ToolResultAnchoredSummarizationCompactionStrategy(
-        client=client, max_input_tokens=10_000_000, tokenizer=TOKENIZER
-    )
+    """A record that is not needed costs an agent turn and buys nothing."""
+    strategy = ToolResultAnchoredSummarizationCompactionStrategy(max_input_tokens=10_000_000, tokenizer=TOKENIZER)
     messages = _conversation(tool_turns=8)
 
     assert await strategy(messages) is False
-    assert client.calls == 0
-
-
-async def test_extracts_are_never_fed_back_into_later_extracts() -> None:
-    """A summary of a summary loses a little more each round and is unbounded."""
-    client = StubExtractor()
-    strategy = _strategy(client)
-
-    messages = _conversation(tool_turns=8)
-    await strategy(messages)
-    grown = _conversation(tool_turns=12)
-    await strategy(grown)
-
-    assert all("EXTRACT-" not in seen for seen in client.seen)
-
-
-async def test_the_synthesised_result_has_a_matching_call() -> None:
-    """A bare tool result with no request is malformed for most providers."""
-    client = StubExtractor()
-    strategy = _strategy(client)
-    messages = _conversation(tool_turns=8)
-
-    await strategy(messages)
-    kept = project_included_messages(messages)
-
-    call_ids = {c.call_id for m in kept for c in m.contents if c.type == "function_call"}
-    result_ids = {c.call_id for m in kept for c in m.contents if c.type == "function_result"}
-    assert result_ids <= call_ids
+    assert strategy.requests_made == 0
 
 
 @pytest.mark.parametrize(
@@ -207,4 +172,4 @@ async def test_the_synthesised_result_has_a_matching_call() -> None:
 def test_invalid_configuration_is_rejected(kwargs: dict[str, Any], match: str) -> None:
     """A silently accepted bad bound produces a plausible-looking wrong measurement."""
     with pytest.raises(ValueError, match=match):
-        ToolResultAnchoredSummarizationCompactionStrategy(client=StubExtractor(), tokenizer=TOKENIZER, **kwargs)
+        ToolResultAnchoredSummarizationCompactionStrategy(tokenizer=TOKENIZER, **kwargs)
