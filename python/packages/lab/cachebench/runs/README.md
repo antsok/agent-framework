@@ -17,6 +17,19 @@ they are copied, not recomputed.
 | `run-09a-400k-aborted.*` | 9a | 400,000 | harness | 53 | 57 min, **failed** |
 | `run-09-272k.*` | 9 | 272,000 | harness | 53 | 1 h 45 min |
 | `probe-reply-cap.*` | — | 60,000 | harness | 53 | 14 min |
+| `run-10-60k-buried.*` | 10 | 60,000 | harness | 53 | part of one sweep |
+| `run-11-120k-buried.*` | 11 | 120,000 | harness | 53 | part of one sweep |
+| `run-12-272k-buried.*` | 12 | 272,000 | harness | 53 | part of one sweep |
+| `run-13-60k-spread.*` | 13 | 60,000 | harness | 53 | 1 h |
+| `run-14-272k-spread.*` | 14 | 272,000 | harness | 53 | 1 h 30 min |
+| `run-15-272k-anchored-scaled.*` | 15 | 272,000 | harness | 53 | 25 min |
+| `run-probe-calibration.*` | — | 60,000 | harness | 53 | 25 min |
+
+Runs 10 to 12 are the **buried** arm: codes inline in prose, so the score covers retrieval as
+well as preservation. Their controls read 11 of 53, which is the five non-tool facts plus the
+one code per result sitting at the start, so their accuracy columns rank nothing. They are
+kept because they hold the one result no other arm shows: compaction scoring *above* the
+uncompacted control by deleting the noise the codes were hiding in.
 
 `probe-reply-cap` is a 2x2 on the control alone, crossing the retrieval-guidance clause with
 the reply cap. It is the evidence that the earlier accuracy instability was truncation rather

@@ -1,0 +1,26 @@
+Unclosed client session
+client_session: <aiohttp.client.ClientSession object at 0x00000234727BA120>
+Unclosed client session
+client_session: <aiohttp.client.ClientSession object at 0x00000234781BA850>
+note: this client keeps history server-side by default; run_live forces store=False
+so the client sends the conversation and the measurement describes it.
+
+model: gpt-5.4-mini   agent: harness   repeats: 5
+window: 60,000   facts: 8 per tool x 6 tools
+
+  narration  placement   median   range            recalled  verdict
+------------------------------------------------------------------------------
+    neutral     spread      98%      6p      52/49/52/52/51  usable
+   prompted     spread     100%      0p      53/53/53/53/53  usable
+ suppressed     spread      98%      4p      52/50/52/52/52  usable
+
+Most measurable: --narration prompted --fact-placement spread (100% median, 0-point range).
+
+Stability is not the only consideration. 'neutral' is the configuration a typical
+caller gets, so if it is unstable that instability is itself a finding about the
+model, and suppressing narration to obtain a clean number measures something else:
+preservation alone, with each value existing in exactly one place. Report which one
+you used.
+Unclosed client session
+client_session: <aiohttp.client.ClientSession object at 0x000002347B8FF890>
+EXIT=0
