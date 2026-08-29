@@ -1250,3 +1250,84 @@ async def test_server_history_can_still_be_opted_into() -> None:
         )
 
     assert "store" not in runtime.options
+
+
+async def test_the_recall_middleware_forces_the_call_inside_the_real_pipeline() -> None:
+    """The middleware must fire when installed on an actual agent, not only in isolation.
+
+    It was verified standalone and then produced a live row showing a record found with zero
+    forced calls -- a combination the code should not allow. Isolation tests cannot catch
+    that: what matters is whether the middleware sees the loaded history at the point it
+    looks, and the history is only assembled inside the pipeline.
+    """
+    from agent_framework_lab_cachebench._live import build_live_agent, make_recall_tool
+    from agent_framework_lab_cachebench._toolsummary import (
+        RECALL_TOOL_NAME,
+        ToolResultAnchoredSummarizationCompactionStrategy,
+        ToolResultRecallMiddleware,
+    )
+
+    ceiling = 2_000
+    strategy = ToolResultAnchoredSummarizationCompactionStrategy(
+        max_input_tokens=ceiling, tokenizer=TOKENIZER, trigger_fraction=0.1, fallback_fraction=0.99
+    )
+    middleware = ToolResultRecallMiddleware(max_input_tokens=ceiling, tokenizer=TOKENIZER, trigger_fraction=0.1)
+    client = StubChatClient()
+    recorder = UsageRecorder()
+    agent = build_live_agent(
+        cast(Any, SimpleNamespace(client=client, model="stub", options={})),
+        kind="harness",
+        strategy=strategy,
+        tokenizer=TOKENIZER,
+        tools=[make_recall_tool()],
+        recorder=recorder,
+        extra_middleware=[middleware],
+        max_context_window_tokens=ceiling,
+        max_output_tokens=100,
+    )
+    session = agent.create_session()
+
+    # Enough turns, each large, that the history passes the trigger.
+    for _ in range(4):
+        await agent.run("x" * 4_000, session=session)
+
+    forced = [options for options in client.options_seen if "tool_choice" in options]
+    assert middleware.forced_calls > 0, "the middleware never fired inside the pipeline"
+    assert any(
+        options["tool_choice"] == {"mode": "required", "required_function_name": RECALL_TOOL_NAME} for options in forced
+    ), "tool_choice never reached the client"
+
+
+async def test_a_pinned_tool_choice_does_not_survive_the_follow_up_call() -> None:
+    """A turn's pinned tool_choice applies to the first call, not to the whole turn.
+
+    This is the only explanation left for a live row that showed a record found with zero
+    forced calls: if the follow-up call after a tool result no longer carries the pin, the
+    model is free to call any registered tool, including the recall tool. A record produced
+    that way is the model volunteering, not the design working, and the two must not be
+    reported as the same thing.
+    """
+    client = StubChatClient(tool_turns=[0])
+    recorder = UsageRecorder()
+    agent = build_live_agent(
+        cast(Any, SimpleNamespace(client=client, model="stub", options={})),
+        kind="harness",
+        strategy=None,
+        tokenizer=TOKENIZER,
+        tools=[make_scope_tools({"early": ("AA-0",)}, 100, narration="neutral")[0]],
+        recorder=recorder,
+        max_context_window_tokens=10_000,
+        max_output_tokens=100,
+    )
+    session = agent.create_session()
+
+    await agent.run(
+        "look it up",
+        session=session,
+        options={"tool_choice": {"mode": "required", "required_function_name": "lookup_early"}},
+    )
+
+    pins = [options.get("tool_choice") for options in client.options_seen]
+    assert len(pins) >= 2, "a tool turn makes at least two calls"
+    assert pins[0] is not None, "the first call carries the pin"
+    assert pins[1] is None, "the follow-up call does not, so the model may call anything"

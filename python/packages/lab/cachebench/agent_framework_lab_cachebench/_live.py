@@ -415,7 +415,13 @@ def _strategy_notes(strategy: Any) -> tuple[str, ...]:
         Short tokens for the flags column.
     """
     notes: list[str] = []
-    for attribute, label in (("records_found", "REC"), ("fallbacks_used", "FALLBACK"), ("forced_calls", "FORCED")):
+    for attribute, label in (
+        ("records_found", "REC"),
+        ("fallbacks_used", "FALLBACK"),
+        ("forced_calls", "FORCED"),
+        ("records_forced", "RECFORCED"),
+        ("records_volunteered", "RECVOLUNTEERED"),
+    ):
         value = getattr(strategy, attribute, None)
         if isinstance(value, int) and value:
             notes.append(f"{label}:{value}")
