@@ -57,8 +57,10 @@ from agent_framework._compaction import (
     set_excluded,
 )
 
+from ._anchored import AnchoredCompactionStrategy
+
 if TYPE_CHECKING:
-    from agent_framework import TokenizerProtocol
+    from agent_framework import CompactionStrategy, TokenizerProtocol
 
 __all__ = [
     "RECALL_INSTRUCTION",
@@ -114,30 +116,59 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
         max_input_tokens: int,
         tokenizer: TokenizerProtocol,
         keep_head_groups: int = 3,
+        keep_tail_groups: int = 4,
         trigger_fraction: float = 0.6,
+        fallback_fraction: float = 0.9,
+        fallback: CompactionStrategy | None = None,
     ) -> None:
         """Validate and store the configuration.
 
         Raises:
-            ValueError: If a bound is out of range.
+            ValueError: If a bound is out of range, or the two thresholds are the wrong way
+                around -- a fallback at or below the trigger would fire before the model had
+                any chance to answer, and the recording step would never happen at all.
         """
         if max_input_tokens <= 0:
             raise ValueError("max_input_tokens must be positive.")
         if not 0.0 < trigger_fraction <= 1.0:
             raise ValueError("trigger_fraction must be in (0.0, 1.0].")
-        if keep_head_groups < 0:
-            raise ValueError("keep_head_groups must be >= 0.")
+        if not 0.0 < fallback_fraction <= 1.0:
+            raise ValueError("fallback_fraction must be in (0.0, 1.0].")
+        if fallback_fraction <= trigger_fraction:
+            raise ValueError("fallback_fraction must be greater than trigger_fraction.")
+        if keep_head_groups < 0 or keep_tail_groups < 0:
+            raise ValueError("keep_head_groups and keep_tail_groups must be >= 0.")
         self.max_input_tokens = max_input_tokens
         self.tokenizer = tokenizer
         self.keep_head_groups = keep_head_groups
+        self.keep_tail_groups = keep_tail_groups
         self.trigger_fraction = trigger_fraction
+        self.fallback_fraction = fallback_fraction
+        self.fallback = fallback or AnchoredCompactionStrategy(
+            max_input_tokens=max_input_tokens,
+            tokenizer=tokenizer,
+            keep_head_groups=keep_head_groups,
+            keep_tail_groups=keep_tail_groups,
+        )
         self._requests = 0
         self._records = 0
+        self._fallbacks = 0
 
     @property
     def requests_made(self) -> int:
         """Passes that asked the model to record. Compare with ``records_found``."""
         return self._requests
+
+    @property
+    def fallbacks_used(self) -> int:
+        """Passes that gave up waiting and truncated instead.
+
+        Non-zero means the record arrived too late to help, or never arrived, and that row is
+        measuring the fallback rather than this design. Reported rather than hidden: a
+        strategy that quietly degrades into another one produces a number that belongs to
+        neither.
+        """
+        return self._fallbacks
 
     @property
     def records_found(self) -> int:
@@ -154,15 +185,28 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
             return False
         annotate_message_groups(messages)
         annotate_token_counts(messages, tokenizer=self.tokenizer)
-        if included_token_count(messages) <= int(self.max_input_tokens * self.trigger_fraction):
+        used = included_token_count(messages)
+        if used <= int(self.max_input_tokens * self.trigger_fraction):
             return False
 
         anchor = self._anchor_index(messages)
-        if anchor is None:
+        if anchor is not None:
+            self._records = max(self._records, 1)
+            changed = self._drop_before(messages, anchor)
+            # Even a good record may not be enough on its own: the groups after it are
+            # untouched by design, and they can exceed the ceiling by themselves.
+            if included_token_count(messages) > self.max_input_tokens:
+                changed = await self.fallback(messages) or changed
+            return changed
+
+        if used < int(self.max_input_tokens * self.fallback_fraction):
             return self._request_record(messages)
 
-        self._records = max(self._records, 1)
-        return self._drop_before(messages, anchor)
+        # Out of room to keep waiting. A model that has not answered by now may never answer,
+        # and the alternative to compacting without a record is a provider error. The tool
+        # results are lost either way at this point; at least the conversation survives.
+        self._fallbacks += 1
+        return await self.fallback(messages)
 
     def _anchor_index(self, messages: list[Message]) -> int | None:
         """Return the index of the newest recall tool result, if the model has made one.
