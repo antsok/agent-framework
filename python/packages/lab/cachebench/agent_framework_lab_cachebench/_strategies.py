@@ -41,6 +41,7 @@ from agent_framework import (
 )
 
 from ._anchored import AnchoredCompactionStrategy
+from ._toolsummary import ToolResultAnchoredSummarizationCompactionStrategy
 
 if TYPE_CHECKING:
     from agent_framework._clients import SupportsChatGetResponse
@@ -193,6 +194,26 @@ def _build_anchored_no_assistant(options: StrategyOptions) -> CompactionStrategy
     )
 
 
+def _build_tool_summary_anchored(options: StrategyOptions) -> CompactionStrategy:
+    """Return the extract-then-drop strategy.
+
+    Raises:
+        ValueError: If no summarizer client was configured.
+    """
+    if options.summarizer is None:
+        raise ValueError(
+            "The 'tool_summary_anchored' strategy needs a summarizer client for its extraction call. "
+            "Pass --summarizer-provider to select one, or drop this strategy from the run."
+        )
+    return ToolResultAnchoredSummarizationCompactionStrategy(
+        client=options.summarizer,
+        max_input_tokens=options.input_budget_tokens,
+        tokenizer=options.tokenizer,
+        keep_head_groups=options.keep_head_groups,
+        keep_tail_groups=options.keep_tail_groups,
+    )
+
+
 def _build_truncation(options: StrategyOptions) -> CompactionStrategy:
     """Return oldest-first truncation triggering at 80% of the input budget."""
     budget = options.input_budget_tokens
@@ -339,6 +360,7 @@ STRATEGY_BUILDERS: Final[dict[str, Callable[[StrategyOptions], CompactionStrateg
     "context_window_lazy": _build_context_window_lazy,
     "truncation": _build_truncation,
     "anchored": _build_anchored,
+    "tool_summary_anchored": _build_tool_summary_anchored,
     "anchored_no_assistant": _build_anchored_no_assistant,
     "sliding_window": _build_sliding_window,
     "tool_result": _build_tool_result,
