@@ -16,6 +16,7 @@ from agent_framework import CharacterEstimatorTokenizer, Message
 from agent_framework._compaction import project_included_messages
 from agent_framework_lab_cachebench._toolsummary import (
     RECALL_TOOL_NAME,
+    RECORD_MARKER,
     ToolResultAnchoredSummarizationCompactionStrategy,
     ToolResultRecallMiddleware,
     find_record_index,
@@ -24,15 +25,9 @@ from agent_framework_lab_cachebench._toolsummary import (
 TOKENIZER = CharacterEstimatorTokenizer()
 
 
-def _stub_tool() -> Any:
-    """A stand-in for the recall tool, named so the middleware's pin matches it."""
-
-    def tool(values: str) -> str:
-        return values
-
-    tool.__name__ = RECALL_TOOL_NAME
-    tool.__doc__ = "Record values."
-    return tool
+#: Every arming the middleware performs, so a test can assert it happened exactly when the
+#: tool was pinned and never otherwise.
+_armings: list[int] = []
 
 
 def _conversation(tool_turns: int, payload_chars: int = 8_000, *, record: str | None = None) -> list[Message]:
@@ -68,7 +63,7 @@ def _conversation(tool_turns: int, payload_chars: int = 8_000, *, record: str | 
             ),
             Message(
                 role="tool",
-                contents=[{"type": "function_result", "call_id": "rec", "result": record}],
+                contents=[{"type": "function_result", "call_id": "rec", "result": f"{RECORD_MARKER} {record}"}],
                 message_id="rec_res",
             ),
         ]
@@ -229,8 +224,9 @@ async def test_the_middleware_forces_the_call_and_sends_no_message() -> None:
     persistence would treat it as new input and store it -- and an instruction of ours would
     then appear in the conversation the application replays to its user.
     """
+    _armings.clear()
     middleware = ToolResultRecallMiddleware(
-        max_input_tokens=1_000, tokenizer=TOKENIZER, recall_tool=_stub_tool(), trigger_fraction=0.1
+        max_input_tokens=1_000, tokenizer=TOKENIZER, arm=lambda: _armings.append(1), trigger_fraction=0.1
     )
     big = _conversation(tool_turns=8)
 
@@ -239,9 +235,7 @@ async def test_the_middleware_forces_the_call_and_sends_no_message() -> None:
 
     second = await _run(middleware, big)
     assert second["tool_choice"] == {"mode": "required", "required_function_name": RECALL_TOOL_NAME}
-    assert [getattr(t, "__name__", None) for t in second["tools"]] == [RECALL_TOOL_NAME], (
-        "the tool is offered only on this call, so the model cannot call it unprompted"
-    )
+    assert len(_armings) == 1, "the tool is armed exactly when it is pinned, and never otherwise"
     assert middleware.forced_calls == 1
     # The prompt is untouched: no instruction, no extra turn.
     assert all("recall" not in str(m.contents[0]).lower() for m in [Message(role="user", contents=["q"])])
@@ -249,8 +243,9 @@ async def test_the_middleware_forces_the_call_and_sends_no_message() -> None:
 
 async def test_the_middleware_stops_once_a_record_exists() -> None:
     """Forcing a second record would re-drop what the first already covered."""
+    _armings.clear()
     middleware = ToolResultRecallMiddleware(
-        max_input_tokens=1_000, tokenizer=TOKENIZER, recall_tool=_stub_tool(), trigger_fraction=0.1
+        max_input_tokens=1_000, tokenizer=TOKENIZER, arm=lambda: _armings.append(1), trigger_fraction=0.1
     )
 
     await _run(middleware, _conversation(tool_turns=8))
@@ -258,13 +253,15 @@ async def test_the_middleware_stops_once_a_record_exists() -> None:
     after = await _run(middleware, _conversation(tool_turns=8, record="CODE-0"))
 
     assert "tool_choice" not in after
-    assert "tools" not in after, "the tool is not offered once a record exists"
     assert find_record_index(_conversation(tool_turns=8, record="CODE-0")) is not None
 
 
 async def test_the_middleware_leaves_small_conversations_alone() -> None:
     """Below the trigger there is nothing to record and nothing to drop."""
-    middleware = ToolResultRecallMiddleware(max_input_tokens=10_000_000, tokenizer=TOKENIZER, recall_tool=_stub_tool())
+    _armings.clear()
+    middleware = ToolResultRecallMiddleware(
+        max_input_tokens=10_000_000, tokenizer=TOKENIZER, arm=lambda: _armings.append(1)
+    )
 
     await _run(middleware, _conversation(tool_turns=8))
     after = await _run(middleware, _conversation(tool_turns=8))
@@ -281,8 +278,9 @@ async def test_a_single_record_is_attributed_exactly_once() -> None:
     RECVOLUNTEERED:18 for a single record in a live run, which turned an attribution into
     noise at exactly the moment it was needed.
     """
+    _armings.clear()
     middleware = ToolResultRecallMiddleware(
-        max_input_tokens=1_000, tokenizer=TOKENIZER, recall_tool=_stub_tool(), trigger_fraction=0.1
+        max_input_tokens=1_000, tokenizer=TOKENIZER, arm=lambda: _armings.append(1), trigger_fraction=0.1
     )
     with_record = _conversation(tool_turns=8, record="CODE-0")
 

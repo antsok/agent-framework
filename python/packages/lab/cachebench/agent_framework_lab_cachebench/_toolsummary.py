@@ -49,7 +49,7 @@ phase 1 deterministic rather than a compliance rate to be estimated.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Sequence
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Final
 
 from agent_framework import ChatContext, ChatMiddleware, Message
 from agent_framework._compaction import (
@@ -68,6 +68,7 @@ if TYPE_CHECKING:
 
 __all__ = [
     "RECALL_TOOL_NAME",
+    "RECORD_MARKER",
     "ToolResultAnchoredSummarizationCompactionStrategy",
     "ToolResultRecallMiddleware",
     "find_record_index",
@@ -76,6 +77,19 @@ __all__ = [
 #: Name of the tool the agent must call. The strategy looks for this name in the history, so
 #: the tool the caller registers has to match it.
 RECALL_TOOL_NAME: Final[str] = "recall_earlier_tool_results"
+
+#: Prefix the recall tool puts on a result that counts as a record.
+#:
+#: The tool cannot be hidden from the model. Tools passed through per-call options reach the
+#: model but not the executor -- ``FunctionInvocationLayer`` wraps ``ChatMiddlewareLayer``, so
+#: it has already built its tool map by the time a middleware could add one, and the model's
+#: call goes unanswered. A registered tool is therefore advertised on every request, and this
+#: one was called unprompted on the unpinned follow-up call in every run.
+#:
+#: So the tool stays visible and becomes *inert* instead: it records only while the middleware
+#: has armed it, and a result without this marker is not a record. The model may still call
+#: it; calling it uninvited simply achieves nothing.
+RECORD_MARKER: Final[str] = "[recorded by compaction]"
 
 
 def find_record_index(messages: Sequence[Message]) -> int | None:
@@ -107,7 +121,13 @@ def find_record_index(messages: Sequence[Message]) -> int | None:
     newest: int | None = None
     for index, message in enumerate(messages):
         for content in message.contents:
-            if content.type == "function_result" and content.call_id in recall_ids:
+            if content.type != "function_result" or content.call_id not in recall_ids:
+                continue
+            result = content.result if isinstance(content.result, str) else str(content.result)
+            # The marker is what separates a record from a call the model made on its own
+            # initiative. Without it an uninvited call would look like a record and the
+            # strategy would drop results nothing had preserved.
+            if RECORD_MARKER in result:
                 newest = index
     return newest
 
@@ -256,9 +276,9 @@ class ToolResultRecallMiddleware(ChatMiddleware):
         tokenizer: Token counter, matching the strategy's.
 
     Keyword Args:
-        recall_tool: The tool to offer, named :data:`RECALL_TOOL_NAME`. Deliberately passed
-            here rather than registered on the agent: a registered tool is advertised on every
-            request, and this one was called unprompted.
+        arm: Called immediately before the forced request, arming the recall tool for one
+            call. The tool is inert otherwise, which is what stops the model producing a
+            record on its own initiative -- it cannot be hidden, only disabled.
         trigger_fraction: Fraction of the ceiling at which the record is forced. Comfortably
             below the strategy's fallback threshold, because the decision is made one call
             late -- see :meth:`process`.
@@ -269,7 +289,7 @@ class ToolResultRecallMiddleware(ChatMiddleware):
         *,
         max_input_tokens: int,
         tokenizer: TokenizerProtocol,
-        recall_tool: Callable[..., Any],
+        arm: Callable[[], None],
         trigger_fraction: float = 0.6,
     ) -> None:
         """Validate and store the configuration.
@@ -283,7 +303,7 @@ class ToolResultRecallMiddleware(ChatMiddleware):
             raise ValueError("trigger_fraction must be in (0.0, 1.0].")
         self.max_input_tokens = max_input_tokens
         self.tokenizer = tokenizer
-        self.recall_tool = recall_tool
+        self.arm = arm
         self.trigger_fraction = trigger_fraction
         self._force_next = False
         self._forced = 0
@@ -335,9 +355,9 @@ class ToolResultRecallMiddleware(ChatMiddleware):
             # model's initiative rather than this middleware. Options replace the tool list
             # rather than adding to it, so offering it here also hides everything else, which
             # is harmless on a call whose only purpose is to make this one call.
+            self.arm()
             context.options = {
                 **dict(context.options or {}),
-                "tools": [self.recall_tool],
                 "tool_choice": {"mode": "required", "required_function_name": RECALL_TOOL_NAME},
             }
             self._force_next = False
