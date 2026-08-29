@@ -1,275 +1,211 @@
-# Compaction on `gpt-5.4-mini`: an intermediate report
+# Compaction on `gpt-5.4-mini`: report
 
-**Date:** 28 August 2026
-**Model:** `gpt-5.4-mini`, Azure Foundry (Responses API), GlobalStandard deployment
+**Date:** 30 August 2026
+**Model:** `gpt-5.4-mini`, Azure Foundry (Responses API), GlobalStandard
 **Agent:** the MAF harness — `create_harness_agent`, the wiring a typical caller gets
-**Scale:** 3 completed matrices x 14 settings x 3 repeats, plus one aborted matrix and two
-probes. About 180 conversations, roughly EUR 65 of model spend.
+**Scale:** ~40 matrices over three windows, several hundred conversations, about EUR 150 of
+model spend
 
 This is a single-model deep dive and it stands apart from the six-model work in
-[`REPORT.md`](REPORT.md). That work ran a different agent, a 32,000-token window, 17 planted
-facts and a control whose accuracy was not stable enough to rank against. **Nothing here
-should be averaged with it.** What carries over is the mechanism; what is new is that the
-accuracy axis can now be trusted.
+[`REPORT.md`](REPORT.md), which used a different agent, 17 planted facts instead of 53, and a
+control too unstable to rank against. **Nothing here should be averaged with it.**
 
 ---
 
-## 1. What was measured
+## 1. The headline
 
-An agent is driven through the same 22-turn conversation, changing only the compaction
-setting. During the conversation it is told **53 verifiable facts** — requirements, a
-mid-conversation correction, and codes returned by six tool calls. It is then asked seven
-targeted questions whose answers together need all 53. Each fact is a unique code, so scoring
-is exact string matching.
+**Which compaction strategy is right depends on how large your tool results are, and the
+answer inverts between 8,000 and 25,000 tokens.**
 
-Then the bill is added up, and the two axes are reported side by side: **what it cost** and
-**what the agent forgot**.
+| tool result size | best strategy | facts kept | cost vs none |
+| ---: | --- | ---: | ---: |
+| 8,000 tokens | **record the values, drop the originals** | 53/53 | **-9%** |
+| 16,000 tokens | *(crossing over)* | 46/53 vs 53/53 | -8% vs +20% |
+| 25,200 tokens | **keep a fixed proportion of each result** | 53/53 | +10% |
 
-Three things make the comparison fair, each added only after an earlier run proved misleading
-without it:
+Asking the model to extract the values and then dropping what it extracted is the cheapest
+approach at every size — and its accuracy falls apart as results grow, because the model
+writes a thinner record when there is more to record. Keeping a fixed *proportion* of each
+result does the opposite: it is poor when the proportion is small and near-perfect when the
+window is large enough to make it generous.
 
-- **Tool calls are pinned.** Each tool turn forces its own dedicated tool; other turns are
-  closed to tools. Without this, models gather different facts run to run, moving both axes
-  for reasons unrelated to compaction.
-- **Every setting is run three times**, the median is reported, and the spread between repeats
-  is printed next to it. A difference smaller than the spread is not claimed as a result.
-- **Facts the agent never fetched are separated from facts compaction removed.** Without that
-  split, a model that simply omits something looks identical to a strategy that deleted it.
+## 2. What was measured
 
-**The control is the instrument.** In all three runs it scored **53 of 53 facts, 100%
-correct, 0 unfetched**, with cost varying 0-7% between repeats. Every claim below is relative
-to that.
+A real agent runs the same 22-turn conversation, changing only the compaction setting. It is
+told **53 verifiable facts** — requirements, one mid-conversation correction, and codes
+returned by six tool calls — then asked eight closing questions: one per deployment scope,
+plus one asking for everything at once.
 
-## 2. The model's real limits, which are not the advertised ones
+Scoring is exact substring matching on 6-hex-digit codes. No grader model, no partial credit.
+Each closing reply is scored **only against the values its own question asked for**, so a code
+listed under the wrong tool does not count: that distinguishes preserving a value from
+preserving the labelling that says where it came from.
 
-The model card says 400,000 tokens. Measured directly on the deployment, one prompt per size:
+**Every run is checked against its control before anything else is read.** The uncompacted
+row must show 53/53 facts, 0 unfetched, an empty flags column, and a narrow spread. Runs that
+failed those checks are recorded as failures rather than quietly dropped.
 
-| prompt | result |
-| ---: | --- |
-| 270,294 | accepted |
-| 275,292 | **HTTP 400 `context_length_exceeded`, `param: "input"`** |
+## 3. The four strategies compared
 
-**The 400,000 is a total: 272,000 input + 128,000 output.** The two are independent, not a
-pool you can allocate between — 270,293 tokens of input are accepted with the output cap set
-to 16, to 100,000 and to 128,000 alike, while 280,000 tokens are refused even at 16. A small
-output cap buys no input headroom, and a large one costs none.
+| | mechanism |
+| --- | --- |
+| `none` | the uncompacted control |
+| `truncation` | oldest-first eviction at 80% of the budget, down to 50% |
+| `tool_result` | the framework's tool-result collapse, head-truncating at 4,096 characters |
+| `anchored` | keeps a fixed head and tail verbatim, shortens the band between them to a share of the ceiling, position-only decisions (`_anchored.py`) |
+| `tool_summary_anchored` | a middleware forces one recall tool call; the strategy then drops every tool group in front of the resulting record (`_toolsummary.py`) |
 
-This matters because MAF computes every compaction threshold from
-`max_context_window_tokens - max_output_tokens`, which models a shared pool this model does
-not have. **Configure `max_context_window_tokens` as the input limit**, 272,000, whenever a
-provider states the two ceilings separately.
-
-## 3. The three configurations
-
-Material is scaled with the window on purpose, so that "how full the window is" stays a
-controlled variable rather than drifting. Holding the conversation fixed while widening the
-window would leave every strategy inert, and a strategy that evicts nothing scores a perfect
-result for having done nothing.
-
-| | Run 7 | Run 8 | Run 9 |
-| --- | ---: | ---: | ---: |
-| Window configured | 60,000 | 120,000 | 272,000 |
-| Working budget | 57,952 | 117,952 | 269,952 |
-| Uncompacted peak prompt | 78,307 | 150,112 | 232,748 |
-| **Fullness** | **135% — overflows** | **127% — overflows** | **86% — fits** |
-| Uncompacted cache hit rate | 93% | 93% | **94%** |
-| Cost per conversation, uncompacted | $0.1621 | $0.3009 | $0.4317 |
-| Verdict | `none` | `none` | `none` |
-
-Runs 7 and 8 are the regime where compaction is *forced* to act. Run 9 is the regime most
-real deployments are actually in: the conversation fits, and compaction is a choice.
+The last two were written for this work, against what the earlier runs measured.
 
 ## 4. Results
 
-### The headline
+Five repeats each, pinned tool calls, neutral narration, values spread through each result.
+`c+-` is the gap between the least and most correct repeat; `all` is the single combined
+question.
 
-**No setting, in any of the three runs, was both cheaper and as accurate as not compacting.**
-The verdict was `none` every time.
+### 60,000-token window (8,000-token tool results)
 
-Run 9 is the sharpest case, because it is the most realistic. Thirteen of fourteen settings
-cost *more* than not compacting at all:
+| strategy | cost | vs none | +- | hit% | peak | facts | correct | c+- | all |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| truncation | $0.1417 | -14% | 8% | 84% | 43,108 | 29/53 | 56% | 48pp | 55% |
+| **tool_summary_anchored** | $0.1507 | **-9%** | 10% | **90%** | 54,608 | **53/53** | **100%** | 59pp | **100%** |
+| **none** | $0.1649 | — | 6% | 94% | 78,003 | 53/53 | 100% | 7pp | 100% |
+| anchored | $0.1939 | +18% | 13% | 82% | 54,882 | 27/53 | 22% | 78pp | 21% |
+| tool_result | $0.2115 | +28% | 9% | 85% | 63,591 | 46/53 | 85% | 63pp | 85% |
 
-| strategy | cost | vs none | facts kept | correct |
-| --- | ---: | ---: | ---: | ---: |
-| token_budget_window_first | $0.3483 | **-19%** | 26/53 | 50% |
-| **none** | **$0.4317** | — | **53/53** | **100%** |
-| truncation | $0.4365 | +1% | 37/53 | 70% |
-| token_budget_truncate_first | $0.4498 | +4% | 29/53 | 11% |
-| token_budget_tools_first | $0.4568 | +6% | 29/53 | 41% |
-| sliding_window | $0.5322 | +23% | 0/53 | 17% |
-| context_window_aggressive | $0.5500 | +27% | 23/53 | 41% |
-| tool_result | $0.5632 | +30% | 53/53 | 100% |
-| selective_tool_call | $0.5667 | +31% | 53/53 | 100% |
-| context_window_lazy | $0.5815 | +35% | 53/53 | 100% |
-| context_window *(shipped default)* | $0.5841 | +35% | 37/53 | 56% |
-| token_budget_fallback | $0.5956 | +38% | 37/53 | 11% |
-| token_budget_summarize | $0.7354 | +70% | 37/53 | 11% |
-| summarization | $1.3286 | +208% | 53/53 | 100% |
+### 120,000-token window (16,000-token tool results)
 
-The single setting that saved money lost 27 of 53 facts.
+| strategy | cost | vs none | +- | hit% | peak | facts | correct | c+- | all |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| tool_summary_anchored | $0.2715 | -8% | 9% | 90% | 102,652 | 46/53 | 48% | 52pp | 47% |
+| truncation | $0.2792 | -5% | 12% | 84% | 92,158 | 27/53 | 52% | 48pp | 51% |
+| **none** | $0.2945 | — | 5% | 94% | 149,562 | 53/53 | 93% | 15pp | 92% |
+| **anchored** | $0.3541 | +20% | 3% | 84% | 107,562 | **53/53** | **100%** | 48pp | **100%** |
+| tool_result | $0.3758 | +28% | 6% | 85% | 118,899 | 39/53 | 67% | 41pp | 66% |
 
-### Why sending less can cost more
+### 272,000-token window, 86% full (25,200-token tool results)
 
-Providers charge far less for text they have already seen — **9.4x less** on this model. The
-discount is strict-prefix: it holds only while the beginning of the conversation stays
-byte-identical. Compaction changes the earlier part; that is what it *is*. So it trades a
-large discount for a smaller prompt.
+This is the model's **real input limit** — see finding 5.
 
-Whether that trade pays is arithmetic:
+| strategy | cost | vs none | +- | hit% | peak | facts | correct | c+- | all |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| tool_summary_anchored | $0.4049 | **-10%** | 7% | 89% | 194,041 | 18/53 | 31% | 72pp | 30% |
+| truncation | $0.4484 | -1% | 3% | 89% | 207,591 | 30/53 | 56% | 22pp | 55% |
+| **none** | $0.4517 | — | 36% | 94% | 233,332 | 53/53 | 76% | 17pp | 83% |
+| **anchored** | $0.4975 | +10% | 3% | 89% | 203,654 | **53/53** | **100%** | 31pp | **100%** |
+| tool_result | $0.5740 | +27% | 3% | 86% | 184,147 | 39/53 | 22% | 78pp | 21% |
 
-> **`T₂/T₁ < (1 − h₁(1−d)) / (1 − h₂(1−d))`**
-> `T` = tokens sent, `h` = cache hit rate, `d` = cached price ÷ input price.
+## 5. Findings
 
-**The formula predicted the cost column of both runs before it was read.** At Run 8, using
-each row's own tokens and hit rate:
+### Finding 1 — A model-written record degrades with the bulk it must summarise
 
-| strategy | predicted | measured |
+| tool result size | facts the record preserved |
+| ---: | ---: |
+| 8,000 | 53 of 53 |
+| 16,000 | 46 of 53 |
+| 25,200 | **18 of 53** |
+
+Monotonic, and far larger than the spread. The mechanism is not at fault — the middleware
+forced the call and the forced call produced a record in every run (`REC:1, FORCED:2,
+RECFORCED:1`). What degrades is the *content*: asked to extract every value from more
+material, the model writes a shorter list.
+
+This is the fundamental limit of extraction as a compaction primitive. **What survives is the
+model's judgement, not a policy**, and that judgement gets worse exactly when compaction
+matters most.
+
+### Finding 2 — Proportional retention improves with scale, for the same reason reversed
+
+`anchored` keeps a share of the ceiling for each collapsed result, so at a larger window each
+result keeps more of itself: 30% at 60,000 and 44% at 272,000. Its accuracy climbs from 22%
+to 100% as a result.
+
+The arithmetic behind it is worth stating, because it also explains why the framework's
+`ToolResultCompactionStrategy` loses values: head-and-tail retention keeps the first and last
+f/2 of a result, so *n* values spread evenly through it — sitting 1/n apart — survive only
+when f exceeds 2/n. With eight values per result that needs **more than 25% of it retained**.
+A fixed retention, like the framework's 4,096 characters, becomes a rounding error as results
+grow.
+
+### Finding 3 — Not compacting still wins on the axis that matters
+
+`none` was the verdict at 60,000 and at 272,000. The one strategy that beat it, at 60,000,
+did so by 9% against a 10% spread — which the tool itself refused to certify.
+
+The reason is unchanged from the earlier work: cached reads are 9.4x cheaper here, the
+discount is strict-prefix, and compaction forfeits it. `none` holds a 94% hit rate at every
+size. The best any compacting strategy managed was 90%.
+
+**But at 272,000 the picture is more interesting than "don't compact".** The control scored
+**76%** — it fits the window, but the model answers less well from a 233,000-token prompt —
+while `anchored` scored **100%** from a 203,000-token one. Compaction did not just cost less
+information than expected; at that size it produced a *better answer* than not compacting,
+because a shorter prompt is easier to answer from.
+
+### Finding 4 — Consistency, not accuracy, is what compaction really costs
+
+Median accuracy for the better strategies is excellent. The spread is not:
+
+| | control | best compacting strategy |
 | --- | ---: | ---: |
-| `context_window_aggressive` | -31% | **-33%** |
-| `truncation` | -7% | -11% |
-| `tool_result` | +28% | +22% |
-| `selective_tool_call` | +24% | **+22%** |
-| `context_window_lazy` | +53% | +46% |
-| `summarization` | +172% | **+165%** |
+| accuracy spread across repeats | 7-17pp | 31-78pp |
+| cost spread | 5-6% | 3-13% |
 
-Every prediction within 7 points, and all six err the same way — the formula counts input
-only, while every compacting strategy also emits fewer output tokens than `none` at 6x the
-input price. The residual is the term it omits.
+The same configuration produced 13, 41, 48, 52, 59, 72 and 78-point spreads on different
+runs. That is not sampling noise to be averaged away; it is the property. A compacted agent
+answers well *on average* and unpredictably *in particular*, and an application that needs a
+dependable answer should read that as the real cost.
 
-At a 93% -> 84% hit rate you must cut **32%** of your tokens just to break even.
-`tool_result` cut 12%.
+### Finding 5 — The advertised context window is not the input limit
 
-### Fullness matters more than window size
+`gpt-5.4-mini` is documented at 400,000 tokens. Measured directly: 270,294 accepted, 275,292
+refused with HTTP 400 `context_length_exceeded`, `param: "input"`. The 400,000 is
+**272,000 input + 128,000 output**, and the two are independent — a large output cap does not
+consume input allowance, and a small one does not buy any.
 
-| | 60,000 (overflows) | 120,000 (overflows) | 272,000 (fits) |
-| --- | ---: | ---: | ---: |
-| `tool_result` vs none | +28% | +22% | +30% |
-| cheapest setting | -15% | -33% | -19% |
-
-While the conversation overflows, a bigger window makes accuracy-preserving compaction
-*cheaper* — the preserved prefix is a larger share of a larger prompt. But when the
-conversation **fits**, the penalty comes back, because a conversation that fits has a nearly
-perfect cache to lose. At 232,748 tokens the control reached a 94% hit rate, the highest
-measured anywhere in this work.
-
-**The more of your conversation is cached, the more compacting it costs.**
-
-### Forgetting is a cliff, and surviving is not the same as being usable
-
-Settings that only rewrite tool output, without deleting messages, lost nothing. Settings that
-delete messages lost 16 to 53 of 53 facts. There is no gentle middle.
-
-But the count of surviving facts is a **ceiling, not a prediction**:
-
-| Run 7 | facts surviving | present but unused | correct |
-| --- | ---: | ---: | ---: |
-| `truncation` | 29/53 | **24** | 11% |
-| `token_budget_tools_first` | 16/53 | **16** | 2% |
-| `token_budget_summarize` | 34/53 | 0 | 65% |
-
-`truncation` left 29 codes in front of the model and the model used none of them. The codes
-survive as strings while the turns that say *which deployment each belongs to* are deleted, so
-a question about the staging deployment cannot be answered from a bare list of identifiers.
-Summarising preserves the labelling, which is why it scores better on fewer facts.
-
-At Run 9's scale this reached a strategy that deletes nothing at all: `selective_tool_call`
-kept 53/53 at 120,000 but scored **70% with 16 unused**, because collapsing a tool-call group
-whose result is 16,000 tokens removes enough surrounding context to strip the codes of their
-meaning.
-
-### The shipped default is the worst of both
-
-`ContextWindowCompactionStrategy` at its shipped 0.5/0.8 thresholds, which is what
-`create_harness_agent` installs:
-
-| run | vs none | facts kept | correct |
-| --- | ---: | ---: | ---: |
-| 60,000 | +21% | 21/53 | 41% |
-| 120,000 | +14% | 27/53 | 37% |
-| 272,000 | +35% | 37/53 | 56% |
-
-It costs more than not compacting in all three, while losing a third to a half of the facts.
-In Run 9 it is beaten on cost by seven settings and on accuracy by four.
-
-## 5. Configuration hazards found along the way
-
-Each of these produces a wrong result or a dead agent, and **none of them reports anything**.
-
-**1. The window must be the input limit.** Passing the advertised 400,000 with a 2,048-token
-output reservation gives a 397,952-token budget — 46% above what the service accepts. Four of
-fourteen strategies then died with HTTP 400, and `truncation` failed on the *same turn as the
-uncompacted control*, which is the proof it never compacted once: its trigger sat at 318,361,
-which the service will never accept. Strategies triggering at or below half the budget
-survived, so the shipped default escaped by luck rather than design.
-
-**2. The output reservation is arithmetic; the cap is a request option.**
-`max_output_tokens` on a strategy only subtracts from the window. What holds the model to it
-is `max_tokens` on the request, and the only thing linking them is a `setdefault` in
-`create_harness_agent` — which a caller supplying their own value silently defeats. A
-hand-built `Agent` carrying a `ContextWindowCompactionStrategy` gets no cap at all, and then
-the reservation is fiction: the strategy leaves room for 2,048 tokens of reply and the model
-is free to emit 40,000. Measured: with no cap, a prompt asking for length produced 1,444
-tokens; there is no modest default.
-
-**3. Half the strategies cannot see tokens.** `SlidingWindowStrategy`,
-`ToolResultCompactionStrategy` and `SelectiveToolCallCompactionStrategy` count message groups.
-Give them a window and they will happily leave a prompt over it, because they never look at
-the number.
-
-**4. A reply cap converts silently into apparent accuracy loss.** This one is about measuring,
-not running, and it cost the most to find. Asking the control for all 53 codes at once:
-
-| retrieval guidance | reply cap | correct | present but unlisted |
-| --- | ---: | ---: | ---: |
-| on | 900 | 100% | 0 |
-| **off** | **900** | **33%** | **36** |
-| off | 4,000 | **100%** | 0 |
-
-Enumerating 53 labelled codes costs ~640 tokens before any prose, so the answer was truncated
-and the scorer counted the missing tail as facts the model ignored. **Truncation is
-indistinguishable from compaction damage** — facts in context, absent from the answer — unless
-the control is checked at the same cap. Two earlier "fixes" turned out to be compensating for
-this rather than curing anything.
+This is not a curiosity. MAF computes every compaction threshold as a fraction of
+`max_context_window_tokens - max_output_tokens`. Configure the advertised 400,000 with a
+2,048-token reply reservation and the budget comes out at 397,952 — 46% above what the service
+accepts — so `TruncationStrategy` triggers at 318,361 and never fires. **The agent dies of a
+provider error before its own compaction runs.** Set `max_context_window_tokens` to the input
+limit, not the advertised window.
 
 ## 6. What to do
 
-**If the conversation fits your window, do not compact.** In the fitting regime, 13 of 14
-settings cost more and every one of them forgot something.
+**Size your tool results before choosing a strategy.** Below roughly 10,000 tokens per result,
+having the model record the values and dropping the originals is both cheapest and lossless.
+Above that, keep a fixed proportion of each result and do not trust a summary.
 
-**If it does not fit, treat compaction as damage control rather than optimisation.** Choose by
-what you can afford to lose, not by price. `truncation` kept the most facts of the settings
-that reduce size meaningfully.
+**If the conversation fits your window comfortably, do not compact** — unless the prompt is
+large enough that the model answers worse from it, which happened here above 230,000 tokens.
 
-**Set the window to the model's input limit**, not its advertised context size, and set the
-reply cap explicitly on the request rather than trusting the reservation to do it.
+**Never let retention be a fixed size.** Make it a share of the window, or it silently becomes
+a rounding error at exactly the scale where it matters.
 
-**Attack the size at the source instead.** Tool output was about half of the context here.
-Returning less, or storing results outside the conversation and fetching on demand, reduces
-size without touching the prefix the discount depends on.
+**Configure the input limit, not the model card.** And set the request's `max_tokens`
+explicitly: the compaction reservation is arithmetic, and nothing constrains the model to it
+unless the request says so.
 
-**Check the cached-read price first.** It is the single number deciding whether compaction can
-pay at all. At this model's 9.4x it rarely does.
+**Read the spread, not the median.** A strategy with a 78-point accuracy spread is not
+"usually fine".
 
-## 7. What this does not cover
+## 7. Limits
 
-**One model, one route, one workload.** The mechanism generalises; the magnitudes do not. The
-six-model work found the same direction everywhere and magnitudes varying by a factor of two
-across routes.
+**One model, one route, one conversation shape.** The mechanisms generalise; the crossover
+point almost certainly does not.
 
-**Two rows in Run 7 cannot be ranked on cost.** `tool_result` (+28% at +-28%) and
-`selective_tool_call` (+22% at +-58%) had spreads as large as their effect. The same two rows
-were tight in Run 9 (+-2% and +-4%), so the instability is a property of this model at that
-size rather than a permanent limitation.
+**Accuracy spreads are wide and did not resolve at five repeats.** Every accuracy figure above
+is a median with a spread beside it, and the spread is often larger than the differences
+between strategies. Cost and prompt-size figures are much tighter.
 
-**Facts sit at the head of each tool result.** `ToolResultCompactionStrategy` head-truncates
-at 4,096 characters, so our markers survive that cut unconditionally. A workload whose values
-sit at the *end* of a long tool result would score it worse. That variant is designed but not
-yet run, and it is the most important gap.
+**The scoring guidance is inert for the control.** Every row is told how to read a compaction
+record; `none` has no record, so the clause helps only the compacting strategies. It cannot
+create facts, but the asymmetry is real.
 
-**Nothing here measures multi-agent or long-horizon runs**, where compaction decisions
-compound across many more turns than 22.
+**`tool_summary_anchored` costs an extra agent turn**, visible as 32 model calls against 29.
+That is included in every cost figure above.
 
 ---
 
-*Source data for every run — verbatim output and exact invocation — is in [`runs/`](runs/).
-Full tables and the cross-model context are in [`RESULTS.md`](RESULTS.md).*
+*Source data — verbatim output and exact invocations — is in [`runs/`](runs/). Full tables and
+the earlier cross-model work are in [`RESULTS.md`](RESULTS.md).*

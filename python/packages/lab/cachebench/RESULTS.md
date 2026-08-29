@@ -48,6 +48,9 @@ between runs, which moves both axes for reasons unrelated to compaction. Runs ma
 | 13 | `gpt-5.4-mini` | Azure Foundry | Responses | yes | `none` (60K, 16 strategies, spread) |
 | 14 | `gpt-5.4-mini` | Azure Foundry | Responses | yes | `none` (272K, focused, spread) |
 | 15 | `gpt-5.4-mini` | Azure Foundry | Responses | yes | `none` (anchored, scaled retention) |
+| 16 | `gpt-5.4-mini` | Azure Foundry | Responses | yes | `tool_summary_anchored` (60K, unsupported) |
+| 17 | `gpt-5.4-mini` | Azure Foundry | Responses | yes | *(120K, crossover)* |
+| 18 | `gpt-5.4-mini` | Azure Foundry | Responses | yes | `none` (272K, `anchored` best on accuracy) |
 
 Runs 7 to 9 are a **separate experiment** on the harness agent at wider windows, with 53
 planted facts instead of 17. The shared configuration above does not describe them; their own
@@ -843,6 +846,109 @@ But individual strategy rows reached 78, 67 and 52 points. **A stable baseline d
 certify a stable comparison**: compaction changes the replies, which become the history, which
 compacts differently. Rows whose `c+-` exceeds 20 points should be read as unresolved on
 accuracy regardless of how steady the control was.
+
+---
+
+## Runs 16 to 18 — two new strategies across three window sizes
+
+The measurement questions of runs 10 to 15 are settled: values are spread on labelled lines,
+the reply cap is 12,000 tokens, closing questions state their expected count, each reply is
+scored only against the values its own question asked for, and a calibration probe confirms
+the control holds still before anything is spent. What changes here is *what* is being
+compared: two strategies written against the earlier measurements, over three window sizes.
+
+| | mechanism |
+| --- | --- |
+| `anchored` | fixed head and tail kept verbatim, the band between shortened to a share of the ceiling, decisions taken from position alone so they never change on a later turn |
+| `tool_summary_anchored` | a middleware forces one recall tool call; the strategy drops every tool group in front of the resulting record |
+
+Five repeats each, pinned, neutral narration, spread placement. Tool results scale with the
+window, which is the variable that turns out to matter.
+
+### The result: the two invert
+
+| tool result size | `tool_summary_anchored` facts | `anchored` facts |
+| ---: | ---: | ---: |
+| 8,000 (60K window) | **53/53** | 27/53 |
+| 16,000 (120K window) | 46/53 | **53/53** |
+| 25,200 (272K window) | 18/53 | **53/53** |
+
+**A model-written record thins out as there is more to record.** The mechanism worked in every
+run -- `REC:1, FORCED:2, RECFORCED:1`, so the middleware forced the call and the forced call
+produced the record -- but the content degraded. What survives is the model's judgement rather
+than a policy, and that judgement gets worse exactly where compaction is most needed.
+
+**Proportional retention improves for the mirror-image reason.** `anchored` gives each
+collapsed result a share of the ceiling, so it keeps 30% of each result at 60,000 and 44% at
+272,000. The arithmetic is the same one that explains the framework's tool-result collapse
+losing values: head-and-tail retention of a fraction f preserves *n* evenly spread values only
+when f exceeds 2/n, which for eight values means retaining over 25%.
+
+### Run 16 — 60,000-token window
+
+| strategy | cost | vs none | +- | hit% | peak | facts | correct | c+- | all |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| truncation | $0.1417 | -14% | 8% | 84% | 43,108 | 29/53 | 56% | 48pp | 55% |
+| **tool_summary_anchored** | $0.1507 | -9% | 10% | 90% | 54,608 | **53/53** | **100%** | 59pp | 100% |
+| **none** | $0.1649 | — | 6% | 94% | 78,003 | 53/53 | 100% | 7pp | 100% |
+| anchored | $0.1939 | +18% | 13% | 82% | 54,882 | 27/53 | 22% | 78pp | 21% |
+| tool_result | $0.2115 | +28% | 9% | 85% | 63,591 | 46/53 | 85% | 63pp | 85% |
+
+Verdict `tool_summary_anchored`, immediately disowned: 9% cheaper against a 10% spread, so the
+cost ranking is unresolved. What holds is a **30% smaller peak prompt at no measurable cost
+difference, losing nothing**.
+
+### Run 17 — 120,000-token window
+
+| strategy | cost | vs none | +- | hit% | peak | facts | correct | c+- | all |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| tool_summary_anchored | $0.2715 | -8% | 9% | 90% | 102,652 | 46/53 | 48% | 52pp | 47% |
+| truncation | $0.2792 | -5% | 12% | 84% | 92,158 | 27/53 | 52% | 48pp | 51% |
+| **none** | $0.2945 | — | 5% | 94% | 149,562 | 53/53 | 93% | 15pp | 92% |
+| **anchored** | $0.3541 | +20% | 3% | 84% | 107,562 | **53/53** | **100%** | 48pp | 100% |
+| tool_result | $0.3758 | +28% | 6% | 85% | 118,899 | 39/53 | 67% | 41pp | 66% |
+
+### Run 18 — 272,000-token window, 86% full
+
+| strategy | cost | vs none | +- | hit% | peak | facts | correct | c+- | all |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| tool_summary_anchored | $0.4049 | -10% | 7% | 89% | 194,041 | 18/53 | 31% | 72pp | 30% |
+| truncation | $0.4484 | -1% | 3% | 89% | 207,591 | 30/53 | 56% | 22pp | 55% |
+| **none** | $0.4517 | — | 36% | 94% | 233,332 | 53/53 | **76%** | 17pp | 83% |
+| **anchored** | $0.4975 | +10% | 3% | 89% | 203,654 | **53/53** | **100%** | 31pp | 100% |
+| tool_result | $0.5740 | +27% | 3% | 86% | 184,147 | 39/53 | 22% | 78pp | 21% |
+
+**The most surprising row in the whole project is the control.** At 233,332 tokens `none`
+scored **76%**, while `anchored` scored **100%** from a prompt 13% smaller. The conversation
+fits the window, nothing was lost, and the uncompacted agent still answered worse. Above some
+size a shorter prompt is easier to answer from, and compaction stops being purely a cost
+question.
+
+### The instrument findings behind these runs
+
+Five, each of which would have produced a plausible wrong number:
+
+**Pinning is per call, not per turn.** A turn's `tool_choice` reaches only its first call;
+the follow-up after a tool result is unconstrained. That is how the recall tool was called
+uninvited in every early run, and it is a source of fact-count variance in every pinned run
+ever taken here.
+
+**A tool passed through per-call options is never executed.** `FunctionInvocationLayer` wraps
+`ChatMiddlewareLayer` and builds its tool map first, so the tool reaches the model and nothing
+answers its call. Tools must be registered with the harness; visibility cannot be controlled
+per call, only *permission* -- hence the one-shot gate that makes the recall tool inert unless
+the middleware armed it.
+
+**A middleware cannot see the history before the call.** `context.messages` holds only the new
+turn until the history middleware replaces it during the call, so the size check reads on the
+way out and the option is set on the way in next time.
+
+**Attribution has to be tracked as a transition.** Counting "is there a record" per call
+reported 18 records for one, because the pre-call check never sees the history.
+
+**Unpinned runs cannot be measured at this scale.** Five repeats of the uncompacted control
+varied **102%** in cost, and the strategy row gathered eight fewer facts than the control.
+Three repeats had shown 3%, which was luck.
 
 ---
 

@@ -1,0 +1,92 @@
+note: gpt-5.4-mini keeps history server-side by default. Forcing store=False so the history is sent by the client and compaction actually applies.
+-> none
+   repeat 1/5
+   repeat 2/5
+   repeat 3/5
+   repeat 4/5
+   repeat 5/5
+-> truncation
+   repeat 1/5
+   repeat 2/5
+   repeat 3/5
+   repeat 4/5
+   repeat 5/5
+-> tool_result
+   repeat 1/5
+   repeat 2/5
+   repeat 3/5
+   repeat 4/5
+   repeat 5/5
+-> anchored
+   repeat 1/5
+   repeat 2/5
+   repeat 3/5
+   repeat 4/5
+   repeat 5/5
+-> tool_summary_anchored
+   repeat 1/5
+   repeat 2/5
+   repeat 3/5
+   repeat 4/5
+   repeat 5/5
+
+Model: gpt-5.4-mini   agent: harness
+Pricing: $0.66/M in, $0.070/M cached, $3.96/M out
+
+strategy                         msgs   tok left/peak  calls       in  hit%     out      cost    +-   summ$  vs none    facts  lost nofetch ignored  correct   c+-   all  vs none   flags
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+truncation                      30/57   31,120/43,108     29  751,973   84%   4,144   $0.1417    8%       -     -14%    29/53    24       0       0     56%   48pp  55%      56%       -
+tool_summary_anchored           53/63   54,608/54,608     32  990,469   90%   5,160   $0.1507   10%       -      -9%    53/53     0       0       0    100%   59pp 100%     100%REC:1,FORCED:2,RECFORCED:1
+none                            56/56   78,003/78,003     291,373,807   94%   4,065   $0.1649    6%       -        -    53/53     0       0       0    100%*   7pp 100%        -       -
+anchored                        56/58   49,752/54,882     291,044,240   82%   3,249   $0.1939   13%       -     +18%    27/53    26       0      16     22%   78pp  21%      22%       -
+tool_result                     55/59   63,591/63,591     291,225,591   85%   4,846   $0.2115    9%       -     +28%    46/53     7       0       1     85%   63pp  85%      85%       -
+
+msgs      = messages in the final prompt, out of the most any call carried
+tok       = billed tokens in that same final prompt, and at the peak. Watch this
+            rather than msgs: a strategy that rewrites content in place removes
+            tokens without removing messages, and msgs cannot see it
+calls     = model calls, which exceed turns whenever the agent used a tool
+in/out    = tokens billed across the whole run, replies included
+cost      = median repeat. Every column describes that one real conversation,
+            so the tokens, facts and cost cannot disagree with each other
++-        = spread between the cheapest and dearest repeat. A gap smaller than
+            this is not a result. n/a means one repeat, so stability is unknown
+summ$     = what this strategy's own summarization calls cost, of that total
+facts     = planted facts surviving compaction into the final prompt: recall's ceiling
+lost      = compaction removed it, so the model could not use it  <- the damage
+nofetch   = the agent never called that tool, so the fact never entered the
+            history at all. Not compaction damage: an uncompacted run shows these
+            too, and counting them as lost overstates every strategy equally
+ignored   = still in context but unused: the model's failing, not compaction's.
+            Without this split a control that simply omits facts looks like
+            compaction damage, and every strategy is judged against a false baseline
+correct   = share of checks passed, each closing reply scored only against the
+            values its own question asked for. Scoring the replies joined lets a code
+            answered under the wrong heading count, which measures emission rather
+            than attribution
+all       = share of all planted values present in the single combined answer, where
+            the model is asked for everything at once from a context they are
+            scattered through. Harder than the per-scope questions and reported apart
+            from them, since a good score there can hide a failure here
+c+-       = points between the least and most correct repeat. The correct column is
+            taken from the median-cost repeat, so without this a strategy whose three
+            runs scored 100, 22 and 22 reads identically to one that scored 22 three
+            times. A wide gap here means the accuracy ranking is not usable, exactly
+            as a wide +- means the cost ranking is not
+flags     = ERR failed turn, S<n> summarizer failures, <n>/<n>t turns completed,
+            REC:<n> records the strategy found, ASK:<n> times it asked for one, and
+            FALLBACK:<n> times it gave up and compacted another way. A row with
+            FALLBACK is measuring that other strategy, not the one named,
+            NO:<opt> the provider rejected that option so it was dropped. A run
+            that dropped tool_choice chose its own tool calls and is not
+            comparable with one that did not,
+            FETCH this row gathered a different set of facts than the control, so
+            its cost and correctness are not comparable with it
+
+VERDICT: tool_summary_anchored
+'tool_summary_anchored' is 9% cheaper than not compacting while answering at 100% of the control. 1 of 4 strategies cleared the correctness bar.
+
+NOT SUPPORTED: repeats of one strategy varied by 10%, wider than the 9% gap this recommendation rests on. Treat the cost ranking as unresolved.
+Unclosed client session
+client_session: <aiohttp.client.ClientSession object at 0x0000020285E5A270>
+EXIT=0
