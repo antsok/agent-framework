@@ -18,6 +18,7 @@ from ._live import (
     MeteredClient,
     build_live_scenario,
     run_live,
+    score_combined,
     score_live,
     unretrieved_facts,
     wants_client_side_history,
@@ -415,6 +416,7 @@ def _render(
     nofetch: dict[str, int],
     spread: dict[str, float],
     correctness_range: dict[str, float],
+    combined: dict[str, float],
     repeats: int,
     pricing: ModelPricing,
     model: str,
@@ -427,7 +429,8 @@ def _render(
     header = (
         f"{'strategy':<28}{'msgs':>9}{'tok left/peak':>16}{'calls':>7}{'in':>9}{'hit%':>6}"
         f"{'out':>8}{'cost':>10}{'+-':>6}{'summ$':>8}{'vs none':>9}"
-        f"{'facts':>9}{'lost':>6}{'nofetch':>8}{'ignored':>8}{'correct':>9}{'c+-':>6}{'vs none':>9}{'flags':>8}"
+        f"{'facts':>9}{'lost':>6}{'nofetch':>8}{'ignored':>8}{'correct':>9}{'c+-':>6}{'all':>6}"
+        f"{'vs none':>9}{'flags':>8}"
     )
     lines = [
         "",
@@ -477,7 +480,8 @@ def _render(
             f"{max(outcome.score.lost_to_compaction - nofetch[outcome.strategy], 0):>6}"
             f"{nofetch[outcome.strategy]:>8}{outcome.score.ignored_by_model:>8}"
             f"{outcome.correctness:>8.0%}{'*' if outcome.strategy == base.strategy else ' '}"
-            f"{(f'{correctness_range[outcome.strategy]:.0f}pp' if repeats > 1 else 'n/a'):>6}{rel:>9}"
+            f"{(f'{correctness_range[outcome.strategy]:.0f}pp' if repeats > 1 else 'n/a'):>6}"
+            f"{combined.get(outcome.strategy, 0.0):>5.0%} {rel:>8}"
             f"{(','.join(flags) or '-'):>8}"
         )
     lines += [
@@ -501,7 +505,14 @@ def _render(
         "ignored   = still in context but unused: the model's failing, not compaction's.",
         "            Without this split a control that simply omits facts looks like",
         "            compaction damage, and every strategy is judged against a false baseline",
-        "correct   = share of correctness checks the final answer passed (* marks the control)",
+        "correct   = share of checks passed, each closing reply scored only against the",
+        "            values its own question asked for. Scoring the replies joined lets a code",
+        "            answered under the wrong heading count, which measures emission rather",
+        "            than attribution",
+        "all       = share of all planted values present in the single combined answer, where",
+        "            the model is asked for everything at once from a context they are",
+        "            scattered through. Harder than the per-scope questions and reported apart",
+        "            from them, since a good score there can hide a failure here",
         "c+-       = points between the least and most correct repeat. The correct column is",
         "            taken from the median-cost repeat, so without this a strategy whose three",
         "            runs scored 100, 22 and 22 reads identically to one that scored 22 three",
@@ -636,6 +647,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
     nofetch: dict[str, int] = {}
     spread: dict[str, float] = {}
     correctness_range: dict[str, float] = {}
+    combined: dict[str, float] = {}
     scenarios: dict[int, RecallScenario] = {}
     joint: list[JointOutcome] = []
     for name in strategies:
@@ -692,6 +704,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
         live[name] = representative
         spread[name] = _spread(repeats, pricing)
         correctness_range[name] = _correctness_range(repeats, scenarios, pricing)
+        combined[name] = score_combined(representative, chosen_scenario)
         nofetch[name] = len(unretrieved_facts(representative, chosen_scenario))
         joint.append(_to_joint(representative, chosen_scenario, pricing))
 
@@ -735,6 +748,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
             nofetch,
             spread,
             correctness_range,
+            combined,
             args.repeats,
             pricing,
             runtime.model,
