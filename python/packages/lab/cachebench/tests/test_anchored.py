@@ -186,7 +186,7 @@ async def test_short_conversations_are_left_alone() -> None:
     [
         ({"max_input_tokens": 0}, "max_input_tokens"),
         ({"max_input_tokens": 100, "keep_head_groups": -1}, "keep_head_groups"),
-        ({"max_input_tokens": 100, "keep_chars": -1}, "keep_chars"),
+        ({"max_input_tokens": 100, "keep_tokens": -1}, "keep_tokens"),
     ],
 )
 def test_invalid_configuration_is_rejected(kwargs: dict[str, int], match: str) -> None:
@@ -231,10 +231,10 @@ async def test_retention_scales_with_the_ceiling() -> None:
         {"kind": "tool_call", "group_id": f"g{index}", "start_index": index, "end_index": index} for index in range(6)
     ]
 
-    assert large._keep_chars_for(band) > 4 * small._keep_chars_for(band)
+    assert large._keep_tokens_for(band) > 4 * small._keep_tokens_for(band)
     # And an explicit value still wins, so a caller can pin it for a comparison.
-    pinned = AnchoredCompactionStrategy(max_input_tokens=269_952, tokenizer=TOKENIZER, keep_chars=600)
-    assert pinned._keep_chars_for(band) == 600
+    pinned = AnchoredCompactionStrategy(max_input_tokens=269_952, tokenizer=TOKENIZER, keep_tokens=600)
+    assert pinned._keep_tokens_for(band) == 600
 
 
 async def test_a_wider_band_share_keeps_more_of_each_result() -> None:
@@ -245,7 +245,7 @@ async def test_a_wider_band_share_keeps_more_of_each_result() -> None:
         {"kind": "tool_call", "group_id": f"g{index}", "start_index": index, "end_index": index} for index in range(6)
     ]
 
-    assert wide._keep_chars_for(band) > narrow._keep_chars_for(band)
+    assert wide._keep_tokens_for(band) > narrow._keep_tokens_for(band)
 
 
 def test_band_share_is_validated() -> None:
