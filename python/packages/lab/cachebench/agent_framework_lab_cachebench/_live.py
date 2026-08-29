@@ -48,7 +48,15 @@ from agent_framework import (
 from agent_framework._compaction import project_included_messages
 
 from ._metrics import serialize_message
-from ._recall import FactOutcome, RecallScenario, build_recall_scenario, render_code, render_codes, score_answer
+from ._recall import (
+    FactOutcome,
+    RecallScenario,
+    build_recall_scenario,
+    render_code,
+    render_codes,
+    score_answer,
+    score_scoped,
+)
 from ._runner import unsupported_option
 from ._strategies import StrategyOptions, build_strategy
 from ._toolsummary import (
@@ -83,6 +91,7 @@ __all__ = [
     "make_scope_tools",
     "resolve_instructions",
     "run_live",
+    "score_combined",
     "score_live",
     "unretrieved_facts",
     "wants_client_side_history",
@@ -357,6 +366,11 @@ class LiveOutcome:
     #: column. A strategy that can silently degrade into a different one has to say so:
     #: this package has twice read a row that scored well for having done nothing.
     strategy_notes: tuple[str, ...] = ()
+    #: One reply per closing turn, so each can be scored against the question that asked for
+    #: it rather than against all of them joined.
+    answers: tuple[str, ...] = ()
+    #: The reply to the combined question, scored separately.
+    combined_answer: str = ""
     summarizer_input_tokens: int = 0
     summarizer_output_tokens: int = 0
     error: str | None = None
@@ -980,6 +994,10 @@ async def run_live(
     # was available to it when it wrote the answer.
     final_prompt = "\n".join(call.prompt_text for call in recorder.calls[final_mark:])
     answer = chr(10).join(answer_parts)
+    # The combined turn is the last one when the scenario has scopes; it is scored on its own
+    # so a failure to assemble everything cannot drag down the per-scope figure, and a good
+    # per-scope figure cannot hide a failure to assemble.
+    combined = answer_parts[-1] if scenario.answer_scopes[-1:] == ("*",) and answer_parts else ""
 
     return LiveOutcome(
         strategy=strategy_name,
@@ -992,6 +1010,8 @@ async def run_live(
         dropped_options=tuple(dropped),
         scopes_called=tuple(scopes_called),
         summarizer_calls=summarizer.calls if summarizer else 0,
+        answers=tuple(answer_parts),
+        combined_answer=combined,
         summarizer_failures=summarizer.failures if summarizer else 0,
         strategy_notes=_strategy_notes(strategy) + _strategy_notes(recall_middleware),
         summarizer_input_tokens=summarizer.input_tokens if summarizer else 0,
@@ -1069,7 +1089,13 @@ def build_live_scenario(
 
 
 def score_live(outcome: LiveOutcome, scenario: RecallScenario) -> tuple[FactOutcome, ...]:
-    """Score a live outcome's answer against the planted facts.
+    """Score a live outcome against the planted facts, per scope where the scenario allows.
+
+    Scoped scoring matches each fact only against the reply to the question that asked for
+    it. Joining the replies first lets a code answered under the wrong heading count as
+    recalled, which measures whether the value was emitted rather than whether it was
+    attributed -- and a strategy that keeps values while losing the labelling that says which
+    tool returned them then scores like one that kept both.
 
     Args:
         outcome: The finished run.
@@ -1078,7 +1104,29 @@ def score_live(outcome: LiveOutcome, scenario: RecallScenario) -> tuple[FactOutc
     Returns:
         One outcome per planted fact.
     """
+    if scenario.answer_scopes and outcome.answers:
+        return score_scoped(outcome.answers, scenario.answer_scopes, scenario.facts, outcome.final_prompt)
     return score_answer(outcome.answer, scenario.facts, outcome.final_prompt)
+
+
+def score_combined(outcome: LiveOutcome, scenario: RecallScenario) -> float:
+    """Return the share of planted facts the single combined answer contained.
+
+    The per-scope questions ask for eight values each from a nearby part of the conversation.
+    This one asks for all 53 at once from a context they are scattered through, which is a
+    materially harder task and the one a real user is more likely to pose.
+
+    Args:
+        outcome: The finished run.
+        scenario: The scenario it was driven from.
+
+    Returns:
+        A fraction, or 0.0 when the scenario has no combined question.
+    """
+    if not outcome.combined_answer or not scenario.facts:
+        return 0.0
+    found = sum(1 for fact in scenario.facts if fact.appears_in(outcome.combined_answer))
+    return found / len(scenario.facts)
 
 
 _INSTRUCTIONS_BY_NARRATION: Final[dict[str, str]] = {

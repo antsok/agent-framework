@@ -14,6 +14,7 @@ from agent_framework_lab_cachebench import (
     score_answer,
 )
 from agent_framework_lab_cachebench._metrics import serialize_message
+from agent_framework_lab_cachebench._recall import score_scoped
 
 TOKENIZER = CharacterEstimatorTokenizer()
 
@@ -266,3 +267,40 @@ def test_the_expected_count_follows_the_markers_actually_planted() -> None:
     closing = [str(turn.request[0].contents[0]) for turn in scenario.transcript.turns[-scenario.answer_turn_count :]]
 
     assert all("returned 3 codes" in text for text in closing if "deployment lookup returned" in text)
+
+
+def test_scoped_scoring_rejects_a_code_answered_under_the_wrong_heading() -> None:
+    """Attribution, not just emission.
+
+    Joining every closing reply and matching each fact against the whole string lets a code
+    listed under the wrong tool count as recalled. A strategy that keeps values while losing
+    the labelling that says which tool returned them then scores like one that kept both --
+    which is exactly the damage truncation was measured doing.
+    """
+    scenario = build_recall_scenario(tool_turns=6, markers_per_tool=8, subset_questions=True, salt="scope")
+    early = [fact for fact in scenario.facts if fact.scope == "early"]
+    late_scope = scenario.answer_scopes[scenario.answer_scopes.index("late")]
+
+    # Every early code, but answered under the "late" question.
+    answers = ["" for _ in scenario.answer_scopes]
+    answers[scenario.answer_scopes.index(late_scope)] = " ".join(fact.marker for fact in early)
+    prompt = " ".join(fact.marker for fact in scenario.facts)
+
+    scoped = score_scoped(answers, scenario.answer_scopes, scenario.facts, prompt)
+    loose = score_answer("\n".join(answers), scenario.facts, prompt)
+
+    assert not any(outcome.recalled for outcome in scoped), "misattributed codes must not count"
+    assert sum(1 for outcome in loose if outcome.recalled) == len(early), "the loose scorer counts them"
+
+
+def test_the_combined_question_is_not_double_counted() -> None:
+    """The combined reply asks for everything, so counting it per scope restores the old flaw."""
+    scenario = build_recall_scenario(tool_turns=6, markers_per_tool=8, subset_questions=True, salt="scope")
+    everything = " ".join(fact.marker for fact in scenario.facts)
+
+    answers = ["" for _ in scenario.answer_scopes]
+    answers[-1] = everything  # the "*" turn
+    scoped = score_scoped(answers, scenario.answer_scopes, scenario.facts, everything)
+
+    assert scenario.answer_scopes[-1] == "*"
+    assert not any(outcome.recalled for outcome in scoped)

@@ -27,7 +27,7 @@ compaction strategy that deleted the context.
 from __future__ import annotations
 
 import hashlib
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Final
 
@@ -46,6 +46,7 @@ __all__ = [
     "render_code",
     "render_codes",
     "score_answer",
+    "score_scoped",
 ]
 
 _FIRST_QUESTION: Final[str] = (
@@ -53,6 +54,22 @@ _FIRST_QUESTION: Final[str] = (
     "reference, and which pipeline we settled on. List them plainly, one per line, no "
     "preamble. If any of them appears nowhere in this conversation, say so for that one."
 )
+_COMBINED_QUESTION: Final[str] = (
+    "Final question. Combine everything now into one list: every requirement code, the "
+    "change-of-direction reference, which pipeline we settled on, and every code returned by "
+    "every deployment lookup. Group them under the tool or requirement they came from. Take "
+    "as long as you need and work through the conversation systematically. If any value "
+    "appears nowhere in this conversation, say so for that one rather than inventing it."
+)
+"""One closing question asking for all of it at once.
+
+Deliberately harder than the per-scope questions, and reported separately from them. Values
+are scattered through a long conversation, so answering needs the model to work through it
+rather than answer from what is nearby -- and a compaction record, if there is one, is where
+they have been gathered. A model that scores well per scope and badly here is telling us
+something the per-scope figure hides.
+"""
+
 _SWEEPING_QUESTION: Final[str] = (
     "Write the final report summary now. It must contain, verbatim: every requireme"
     "nt code you were given; the change-of-direction reference and which pipeline w"
@@ -71,6 +88,11 @@ class PlantedFact:
     kind: str
     turn: int
     description: str
+    #: Which closing question owns this fact. A tool's label for a code it returned, and
+    #: empty for the requirements and the correction, which the first closing question asks
+    #: about. Scoring every fact against every reply lets a code answered under the wrong
+    #: heading count as recalled, which measures emission rather than attribution.
+    scope: str = ""
 
     def appears_in(self, text: str) -> bool:
         """Return whether this fact's marker occurs in ``text``."""
@@ -214,6 +236,9 @@ class RecallScenario:
     facts: tuple[PlantedFact, ...]
     contradictions: tuple[Contradiction, ...] = ()
     answer_turn_count: int = 1
+    #: Scope asked about by each closing turn, in order. ``""`` is the requirements turn and
+    #: ``"*"`` the combined one, which is asked for everything at once.
+    answer_scopes: tuple[str, ...] = ()
     """Closing turns whose replies are scored, counted from the end of the transcript."""
     tool_turn_scopes: Mapping[int, str] = field(default_factory=dict[int, str])
     """Turn index mapped to the scope that turn asks for.
@@ -373,7 +398,7 @@ def build_recall_scenario(
         lookups[label] = codes
         tool_turn_scopes[len(turns)] = label
         facts.extend(
-            PlantedFact(code, "tool_result", len(turns) + 1, f"{label} code {index + 1}")
+            PlantedFact(code, "tool_result", len(turns) + 1, f"{label} code {index + 1}", scope=label)
             for index, code in enumerate(codes)
         )
         return TranscriptTurn(
@@ -550,7 +575,19 @@ def build_recall_scenario(
                     reply=(),
                 )
             )
-        answer_turns = 1 + len(lookups)
+        # One last question asking for everything at once. The per-scope turns measure
+        # whether each value survived where it belonged; this one measures whether the model
+        # can assemble them all from a context they are scattered through, which is a
+        # materially harder task and one it has usually failed. Scored separately so a
+        # failure here cannot drag down the per-scope figure, and vice versa.
+        turns.append(
+            TranscriptTurn(
+                request=(Message(role="user", contents=[_COMBINED_QUESTION]),),
+                reply=(),
+            )
+        )
+        answer_scopes = ("", *lookups, "*")
+        answer_turns = 2 + len(lookups)
     else:
         turns.append(
             TranscriptTurn(
@@ -558,6 +595,9 @@ def build_recall_scenario(
                 reply=(),
             )
         )
+        # The sweeping form is one turn asked for everything, so it is the combined scope
+        # and nothing else.
+        answer_scopes = ("*",)
         answer_turns = 1
 
     return RecallScenario(
@@ -578,6 +618,47 @@ def build_recall_scenario(
         tool_lookups=lookups,
         tool_turn_scopes=tool_turn_scopes,
         answer_turn_count=answer_turns,
+        answer_scopes=answer_scopes,
+    )
+
+
+def score_scoped(
+    answers: Sequence[str],
+    scopes: Sequence[str],
+    facts: tuple[PlantedFact, ...],
+    final_prompt: str,
+) -> tuple[FactOutcome, ...]:
+    """Score each closing reply against only the facts its question asked for.
+
+    Joining the replies and matching every fact against the whole string lets a code answered
+    under the wrong heading count as recalled, which measures whether the value was emitted
+    rather than whether it was attributed. A strategy that preserves values but loses the
+    labelling that says which tool returned them scores identically to one that preserves
+    both.
+
+    The combined scope ``"*"`` is excluded here and scored on its own: it asks for everything,
+    so counting it would restore the loose behaviour through the back door.
+
+    Args:
+        answers: One reply per closing turn, in order.
+        scopes: The scope each of those turns asked about.
+        facts: Every planted fact.
+        final_prompt: Serialized prompts of the closing turns, for the survival check.
+
+    Returns:
+        One outcome per fact.
+    """
+    by_scope: dict[str, str] = {}
+    for scope, answer in zip(scopes, answers, strict=False):
+        if scope != "*":
+            by_scope[scope] = by_scope.get(scope, "") + "\n" + answer
+    return tuple(
+        FactOutcome(
+            fact=fact,
+            survived=fact.appears_in(final_prompt),
+            recalled=fact.appears_in(by_scope.get(fact.scope, "")),
+        )
+        for fact in facts
     )
 
 
