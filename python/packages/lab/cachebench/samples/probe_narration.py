@@ -164,8 +164,9 @@ async def run(args: argparse.Namespace) -> int:
     placements = [item.strip() for item in args.placements.split(",") if item.strip()]
     provider, model_override = parse_provider_selector(args.provider)
     runtime = build_provider(provider, temperature=None, response_max_tokens=16, model=model_override)
-    if not wants_client_side_history(runtime.client):
-        print("note: this client keeps history server-side; the live run forces store=False so compaction applies.\n")
+    if wants_client_side_history(runtime.client):
+        print("note: this client keeps history server-side by default; run_live forces store=False")
+        print("so the client sends the conversation and the measurement describes it.\n")
 
     if args.repeats < 5:
         # Measured the hard way: the same configuration was estimated at a 9-point range on

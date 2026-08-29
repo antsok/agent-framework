@@ -11,8 +11,10 @@ between those layers, and a hand-rolled mock that skipped them would answer none
 
 from __future__ import annotations
 
+import contextlib
 from collections.abc import Mapping, Sequence
-from typing import Any
+from types import SimpleNamespace
+from typing import Any, cast
 
 import pytest
 from agent_framework import (
@@ -1194,3 +1196,57 @@ def test_narration_probe_declares_every_flag_it_reads() -> None:
     # The defaults must name real modes, or the probe fails on its own first run.
     assert set(args.narrations.split(",")) <= {"neutral", "prompted", "suppressed"}
     assert set(args.placements.split(",")) <= {"spread", "buried", "head"}
+
+
+async def test_run_live_forces_client_side_history_without_being_asked() -> None:
+    """A Responses-API client must have store=False set by run_live, not by its caller.
+
+    When the service owns the conversation, MAF skips history loading and the agent sends
+    only the new turn: compaction has nothing to act on and every setting measures the same
+    thing. The live CLI has always forced this. A calibration probe calling run_live directly
+    did not, and reported all three narration modes as stable with ranges of 0 to 7 points --
+    against 78 points for the same model measured properly -- because the model was reading a
+    history the client had never compacted.
+    """
+
+    class StoringRuntime:
+        """Minimal stand-in exposing what the forcing looks at."""
+
+        STORES_BY_DEFAULT = True
+
+    runtime = SimpleNamespace(client=StoringRuntime(), model="stub", options={})
+
+    assert wants_client_side_history(runtime.client) is True
+    assert "store" not in runtime.options
+
+    # run_live sets it before doing anything else; the call is expected to fail past that
+    # point because the stub is not a real client, which is enough to prove the ordering.
+    with contextlib.suppress(Exception):
+        await run_live(
+            cast(Any, runtime),
+            strategy_name="none",
+            options=StrategyOptions(tokenizer=TOKENIZER, max_context_window_tokens=1_000, max_output_tokens=100),
+            scenario=build_live_scenario(salt="store", filler_turns=1, filler_tokens=10, tool_turns=6),
+        )
+
+    assert runtime.options.get("store") is False
+
+
+async def test_server_history_can_still_be_opted_into() -> None:
+    """The escape hatch must survive, or --server-history silently stops meaning anything."""
+
+    class StoringRuntime:
+        STORES_BY_DEFAULT = True
+
+    runtime = SimpleNamespace(client=StoringRuntime(), model="stub", options={})
+
+    with contextlib.suppress(Exception):
+        await run_live(
+            cast(Any, runtime),
+            strategy_name="none",
+            options=StrategyOptions(tokenizer=TOKENIZER, max_context_window_tokens=1_000, max_output_tokens=100),
+            scenario=build_live_scenario(salt="store", filler_turns=1, filler_tokens=10, tool_turns=6),
+            allow_server_history=True,
+        )
+
+    assert "store" not in runtime.options
