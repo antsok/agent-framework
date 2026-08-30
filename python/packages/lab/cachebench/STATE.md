@@ -64,19 +64,28 @@ reaches `REC:1 / RECFORCED:1` before the freeze.
 `tool_summary_anchored` 0 to 13, `truncation` held at 59. Mid-answer eviction is not the source
 of the bimodality.
 
-**What run 22 found instead is worse, and is now the open problem.** Its unfrozen arm is a
-replication of run 18 and disagrees with it by up to 69 points per row, in both directions. The
-mode is selected per *invocation*, not per repeat: `tool_summary_anchored` scored 100% three
-times running in one arm and about 35% three times running in the other, and emitted 10,941
-output tokens against 4,603. So `c+-` understates the real error bar, because the repeats it
-measures are correlated, and **no accuracy claim at 272,000 that rests on a single invocation
-is safe** — which includes runs 16 to 20 and the crossover in the report.
+**What run 22 found instead, once run 23 corrected it.** Run 22's unfrozen arm is a replication
+of run 18 and disagrees with it by up to 69 points per row. I first read that as the answering
+mode being fixed per *invocation*. It is not: run 18's own `c+-` for `tool_summary_anchored` is
+72 points, and run 23 measured both spreads directly at 60,000 — 7pp within and 7pp across for
+the control, 78pp and 78pp for `anchored`. **The variance is per repeat and `c+-` reports it
+correctly.** The usable claim is only that a single sample of a configuration says little about
+accuracy, which still makes the tables in runs 16 to 20 one sample each.
 
-Cost columns are unaffected: `+-` runs 1-11% and the ordering is stable across all three runs.
+**The spread belongs to compaction, not the model** (run 23, six invocations at 60,000). The
+uncompacted control moves 7 points while `anchored` moves 78, so it is not the model choosing
+how thoroughly to answer. `facts` is discrete: `tool_summary_anchored` returned exactly 53 or 39
+with nothing between, `anchored` returned 27, 52 or 53. The scenario salt moves where facts fall
+relative to a retention boundary and the strategy clears it or does not. A second, smaller
+source sits on top — `anchored` scored 52/52/52/22 across four invocations that all preserved
+exactly 27 facts — worth about 30 points against compaction's 78.
 
-Fixing it needs invocation-level repetition — the same command run N times, correctness taken
-across invocations — at about EUR 5 per 272,000 invocation. Whether cheaper windows show the
-same bimodality is unknown and worth checking first.
+**Cost is steadier than accuracy, but not for every row.** Across run 23's six invocations the
+control moved 6.5% and `anchored` 7.3%, with `anchored` dearest every time. But
+`tool_summary_anchored` moved **25%** and on one invocation came out 10% dearer than the
+control instead of 9% cheaper: a strategy whose record is sometimes complete carries a
+different prompt and writes a different amount, so its cost inherits its accuracy's
+bimodality.
 
 ## 4. The finding the report does not yet state correctly
 
@@ -129,10 +138,10 @@ Each of these produced a plausible wrong number first.
   in cost; three repeats had shown 3%.
 - **The dry run under-reported size** until the probe scenario was given `filler_tool_turns`;
   it reported 6 tool groups and 48,000 tokens where the scenario had 16 and 129,000.
-- **Repeats inside one invocation are correlated.** `c+-` measures them and so understates the
-  real error bar: run 22 scored `tool_summary_anchored` at 100% three times running in one
-  invocation and about 35% three times running in the next, on the same command. Accuracy needs
-  invocation-level repetition; cost does not.
+- **Accuracy needs several samples; cost does not.** `c+-` is an honest error bar (run 23 showed
+  within- and across-invocation spread are the same size), but it routinely runs 26 to 78 points
+  on a compacting strategy, so any single accuracy figure is one draw from a wide, often
+  two-valued distribution. Cost spread is 1 to 11% and its ordering reproduces every time.
 - **`--tool-turns` is silently capped** by `--filler-turns`: extra tool groups are placed
   inside filler sections, so 16 requested with the default 6 filler turns yields 9.
 

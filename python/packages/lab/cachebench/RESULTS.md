@@ -51,7 +51,7 @@ between runs, which moves both axes for reasons unrelated to compaction. Runs ma
 | 16 | `gpt-5.4-mini` | Azure Foundry | Responses | yes | `tool_summary_anchored` (60K, unsupported) |
 | 17 | `gpt-5.4-mini` | Azure Foundry | Responses | yes | *(120K, crossover)* |
 | 18 | `gpt-5.4-mini` | Azure Foundry | Responses | yes | `none` (272K, `anchored` best on accuracy) |
-| 19 | `gpt-5.4-mini` | Azure Foundry | Responses | yes | *(16 calls, confounded -- kept as a series point)* |
+| 19 | `gpt-5.4-mini` | Azure Foundry | Responses | yes | *(16 calls, confounded — kept as a series point)* |
 | 20 | `gpt-5.4-mini` | Azure Foundry | Responses | yes | `none` (16 calls, controlled with code-free asides) |
 
 Runs 7 to 9 are a **separate experiment** on the harness agent at wider windows, with 53
@@ -876,8 +876,8 @@ window, which is the variable that turns out to matter.
 | 25,200 (272K window) | 18/53 | **53/53** |
 
 **A model-written record thins out as there is more to record.** The mechanism worked in every
-run -- `REC:1, FORCED:2, RECFORCED:1`, so the middleware forced the call and the forced call
-produced the record -- but the content degraded. What survives is the model's judgement rather
+run — `REC:1, FORCED:2, RECFORCED:1`, so the middleware forced the call and the forced call
+produced the record — but the content degraded. What survives is the model's judgement rather
 than a policy, and that judgement gets worse exactly where compaction is most needed.
 
 **Proportional retention improves for the mirror-image reason.** `anchored` gives each
@@ -938,7 +938,7 @@ ever taken here.
 **A tool passed through per-call options is never executed.** `FunctionInvocationLayer` wraps
 `ChatMiddlewareLayer` and builds its tool map first, so the tool reaches the model and nothing
 answers its call. Tools must be registered with the harness; visibility cannot be controlled
-per call, only *permission* -- hence the one-shot gate that makes the recall tool inert unless
+per call, only *permission* — hence the one-shot gate that makes the recall tool inert unless
 the middleware armed it.
 
 **A middleware cannot see the history before the call.** `context.messages` holds only the new
@@ -963,7 +963,7 @@ separate them.
 **Run 19 raised the call count the cheap way and is confounded.** Sixteen tool calls of 8,000
 tokens, but `--markers-per-tool` dropped from 8 to 3 to hold the fact count at 53. That changed
 the number of calls, the size of each result *and* the codes each result carried. The record
-scored 53/53 -- but three variables had moved.
+scored 53/53 — but three variables had moved.
 
 **Run 20 is the honest form.** `--filler-tool-turns` adds lookups whose results carry no codes,
 so six code-bearing results with eight codes each stay exactly as they were and ten code-free
@@ -1079,7 +1079,7 @@ Mid-answer eviction is not the source of the spread. The confound is real — co
 keep firing through the closing turns, 16 suppressed calls per strategy prove it — but it is
 not what makes the accuracy figure jump.
 
-### The finding that displaces it: the same configuration does not reproduce
+### The finding that displaces it: one sample per configuration is not enough
 
 The unfrozen arm and run 18 are the same command. They disagree by more than the freeze does:
 
@@ -1090,37 +1090,87 @@ The unfrozen arm and run 18 are the same command. They disagree by more than the
 | none | 53/53, **76%** | 53/53, **100%** | 53/53, 81% |
 | anchored | 53/53, **100%** | 39/53, **70%** | 44/53, 54% |
 
-Every row moves, in both directions, by up to 69 points. Note where the frozen arm lands: on
-`tool_summary_anchored` it matches run 18 — 18/53 facts, ~1/3 correct, -10% cost — while the
-*unfrozen* arm is the outlier on all three. If the freeze were driving this, the frozen arm
-should be the one that differs from run 18. It is not.
+Every row moves, in both directions, by up to 69 points. Note also where the frozen arm lands:
+on `tool_summary_anchored` it matches run 18 — 18/53 facts, about a third correct, -10% cost --
+while the *unfrozen* arm is the outlier on all three. If the freeze were driving this, the
+frozen arm should be the one that differs from run 18. It is not.
 
-**So `c+-` understates the real error bar.** It measures repeats inside one invocation, and
-those repeats are correlated: `tool_summary_anchored` scored 100% three times running in one
-arm and ~35% three times running in the other. Whatever selects the mode operates at the level
-of the invocation, not the repeat, so adding repeats inside a run cannot see it and cannot
-average it out.
+> **Corrected by run 23.** This section first concluded that the answering mode is fixed per
+> *invocation*, because `tool_summary_anchored` scored 100% three times running in one arm and
+> about 35% three times running in the other. That over-read a small sample. Run 18's own `c+-`
+> for that strategy is **72pp**, which is large within-invocation spread, and with a roughly
+> even two-sided distribution three repeats land on the same side a quarter of the time. Run 23
+> then measured both spreads directly at 60,000 and found them the same size. The variance is
+> **per repeat**, and `c+-` does report it — it was simply not being respected.
 
-The proximate mechanism is visible in the output column. `tool_summary_anchored` emitted
-**10,941** output tokens in the unfrozen arm against 4,603 in run 18 and 4,873 frozen. The
-model either enumerates exhaustively or it answers tersely, and it does so for a whole
-invocation at a time. `survived` then follows the answers rather than leading them: each
-closing reply puts its codes back into the history as assistant text, so an arm that enumerates
-well scores 53/53 on facts *because* it answered well, not the other way round.
-
-### What this costs the rest of this file
-
-Any accuracy claim at 272,000 resting on a single invocation is unsafe, which includes the
-per-run tables in runs 16 to 20 and the crossover they describe. The cost columns are not
-affected: `+-` runs 1-11% and the cost ordering is stable across all three runs. The CLI's own
-guard caught this in the unfrozen arm — *"ACCURACY NOT RANKABLE: repeats of the uncompacted
-control varied by 26 points"* — and it should be believed.
-
-Fixing it needs invocation-level repetition, not repeat-level: the same command run N times and
-the correctness distribution taken across invocations. At about EUR 5 per 272,000 invocation
-that is expensive, and cheaper windows may not exhibit the same bimodality.
+The claim that survives is the weaker and more useful one: **a single sample of a configuration
+says very little about its accuracy**, and the accuracy tables in runs 16 to 20 are one sample
+each. Cost is unaffected: `+-` runs 1-11% and the ordering held across all three runs.
 
 Cost: about $10.9, roughly EUR 10, for both arms.
+
+---
+
+## Run 23 — the spread is per repeat, and it is compaction's, not the model's
+
+Six independent invocations of one command at 60,000, one repeat each, on run 16's exact
+profile. Run 16 ran the same command with five repeats *inside* one invocation, so the two
+measure the same thing at different levels.
+
+| strategy | inv 1 | 2 | 3 | 4 | 5 | 6 | across invocations | run 16, within one |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| none | 98% | 93% | 100% | 96% | 96% | 93% | **7pp** | **7pp** |
+| tool_summary_anchored | 100% | 100% | 100% | 74% | 74% | 100% | **26pp** | **59pp** |
+| anchored | 52% | 98% | 100% | 52% | 22% | 52% | **78pp** | **78pp** |
+
+**The two spreads are the same size**, and for `tool_summary_anchored` the within-invocation
+one is larger. There is no invocation-level effect to find: repeats inside a run vary as much
+as runs do, so `c+-` is the honest error bar and always was.
+
+### The spread belongs to compaction, not to the model
+
+The control varies by 7 points across six invocations while `anchored` varies by 78. Whatever
+drives the instability, it is not the model deciding how thoroughly to answer — that would
+move the uncompacted row too.
+
+**`facts` is discrete, which is what a cliff looks like.** Across six invocations the survival
+counts take a handful of values and nothing between them:
+
+| strategy | facts survived, by invocation | distinct values |
+| --- | --- | --- |
+| none | 53, 53, 53, 53, 53, 53 | one |
+| tool_summary_anchored | 53, 53, 53, **39**, **39**, 53 | **two** |
+| anchored | **27**, **52**, 53, 27, 27, 27 | **three** |
+
+Correctness follows them: `tool_summary_anchored` is 100% whenever 53 survive and 74% whenever
+39 do, with no intermediate result in six tries. The scenario salt changes on every invocation,
+which moves where the planted facts fall relative to a retention boundary; the strategy then
+either clears that boundary or does not.
+
+A second, smaller source sits on top. `anchored` scored 52%, 52%, 52% and 22% on the four
+invocations where exactly 27 facts survived — same material available, different amount of it
+quoted. That is the model's enumeration varying, and it is worth about 30 points against
+compaction's 78.
+
+### Cost is steadier, but not uniformly
+
+| strategy | median | across six | spread | position |
+| --- | ---: | ---: | ---: | --- |
+| tool_summary_anchored | $0.1560 | $0.1488–$0.1855 | **25%** | cheapest in 5 of 6 |
+| none | $0.1664 | $0.1596–$0.1700 | 6.5% | middle in 5 of 6 |
+| anchored | $0.1927 | $0.1879–$0.2017 | 7.3% | dearest in 6 of 6 |
+
+The control and `anchored` sit around 7%, which is the ordinary run-to-run figure. But
+`tool_summary_anchored` swings **25%**, and on invocation 4 it came out 10% *dearer* than the
+control rather than 9% cheaper — the one invocation where its saving reversed sign.
+
+That is the same defect showing up in the other column. A strategy whose record is sometimes
+complete and sometimes not writes a different amount of text and carries a different prompt,
+so its cost inherits the bimodality of its accuracy. **`anchored`'s cost claim is safe at one
+sample; `tool_summary_anchored`'s is not**, even though its accuracy and cost do not move
+together — invocations 4 and 5 both scored 74% at $0.1855 and $0.1488.
+
+Cost: about $3.1, roughly EUR 2.8.
 
 ---
 

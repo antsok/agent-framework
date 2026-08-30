@@ -10,14 +10,18 @@ This is a single-model deep dive and it stands apart from the six-model work in
 [`REPORT.md`](REPORT.md), which used a different agent, 17 planted facts instead of 53, and a
 control too unstable to rank against. **Nothing here should be averaged with it.**
 
-> **Correction pending, added after run 22.** Every accuracy figure below comes from a single
-> invocation of its configuration, and run 22 showed that is not enough. Re-running run 18's
-> exact command moved every row by up to 69 points, in both directions, because the model
-> settles into either exhaustive enumeration or terse answering for a whole invocation at a
-> time. The `c+-` column cannot see this: it measures repeats *within* an invocation, and those
-> repeats are correlated. **Read the accuracy claims here as one sample each, not as measured
-> values.** The cost claims are unaffected — cost spread runs 1-11% and the ordering held
-> across all three 272,000-token runs. See [`RESULTS.md`](RESULTS.md), run 22.
+> **Correction, added after runs 22 and 23.** Every accuracy figure below is a single sample of
+> its configuration, and that is not enough. Compacting strategies land on a small number of
+> discrete outcomes rather than scattering around a mean — `tool_summary_anchored` preserved
+> either 53 facts or 39 across six repeat invocations, with nothing between, and `anchored`
+> preserved 27, 52 or 53 — so a run reports whichever side of a retention boundary it happened
+> to fall on. The `c+-` column is an honest measure of this and routinely reads 26 to 78 points;
+> it should be read as the error bar it is. The instability is compaction's, not the model's:
+> the uncompacted control moves 7 points where `anchored` moves 78. **Most cost claims survive**
+> — the control and `anchored` move 6 to 8% and their ordering reproduced every time — but
+> `tool_summary_anchored`'s does not: across six invocations its cost moved 25%, and on one it
+> came out 10% dearer than the control rather than 9% cheaper. Its saving is real on average and
+> unreliable on any single run. See [`RESULTS.md`](RESULTS.md), runs 22 and 23.
 
 ---
 
@@ -223,7 +227,7 @@ unless the request says so.
 
 **Summarise each tool result on its own, not all of them in one call.** The record thins as
 there is more to record, and the current design asks for one record covering every result in
-the band -- so at 272,000 the model is asked to recall values from 151,200 tokens of material
+the band — so at 272,000 the model is asked to recall values from 151,200 tokens of material
 in a single answer. Summarising one result at a time bounds that work to roughly 8,000 tokens
 per call whatever the window size, which is the regime where the record scored 53 of 53.
 
@@ -245,7 +249,7 @@ Design notes for whoever builds it:
 
 **Settle whether compaction should keep running while the model is being scored.** It
 currently does: the closing turns go through the same loop as every other turn, so the first
-scope is asked from a fuller context than the last, and the combined question -- the hardest --
+scope is asked from a fuller context than the last, and the combined question — the hardest --
 is asked from the most compacted context of all. Each closing answer also lists codes, putting
 them back into history, which offsets that in an uncontrolled direction. A
 `--freeze-during-answers` flag and both arms at 272,000 would settle it, and it is a live
