@@ -32,7 +32,7 @@ Working copies were under `/tmp/cachebench/`, which is volatile.
 | Uncompacted cache hit rate | 93-97% at every size tested |
 | `tiktoken` `o200k_base` accuracy | within 6 tokens on a 270,294-token prompt |
 
-## 3. The current question, unanswered
+## 3. The question that replaced the old one
 
 **Compaction keeps running during the closing questions.** The eight closing turns go through
 the same `agent.run()` loop as every other turn and the strategy is the agent's
@@ -57,12 +57,26 @@ already recorded. Suppressed calls surface as a `FROZEN:<n>` note in the flags c
 
 Validated live in run 21 (120,000, one repeat, EUR 0.93): 16 compaction calls suppressed per
 strategy, so the closing turns really were still compacting, and `tool_summary_anchored` still
-reaches `REC:1 / RECFORCED:1` before the freeze. That run measures the mechanism only.
+reaches `REC:1 / RECFORCED:1` before the freeze.
 
-**Still to do:** both arms at 272K, which is what actually answers the question. This is a
-live candidate for the accuracy spread (39-78 points) that nothing else has explained — if
-eviction fires mid-sequence in some repeats and not others, that is exactly the bimodality
-observed. Estimated EUR 10.
+**Run 22 answered it, and the answer was no.** Paired arms at 272,000, three repeats each, EUR
+10. Freezing narrowed the spread for nothing: `anchored` widened 13 to 37 points,
+`tool_summary_anchored` 0 to 13, `truncation` held at 59. Mid-answer eviction is not the source
+of the bimodality.
+
+**What run 22 found instead is worse, and is now the open problem.** Its unfrozen arm is a
+replication of run 18 and disagrees with it by up to 69 points per row, in both directions. The
+mode is selected per *invocation*, not per repeat: `tool_summary_anchored` scored 100% three
+times running in one arm and about 35% three times running in the other, and emitted 10,941
+output tokens against 4,603. So `c+-` understates the real error bar, because the repeats it
+measures are correlated, and **no accuracy claim at 272,000 that rests on a single invocation
+is safe** — which includes runs 16 to 20 and the crossover in the report.
+
+Cost columns are unaffected: `+-` runs 1-11% and the ordering is stable across all three runs.
+
+Fixing it needs invocation-level repetition — the same command run N times, correctness taken
+across invocations — at about EUR 5 per 272,000 invocation. Whether cheaper windows show the
+same bimodality is unknown and worth checking first.
 
 ## 4. The finding the report does not yet state correctly
 
@@ -115,6 +129,10 @@ Each of these produced a plausible wrong number first.
   in cost; three repeats had shown 3%.
 - **The dry run under-reported size** until the probe scenario was given `filler_tool_turns`;
   it reported 6 tool groups and 48,000 tokens where the scenario had 16 and 129,000.
+- **Repeats inside one invocation are correlated.** `c+-` measures them and so understates the
+  real error bar: run 22 scored `tool_summary_anchored` at 100% three times running in one
+  invocation and about 35% three times running in the next, on the same command. Accuracy needs
+  invocation-level repetition; cost does not.
 - **`--tool-turns` is silently capped** by `--filler-turns`: extra tool groups are placed
   inside filler sections, so 16 requested with the default 6 filler turns yields 9.
 
