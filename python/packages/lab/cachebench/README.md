@@ -148,6 +148,59 @@ The cost is comparability. Two models write different replies, so their historie
 the first turn. **Live numbers compare strategies within one model, never models with each
 other.** Use the replay commands for cross-provider work.
 
+#### Seed, snapshot, probe
+
+A live run has three phases, and the split is the measurement design rather than plumbing.
+
+The **seed** phase drives every turn except the closing questions, exactly as an agent in use
+would. Only the user-side turn list is shared between strategies; the replies, and so the
+histories, diverge from the first turn.
+
+The **snapshot** is a deep copy of the session state taken once seeding ends. Deep because
+compaction records its decisions by mutating the messages themselves.
+
+Every closing question is then asked as a **probe**: the snapshot is restored, the question is
+put, and the answer is thrown back into nothing. Each question is asked `--probe-repeats`
+times (3 by default). No probe's answer can reach another probe's context, no question is
+asked from a context an earlier question compacted further, and survival is scored against the
+snapshot, which is by construction exactly the context every probe was answered from.
+
+None of the three held when the closing questions were ordinary turns appended to the
+conversation. Each answer re-listed codes into the history as assistant text, so `survived`
+was scored against a prompt the previous answers had written: the same strategy read 53/53 on
+a run that emitted 10,941 output tokens and 18/53 on one that emitted 4,873.
+
+#### Fill and the tried limit
+
+`--context-window` is the limit the run stands in for. It is simulated — the model itself
+accepts far more — so it is enforced here: any call whose prompt exceeds it disqualifies that
+row, and a cell that disqualifies at all leaves the ranking rather than being starred. Before
+this, the 60,000 control ran at 78,003 tokens and was ranked anyway, which made every
+"cheaper than not compacting" at that size a comparison with a baseline no model that size
+could have produced.
+
+`--fill` is the share of that limit the seeded conversation is sized to reach, solved
+analytically from the payload and filler sizes rather than by running one strategy and
+adjusting. The filler is the dial; the payload — how many tool results, how large, how many
+codes each — is a run-level parameter, varied between runs and compared across them, never
+inside one matrix. So a fill fraction means "how much irrelevant context surrounds a fixed set
+of facts", and a payload that will not fit inside the smallest cell is refused with an error
+rather than quietly overshooting. The achieved fill is measured on the uncompacted run and
+flagged if it lands more than 5% from the target.
+
+#### Accuracy is a distribution
+
+Two variance sources used to arrive as one number. They are now reported apart:
+
+- `seed+-` is the spread between seeds — different conversations, so this is compaction's own
+  reliability: whether it cleared a retention boundary this time and not last time.
+- `rep+-` is the spread between repeats *within* one seed — identical facts in identical
+  positions, so this is the model's willingness to enumerate and nothing else.
+
+Every sample is printed below the table. A strategy that scored 52, 52, 52 and 22 while
+preserving exactly the same 27 facts every time used to read the same as one that lost
+different facts each time.
+
 `--agent harness` swaps the plain agent for `create_harness_agent`, which is what production
 code actually calls. Its optional providers are switched off, because each one adds tools and
 system-prompt text to every measured prompt and would shift the trigger points without saying

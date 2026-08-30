@@ -241,38 +241,29 @@ async def test_the_middleware_forces_the_call_and_sends_no_message() -> None:
     assert all("recall" not in str(m.contents[0]).lower() for m in [Message(role="user", contents=["q"])])
 
 
-async def test_a_paused_middleware_forces_nothing() -> None:
-    """While the runner has frozen compaction, no record may be forced.
+async def test_forgetting_the_pending_decision_stops_the_next_call_forcing() -> None:
+    """Restoring the snapshot has to clear the middleware's pending decision too.
 
-    The pending decision from the previous call has to be dropped as well, not merely
-    deferred: the freeze begins between two calls, so there is normally a call already
-    marked for forcing when it arrives. Letting that one through would put a fresh record
-    into the history at exactly the point the closing questions start reading it.
+    The decision to force a record is taken on one call and applied to the next, so it belongs
+    to the conversation rather than to the middleware. Left in place, a decision taken while
+    the conversation was being seeded fires on the first question asked of the snapshot and on
+    none of the others -- one probe carrying a prompt the rest do not, which is exactly the
+    difference between probes the snapshot design exists to remove.
     """
     _armings.clear()
-    paused = False
     middleware = ToolResultRecallMiddleware(
-        max_input_tokens=1_000,
-        tokenizer=TOKENIZER,
-        arm=lambda: _armings.append(1),
-        trigger_fraction=0.1,
-        paused=lambda: paused,
+        max_input_tokens=1_000, tokenizer=TOKENIZER, arm=lambda: _armings.append(1), trigger_fraction=0.1
     )
     big = _conversation(tool_turns=8)
 
     # The first call arms nothing but leaves the middleware intending to force the next one.
     await _run(middleware, big)
-    paused = True
-    during = await _run(middleware, big)
-
-    assert "tool_choice" not in during
-    assert not _armings, "the recall tool was armed while frozen"
-    assert middleware.forced_calls == 0
-
-    # And the intent does not survive the thaw: it is re-derived from the next call's history.
-    paused = False
+    middleware.forget_pending()
     after = await _run(middleware, big)
+
     assert "tool_choice" not in after
+    assert not _armings, "the recall tool was armed on a call the snapshot had reset"
+    assert middleware.forced_calls == 0
 
 
 async def test_the_middleware_stops_once_a_record_exists() -> None:

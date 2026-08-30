@@ -41,7 +41,7 @@ from agent_framework_lab_cachebench import (
     build_tokenizer,
     parse_provider_selector,
     run_live,
-    score_live,
+    score_samples,
     wants_client_side_history,
 )
 
@@ -140,16 +140,20 @@ async def _measure(args: argparse.Namespace, narration: str, placement: str) -> 
         )
         if outcome.error and not error:
             error = outcome.error
-        score = RecallScore(
-            outcomes=score_live(outcome, scenario),
-            answer=outcome.answer,
-            messages_left=outcome.messages_left,
-            messages_total=outcome.messages_peak,
-            contradictions=scenario.contradictions,
-            error=outcome.error,
-        )
-        scores.append(score.correctness_score * 100)
-        recalled.append(score.recalled)
+        # Every probe repeat is its own reading of one snapshot, so each is a sample here.
+        # A configuration whose repeats disagree is unusable whether the disagreement came
+        # from a fresh conversation or from asking the same one twice.
+        for repeat, outcomes in enumerate(score_samples(outcome, scenario), start=1):
+            score = RecallScore(
+                outcomes=outcomes,
+                answer=chr(10).join(outcome.sample(repeat)[1]),
+                messages_left=outcome.messages_left,
+                messages_total=outcome.messages_peak,
+                contradictions=scenario.contradictions,
+                error=outcome.error,
+            )
+            scores.append(score.correctness_score * 100)
+            recalled.append(score.recalled)
     return scores, recalled, error
 
 

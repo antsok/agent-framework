@@ -18,6 +18,7 @@ sometimes overlooks a fact even when everything is in front of it.
 from __future__ import annotations
 
 from dataclasses import dataclass
+from statistics import fmean
 from typing import TYPE_CHECKING, Final
 
 if TYPE_CHECKING:
@@ -43,10 +44,21 @@ class JointOutcome:
     messages_left: int
     messages_total: int
     score: RecallScore
+    correctness_samples: tuple[float, ...] = ()
+    """Correctness of each independent reading, when the caller measured more than one.
+
+    A live cell is read several times: every closing question is asked repeatedly of one
+    snapshot, and the whole conversation is seeded more than once. Accuracy here is often
+    two-valued, so the single ``score`` is a draw from a distribution rather than a summary of
+    it, and the verdict has to rank on the distribution's mean or it ranks on a coin toss.
+    Empty for the replay paths, which read a cell once.
+    """
 
     @property
     def correctness(self) -> float:
-        """Share of correctness checks the final answer passed."""
+        """Share of correctness checks passed, averaged over every reading that was taken."""
+        if self.correctness_samples:
+            return fmean(self.correctness_samples)
         return self.score.correctness_score
 
     @property

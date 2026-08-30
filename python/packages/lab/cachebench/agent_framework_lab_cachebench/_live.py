@@ -30,14 +30,17 @@ after phase belongs on the provider.
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Mapping, Sequence
+from copy import deepcopy
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Final
 
 from agent_framework import (
     Agent,
+    AgentSession,
     ChatContext,
     ChatMiddleware,
     CompactionProvider,
+    HistoryProvider,
     InMemoryHistoryProvider,
     Message,
     create_harness_agent,
@@ -75,6 +78,7 @@ if TYPE_CHECKING:
 __all__ = [
     "AGENT_KINDS",
     "COMPACTION_GUIDANCE",
+    "DEFAULT_PROBE_REPEATS",
     "DEFAULT_TOOL_RESULT_TOKENS",
     "NEUTRAL_INSTRUCTIONS",
     "RETRIEVAL_GUIDANCE",
@@ -82,6 +86,7 @@ __all__ = [
     "LiveOutcome",
     "MeteredClient",
     "ModelCall",
+    "ProbeOutcome",
     "RecallGate",
     "UsageRecorder",
     "build_live_agent",
@@ -90,9 +95,12 @@ __all__ = [
     "make_recall_tool",
     "make_scope_tools",
     "resolve_instructions",
+    "restore_state",
     "run_live",
-    "score_combined",
-    "score_live",
+    "score_combined_samples",
+    "score_samples",
+    "serialize_history",
+    "snapshot_state",
     "unretrieved_facts",
     "wants_client_side_history",
 ]
@@ -104,6 +112,14 @@ __all__ = [
 #: is what production code calls, at the cost of adding its own tools and system prompt to
 #: every measured prompt.
 AGENT_KINDS: Final[tuple[str, ...]] = ("plain", "harness")
+
+#: How many times each closing question is put to the same snapshot.
+#:
+#: Three, because accuracy here is often two-valued and one reading of it is a draw rather
+#: than a measurement: the same strategy scored 52, 52, 52 and 22 on four runs that preserved
+#: exactly the same 27 facts. Asking repeatedly against material that cannot have changed is
+#: what separates the model's own enumeration variance from compaction's.
+DEFAULT_PROBE_REPEATS: Final[int] = 3
 
 #: Default size of each tool result, in tokens. Set high on purpose: in a real agent
 #: trace tool output is usually the bulk of the context, and a benchmark whose tool
@@ -337,13 +353,53 @@ class MeteredClient:
 
 
 @dataclass(frozen=True, slots=True)
+class ProbeOutcome:
+    """One closing question, asked once, from the snapshot.
+
+    A probe is not a turn. Each one starts from a restored copy of the seeded conversation,
+    so no probe's answer can reach another probe's context and no probe is asked from a
+    context an earlier probe has already changed. That is the whole reason this type exists
+    separately from the seeding turns.
+    """
+
+    scope: str
+    """Which closing question this is, matching :attr:`RecallScenario.answer_scopes`."""
+    question: str
+    repeat: int
+    """1-based index within this question's repeats, so a sample can be assembled across
+    questions: repeat *n* of every question is one independent reading of the snapshot."""
+    answer: str
+    prompt_text: str
+    """Serialized prompts of the calls this probe made, projected through compaction.
+
+    Recorded per probe rather than summed with the rest, because the property this design
+    exists to guarantee -- that no probe's answer appears in another probe's prompt -- is
+    only checkable if the prompts are kept apart.
+    """
+    calls: tuple[ModelCall, ...]
+
+
+@dataclass(frozen=True, slots=True)
 class LiveOutcome:
     """Everything one live strategy run produced."""
 
     strategy: str
     calls: tuple[ModelCall, ...]
+    """Every model call the run made, seeding and probes alike, in order.
+
+    One sequence rather than two, because cost is one number: the seeding spend plus what
+    each probe added. Splitting it invites a table that reports the cheap half.
+    """
     answer: str
-    final_prompt: str
+    snapshot_prompt: str
+    """The seeded conversation as compaction left it, serialized.
+
+    Survival is judged against this and nothing else. Judging it against a closing prompt is
+    circular once several questions have been asked in sequence: each answer re-lists codes
+    into the history as assistant text, so a code compaction destroyed reappears because the
+    model recited it two questions ago. The same strategy read 53/53 on a run that emitted
+    10,941 output tokens and 18/53 on one that emitted 4,873.
+    """
     tool_calls_made: int
     turns_completed: int
     turns_total: int
@@ -366,11 +422,31 @@ class LiveOutcome:
     #: column. A strategy that can silently degrade into a different one has to say so:
     #: this package has twice read a row that scored well for having done nothing.
     strategy_notes: tuple[str, ...] = ()
-    #: One reply per closing turn, so each can be scored against the question that asked for
-    #: it rather than against all of them joined.
-    answers: tuple[str, ...] = ()
-    #: The reply to the combined question, scored separately.
-    combined_answer: str = ""
+    #: Every probe, in the order they were asked: each question in turn, each asked
+    #: ``probe_repeats`` times.
+    probes: tuple[ProbeOutcome, ...] = ()
+    probe_repeats: int = 1
+    """How many times each closing question was asked.
+
+    Reported rather than assumed, because it is the denominator of the within-seed spread:
+    one repeat measures nothing about the model's own enumeration variance.
+    """
+    context_drift: int = 0
+    """Probes whose prompt was not the snapshot verbatim.
+
+    Restoring the snapshot stops compaction *accumulating* across the probes; it does not stop
+    the strategy running once more on the restored state, and a strategy that then evicts or
+    rewrites something has been asked its question from slightly less than the snapshot.
+    Survival is scored against the snapshot, so those probes would be credited with facts the
+    model was not shown. Counted rather than assumed away: it is zero whenever the strategy is
+    already at rest by the end of seeding, which is the usual case and not one to rely on.
+    """
+    seed_prompt_tokens: int = 0
+    """Billed size of the last prompt the seeding phase sent.
+
+    The achieved fill, against which the analytic sizing is checked. Taken from the last
+    seeding call rather than from a probe, because a probe's prompt carries its question too.
+    """
     summarizer_input_tokens: int = 0
     summarizer_output_tokens: int = 0
     error: str | None = None
@@ -393,7 +469,12 @@ class LiveOutcome:
 
     @property
     def messages_left(self) -> int:
-        """Messages in the last prompt sent, after compaction."""
+        """Messages in a probe's prompt: the snapshot as compaction left it, plus the question.
+
+        Stable across probes by construction, since each one is asked from a restored copy of
+        the same snapshot. Before the snapshot existed this was the last of a chain of closing
+        turns and drifted downwards through the scoring.
+        """
         return self.calls[-1].messages_sent if self.calls else 0
 
     @property
@@ -437,6 +518,42 @@ class LiveOutcome:
         """
         return sum(call.output_tokens for call in self.calls[:-1]) if len(self.calls) > 1 else 0
 
+    def disqualified(self, tried_limit: int) -> bool:
+        """Whether any call sent a prompt larger than the context limit this run stands in for.
+
+        The limit is simulated. The model under test accepts 272,000 tokens, so a 60,000-token
+        cell means nothing unless our own code refuses what a 60,000-token model would have
+        refused: the uncompacted control at 60,000 ran at 78,003 tokens and was ranked anyway,
+        which made every "+18% versus not compacting" at that size a comparison against a
+        baseline no 60,000-token model could have produced.
+
+        Measured on billed prompt size, so a provider that reports no usage can never be
+        policed by this. That case is visible in the table anyway, because its cost is zero.
+
+        Args:
+            tried_limit: The context limit this cell is standing in for.
+
+        Returns:
+            True when at least one call's prompt was over the limit.
+        """
+        return self.prompt_tokens_peak > tried_limit
+
+    def sample(self, repeat: int) -> tuple[tuple[str, ...], tuple[str, ...]]:
+        """Return one independent reading of the snapshot: repeat ``repeat`` of every question.
+
+        A sample, not a run. Every probe in it was answered from the same restored snapshot, so
+        the samples differ only in what the model chose to write -- which is the point of
+        having more than one.
+
+        Args:
+            repeat: 1-based repeat index.
+
+        Returns:
+            The scopes asked, and the answers given, in the order the questions were put.
+        """
+        chosen = [probe for probe in self.probes if probe.repeat == repeat]
+        return tuple(probe.scope for probe in chosen), tuple(probe.answer for probe in chosen)
+
 
 def _strategy_notes(strategy: Any) -> tuple[str, ...]:
     """Return what a strategy reports about its own run, if it reports anything.
@@ -458,7 +575,6 @@ def _strategy_notes(strategy: Any) -> tuple[str, ...]:
         ("forced_calls", "FORCED"),
         ("records_forced", "RECFORCED"),
         ("records_volunteered", "RECVOLUNTEERED"),
-        ("compactions_skipped", "FROZEN"),
     ):
         value = getattr(strategy, attribute, None)
         if isinstance(value, int) and value:
@@ -600,91 +716,6 @@ class RecallGate:
         """
         armed, self._armed = self._armed, False
         return armed
-
-
-class CompactionSwitch:
-    """Whether compaction may still run, and how often it was stopped.
-
-    The closing questions go through the same ``agent.run()`` loop as every other turn, so by
-    default the strategy fires before each of them. Three things follow, none of them
-    controlled: the first scope is answered from a fuller context than the last; the combined
-    question is answered from the most compacted context of the whole run; and a fact can be
-    evicted *during* scoring, so ``survived`` is computed against a prompt that is still
-    moving. Freezing at the first closing turn holds one context still for all of them, so
-    the answers differ only in what they were asked.
-
-    Off by default, because the unfrozen run is the one an agent would actually perform.
-    """
-
-    def __init__(self) -> None:
-        """Start thawed: nothing is frozen until the runner reaches the closing turns."""
-        self._frozen = False
-        self._skipped = 0
-
-    @property
-    def frozen(self) -> bool:
-        """True once the closing turns have begun."""
-        return self._frozen
-
-    @property
-    def skipped(self) -> int:
-        """How many compaction calls the freeze suppressed.
-
-        Zero on a frozen run means the freeze changed nothing, which is worth telling apart
-        from the freeze never having been asked for.
-        """
-        return self._skipped
-
-    def freeze(self) -> None:
-        """Stop compaction for the rest of the run."""
-        self._frozen = True
-
-    def note_skip(self) -> None:
-        """Record one suppressed call."""
-        self._skipped += 1
-
-
-class _FreezableStrategy:
-    """A compaction strategy that can be switched off part-way through a run.
-
-    Everything except ``__call__`` reads through to the wrapped strategy, so the counters the
-    runner reports and the configuration the middleware copies behave as though it were not
-    here. Installed only when the freeze is asked for, which keeps the default path
-    byte-identical to the runs already recorded.
-    """
-
-    def __init__(self, inner: Any, switch: CompactionSwitch) -> None:
-        """Wrap ``inner``, consulting ``switch`` before every call."""
-        self._inner = inner
-        self._switch = switch
-
-    async def __call__(self, messages: list[Message]) -> bool:
-        """Run the wrapped strategy unless the switch is frozen.
-
-        Returns:
-            What the wrapped strategy returned, or False when frozen, meaning nothing changed.
-        """
-        if self._switch.frozen:
-            self._switch.note_skip()
-            return False
-        return await self._inner(messages)
-
-    @property
-    def compactions_skipped(self) -> int:
-        """Suppressed calls, surfaced in the flags column by :func:`_strategy_notes`."""
-        return self._switch.skipped
-
-    def __getattr__(self, name: str) -> Any:
-        """Read anything else off the wrapped strategy.
-
-        Reached only for names the wrapper does not define. Goes through ``__dict__`` rather
-        than ``self._inner`` so that a lookup arriving before ``__init__`` has finished raises
-        rather than recursing.
-
-        Returns:
-            The wrapped strategy's attribute.
-        """
-        return getattr(self.__dict__["_inner"], name)
 
 
 def make_recall_tool(gate: RecallGate | None = None) -> Callable[[str], str]:
@@ -909,6 +940,80 @@ def _turn_text(messages: Sequence[Message]) -> str:
     )
 
 
+def serialize_history(agent: Agent[Any], state: Mapping[str, Any]) -> str:
+    """Return the conversation a session state holds, as compaction left it.
+
+    Two things here are easy to get wrong and both were.
+
+    The history is not at a fixed key. A ``HistoryProvider`` is handed
+    ``state[provider.source_id]`` and stores its messages under ``"messages"`` inside that,
+    and the harness installs its own provider instance rather than the one the plain agent
+    builds. Reading a hard-coded key therefore reports an empty conversation for one of the
+    two agent kinds, which reads as a strategy that deleted everything.
+
+    The stored list is also not the prompt. ``InMemoryHistoryProvider`` keeps excluded
+    messages in state so that a strategy can still reconsider them, so serializing it without
+    projecting reports that every strategy preserved every fact.
+
+    Args:
+        agent: The agent whose providers say where the history lives.
+        state: Session state, live or snapshotted.
+
+    Returns:
+        The included messages, serialized the same way a recorded prompt is, so the two can
+        be compared directly.
+    """
+    for provider in agent.context_providers:
+        if isinstance(provider, HistoryProvider):
+            stored: Mapping[str, Any] = state.get(provider.source_id) or {}
+            messages: list[Message] = list(stored.get("messages", []))
+            return chr(10).join(serialize_message(message) for message in project_included_messages(messages))
+    return ""
+
+
+def snapshot_state(session: AgentSession) -> dict[str, Any]:
+    """Deep-copy a session's state, so the conversation can be re-entered from here.
+
+    Deep on purpose. ``apply_compaction`` records its decisions by mutating
+    ``additional_properties`` on the ``Message`` objects rather than by shortening any list,
+    so a snapshot sharing those objects would be silently rewritten by the first probe and
+    every later probe would start somewhere else.
+
+    Args:
+        session: The session to snapshot.
+
+    Returns:
+        An independent copy of the session state.
+    """
+    return deepcopy(session.state)
+
+
+def restore_state(
+    session: AgentSession,
+    snapshot: Mapping[str, Any],
+    recall_middleware: ToolResultRecallMiddleware | None = None,
+) -> None:
+    """Put a session back to a snapshot, before the next probe is asked.
+
+    Copied again on every restore rather than assigned once: the probe about to run will
+    mutate what it is given, and a shared copy would leak that into the probe after it.
+
+    The middleware is reset for the same reason the state is. Its pending decision to force a
+    recall call is conversation state -- it is made on one call and applied to the next -- so a
+    decision taken during seeding would fire on the first probe and on no other, giving that
+    one probe a different prompt from the rest. That is precisely the difference between
+    probes this design exists to remove.
+
+    Args:
+        session: The session to restore.
+        snapshot: The state to restore it to.
+        recall_middleware: The middleware to clear, when the strategy under test installs one.
+    """
+    session.state = deepcopy(dict(snapshot))
+    if recall_middleware is not None:
+        recall_middleware.forget_pending()
+
+
 async def run_live(
     runtime: ProviderRuntime,
     *,
@@ -922,9 +1027,32 @@ async def run_live(
     retrieval_guidance: bool = True,
     fact_placement: str = "spread",
     allow_server_history: bool = False,
-    freeze_during_answers: bool = False,
+    probe_repeats: int = DEFAULT_PROBE_REPEATS,
 ) -> LiveOutcome:
-    """Run the scenario end to end against a real agent.
+    """Seed a conversation against a real agent, snapshot it, then probe the snapshot.
+
+    Three phases, and the split is the measurement design rather than an implementation
+    detail.
+
+    **Seed.** The scenario's non-closing turns are driven as an agent in use would drive them:
+    a real tool, the model writing its own replies, the strategy compacting throughout. Only
+    the user-side turn list is shared between strategies; the replies, and therefore the
+    histories, diverge from the first turn, and that divergence is part of what is measured.
+
+    **Snapshot.** The session state is deep-copied. It has to be a real deep copy:
+    ``apply_compaction`` marks exclusions by mutating ``additional_properties`` on the
+    ``Message`` objects themselves, so a shallow copy would hand every probe a history the
+    previous probe had already re-marked.
+
+    **Probe.** Every closing question is asked from that snapshot, restored before each one,
+    and asked ``probe_repeats`` times. No probe's answer can reach another probe's context, no
+    question is asked from a context an earlier question has already compacted further, and
+    survival is scored against the snapshot -- which is by construction exactly the context
+    every probe was answered from. None of the three held when the closing questions were
+    ordinary turns appended to the conversation, and each moved the numbers: the first scope
+    was answered from a fuller context than the last, the combined question from the most
+    compacted context of the run, and a code compaction had destroyed came back because the
+    model had recited it two questions earlier.
 
     Args:
         runtime: The provider's client, model and per-request options.
@@ -954,10 +1082,11 @@ async def run_live(
             left to the caller: a calibration probe that forgot it reported every narration
             mode as stable, because the service was feeding the model a history the client
             had never compacted.
-        freeze_during_answers: Stop compacting once the closing questions begin, so every
-            closing answer is written from the same history. See :class:`CompactionSwitch`
-            for what this controls for. Off by default, because an agent in use compacts
-            while it answers, and the default row should be that agent.
+        probe_repeats: How many times each closing question is asked, each time from the
+            restored snapshot. Several, because accuracy is two-valued often enough that one
+            reading is a draw rather than a measurement: one strategy scored 52, 52, 52 and 22
+            on runs that preserved exactly the same 27 facts. Repeating the question against
+            unchanged material is what separates that from compaction's own spread.
 
     Returns:
         The outcome. A turn that fails sets ``error`` and stops the run rather than raising,
@@ -994,10 +1123,6 @@ async def run_live(
     # Adding it to every row would put an extra tool in every prompt and give unrelated
     # strategies something new to call, which is a difference between rows that has nothing
     # to do with compaction.
-    # Flipped by the loop below at the first closing turn. The middleware consults it too:
-    # forcing a fresh record mid-answer would move the history the answers are written from,
-    # which is the one thing the freeze exists to hold still.
-    switch = CompactionSwitch()
     recall_middleware: ToolResultRecallMiddleware | None = None
     if isinstance(strategy, ToolResultAnchoredSummarizationCompactionStrategy):
         gate = RecallGate()
@@ -1009,19 +1134,12 @@ async def run_live(
             tokenizer=options.tokenizer,
             arm=gate.arm,
             trigger_fraction=strategy.trigger_fraction,
-            paused=(lambda: switch.frozen) if freeze_during_answers else None,
         )
-
-    # Wrapped only when the freeze is asked for, so an ordinary run is exactly the run every
-    # recorded result was produced by.
-    installed: Any = strategy
-    if strategy is not None and freeze_during_answers:
-        installed = _FreezableStrategy(strategy, switch)
 
     agent = build_live_agent(
         runtime,
         kind=agent_kind,
-        strategy=installed,
+        strategy=strategy,
         tokenizer=options.tokenizer,
         tools=scope_tools,
         recorder=recorder,
@@ -1033,25 +1151,25 @@ async def run_live(
     session = agent.create_session()
 
     turns = scenario.transcript.turns
-    # Every closing turn is scored. With several targeted questions the answer is their union,
-    # and survival is judged against the union of the prompts that carried them.
-    first_answer_turn = len(turns) - max(scenario.answer_turn_count, 1)
-    answer_parts: list[str] = []
-    replies: list[str] = []
+    question_count = min(max(scenario.answer_turn_count, 1), len(turns))
+    seed_turns = turns[: len(turns) - question_count]
+    probe_turns = turns[len(turns) - question_count :]
+    # The declared scopes line up with the closing turns one for one. A scenario that closes
+    # with a single sweeping question declares one scope, so the pairing is exact either way.
+    scopes = scenario.answer_scopes or ("*",) * question_count
+
     error: str | None = None
-    completed = 0
-    answer = ""
-    final_mark = 0
+    replies: list[str] = []
     forced: dict[int, str] = dict(scenario.tool_turn_scopes) if force_tool_calls else {}
     dropped: list[str] = []
-    for index, turn in enumerate(turns):
-        if freeze_during_answers and index == first_answer_turn:
-            # Frozen on the way in to the first closing turn, not after it: the strategy runs
-            # before the model call, so freezing afterwards would already have let it act on
-            # the turn it was meant to protect.
-            switch.freeze()
-        final_mark = len(recorder.calls)
-        response = None
+
+    async def _send(text: str, *, turn_index: int, label: str) -> Any:
+        """Send one turn, dropping an option the provider rejects and retrying once.
+
+        Returns:
+            The agent response, or None when the turn could not be sent at all.
+        """
+        nonlocal error, forced
         # Two attempts. Providers differ in which request options they accept, and one that
         # rejects an option names it. Dropping that option and retrying is what lets a model
         # with an unusual surface be measured at all instead of returning an empty run:
@@ -1062,13 +1180,13 @@ async def run_live(
             # per-call option set rather than adding to it.
             turn_options: dict[str, Any] = {k: v for k, v in runtime.options.items() if k not in dropped}
             if "tool_choice" not in dropped:
-                if index in forced:
+                if turn_index in forced:
                     # Name the function, not just "required". Requiring *a* call still lets
                     # the model pick the scope, and it picks wrong: measured reaching 3 of 6
                     # scopes while calling one of them twice.
                     turn_options["tool_choice"] = {
                         "mode": "required",
-                        "required_function_name": f"lookup_{forced[index]}",
+                        "required_function_name": f"lookup_{forced[turn_index]}",
                     }
                 elif force_tool_calls:
                     # Every other turn is closed to tools. Pinning only the wanted calls
@@ -1076,51 +1194,91 @@ async def run_live(
                     # against the 6 asked for, on one repeat in three.
                     turn_options["tool_choice"] = "none"
             try:
-                response = await agent.run(_turn_text(turn.request), session=session, options=turn_options)
-                break
+                return await agent.run(text, session=session, options=turn_options)
             except Exception as exc:
                 option = unsupported_option(exc)
                 if option is None or option in dropped:
-                    error = f"turn {index + 1}: {type(exc).__name__}: {exc}"
-                    break
+                    error = f"{label}: {type(exc).__name__}: {exc}"
+                    return None
                 dropped.append(option)
                 if option == "tool_choice":
                     forced = {}
+        return None
+
+    seeded = 0
+    for index, turn in enumerate(seed_turns):
+        response = await _send(_turn_text(turn.request), turn_index=index, label=f"turn {index + 1}")
         if response is None:
             if error is None:
                 error = f"turn {index + 1}: no response"
             break
-        completed += 1
-        text = response.text or ""
-        replies.append(text)
-        if index >= first_answer_turn:
-            answer_parts.append(text)
+        seeded += 1
+        replies.append(response.text or "")
 
-    # Survival is judged against every prompt sent during the final turn, not just the last
-    # one. A turn that calls a tool sends several, and a fact the model saw in any of them
-    # was available to it when it wrote the answer.
-    final_prompt = "\n".join(call.prompt_text for call in recorder.calls[final_mark:])
-    answer = chr(10).join(answer_parts)
-    # The combined turn is the last one when the scenario has scopes; it is scored on its own
-    # so a failure to assemble everything cannot drag down the per-scope figure, and a good
-    # per-scope figure cannot hide a failure to assemble.
-    combined = answer_parts[-1] if scenario.answer_scopes[-1:] == ("*",) and answer_parts else ""
+    seed_prompt_tokens = recorder.calls[-1].input_tokens if recorder.calls else 0
+    snapshot = snapshot_state(session)
+    snapshot_prompt = serialize_history(agent, snapshot)
+
+    probes: list[ProbeOutcome] = []
+    questions_done = 0
+    drift = 0
+    if error is None:
+        # Grouped by question rather than interleaved, so a question's repeats sit together
+        # in the log and in ``LiveOutcome.sample``. The order is otherwise immaterial: every
+        # probe is sent the same restored context whatever came before it.
+        for offset, (scope, turn) in enumerate(zip(scopes, probe_turns, strict=False)):
+            question = _turn_text(turn.request)
+            answered = 0
+            for repeat in range(1, max(probe_repeats, 1) + 1):
+                restore_state(session, snapshot, recall_middleware)
+                mark = len(recorder.calls)
+                response = await _send(
+                    question,
+                    turn_index=len(seed_turns) + offset,
+                    label=f"probe {offset + 1} repeat {repeat}",
+                )
+                if response is None:
+                    if error is None:
+                        error = f"probe {offset + 1} repeat {repeat}: no response"
+                    break
+                made = tuple(recorder.calls[mark:])
+                prompt = chr(10).join(call.prompt_text for call in made)
+                # The probe was sent the snapshot plus its question, so its prompt begins with
+                # the snapshot verbatim -- unless the strategy acted again on the way in.
+                if not prompt.startswith(snapshot_prompt):
+                    drift += 1
+                probes.append(
+                    ProbeOutcome(
+                        scope=scope,
+                        question=question,
+                        repeat=repeat,
+                        answer=response.text or "",
+                        prompt_text=prompt,
+                        calls=made,
+                    )
+                )
+                answered += 1
+            if answered < max(probe_repeats, 1):
+                break
+            questions_done += 1
 
     return LiveOutcome(
         strategy=strategy_name,
         calls=tuple(recorder.calls),
-        answer=answer,
-        final_prompt=final_prompt,
+        answer=chr(10).join(probe.answer for probe in probes),
+        snapshot_prompt=snapshot_prompt,
         tool_calls_made=tool_calls,
-        turns_completed=completed,
+        turns_completed=seeded + questions_done,
         turns_total=len(turns),
         dropped_options=tuple(dropped),
         scopes_called=tuple(scopes_called),
         summarizer_calls=summarizer.calls if summarizer else 0,
-        answers=tuple(answer_parts),
-        combined_answer=combined,
+        probes=tuple(probes),
+        probe_repeats=max(probe_repeats, 1),
+        context_drift=drift,
+        seed_prompt_tokens=seed_prompt_tokens,
         summarizer_failures=summarizer.failures if summarizer else 0,
-        strategy_notes=_strategy_notes(installed) + _strategy_notes(recall_middleware),
+        strategy_notes=_strategy_notes(strategy) + _strategy_notes(recall_middleware),
         summarizer_input_tokens=summarizer.input_tokens if summarizer else 0,
         summarizer_output_tokens=summarizer.output_tokens if summarizer else 0,
         error=error,
@@ -1199,8 +1357,12 @@ def build_live_scenario(
     )
 
 
-def score_live(outcome: LiveOutcome, scenario: RecallScenario) -> tuple[FactOutcome, ...]:
-    """Score a live outcome against the planted facts, per scope where the scenario allows.
+def score_samples(outcome: LiveOutcome, scenario: RecallScenario) -> tuple[tuple[FactOutcome, ...], ...]:
+    """Score every independent reading of the snapshot, one tuple of outcomes per repeat.
+
+    A distribution rather than a number, because a single reading is a draw from it. The
+    repeats share a snapshot, so the facts in front of the model are identical in all of them
+    and whatever they disagree about is the model, not compaction.
 
     Scoped scoring matches each fact only against the reply to the question that asked for
     it. Joining the replies first lets a code answered under the wrong heading count as
@@ -1208,36 +1370,56 @@ def score_live(outcome: LiveOutcome, scenario: RecallScenario) -> tuple[FactOutc
     attributed -- and a strategy that keeps values while losing the labelling that says which
     tool returned them then scores like one that kept both.
 
+    Survival is judged against ``snapshot_prompt`` for every sample, which is the context every
+    probe was answered from.
+
     Args:
         outcome: The finished run.
         scenario: The scenario it was driven from.
 
     Returns:
-        One outcome per planted fact.
+        One tuple of fact outcomes per probe repeat, in repeat order.
     """
-    if scenario.answer_scopes and outcome.answers:
-        return score_scoped(outcome.answers, scenario.answer_scopes, scenario.facts, outcome.final_prompt)
-    return score_answer(outcome.answer, scenario.facts, outcome.final_prompt)
+    if not outcome.probes:
+        return (score_answer(outcome.answer, scenario.facts, outcome.snapshot_prompt),)
+    samples: list[tuple[FactOutcome, ...]] = []
+    for repeat in range(1, outcome.probe_repeats + 1):
+        scopes, answers = outcome.sample(repeat)
+        if not answers:
+            continue
+        if scenario.answer_scopes:
+            samples.append(score_scoped(answers, scopes, scenario.facts, outcome.snapshot_prompt))
+        else:
+            samples.append(score_answer(chr(10).join(answers), scenario.facts, outcome.snapshot_prompt))
+    return tuple(samples)
 
 
-def score_combined(outcome: LiveOutcome, scenario: RecallScenario) -> float:
-    """Return the share of planted facts the single combined answer contained.
+def score_combined_samples(outcome: LiveOutcome, scenario: RecallScenario) -> tuple[float, ...]:
+    """Return, per repeat, the share of planted facts the single combined answer contained.
 
     The per-scope questions ask for eight values each from a nearby part of the conversation.
     This one asks for all 53 at once from a context they are scattered through, which is a
-    materially harder task and the one a real user is more likely to pose.
+    materially harder task and the one a real user is more likely to pose. It is the question
+    the old design punished hardest by construction, since it was asked last and so from the
+    most compacted context of the run; asked from the snapshot it is on the same footing as
+    every other probe.
 
     Args:
         outcome: The finished run.
         scenario: The scenario it was driven from.
 
     Returns:
-        A fraction, or 0.0 when the scenario has no combined question.
+        One fraction per repeat, empty when the scenario has no combined question.
     """
-    if not outcome.combined_answer or not scenario.facts:
-        return 0.0
-    found = sum(1 for fact in scenario.facts if fact.appears_in(outcome.combined_answer))
-    return found / len(scenario.facts)
+    if not scenario.facts:
+        return ()
+    shares: list[float] = []
+    for repeat in range(1, outcome.probe_repeats + 1):
+        answer = chr(10).join(probe.answer for probe in outcome.probes if probe.repeat == repeat and probe.scope == "*")
+        if not answer:
+            continue
+        shares.append(sum(1 for fact in scenario.facts if fact.appears_in(answer)) / len(scenario.facts))
+    return tuple(shares)
 
 
 _INSTRUCTIONS_BY_NARRATION: Final[dict[str, str]] = {

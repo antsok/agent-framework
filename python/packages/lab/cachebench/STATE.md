@@ -32,60 +32,79 @@ Working copies were under `/tmp/cachebench/`, which is volatile.
 | Uncompacted cache hit rate | 93-97% at every size tested |
 | `tiktoken` `o200k_base` accuracy | within 6 tokens on a 270,294-token prompt |
 
-## 3. The question that replaced the old one
+## 3. The measurement was rebuilt: seed, snapshot, probe
 
-**Compaction keeps running during the closing questions.** The eight closing turns go through
-the same `agent.run()` loop as every other turn and the strategy is the agent's
-`compaction_strategy`, so it fires before every model call including those. Consequences, none
-of them controlled:
+**The old closing turns are gone.** They were ordinary conversation turns appended to the
+seeded conversation, and four defects followed, all measured:
 
-- The `early` scope is asked first from a fuller context; the **combined question is asked
-  last, from the most compacted context of all**.
-- Each closing answer lists codes, putting them back into history as assistant text, which
-  partly offsets the above in an uncontrolled direction.
-- `survived` is computed from the closing prompts, so a fact can be evicted *during* scoring.
+1. `survived` was circular. It was scored against `final_prompt`, built from the *last*
+   turn's prompts, by which time earlier closing answers had re-listed codes into history as
+   assistant text. The same strategy read 53/53 on a run that emitted 10,941 output tokens
+   and 18/53 on one that emitted 4,873.
+2. Ordering bias: the first scope was answered from a fuller context than the last, and the
+   combined question from the most compacted context of the run.
+3. Compaction kept firing during scoring, so a fact could be evicted while it was scored.
+4. Two variance sources arrived as one number. `anchored` scored 52%, 52%, 52% and 22% on
+   runs that preserved exactly 27 facts each time.
 
-Eviction is demonstrably still active at the end: `tool_summary_anchored` ends at 95 messages
-against a peak of 123, `truncation` at 82 against 121.
+**What replaced it.** `run_live` now has three phases:
 
-**`--freeze-during-answers` now exists** (`_live.py`: `CompactionSwitch`, `_FreezableStrategy`;
-`run_live(freeze_during_answers=...)`). It freezes on the way *into* the first closing turn,
-and it pauses `ToolResultRecallMiddleware` as well — a record forced mid-answer would move the
-history the answers are scored against, which is the thing being held still. The wrapper is
-installed only when the flag is passed, so an ordinary run is byte-identical to every run
-already recorded. Suppressed calls surface as a `FROZEN:<n>` note in the flags column.
+- **Seed** — every turn except the closing questions, driven exactly as before. Only the
+  user-side turn list is shared between strategies; replies and therefore transcripts diverge
+  from turn one, and that divergence is part of what is measured.
+- **Snapshot** — `snapshot_state(session)` deep-copies `session.state`. Deep is load-bearing:
+  `apply_compaction` marks exclusions by mutating `additional_properties` in place. The state
+  is nested per provider (`state["in_memory"]["messages"]`), so `serialize_history` finds it
+  through `agent.context_providers` rather than a fixed key -- the harness installs a
+  different provider instance from the plain agent.
+- **Probe** — every closing question, asked from the restored snapshot, `--probe-repeats`
+  times (default 3). `restore_state` deep-copies again per probe *and* calls
+  `ToolResultRecallMiddleware.forget_pending()`: a pending decision to force a recall call is
+  taken on one call and applied to the next, so it is conversation state, and left in place it
+  would fire on the first probe and no other.
 
-Validated live in run 21 (120,000, one repeat, EUR 0.93): 16 compaction calls suppressed per
-strategy, so the closing turns really were still compacting, and `tool_summary_anchored` still
-reaches `REC:1 / RECFORCED:1` before the freeze.
+Survival is scored against `LiveOutcome.snapshot_prompt` and nothing else.
 
-**Run 22 answered it, and the answer was no.** Paired arms at 272,000, three repeats each, EUR
-10. Freezing narrowed the spread for nothing: `anchored` widened 13 to 37 points,
-`tool_summary_anchored` 0 to 13, `truncation` held at 59. Mid-answer eviction is not the source
-of the bimodality.
+**The one residual, measured rather than assumed.** Restoring stops compaction *accumulating*
+across the probes; it does not stop the strategy running once more on the restored state. A
+strategy that then evicts or rewrites something has answered from slightly less than the
+snapshot it is scored against. `LiveOutcome.context_drift` counts the probes whose prompt was
+not the snapshot verbatim and the table flags it as `DRIFT:<n>`. It is zero whenever the
+strategy has settled by the end of seeding, which is the usual case; a row carrying the flag
+overstates what reached the model.
 
-**What run 22 found instead, once run 23 corrected it.** Run 22's unfrozen arm is a replication
-of run 18 and disagrees with it by up to 69 points per row. I first read that as the answering
-mode being fixed per *invocation*. It is not: run 18's own `c+-` for `tool_summary_anchored` is
-72 points, and run 23 measured both spreads directly at 60,000 — 7pp within and 7pp across for
-the control, 78pp and 78pp for `anchored`. **The variance is per repeat and `c+-` reports it
-correctly.** The usable claim is only that a single sample of a configuration says little about
-accuracy, which still makes the tables in runs 16 to 20 one sample each.
+**`--freeze-during-answers` is deleted**, with `CompactionSwitch`, `_FreezableStrategy` and
+the `paused` parameter. The new design makes mid-scoring compaction structurally impossible,
+so the flag was dead. Its evidence survives in `runs/run-21-*`, `runs/run-22-*` and in git
+history; runs 21 to 23 in `RESULTS.md` still describe it. Those two shell scripts no longer
+run -- they pass a flag that does not exist -- and are kept as the record of what was done,
+not as something to re-run.
 
-**The spread belongs to compaction, not the model** (run 23, six invocations at 60,000). The
-uncompacted control moves 7 points while `anchored` moves 78, so it is not the model choosing
-how thoroughly to answer. `facts` is discrete: `tool_summary_anchored` returned exactly 53 or 39
-with nothing between, `anchored` returned 27, 52 or 53. The scenario salt moves where facts fall
-relative to a retention boundary and the strategy clears it or does not. A second, smaller
-source sits on top — `anchored` scored 52/52/52/22 across four invocations that all preserved
-exactly 27 facts — worth about 30 points against compaction's 78.
+**Disqualification.** `--context-window` is the *tried limit*, and it is simulated -- the real
+ceiling is 272,000 -- so `LiveOutcome.disqualified(limit)` enforces it in our own code. Any
+call whose billed prompt exceeds it disqualifies that seed; `dq` reports the share of a cell's
+seeds that did; a cell with `dq > 0` is excluded from the ranking rather than starred. If the
+control itself is disqualified the run exits, because there is no admissible baseline at that
+size -- which is the finding for the 60,000 cell, where the control ran at 78,003 tokens.
 
-**Cost is steadier than accuracy, but not for every row.** Across run 23's six invocations the
-control moved 6.5% and `anchored` 7.3%, with `anchored` dearest every time. But
-`tool_summary_anchored` moved **25%** and on one invocation came out 10% dearer than the
-control instead of 9% cheaper: a strategy whose record is sometimes complete carries a
-different prompt and writes a different amount, so its cost inherits its accuracy's
-bimodality.
+**Fill targeting.** `--fill` (default 0.70) sizes the seeded conversation to a share of the
+tried limit, solved analytically in `_fill.py`: the filler count is the coarse dial and its
+size the fine one, the payload is fixed, and a payload that will not fit the smallest cell is
+refused with an explanatory error. The one term that cannot be computed is the model's own
+replies (`ASSUMED_REPLY_TOKENS = 150`), which is why the achieved fill is measured on the
+uncompacted run and flagged beyond +-5%. `--fill 0` restores manual sizing from
+`--filler-turns` and `--filler-tokens`.
+
+**Accuracy is a distribution.** `_representative()` is gone. Correctness is the mean over
+every probe repeat of every seed, the per-sample values are printed below the table, and the
+two spreads are separate columns: `seed+-` between seeds (compaction's reliability) and
+`rep+-` within one seed across probe repeats (the model's enumeration variance). `cost` stays
+one column: seeding plus every probe, summed. `out` has its own column so a total driven by
+verbosity is visible.
+
+**Unverified against a live model.** Everything above was built and validated offline against
+the stub. No live run has been made under the new design, so the numbers in `RESULTS.md` and
+`REPORT-GPT-5-4-MINI.md` all predate it and none of them are disqualification-checked.
 
 ## 4. The finding the report does not yet state correctly
 
@@ -143,14 +162,20 @@ Each of these produced a plausible wrong number first.
   on a compacting strategy, so any single accuracy figure is one draw from a wide, often
   two-valued distribution. Cost spread is 1 to 11% and its ordering reproduces every time.
 - **`--tool-turns` is silently capped** by `--filler-turns`: extra tool groups are placed
-  inside filler sections, so 16 requested with the default 6 filler turns yields 9.
+  inside filler sections, so 16 requested with the default 6 filler turns yields 9. `plan_fill`
+  now sizes the filler above that floor, and a test pins it.
+- **The history provider drops byte-identical messages.** `filter_new_messages` hashes them,
+  so a stub that answered the same words on every turn built a history a third the size it
+  appeared to be, and the offline sizing test read 16,565 tokens where it should have read
+  19,881. The stub numbers its replies now. Nothing about the live runs was affected -- a real
+  model never repeats itself exactly -- but any future offline fixture must.
 
 ## 7. Repository state
 
 - Branch `python-lab-cachebench`, ~40 commits ahead of `origin`, **not pushed**. Pushing needs
   its own go-ahead.
 - `dev/` is untracked Git-LFS junk. **Never stage it.**
-- 194 tests pass; ruff and the pre-commit hooks are clean.
+- 211 tests pass; ruff and pyright are clean. The measurement rebuild above is **uncommitted**.
 - `REPORT.md` and `ARTICLE.md` still describe only the six-model cross-provider work and
   predate everything from run 7 onward. They do not mention the 272,000 input limit, the
   crossover, or either new strategy.
@@ -159,4 +184,12 @@ Each of these produced a plausible wrong number first.
 
 About EUR 175 total. Roughly EUR 19 remains of the last top-up. A five-repeat matrix of five
 strategies costs about EUR 4 at 60K, EUR 8 at 120K, EUR 11 at 272K, and EUR 10 for the
-sixteen-call variants.
+sixteen-call variants -- **all measured under the old design, where each closing question was
+asked once**.
+
+**The probe phase costs more than the seeding does.** Every probe carries the whole snapshot,
+and there are `questions x --probe-repeats` of them. At the 270,000/0.86 cell with 16 tool
+groups that is 18 questions x 3 = 54 probes of ~232,000 tokens each, against ~11.6M for the
+seeding: the probes are now the larger half and `--probe-repeats` scales exactly that half.
+`--dry-run` prints the arithmetic. Price a matrix before running one; the estimates above no
+longer apply.
