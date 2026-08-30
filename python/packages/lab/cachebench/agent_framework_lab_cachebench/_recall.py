@@ -311,6 +311,7 @@ def build_recall_scenario(
     tool_result_tokens: int = 600,
     narration: str = "prompted",
     markers_per_tool: int = 2,
+    filler_tool_turns: int = 0,
     subset_questions: bool = False,
 ) -> RecallScenario:
     """Build a conversation whose final question needs facts from throughout the history.
@@ -332,6 +333,10 @@ def build_recall_scenario(
         subset_questions: Close with several targeted questions instead of one sweeping
             one. Their union covers every planted fact, but each asks for a handful of
             codes, which measures retrieval rather than willingness to enumerate.
+        filler_tool_turns: Extra tool calls whose results carry no codes. They add calls and
+            bulk without adding anything to remember, which is what separates "the agent made
+            more calls" from "the agent has more values to recall" -- two variables that move
+            together unless one is held still deliberately.
         markers_per_tool: Verifiable codes each tool result carries. Two is easy for a model
             to echo into its reply, which lets narration preserve everything a strategy
             discards. More codes raise the resolution of the accuracy measure and make
@@ -391,10 +396,15 @@ def build_recall_scenario(
             ),
         )
 
-    def _tool_turn(label: str, seed: int, position: int) -> TranscriptTurn:
-        """Emit a lookup whose result carries two facts the final answer must repeat."""
+    def _tool_turn(label: str, seed: int, position: int, *, bearing: bool = True) -> TranscriptTurn:
+        """Emit a lookup, optionally one whose result carries no facts at all.
+
+        A code-free lookup is what makes "more tool calls" separable from "more values to
+        remember". Adding calls that also carry codes changes both at once, and a comparison
+        drawn across that is not a comparison of one variable.
+        """
         call_id = f"call_{label}"
-        codes = tuple(tool_markers[position * per_tool : (position + 1) * per_tool])
+        codes = tuple(tool_markers[position * per_tool : (position + 1) * per_tool]) if bearing else ()
         lookups[label] = codes
         tool_turn_scopes[len(turns)] = label
         facts.extend(
@@ -497,6 +507,9 @@ def build_recall_scenario(
     # Extra lookups beyond the early/mid/late anchors, spread through the filler so that a
     # tool-heavy trace can be built without disturbing where the anchors land.
     extras = [f"extra{n}" for n in range(tool_count - 3)]
+    # Interleaved with the code-bearing ones so they age into the band together; a block of
+    # them at one end would be evicted as a group and stop being a fair share of the bulk.
+    fillers = [f"aside{n}" for n in range(max(filler_tool_turns, 0))]
     next_position = 1
 
     def _filler_section(base: int) -> None:
@@ -506,6 +519,8 @@ def build_recall_scenario(
             if extras:
                 turns.append(_tool_turn(extras.pop(0), 50 + next_position, next_position))
                 next_position += 1
+            if fillers:
+                turns.append(_tool_turn(fillers.pop(0), 70 + len(turns), 0, bearing=False))
 
     _filler_section(0)
 
@@ -556,7 +571,7 @@ def build_recall_scenario(
                 reply=(),
             )
         )
-        for label in lookups:
+        for label in [name for name in lookups if lookups[name]]:
             turns.append(
                 TranscriptTurn(
                     request=(
@@ -586,8 +601,8 @@ def build_recall_scenario(
                 reply=(),
             )
         )
-        answer_scopes = ("", *lookups, "*")
-        answer_turns = 2 + len(lookups)
+        answer_scopes = ("", *[name for name in lookups if lookups[name]], "*")
+        answer_turns = 2 + sum(1 for name in lookups if lookups[name])
     else:
         turns.append(
             TranscriptTurn(

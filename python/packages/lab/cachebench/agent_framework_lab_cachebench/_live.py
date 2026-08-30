@@ -1056,6 +1056,7 @@ def build_live_scenario(
     tool_turns: int = 6,
     narration: str = "prompted",
     markers_per_tool: int = 2,
+    filler_tool_turns: int = 0,
     subset_questions: bool = True,
 ) -> RecallScenario:
     """Build the scenario in the shape a live run needs.
@@ -1068,6 +1069,8 @@ def build_live_scenario(
             ``keep_last_tool_call_groups`` of 4, so that tool-oriented strategies
             actually engage instead of scoring a perfect result for doing nothing.
         narration: How hard the scenario pushes the model to restate tool values.
+        filler_tool_turns: Extra tool calls whose results carry no codes, so that adding
+            calls does not also add values to remember.
         markers_per_tool: Verifiable codes each tool result carries.
         subset_questions: Close with several targeted questions rather than one sweeping
             one. On by default: the sweeping form measures stamina, not retrieval.
@@ -1082,6 +1085,7 @@ def build_live_scenario(
         filler_tokens=filler_tokens,
         bulk_in_user=True,
         tool_turns=tool_turns,
+        filler_tool_turns=filler_tool_turns,
         narration=narration,
         markers_per_tool=markers_per_tool,
         subset_questions=subset_questions,
