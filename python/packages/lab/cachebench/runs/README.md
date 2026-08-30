@@ -30,6 +30,7 @@ they are copied, not recomputed.
 | `run-x-unpinned-void.*` | — | 60,000 | harness | 53 | **void** |
 | `run-19-16calls-confounded.*` | 19 | 272,000 | harness | 53 | 2 h |
 | `run-20-16calls-controlled.*` | 20 | 272,000 | harness | 53 | 1 h 45 min |
+| `run-21-freeze-validation.*` | 21 | 120,000 | harness | 53 | 8 min, **mechanism only** |
 
 Run 19 raised the call count to sixteen by dropping the codes per result from eight to three,
 so it changed call count, result size and code count together. Run 20 is the honest form: six

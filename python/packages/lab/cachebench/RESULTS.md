@@ -1000,6 +1000,44 @@ against 29, and every row costs more than the equivalent six-call run.
 
 ---
 
+## Run 21 — the freeze flag works, and measures nothing yet
+
+Compaction had been running *through* the closing questions in every run above, because they
+go through the same `agent.run()` loop as the conversation. So the first scope was answered
+from a fuller context than the last, the combined question from the most compacted context of
+the run, and `survived` was computed against a prompt still being edited while it was scored.
+`--freeze-during-answers` stops the strategy at the first closing turn so that all the closing
+answers come from one history.
+
+This run only checks the mechanism fires. One repeat, 120,000-token window, two strategies and
+the mandatory control:
+
+| strategy | cost | vs none | hit% | peak | facts | correct | all | flags |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| tool_summary_anchored | $0.2700 | **-19%** | 90% | 103,322 | 32/53 | 26% | 25% | `REC:1,FROZEN:16,FORCED:2,RECFORCED:1` |
+| **none** | $0.3341 | — | 94% | 165,590 | 53/53 | 100% | 100% | — |
+| anchored | $0.4101 | +23% | 84% | 113,489 | 32/53 | 56% | 58% | `FROZEN:16` |
+
+**The flag does what it claims.** Sixteen compaction calls suppressed per strategy, so the
+closing turns were genuinely still compacting before this and the arms will differ. The recall
+mechanism still completes *ahead* of the freeze — `REC:1` with `RECFORCED:1` and no
+`RECVOLUNTEERED` — which is the ordering the design needs: phase 1 must have produced its
+record before phase 2 is switched off. `none` correctly carries no note, having no strategy to
+freeze.
+
+**Do not read the accuracy columns as freeze damage.** One repeat means no error bars, and the
+run is unpinned (`--no-force-tool-calls`), which alone moves this figure: `anchored` scored
+27/53 at 60,000 in run 16, 53/53 at 120,000 in run 17, and 22/53 unpinned in the void run. 32/53
+sits inside that spread. Sizing the freeze costs a paired frozen/unfrozen run at three or more
+repeats, which has not been done.
+
+**Found by running it:** `cachebench_live --help` crashed on an unescaped `%` in two help
+strings. argparse `%`-formats help text, so one bare percent sign makes the whole parser
+unprintable while parsing and running continue to work perfectly — the CLI was simply
+undiscoverable. Now covered by a test that formats the help.
+
+---
+
 ## Models that could not be measured
 
 **`google/gemini-3.7-flash` — excluded.** Its turns fail partway through a conversation

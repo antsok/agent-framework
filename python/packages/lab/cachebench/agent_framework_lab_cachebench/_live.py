@@ -458,6 +458,7 @@ def _strategy_notes(strategy: Any) -> tuple[str, ...]:
         ("forced_calls", "FORCED"),
         ("records_forced", "RECFORCED"),
         ("records_volunteered", "RECVOLUNTEERED"),
+        ("compactions_skipped", "FROZEN"),
     ):
         value = getattr(strategy, attribute, None)
         if isinstance(value, int) and value:
@@ -599,6 +600,91 @@ class RecallGate:
         """
         armed, self._armed = self._armed, False
         return armed
+
+
+class CompactionSwitch:
+    """Whether compaction may still run, and how often it was stopped.
+
+    The closing questions go through the same ``agent.run()`` loop as every other turn, so by
+    default the strategy fires before each of them. Three things follow, none of them
+    controlled: the first scope is answered from a fuller context than the last; the combined
+    question is answered from the most compacted context of the whole run; and a fact can be
+    evicted *during* scoring, so ``survived`` is computed against a prompt that is still
+    moving. Freezing at the first closing turn holds one context still for all of them, so
+    the answers differ only in what they were asked.
+
+    Off by default, because the unfrozen run is the one an agent would actually perform.
+    """
+
+    def __init__(self) -> None:
+        """Start thawed: nothing is frozen until the runner reaches the closing turns."""
+        self._frozen = False
+        self._skipped = 0
+
+    @property
+    def frozen(self) -> bool:
+        """True once the closing turns have begun."""
+        return self._frozen
+
+    @property
+    def skipped(self) -> int:
+        """How many compaction calls the freeze suppressed.
+
+        Zero on a frozen run means the freeze changed nothing, which is worth telling apart
+        from the freeze never having been asked for.
+        """
+        return self._skipped
+
+    def freeze(self) -> None:
+        """Stop compaction for the rest of the run."""
+        self._frozen = True
+
+    def note_skip(self) -> None:
+        """Record one suppressed call."""
+        self._skipped += 1
+
+
+class _FreezableStrategy:
+    """A compaction strategy that can be switched off part-way through a run.
+
+    Everything except ``__call__`` reads through to the wrapped strategy, so the counters the
+    runner reports and the configuration the middleware copies behave as though it were not
+    here. Installed only when the freeze is asked for, which keeps the default path
+    byte-identical to the runs already recorded.
+    """
+
+    def __init__(self, inner: Any, switch: CompactionSwitch) -> None:
+        """Wrap ``inner``, consulting ``switch`` before every call."""
+        self._inner = inner
+        self._switch = switch
+
+    async def __call__(self, messages: list[Message]) -> bool:
+        """Run the wrapped strategy unless the switch is frozen.
+
+        Returns:
+            What the wrapped strategy returned, or False when frozen, meaning nothing changed.
+        """
+        if self._switch.frozen:
+            self._switch.note_skip()
+            return False
+        return await self._inner(messages)
+
+    @property
+    def compactions_skipped(self) -> int:
+        """Suppressed calls, surfaced in the flags column by :func:`_strategy_notes`."""
+        return self._switch.skipped
+
+    def __getattr__(self, name: str) -> Any:
+        """Read anything else off the wrapped strategy.
+
+        Reached only for names the wrapper does not define. Goes through ``__dict__`` rather
+        than ``self._inner`` so that a lookup arriving before ``__init__`` has finished raises
+        rather than recursing.
+
+        Returns:
+            The wrapped strategy's attribute.
+        """
+        return getattr(self.__dict__["_inner"], name)
 
 
 def make_recall_tool(gate: RecallGate | None = None) -> Callable[[str], str]:
@@ -836,6 +922,7 @@ async def run_live(
     retrieval_guidance: bool = True,
     fact_placement: str = "spread",
     allow_server_history: bool = False,
+    freeze_during_answers: bool = False,
 ) -> LiveOutcome:
     """Run the scenario end to end against a real agent.
 
@@ -867,6 +954,10 @@ async def run_live(
             left to the caller: a calibration probe that forgot it reported every narration
             mode as stable, because the service was feeding the model a history the client
             had never compacted.
+        freeze_during_answers: Stop compacting once the closing questions begin, so every
+            closing answer is written from the same history. See :class:`CompactionSwitch`
+            for what this controls for. Off by default, because an agent in use compacts
+            while it answers, and the default row should be that agent.
 
     Returns:
         The outcome. A turn that fails sets ``error`` and stops the run rather than raising,
@@ -903,6 +994,10 @@ async def run_live(
     # Adding it to every row would put an extra tool in every prompt and give unrelated
     # strategies something new to call, which is a difference between rows that has nothing
     # to do with compaction.
+    # Flipped by the loop below at the first closing turn. The middleware consults it too:
+    # forcing a fresh record mid-answer would move the history the answers are written from,
+    # which is the one thing the freeze exists to hold still.
+    switch = CompactionSwitch()
     recall_middleware: ToolResultRecallMiddleware | None = None
     if isinstance(strategy, ToolResultAnchoredSummarizationCompactionStrategy):
         gate = RecallGate()
@@ -914,12 +1009,19 @@ async def run_live(
             tokenizer=options.tokenizer,
             arm=gate.arm,
             trigger_fraction=strategy.trigger_fraction,
+            paused=(lambda: switch.frozen) if freeze_during_answers else None,
         )
+
+    # Wrapped only when the freeze is asked for, so an ordinary run is exactly the run every
+    # recorded result was produced by.
+    installed: Any = strategy
+    if strategy is not None and freeze_during_answers:
+        installed = _FreezableStrategy(strategy, switch)
 
     agent = build_live_agent(
         runtime,
         kind=agent_kind,
-        strategy=strategy,
+        strategy=installed,
         tokenizer=options.tokenizer,
         tools=scope_tools,
         recorder=recorder,
@@ -943,6 +1045,11 @@ async def run_live(
     forced: dict[int, str] = dict(scenario.tool_turn_scopes) if force_tool_calls else {}
     dropped: list[str] = []
     for index, turn in enumerate(turns):
+        if freeze_during_answers and index == first_answer_turn:
+            # Frozen on the way in to the first closing turn, not after it: the strategy runs
+            # before the model call, so freezing afterwards would already have let it act on
+            # the turn it was meant to protect.
+            switch.freeze()
         final_mark = len(recorder.calls)
         response = None
         # Two attempts. Providers differ in which request options they accept, and one that
@@ -1013,7 +1120,7 @@ async def run_live(
         answers=tuple(answer_parts),
         combined_answer=combined,
         summarizer_failures=summarizer.failures if summarizer else 0,
-        strategy_notes=_strategy_notes(strategy) + _strategy_notes(recall_middleware),
+        strategy_notes=_strategy_notes(installed) + _strategy_notes(recall_middleware),
         summarizer_input_tokens=summarizer.input_tokens if summarizer else 0,
         summarizer_output_tokens=summarizer.output_tokens if summarizer else 0,
         error=error,
