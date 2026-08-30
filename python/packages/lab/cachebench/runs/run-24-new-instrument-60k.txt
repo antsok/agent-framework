@@ -1,0 +1,93 @@
+sizing: 15 filler turns of ~1,682 tokens, predicting 51,602 against a target of 51,600 (86% of 60,000); payload 24,497 tokens, of which 21,967 is tool results.
+note: gpt-5.4-mini keeps history server-side by default. Forcing store=False so the history is sent by the client and compaction actually applies.
+-> none
+-> context_window
+-> truncation
+-> anchored
+-> tool_summary_anchored
+
+Model: gpt-5.4-mini   agent: harness   probe repeats: 3
+Pricing: $0.66/M in, $0.070/M cached, $3.96/M out
+
+strategy                         msgs   tok left/peak  calls          in  hit%       out      cost    +-   summ$  vs none    facts  lost nofetch ignored      acc seed+-  rep+-   all  vs none   dq     flags
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+truncation                      40/61   35,898/43,855     54   1,551,202   94%     6,900   $0.1935    0%       -     -16%    29/53    24       0       2     52%     0pp    9pp  15%      52%   0%         -
+none                            59/59   54,224/54,224     54   2,096,454   96%     9,173   $0.2296    0%       -        -    53/53     0       0       0    100%*    0pp    0pp 100%        -   0%         -
+anchored                        61/61   53,782/53,782     54   2,085,235   95%     9,227   $0.2447    0%       -      +7%    53/53     0       0       0    100%     0pp    0pp 100%     100%   0%         -
+tool_summary_anchored           55/67   45,112/45,112     57   1,851,233   95%    14,347   $0.2463    0%       -      +7%    53/53     0       0       0    100%     0pp    0pp 100%     100%   0%FORCED:2,REC:1,RECFORCED:1
+context_window                  32/61   27,650/27,718     54   1,252,292   76%     6,776   $0.2886    0%       -     +26%    21/53    32       0       0     41%     0pp    0pp  13%      41%   0%         -
+
+msgs      = messages in a probe's prompt, out of the most any call carried. Every probe
+            is asked from the same restored snapshot, so this no longer drifts downwards
+            through the questions the way it did when they were ordinary turns
+tok       = billed tokens in that same prompt, and at the peak. Watch this rather than
+            msgs: a strategy that rewrites content in place removes tokens without
+            removing messages, and msgs cannot see it
+calls     = model calls, seeding and probes together
+in        = input tokens billed across the whole run
+hit%      = share of those served from the provider's cache. Compaction breaks the
+            cached prefix by construction, so this is what it gives up to save tokens
+out       = output tokens billed across the whole run. Its own column because a total
+            driven by how much the model wrote is a different finding from one driven
+            by how much context it was sent, and one number cannot show which
+cost      = the whole run: seeding, plus what every probe added, summed. Not split into
+            a seed and a probe column, because half of it is not a price anyone pays
++-        = spread between the cheapest and dearest seed. A gap smaller than this is not
+            a result. 0% with one seed means stability is unknown, not that it is stable
+summ$     = what this strategy's own summarization calls cost, of that total
+vs none   = against the uncompacted control: the first is cost, the second accuracy.
+            Read them together or not at all -- cheaper and less correct is not a saving
+facts     = planted facts surviving compaction into the snapshot: recall's ceiling.
+            Scored against the snapshot, which is exactly the context every probe was
+            answered from. Scored against a closing prompt instead, this was circular:
+            each answer re-listed codes into the history, so a code compaction had
+            destroyed came back because the model had recited it two questions earlier
+lost      = compaction removed it, so the model could not use it  <- the damage
+nofetch   = the agent never called that tool, so the fact never entered the history at
+            all. Not compaction damage: an uncompacted run shows these too
+ignored   = still in the snapshot but unused: the model's failing, not compaction's
+acc       = mean share of checks passed across every probe repeat of every seed, each
+            reply scored only against the values its own question asked for
+seed+-    = points between the least and most correct seed. Different conversations, so
+            this is compaction's own reliability: whether it cleared a retention
+            boundary this time and not last time
+rep+-     = points between the least and most correct repeat *within* one seed, averaged
+            over seeds. Identical facts in identical positions, so this is the model's
+            willingness to enumerate and nothing else. The two used to arrive as one
+            number, and a strategy scoring 52, 52, 52 and 22 with exactly 27 facts
+            preserved every time read the same as one that lost different facts each time
+all       = share of all planted values present in the combined answer, where the model
+            is asked for everything at once. Asked from the snapshot like every other
+            probe, so it is no longer penalised for having been asked last
+dq        = share of this cell's seeds that sent a prompt larger than the tried limit.
+            The limit is simulated, so it is enforced here or not at all. A cell that
+            disqualifies at all is excluded from the ranking rather than starred: a row
+            a model that size would have refused is not a baseline for anything
+flags     = DQ disqualified, ERR failed turn, DRIFT:<n> probes whose prompt was not the
+            snapshot verbatim, because the strategy acted again on the restored state.
+            Those probes saw slightly less than survival was scored against, so a row
+            carrying this overstates what reached the model. S<n> summarizer failures,
+            <n>/<n>t turns
+            completed, REC:<n> records the strategy found, FORCED:<n> times it asked for
+            one, FALLBACK:<n> times it gave up and compacted another way. A row with
+            FALLBACK is measuring that other strategy, not the one named. NO:<opt> the
+            provider rejected that option so it was dropped; a run that dropped
+            tool_choice chose its own tool calls and is not comparable with one that did
+            not. FETCH this row gathered a different set of facts than the control
+
+per-sample correctness, one group per seed:
+  truncation                  [46% 56% 56%]
+  none                        [100% 100% 100%]
+  anchored                    [100% 100% 100%]
+  tool_summary_anchored       [100% 100% 100%]
+  context_window              [41% 41% 41%]
+
+Fill: 53,837 tokens seeded against a target of 51,600 (86% of 60,000), +4.3%. Payload 24,497 tokens, of which 21,967 is tool results.
+
+VERDICT: none
+Every strategy that keeps the answer intact also costs more than not compacting. Leave it off unless the conversation would overflow the window.
+
+Single seed: nothing here measures compaction's own reliability. Re-run with --repeats 3.
+Unclosed client session
+client_session: <aiohttp.client.ClientSession object at 0x000001DDF226ECF0>
+EXIT=0

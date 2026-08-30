@@ -282,9 +282,6 @@ class ToolResultRecallMiddleware(ChatMiddleware):
         trigger_fraction: Fraction of the ceiling at which the record is forced. Comfortably
             below the strategy's fallback threshold, because the decision is made one call
             late -- see :meth:`process`.
-        paused: Consulted before each call; while it returns True nothing is forced. The
-            runner uses it to hold the conversation still for the closing questions, where a
-            fresh record would change the history the answers are being scored against.
     """
 
     def __init__(
@@ -294,7 +291,6 @@ class ToolResultRecallMiddleware(ChatMiddleware):
         tokenizer: TokenizerProtocol,
         arm: Callable[[], None],
         trigger_fraction: float = 0.6,
-        paused: Callable[[], bool] | None = None,
     ) -> None:
         """Validate and store the configuration.
 
@@ -309,12 +305,22 @@ class ToolResultRecallMiddleware(ChatMiddleware):
         self.tokenizer = tokenizer
         self.arm = arm
         self.trigger_fraction = trigger_fraction
-        self._paused = paused
         self._force_next = False
         self._forced = 0
         self._records_forced = 0
         self._records_volunteered = 0
         self._seen_record = False
+
+    def forget_pending(self) -> None:
+        """Drop the decision to force a record on the next call.
+
+        The decision is taken on one call and applied to the next, which makes it part of the
+        conversation rather than of this object: a decision taken while the conversation was
+        being seeded would fire on the first question asked of the snapshot and on none of the
+        others, so that one probe would carry a prompt the rest do not. Restoring the snapshot
+        has to restore this too.
+        """
+        self._force_next = False
 
     @property
     def forced_calls(self) -> int:
@@ -349,14 +355,6 @@ class ToolResultRecallMiddleware(ChatMiddleware):
         time. The trigger sits well below the strategy's fallback threshold to absorb that
         one-call delay.
         """
-        if self._paused is not None and self._paused():
-            # Nothing is forced and nothing is re-armed while paused, including the pending
-            # decision from the last call: a record arriving now would replace tool results
-            # part-way through the questions that are scoring them.
-            self._force_next = False
-            await call_next()
-            return
-
         forced_this_call = self._force_next
         if forced_this_call:
             # Replaced rather than mutated: options may be shared with the caller's own dict,

@@ -641,7 +641,7 @@ def score_scoped(
     answers: Sequence[str],
     scopes: Sequence[str],
     facts: tuple[PlantedFact, ...],
-    final_prompt: str,
+    context_prompt: str,
 ) -> tuple[FactOutcome, ...]:
     """Score each closing reply against only the facts its question asked for.
 
@@ -658,7 +658,10 @@ def score_scoped(
         answers: One reply per closing turn, in order.
         scopes: The scope each of those turns asked about.
         facts: Every planted fact.
-        final_prompt: Serialized prompts of the closing turns, for the survival check.
+        context_prompt: The context these answers were written from, for the survival check.
+            A live run passes the snapshot every probe was asked from. Passing a prompt that
+            already carried an answer makes the check circular: each answer re-lists codes,
+            so a code compaction destroyed scores as having survived.
 
     Returns:
         One outcome per fact.
@@ -670,7 +673,7 @@ def score_scoped(
     return tuple(
         FactOutcome(
             fact=fact,
-            survived=fact.appears_in(final_prompt),
+            survived=fact.appears_in(context_prompt),
             recalled=fact.appears_in(by_scope.get(fact.scope, "")),
         )
         for fact in facts

@@ -12,6 +12,7 @@ between those layers, and a hand-rolled mock that skipped them would answer none
 from __future__ import annotations
 
 import contextlib
+import re
 from collections.abc import Mapping, Sequence
 from types import SimpleNamespace
 from typing import Any, cast
@@ -39,6 +40,7 @@ from agent_framework_lab_cachebench import (
     LiveOutcome,
     MeteredClient,
     ModelCall,
+    ProbeOutcome,
     ProviderRuntime,
     StrategyOptions,
     UsageRecorder,
@@ -47,7 +49,9 @@ from agent_framework_lab_cachebench import (
     build_recall_scenario,
     build_strategy,
     make_lookup_tool,
+    recommend,
     run_live,
+    score_samples,
     unretrieved_facts,
     wants_client_side_history,
 )
@@ -62,11 +66,15 @@ from agent_framework_lab_cachebench._live import (
 )
 from agent_framework_lab_cachebench._live_cli import (
     _accuracy_note,
-    _correctness_range,
+    _aggregate,
     _cost,
-    _representative,
+    _excluded_cells,
+    _probe_spread,
+    _render,
+    _seed_spread,
     _spread,
     _summarizer_cost,
+    _to_joint,
     build_parser,
 )
 from agent_framework_lab_cachebench._toolsummary import (
@@ -86,18 +94,35 @@ class StubChatClient(FunctionInvocationLayer[Any], ChatMiddlewareLayer[Any], Bas
     is the ground truth every recorder assertion is checked against.
     """
 
-    def __init__(self, *, tool_turns: Sequence[int] = (), usage: UsageDetails | None = None, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *,
+        tool_turns: Sequence[int] = (),
+        usage: UsageDetails | None = None,
+        reply: str = "a reply with some body to it",
+        obey_tool_choice: bool = False,
+        **kwargs: Any,
+    ) -> None:
         """Create the stub.
 
         Keyword Args:
             tool_turns: Indices of calls that should answer with a tool call instead of text.
             usage: Usage to report on every response.
+            reply: What every non-tool call answers with. Settable because a reply is history
+                for every later turn, so a test about how large a conversation gets cannot use
+                a six-word one.
+            obey_tool_choice: Call whatever function the request pinned, as a real model does.
+                Off by default so that the tests written against ``tool_turns`` keep choosing
+                which calls use a tool; on, the conversation actually gathers every tool result,
+                which is the only way an offline test can see how large a real run gets.
         """
         super().__init__(**kwargs)
         self.seen: list[int] = []
         self.options_seen: list[dict[str, Any]] = []
         self.tool_turns = set(tool_turns)
         self.usage = usage
+        self.reply = reply
+        self.obey_tool_choice = obey_tool_choice
 
     def _inner_get_response(
         self,
@@ -110,20 +135,26 @@ class StubChatClient(FunctionInvocationLayer[Any], ChatMiddlewareLayer[Any], Bas
         index = len(self.seen)
         self.seen.append(len(messages))
         self.options_seen.append(dict(options))
+        choice = options.get("tool_choice")
+        pinned = choice.get("required_function_name") if isinstance(choice, Mapping) else None
 
         async def _go() -> ChatResponse[Any]:
-            if index in self.tool_turns:
+            if index in self.tool_turns or (self.obey_tool_choice and pinned):
                 contents: list[Any] = [
                     Content.from_function_call(
                         call_id=f"call_{index}",
                         # One no-argument tool per scope: the turn's scope is pinned by which
                         # function is called, not by an argument the model chooses.
-                        name="lookup_early",
+                        name=pinned or "lookup_early",
                         arguments="{}",
                     )
                 ]
             else:
-                contents = ["a reply with some body to it"]
+                # Numbered, because the history provider hashes messages to decide what is
+                # new: byte-identical replies after the first are dropped as duplicates, and
+                # a stub that answered the same words every time built a history a third the
+                # size it appeared to be.
+                contents = [f"{self.reply} #{index}"]
             return ChatResponse(
                 messages=Message(role="assistant", contents=contents),
                 usage_details=self.usage,
@@ -540,7 +571,8 @@ def test_every_argument_the_runner_reads_is_defined() -> None:
         "tokenizer",
         "show_answers",
         "dry_run",
-        "freeze_during_answers",
+        "fill",
+        "probe_repeats",
     ):
         assert hasattr(args, name), f"--{name.replace('_', '-')} is read by the runner but not declared"
 
@@ -552,7 +584,7 @@ def test_the_help_can_actually_be_printed() -> None:
     parsing works, runs work, and the CLI is simply undiscoverable. Two help strings quoting
     percentages had broken it, found only because someone ran ``--help``.
     """
-    assert "--freeze-during-answers" in build_parser().format_help()
+    assert "--probe-repeats" in build_parser().format_help()
 
 
 # endregion
@@ -733,7 +765,7 @@ def test_messages_peak_is_measured_before_compaction() -> None:
         strategy="s",
         calls=(_call(2, 5), _call(2, 9), _call(2, 7)),
         answer="",
-        final_prompt="",
+        snapshot_prompt="",
         tool_calls_made=0,
         turns_completed=3,
         turns_total=3,
@@ -756,7 +788,7 @@ def test_prompt_size_is_reported_in_tokens_not_only_messages() -> None:
         strategy="tool_result",
         calls=(_call(9, 9, inp=8_000), _call(9, 9, inp=5_000)),
         answer="",
-        final_prompt="",
+        snapshot_prompt="",
         tool_calls_made=0,
         turns_completed=2,
         turns_total=2,
@@ -780,7 +812,7 @@ def test_cost_includes_generation_and_summarizer_charges() -> None:
         strategy="s",
         calls=(_call(1, 1, inp=1_000_000, out=100_000),),
         answer="",
-        final_prompt="",
+        snapshot_prompt="",
         tool_calls_made=0,
         turns_completed=1,
         turns_total=1,
@@ -789,7 +821,7 @@ def test_cost_includes_generation_and_summarizer_charges() -> None:
         strategy="s",
         calls=(_call(1, 1, inp=1_000_000, out=100_000),),
         answer="",
-        final_prompt="",
+        snapshot_prompt="",
         tool_calls_made=0,
         turns_completed=1,
         turns_total=1,
@@ -813,7 +845,7 @@ def test_summarizer_cost_is_zero_for_a_strategy_that_never_summarized() -> None:
         strategy="truncation",
         calls=(_call(1, 1, inp=1_000, out=100),),
         answer="",
-        final_prompt="",
+        snapshot_prompt="",
         tool_calls_made=0,
         turns_completed=1,
         turns_total=1,
@@ -829,7 +861,7 @@ def test_total_cost_is_the_agent_plus_its_own_summarizer() -> None:
         strategy="summarization",
         calls=(_call(1, 1, inp=2_000_000, out=100_000),),
         answer="",
-        final_prompt="",
+        snapshot_prompt="",
         tool_calls_made=0,
         turns_completed=1,
         turns_total=1,
@@ -847,23 +879,11 @@ def _priced(strategy: str, inp: int) -> LiveOutcome:
         strategy=strategy,
         calls=(_call(1, 1, inp=inp),),
         answer="",
-        final_prompt="",
+        snapshot_prompt="",
         tool_calls_made=0,
         turns_completed=1,
         turns_total=1,
     )
-
-
-def test_representative_repeat_is_the_median_not_an_average() -> None:
-    """The reported row must be one conversation that actually happened.
-
-    Blending repeats would let the columns contradict each other: an averaged cost against a
-    token count from a different run, and a fact count from a third.
-    """
-    pricing = ModelPricing(input_per_million=1.0, cached_read_per_million=0.1, output_per_million=1.0)
-    repeats = [_priced("s", 1_000), _priced("s", 9_000), _priced("s", 5_000)]
-
-    assert _representative(repeats, pricing).input_tokens == 5_000
 
 
 def test_spread_reports_the_gap_between_repeats() -> None:
@@ -888,7 +908,7 @@ def test_cached_tokens_are_discounted() -> None:
         strategy="s",
         calls=(_call(1, 1, inp=1_000_000, cached=1_000_000),),
         answer="",
-        final_prompt="",
+        snapshot_prompt="",
         tool_calls_made=0,
         turns_completed=1,
         turns_total=1,
@@ -949,12 +969,13 @@ async def test_dropping_tool_choice_also_stops_forcing() -> None:
     assert outcome.turns_completed == outcome.turns_total
 
 
-async def test_every_closing_answer_reaches_the_score() -> None:
-    """The scored answer must contain what the model said in every closing turn.
+async def test_every_probe_answer_reaches_the_score() -> None:
+    """Every question, asked every time, must reach the scorer.
 
-    With several targeted closing questions the answer is their union. Collecting the parts
-    but never joining them leaves the answer empty, and every fact scores as ignored -- a
-    control that recalls nothing looks like a stable measurement rather than a broken one.
+    With several targeted closing questions the answer is their union, and each is now asked
+    repeatedly. Collecting the parts but never joining them leaves the answer empty and every
+    fact scores as ignored -- a control that recalls nothing looks like a stable measurement
+    rather than a broken one.
     """
     scenario = build_live_scenario(salt="join", filler_turns=3, filler_tokens=50, tool_turns=6)
     assert scenario.answer_turn_count > 1, "the default scenario should close with several questions"
@@ -964,10 +985,12 @@ async def test_every_closing_answer_reaches_the_score() -> None:
         strategy_name="none",
         options=_options(),
         scenario=scenario,
+        probe_repeats=3,
     )
 
-    assert outcome.answer, "no closing answer reached the scorer"
-    assert outcome.answer.count("a reply with some body to it") == scenario.answer_turn_count
+    assert outcome.answer, "no probe answer reached the scorer"
+    assert len(outcome.probes) == scenario.answer_turn_count * 3
+    assert outcome.answer.count("a reply with some body to it") == scenario.answer_turn_count * 3
 
 
 async def test_run_live_reports_a_failed_turn_without_raising() -> None:
@@ -1049,78 +1072,376 @@ async def test_run_live_drives_every_turn_and_counts_tool_use() -> None:
     assert len(outcome.calls) > outcome.turns_total, "the tool round trip should add a call"
 
 
-async def _questions_the_strategy_saw(monkeypatch: pytest.MonkeyPatch, *, freeze: bool) -> tuple[bool, LiveOutcome]:
-    """Run the scenario with a strategy that only reports whether it saw the first question.
+# endregion
+
+
+# region probes
+
+
+def _probe_scenario() -> Any:
+    return build_live_scenario(salt="probe", filler_turns=3, filler_tokens=50, tool_turns=6)
+
+
+class ClosingAnswerStub(StubChatClient):
+    """A stub that says something distinctive only when it is asked a closing question.
+
+    The seeding replies have to stay ordinary. A stub that answered with the marker on every
+    turn would plant it in the snapshot itself, and a test asking whether the marker reached a
+    probe's prompt would then pass for entirely the wrong reason.
+    """
+
+    def __init__(self, *, closing: Sequence[str], answer: str, **kwargs: Any) -> None:
+        """Create the stub.
+
+        Keyword Args:
+            closing: The closing question texts, which mark a probe.
+            answer: What to reply to those, and to nothing else.
+        """
+        super().__init__(**kwargs)
+        self.closing = tuple(closing)
+        self.answer = answer
+
+    def _inner_get_response(
+        self, *, messages: Sequence[Message], stream: bool, options: Mapping[str, Any], **kwargs: Any
+    ) -> Any:
+        asked = _turn_text(messages[-1:]) if messages else ""
+        # Set before the response is built and read a moment later, when it is awaited. Calls
+        # here are strictly sequential, so the two cannot disagree.
+        self.reply = self.answer if any(question in asked for question in self.closing) else "an ordinary reply"
+        return super()._inner_get_response(messages=messages, stream=stream, options=options, **kwargs)
+
+
+def _closing_questions(scenario: Any) -> list[str]:
+    """Return the text of every closing question, which is what marks a call as a probe."""
+    turns = scenario.transcript.turns
+    return [_turn_text(turn.request) for turn in turns[len(turns) - scenario.answer_turn_count :]]
+
+
+async def _probed(
+    client: StubChatClient, *, scenario: Any = None, strategy: str = "none", repeats: int = 3
+) -> tuple[LiveOutcome, Any]:
+    """Run one scenario through the seed, snapshot and probe phases.
 
     Returns:
-        Whether the first closing question ever reached the strategy, and the outcome.
+        The outcome and the scenario it was driven from.
     """
-    scenario = build_live_scenario(salt="freeze", filler_turns=3, filler_tokens=50, tool_turns=6)
-    turns = scenario.transcript.turns
-    question = _turn_text(turns[len(turns) - scenario.answer_turn_count].request)
-    saw: list[bool] = []
+    scenario = scenario if scenario is not None else _probe_scenario()
+    outcome = await run_live(
+        ProviderRuntime(client=client, model="stub"),
+        strategy_name=strategy,
+        options=_options(),
+        scenario=scenario,
+        probe_repeats=repeats,
+    )
+    assert outcome.error is None
+    return outcome, scenario
+
+
+async def test_each_question_is_asked_three_times_by_default() -> None:
+    """The default must be several readings of one snapshot, not one.
+
+    A single reading of a two-valued accuracy distribution is a draw, and the whole point of
+    separating the two spreads is that there is something to take a spread of.
+    """
+    scenario = _probe_scenario()
+    outcome = await run_live(
+        ProviderRuntime(client=StubChatClient(), model="stub"),
+        strategy_name="none",
+        options=_options(),
+        scenario=scenario,
+    )
+
+    assert outcome.probe_repeats == 3
+    assert len(outcome.probes) == scenario.answer_turn_count * 3
+    for scope in scenario.answer_scopes:
+        asked = [probe for probe in outcome.probes if probe.scope == scope]
+        assert [probe.repeat for probe in asked] == [1, 2, 3], f"{scope} was not asked exactly three times"
+
+
+async def test_a_probe_never_sees_another_probes_answer() -> None:
+    """No probe's answer may reach any other probe's prompt.
+
+    This is the change. When the closing questions were ordinary turns, each answer re-listed
+    codes into the history as assistant text, so the next question was asked from a context
+    the previous answer had rewritten -- and survival, scored against that context, credited
+    compaction for a code the model had recited two questions earlier. The same strategy read
+    53/53 on a run that emitted 10,941 output tokens and 18/53 on one that emitted 4,873.
+    """
+    scenario = _probe_scenario()
+    stub = ClosingAnswerStub(closing=_closing_questions(scenario), answer="ANSWER-MARKER answering now")
+    outcome, _ = await _probed(stub, scenario=scenario)
+
+    assert len(outcome.probes) > 1, "one probe cannot contaminate anything, so this proves nothing"
+    assert "ANSWER-MARKER" in outcome.answer, "no probe said the marker, so nothing could have leaked"
+    for probe in outcome.probes:
+        assert "ANSWER-MARKER" not in probe.prompt_text, f"a probe answer reached the {probe.scope} probe"
+    assert "ANSWER-MARKER" not in outcome.snapshot_prompt
+
+
+async def test_every_probe_is_asked_from_the_same_restored_snapshot() -> None:
+    """Probe N's prompt must equal probe 1's apart from the question.
+
+    A shallow restore passes every other check here and fails this one: compaction marks its
+    exclusions on the message objects themselves, so a snapshot sharing them is rewritten by
+    the first probe and every later probe starts from somewhere else.
+    """
+    outcome, _ = await _probed(StubChatClient())
+
+    # The question is the last message of the prompt; everything before it is the snapshot.
+    contexts = {probe.prompt_text.rsplit(chr(10), 1)[0] for probe in outcome.probes}
+    questions = {probe.prompt_text.rsplit(chr(10), 1)[1] for probe in outcome.probes}
+
+    assert len(contexts) == 1, "the probes were asked from different contexts"
+    assert len(questions) == len({probe.question for probe in outcome.probes})
+
+
+async def test_the_snapshot_survives_the_probes_that_read_it() -> None:
+    """Restoring must not hand the next probe the copy the last one mutated.
+
+    Restoring is a fresh deep copy each time rather than one copy assigned once, because the
+    probe about to run will mark exclusions on whatever it is given.
+    """
+    outcome, _ = await _probed(StubChatClient(), strategy="truncation")
+    before = outcome.snapshot_prompt
+
+    assert before, "nothing was snapshotted, so the comparison is vacuous"
+    assert all(probe.prompt_text.startswith(before) for probe in outcome.probes), (
+        "a probe was asked from a context that was not the snapshot"
+    )
+
+
+async def test_compaction_cannot_accumulate_across_the_probes(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The strategy must meet the same history on every probe.
+
+    The old design let compaction keep firing through the closing turns, so the first scope
+    was answered from a fuller context than the last and the combined question from the most
+    compacted context of the run. Restoring the snapshot makes that structurally impossible
+    rather than switchable, and this is the assertion that says so.
+    """
+    scenario = _probe_scenario()
+    seen: list[int] = []
 
     async def counting(messages: list[Message]) -> bool:
-        saw.append(
-            any(
-                question in (getattr(content, "text", "") or "") for message in messages for content in message.contents
-            )
-        )
+        seen.append(len(messages))
         return False
 
     monkeypatch.setattr("agent_framework_lab_cachebench._live.build_strategy", lambda name, options: counting)
     outcome = await run_live(
-        ProviderRuntime(client=StubChatClient(tool_turns=(1,)), model="stub"),
+        ProviderRuntime(client=StubChatClient(), model="stub"),
         strategy_name="truncation",
         options=_options(),
         scenario=scenario,
-        freeze_during_answers=freeze,
+        probe_repeats=3,
     )
 
     assert outcome.error is None
-    assert saw, "the strategy was never called at all, so the test proves nothing"
-    return any(saw), outcome
+    # Two invocations per probe: the before phase runs as the agent's compaction_strategy
+    # inside the client, and the after phase runs on the provider once the reply is in hand,
+    # so it sees one message more. Sliced apart, each must be flat.
+    probe_calls = seen[len(seen) - 2 * len(outcome.probes) :]
+    assert len(set(probe_calls[0::2])) == 1, f"the before phase saw a moving history: {sorted(set(probe_calls[0::2]))}"
+    assert len(set(probe_calls[1::2])) == 1, f"the after phase saw a moving history: {sorted(set(probe_calls[1::2]))}"
 
 
-async def test_compaction_runs_during_the_closing_questions_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
-    """The default must keep compacting while the model answers.
+async def test_a_strategy_that_acts_again_on_the_snapshot_is_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Restoring stops compaction accumulating; it does not stop it acting once more.
 
-    This is the behaviour ``--freeze-during-answers`` exists to be compared against, and it is
-    easy to assume away: the closing turns look like scoring rather than conversation, but they
-    go through the same ``agent.run()`` loop, so the strategy fires before each of them. If
-    this ever stopped being true the frozen arm would be measuring nothing.
+    Survival is scored against the snapshot, so a probe that was sent less than the snapshot
+    would be credited with facts the model never saw. It cannot be prevented -- the strategy
+    has to run, or the probe would be answered from a context no row ever had -- so it is
+    counted and flagged instead of assumed away.
     """
-    reached, outcome = await _questions_the_strategy_saw(monkeypatch, freeze=False)
+    scenario = _probe_scenario()
+    closing = _closing_questions(scenario)
 
-    assert reached, "the strategy never saw the closing question, so it was not running during it"
-    assert not any(note.startswith("FROZEN:") for note in outcome.strategy_notes)
+    async def evicting(messages: list[Message]) -> bool:
+        """Leave the seeding alone and evict one message on the way into each probe.
+
+        Quiet during seeding so the snapshot is the whole conversation, which is what makes the
+        difference between the snapshot and a probe's prompt attributable to this and nothing
+        else.
+        """
+        asked = _turn_text(messages[-1:]) if messages else ""
+        if not any(question in asked for question in closing):
+            return False
+        for message in messages:
+            if not message.additional_properties.get("_excluded"):
+                message.additional_properties["_excluded"] = True
+                return True
+        return False
+
+    monkeypatch.setattr("agent_framework_lab_cachebench._live.build_strategy", lambda name, options: evicting)
+    outcome = await run_live(
+        ProviderRuntime(client=StubChatClient(), model="stub"),
+        strategy_name="truncation",
+        options=_options(),
+        scenario=scenario,
+        probe_repeats=2,
+    )
+
+    assert outcome.error is None
+    assert outcome.context_drift == len(outcome.probes), "the drift went unnoticed"
+    # Still identical to each other, which is the property restoring the snapshot buys: the
+    # strategy acts once on each probe rather than once more on each probe than on the last.
+    assert len({probe.prompt_text.rsplit(chr(10), 1)[0] for probe in outcome.probes}) == 1
 
 
-async def test_freezing_keeps_the_closing_questions_out_of_the_strategy(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Frozen, the strategy must not run once the questions begin.
+async def test_a_settled_strategy_reports_no_drift() -> None:
+    """The usual case must read zero, or the flag says nothing when it appears."""
+    outcome, _ = await _probed(StubChatClient(), strategy="none", repeats=2)
 
-    The freeze is applied on the way *into* the first closing turn. Applying it after that turn
-    would let the strategy act on the very context the freeze exists to hold still, which is a
-    failure that would still leave the later turns frozen and so look like it worked.
+    assert outcome.probes
+    assert outcome.context_drift == 0
+
+
+async def test_survival_is_scored_against_the_snapshot_not_the_answers() -> None:
+    """A fact the model produced but was never given must not score as surviving.
+
+    The model here quotes every planted code while never calling a single tool, so no tool
+    result ever entered the history. Scored against a prompt that had already carried an
+    answer, those codes read as preserved by compaction; scored against the snapshot they read
+    as what they are, which is a model producing values it was not shown.
     """
-    reached, outcome = await _questions_the_strategy_saw(monkeypatch, freeze=True)
+    scenario = _probe_scenario()
+    codes = " ".join(fact.marker for fact in scenario.facts)
+    stub = ClosingAnswerStub(closing=_closing_questions(scenario), answer=f"here they are: {codes}")
+    outcome, _ = await _probed(stub, scenario=scenario)
+    tool_facts = {fact.marker for fact in scenario.facts if fact.kind == "tool_result"}
 
-    assert not reached, "the strategy ran on the first closing question despite the freeze"
-    # Reported, not merely done: a frozen run that suppressed nothing means the strategy had
-    # already stopped firing on its own, and the arms are then not comparable.
-    assert any(note.startswith("FROZEN:") for note in outcome.strategy_notes)
+    assert outcome.scopes_called == (), "the agent fetched a tool, so this proves nothing"
+    assert tool_facts, "the scenario planted no tool facts"
+    for sample in score_samples(outcome, scenario):
+        for entry in sample:
+            if entry.fact.marker in tool_facts:
+                assert not entry.survived, f"{entry.fact.marker} was never in the history but scored as surviving"
 
 
-async def test_a_frozen_run_still_answers_every_closing_question(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Freezing changes what the model sees, not how many questions it is asked.
+def test_a_prompt_over_the_tried_limit_disqualifies_the_run() -> None:
+    """A row whose prompt exceeded the limit it stands in for is not a row.
 
-    Skipping the strategy by skipping the turn would raise every accuracy figure for free.
+    The limit is simulated -- the model itself accepts 272,000 -- so nothing but this check
+    enforces it. Without it the 60,000 control ran at 78,003 tokens and was ranked anyway, and
+    every "cheaper than not compacting" at that size was measured against a baseline no model
+    of that size could have produced.
     """
-    _, outcome = await _questions_the_strategy_saw(monkeypatch, freeze=True)
+    within = LiveOutcome(
+        strategy="none",
+        calls=(_call(2, 2, inp=57_000), _call(2, 2, inp=40_000)),
+        answer="",
+        snapshot_prompt="",
+        tool_calls_made=0,
+        turns_completed=1,
+        turns_total=1,
+    )
+    over = LiveOutcome(
+        strategy="none",
+        calls=(_call(2, 2, inp=40_000), _call(2, 2, inp=78_003)),
+        answer="",
+        snapshot_prompt="",
+        tool_calls_made=0,
+        turns_completed=1,
+        turns_total=1,
+    )
 
-    assert outcome.turns_completed == outcome.turns_total
-    scenario = build_live_scenario(salt="freeze", filler_turns=3, filler_tokens=50, tool_turns=6)
-    assert len(outcome.answers) == scenario.answer_turn_count
+    assert not within.disqualified(60_000)
+    # Any call, not only the last: the run overran while it was being seeded and the closing
+    # prompts were smaller, which is exactly the shape the 60,000 cell had.
+    assert over.disqualified(60_000)
+
+
+async def test_a_disqualified_cell_is_excluded_from_the_ranking() -> None:
+    """A cell that disqualifies at all leaves the ranking rather than being starred.
+
+    Ranked with an asterisk it still sets the baseline every other row is compared against,
+    which is the failure the asterisk was supposed to warn about.
+    """
+    pricing = ModelPricing(input_per_million=1.0, cached_read_per_million=0.1, output_per_million=1.0)
+    scenarios: dict[int, Any] = {}
+    cells = []
+    for name, usage in (("none", 1_000), ("truncation", 90_000)):
+        outcome, scenario = await _probed(StubChatClient(usage=UsageDetails(input_token_count=usage)), repeats=1)
+        scenarios[id(outcome)] = scenario
+        cells.append(_aggregate(name, [outcome], scenarios, pricing, 60_000))
+
+    incomplete, oversized = _excluded_cells(cells)
+    ranked = [cell.strategy for cell in cells if cell.strategy not in incomplete | oversized]
+
+    assert cells[0].disqualified == 0.0
+    assert cells[1].disqualified == 1.0
+    assert oversized == {"truncation"}
+    assert ranked == ["none"]
+
+
+async def test_the_table_renders_every_column_it_declares() -> None:
+    """The table must actually print, with a legend entry for every column it shows.
+
+    Nothing else exercises the formatting, and it is entirely f-strings: a mis-specified
+    width or a missing key raises only at the end of a paid run, after every call has been
+    made. The legend is checked against the header for the same reason a flag list is checked
+    against the parser -- a column that appears with no explanation is how "correct" was read
+    as the median-cost repeat for three matrices running.
+    """
+    pricing = ModelPricing(input_per_million=1.0, cached_read_per_million=0.1, output_per_million=1.0)
+    scenarios: dict[int, Any] = {}
+    cells = []
+    for name, usage in (("none", 1_000), ("truncation", 900)):
+        outcome, scenario = await _probed(
+            StubChatClient(usage=UsageDetails(input_token_count=usage, output_token_count=20)), repeats=2
+        )
+        scenarios[id(outcome)] = scenario
+        cells.append(_aggregate(name, [outcome], scenarios, pricing, 60_000))
+    verdict = recommend([_to_joint(cell, scenarios) for cell in cells])
+
+    table = _render(verdict, cells, set(), "none", 1, pricing, "stub", "plain", None, show_answers=False)
+
+    header = next(line for line in table.splitlines() if line.strip().startswith("strategy"))
+    # Split on the padding between fields, not on spaces: two columns have a space in the name.
+    explained = {line.split("=", 1)[0].strip() for line in table.splitlines() if "=" in line}
+    for column in re.split(r"\s{2,}", header.strip()):
+        if column not in {"strategy", "flags"}:
+            # By its first word, since a header cell can carry a "left/peak" qualifier the
+            # legend explains in its body rather than in its key.
+            assert column in explained or column.split()[0] in explained, f"the {column!r} column has no legend entry"
+    assert "per-sample correctness" in table
+    assert "VERDICT:" in table
+
+
+async def test_the_two_spreads_are_reported_apart() -> None:
+    """Between-seed and within-seed disagreement must not arrive as one number.
+
+    They are different findings. A strategy that scored 52, 52, 52 and 22 while preserving
+    exactly the same 27 facts every time is telling us about the model; one whose seeds
+    disagree is telling us about compaction. Reported together, the first reads as the second.
+    """
+    scenario = _probe_scenario()
+    codes = [fact.marker for fact in scenario.facts]
+
+    def outcome_with(answers: Sequence[str]) -> LiveOutcome:
+        return LiveOutcome(
+            strategy="none",
+            calls=(_call(2, 2, inp=100),),
+            answer=chr(10).join(answers),
+            snapshot_prompt=" ".join(codes),
+            tool_calls_made=0,
+            turns_completed=1,
+            turns_total=1,
+            probe_repeats=len(answers),
+            probes=tuple(
+                ProbeOutcome(scope="", question="q", repeat=index, answer=answer, prompt_text="", calls=())
+                for index, answer in enumerate(answers, start=1)
+            ),
+        )
+
+    # One seed answered thoroughly every time, one that wandered: identical facts in front of
+    # the model in both, so all of this belongs to the within-seed column.
+    steady = outcome_with([" ".join(codes)] * 3)
+    wandering = outcome_with([" ".join(codes), " ".join(codes[:2]), " ".join(codes)])
+    scenarios = {id(steady): scenario, id(wandering): scenario}
+
+    assert _probe_spread([wandering], scenarios) > 0
+    assert _seed_spread([wandering], scenarios) == 0.0, "one seed cannot show a between-seed spread"
+    assert _probe_spread([steady], scenarios) == 0.0
+    assert _seed_spread([steady, wandering], scenarios) > 0
 
 
 # endregion
@@ -1203,7 +1524,7 @@ def test_buried_placement_hides_codes_in_prose() -> None:
     assert all(code in buried for code in codes)
 
 
-def test_correctness_range_reads_the_scored_outcome_not_the_raw_run() -> None:
+def test_seed_spread_reads_the_scored_outcome_not_the_raw_run() -> None:
     """Regression: correctness is not an attribute of ``LiveOutcome``.
 
     Reading it from the raw run passes ruff, pyright and the whole suite, then raises
@@ -1213,14 +1534,13 @@ def test_correctness_range_reads_the_scored_outcome_not_the_raw_run() -> None:
     """
     scenario = build_live_scenario(salt="range", filler_turns=1, filler_tokens=10, tool_turns=6, markers_per_tool=2)
     codes = [fact.marker for fact in scenario.facts]
-    pricing = ModelPricing(input_per_million=1.0, cached_read_per_million=0.1, output_per_million=2.0)
 
     def outcome_with(answer: str) -> LiveOutcome:
         return LiveOutcome(
             strategy="none",
             calls=(_call(2, 2, inp=100),),
             answer=answer,
-            final_prompt=" ".join(codes),
+            snapshot_prompt=" ".join(codes),
             tool_calls_made=0,
             turns_completed=1,
             turns_total=1,
@@ -1231,10 +1551,9 @@ def test_correctness_range_reads_the_scored_outcome_not_the_raw_run() -> None:
     scenarios = {id(perfect): scenario, id(partial): scenario}
 
     assert not hasattr(perfect, "correctness")
-    spread = _correctness_range([perfect, partial], scenarios, pricing)
-    assert spread > 0
-    # A single repeat says nothing about stability, and must not claim to.
-    assert _correctness_range([perfect], {id(perfect): scenario}, pricing) == 0.0
+    assert _seed_spread([perfect, partial], scenarios) > 0
+    # A single seed says nothing about compaction's reliability, and must not claim to.
+    assert _seed_spread([perfect], {id(perfect): scenario}) == 0.0
 
 
 def test_an_unstable_control_disables_the_accuracy_ranking() -> None:
