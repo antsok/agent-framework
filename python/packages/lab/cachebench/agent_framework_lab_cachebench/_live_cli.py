@@ -65,7 +65,7 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=1,
         help=(
-            "Replays per strategy. Live cost was measured swinging about 20% between identical "
+            "Replays per strategy. Live cost was measured swinging about 20%% between identical "
             "runs, mostly from reply length, so a single sample cannot rank strategies that are "
             "close together. 3 or more is what makes a ranking defensible."
         ),
@@ -121,7 +121,7 @@ def build_parser() -> argparse.ArgumentParser:
             "Measures how much of the closing answer is the model's willingness to enumerate "
             "rather than what compaction left behind. Off by default. Note that dropping it "
             "is only safe with an adequate --answer-max-tokens: at 900 the control scored "
-            "33% without the clause and 100% with it, which measures the cap, not retrieval."
+            "33%% without the clause and 100%% with it, which measures the cap, not retrieval."
         ),
     )
     parser.add_argument(
@@ -232,6 +232,18 @@ def build_parser() -> argparse.ArgumentParser:
             "Let the service keep the conversation server-side. Compaction then has nothing to "
             "act on, because the agent only sends the new turn. Off by default so that what is "
             "measured is actually compaction."
+        ),
+    )
+    parser.add_argument(
+        "--freeze-during-answers",
+        action="store_true",
+        help=(
+            "Stop compacting once the closing questions begin, so every closing answer is "
+            "written from the same history. By default a strategy keeps firing through them: "
+            "the first scope is answered from a fuller context than the last, the combined "
+            "question from the most compacted context of the run, and a fact can be evicted "
+            "while it is being scored. Run both ways to size that; the default is the honest "
+            "one, because a deployed agent compacts while it answers."
         ),
     )
     parser.add_argument("--no-temperature", action="store_true", help="Omit temperature for models that reject it.")
@@ -649,6 +661,14 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
             "control. This measures the service, not compaction.",
             flush=True,
         )
+    if args.freeze_during_answers:
+        # Printed because the flag is invisible in the table apart from a FROZEN count, and
+        # these logs are archived and read back months later against runs made the other way.
+        print(
+            "note: compaction is frozen for the closing questions, so every answer is written "
+            "from one history. This is a control, not how a deployed agent behaves.",
+            flush=True,
+        )
     summarizer_client: Any = None
     if args.summarizer_provider is not None:
         sum_provider, sum_model = parse_provider_selector(args.summarizer_provider)
@@ -705,6 +725,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
                 narration=args.narration,
                 retrieval_guidance=not args.no_retrieval_guidance,
                 fact_placement=args.fact_placement,
+                freeze_during_answers=args.freeze_during_answers,
             )
             repeats.append(outcome)
             if chosen_scenario is None:

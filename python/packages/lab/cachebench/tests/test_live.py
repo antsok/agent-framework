@@ -55,6 +55,7 @@ from agent_framework_lab_cachebench._advisor import ModelPricing
 from agent_framework_lab_cachebench._live import (
     RETRIEVAL_GUIDANCE,
     RecallGate,
+    _turn_text,
     make_recall_tool,
     make_scope_tools,
     resolve_instructions,
@@ -539,8 +540,19 @@ def test_every_argument_the_runner_reads_is_defined() -> None:
         "tokenizer",
         "show_answers",
         "dry_run",
+        "freeze_during_answers",
     ):
         assert hasattr(args, name), f"--{name.replace('_', '-')} is read by the runner but not declared"
+
+
+def test_the_help_can_actually_be_printed() -> None:
+    """``--help`` must not raise, which is not free: argparse %-formats every help string.
+
+    A bare ``%`` in help text makes the whole parser unprintable, and nothing else notices --
+    parsing works, runs work, and the CLI is simply undiscoverable. Two help strings quoting
+    percentages had broken it, found only because someone ran ``--help``.
+    """
+    assert "--freeze-during-answers" in build_parser().format_help()
 
 
 # endregion
@@ -1035,6 +1047,80 @@ async def test_run_live_drives_every_turn_and_counts_tool_use() -> None:
     assert outcome.tool_calls_made == 1
     assert outcome.input_tokens > 0
     assert len(outcome.calls) > outcome.turns_total, "the tool round trip should add a call"
+
+
+async def _questions_the_strategy_saw(monkeypatch: pytest.MonkeyPatch, *, freeze: bool) -> tuple[bool, LiveOutcome]:
+    """Run the scenario with a strategy that only reports whether it saw the first question.
+
+    Returns:
+        Whether the first closing question ever reached the strategy, and the outcome.
+    """
+    scenario = build_live_scenario(salt="freeze", filler_turns=3, filler_tokens=50, tool_turns=6)
+    turns = scenario.transcript.turns
+    question = _turn_text(turns[len(turns) - scenario.answer_turn_count].request)
+    saw: list[bool] = []
+
+    async def counting(messages: list[Message]) -> bool:
+        saw.append(
+            any(
+                question in (getattr(content, "text", "") or "") for message in messages for content in message.contents
+            )
+        )
+        return False
+
+    monkeypatch.setattr("agent_framework_lab_cachebench._live.build_strategy", lambda name, options: counting)
+    outcome = await run_live(
+        ProviderRuntime(client=StubChatClient(tool_turns=(1,)), model="stub"),
+        strategy_name="truncation",
+        options=_options(),
+        scenario=scenario,
+        freeze_during_answers=freeze,
+    )
+
+    assert outcome.error is None
+    assert saw, "the strategy was never called at all, so the test proves nothing"
+    return any(saw), outcome
+
+
+async def test_compaction_runs_during_the_closing_questions_by_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The default must keep compacting while the model answers.
+
+    This is the behaviour ``--freeze-during-answers`` exists to be compared against, and it is
+    easy to assume away: the closing turns look like scoring rather than conversation, but they
+    go through the same ``agent.run()`` loop, so the strategy fires before each of them. If
+    this ever stopped being true the frozen arm would be measuring nothing.
+    """
+    reached, outcome = await _questions_the_strategy_saw(monkeypatch, freeze=False)
+
+    assert reached, "the strategy never saw the closing question, so it was not running during it"
+    assert not any(note.startswith("FROZEN:") for note in outcome.strategy_notes)
+
+
+async def test_freezing_keeps_the_closing_questions_out_of_the_strategy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Frozen, the strategy must not run once the questions begin.
+
+    The freeze is applied on the way *into* the first closing turn. Applying it after that turn
+    would let the strategy act on the very context the freeze exists to hold still, which is a
+    failure that would still leave the later turns frozen and so look like it worked.
+    """
+    reached, outcome = await _questions_the_strategy_saw(monkeypatch, freeze=True)
+
+    assert not reached, "the strategy ran on the first closing question despite the freeze"
+    # Reported, not merely done: a frozen run that suppressed nothing means the strategy had
+    # already stopped firing on its own, and the arms are then not comparable.
+    assert any(note.startswith("FROZEN:") for note in outcome.strategy_notes)
+
+
+async def test_a_frozen_run_still_answers_every_closing_question(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Freezing changes what the model sees, not how many questions it is asked.
+
+    Skipping the strategy by skipping the turn would raise every accuracy figure for free.
+    """
+    _, outcome = await _questions_the_strategy_saw(monkeypatch, freeze=True)
+
+    assert outcome.turns_completed == outcome.turns_total
+    scenario = build_live_scenario(salt="freeze", filler_turns=3, filler_tokens=50, tool_turns=6)
+    assert len(outcome.answers) == scenario.answer_turn_count
 
 
 # endregion

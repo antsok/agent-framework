@@ -48,11 +48,21 @@ of them controlled:
 Eviction is demonstrably still active at the end: `tool_summary_anchored` ends at 95 messages
 against a peak of 123, `truncation` at 82 against 121.
 
-**Proposed next step:** a `--freeze-during-answers` flag skipping the strategy once
-`index >= first_answer_turn` in `run_live`, then both arms at 272K. This is a live candidate
-for the accuracy spread (39-78 points) that nothing else has explained — if eviction fires
-mid-sequence in some repeats and not others, that is exactly the bimodality observed.
-Estimated EUR 10.
+**`--freeze-during-answers` now exists** (`_live.py`: `CompactionSwitch`, `_FreezableStrategy`;
+`run_live(freeze_during_answers=...)`). It freezes on the way *into* the first closing turn,
+and it pauses `ToolResultRecallMiddleware` as well — a record forced mid-answer would move the
+history the answers are scored against, which is the thing being held still. The wrapper is
+installed only when the flag is passed, so an ordinary run is byte-identical to every run
+already recorded. Suppressed calls surface as a `FROZEN:<n>` note in the flags column.
+
+Validated live in run 21 (120,000, one repeat, EUR 0.93): 16 compaction calls suppressed per
+strategy, so the closing turns really were still compacting, and `tool_summary_anchored` still
+reaches `REC:1 / RECFORCED:1` before the freeze. That run measures the mechanism only.
+
+**Still to do:** both arms at 272K, which is what actually answers the question. This is a
+live candidate for the accuracy spread (39-78 points) that nothing else has explained — if
+eviction fires mid-sequence in some repeats and not others, that is exactly the bimodality
+observed. Estimated EUR 10.
 
 ## 4. The finding the report does not yet state correctly
 
