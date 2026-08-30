@@ -144,6 +144,17 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--filler-tool-turns",
+        type=int,
+        default=0,
+        help=(
+            "Extra tool calls whose results carry no codes. Adds calls and bulk without "
+            "adding anything to remember, which is what separates 'the agent made more calls' "
+            "from 'the agent has more values to recall'. Without them, raising --tool-turns "
+            "moves both at once and no comparison across it is honest."
+        ),
+    )
+    parser.add_argument(
         "--tool-turns",
         type=int,
         default=6,
@@ -570,6 +581,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
         filler_turns=args.filler_turns,
         filler_tokens=1,
         tool_turns=args.tool_turns,
+        filler_tool_turns=args.filler_tool_turns,
     )
     planted_groups = len(probe.tool_lookups)
     # Every tool-oriented strategy keeps the last `retained` groups verbatim. With no more
@@ -588,6 +600,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
             filler_tokens=args.filler_tokens,
             tool_turns=args.tool_turns,
             markers_per_tool=args.markers_per_tool,
+            filler_tool_turns=args.filler_tool_turns,
             narration=args.narration,
             subset_questions=not args.sweeping_question,
         )
@@ -668,6 +681,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
                 filler_tokens=args.filler_tokens,
                 tool_turns=args.tool_turns,
                 markers_per_tool=args.markers_per_tool,
+                filler_tool_turns=args.filler_tool_turns,
                 narration=args.narration,
                 subset_questions=not args.sweeping_question,
             )
