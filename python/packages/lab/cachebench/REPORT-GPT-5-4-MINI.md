@@ -14,20 +14,31 @@ control too unstable to rank against. **Nothing here should be averaged with it.
 
 ## 1. The headline
 
-**Which compaction strategy is right depends on how large your tool results are, and the
-answer inverts between 8,000 and 25,000 tokens.**
-
-| tool result size | best strategy | facts kept | cost vs none |
-| ---: | --- | ---: | ---: |
-| 8,000 tokens | **record the values, drop the originals** | 53/53 | **-9%** |
-| 16,000 tokens | *(crossing over)* | 46/53 vs 53/53 | -8% vs +20% |
-| 25,200 tokens | **keep a fixed proportion of each result** | 53/53 | +10% |
+**Which compaction strategy is right depends on the shape of your tool results, and the answer
+inverts between small and large ones.**
 
 Asking the model to extract the values and then dropping what it extracted is the cheapest
-approach at every size — and its accuracy falls apart as results grow, because the model
-writes a thinner record when there is more to record. Keeping a fixed *proportion* of each
-result does the opposite: it is poor when the proportion is small and near-perfect when the
-window is large enough to make it generous.
+approach at every size measured — 9 to 18% below not compacting — and its accuracy falls apart
+as results grow. Keeping a fixed *proportion* of each result does the opposite: poor when the
+proportion is small, near-perfect once the window makes it generous.
+
+**Two things break the record, and both had to be measured separately:**
+
+| bearing results | codes each | per result | facts the record preserved |
+| ---: | ---: | ---: | ---: |
+| 6 | 8 | 25,200 | 18 of 53 |
+| 6 | 8 | **8,000** | **36 of 53** |
+| 16 | **3** | 8,000 | **53 of 53** |
+
+Shrinking each result from 25,200 to 8,000 tokens, with the code count held at eight, lifts
+recall from 18 to 36. Dropping the values per result from eight to three lifts it from 36 to
+53. **Neither variable alone accounts for the collapse**, and total tool output is not the
+driver at all — the last two rows carry a comparable total to the first and score very
+differently.
+
+So the rule is about how much a single extraction call is asked to do: **how much text it must
+read, and how many values it must pull out of that text.** Section 7 proposes the design that
+follows from it.
 
 ## 2. What was measured
 
@@ -99,13 +110,21 @@ This is the model's **real input limit** — see finding 5.
 
 ### Finding 1 — A model-written record degrades with the bulk it must summarise
 
+Across the window series, holding the scenario shape fixed and scaling only sizes:
+
 | tool result size | facts the record preserved |
 | ---: | ---: |
 | 8,000 | 53 of 53 |
 | 16,000 | 46 of 53 |
 | 25,200 | **18 of 53** |
 
-Monotonic, and far larger than the spread. The mechanism is not at fault — the middleware
+Monotonic, and far larger than the spread. Two later runs separate the causes: at 8,000-token
+results still carrying eight codes each the record recovers only to 36 of 53, and it reaches
+53 of 53 only when the codes per result also drop to three. **Both the length of a result and
+the number of values buried in it degrade the record**, and the window series alone could not
+tell them apart because it moved them together.
+
+The mechanism is not at fault — the middleware
 forced the call and the forced call produced a record in every run (`REC:1, FORCED:2,
 RECFORCED:1`). What degrades is the *content*: asked to extract every value from more
 material, the model writes a shorter list.
@@ -172,8 +191,9 @@ limit, not the advertised window.
 
 ## 6. What to do
 
-**Size your tool results before choosing a strategy** -- provisionally, since section 7
-notes the measurement cannot yet separate per-result size from total tool output. Below roughly 10,000 tokens per result,
+**Size your tool results before choosing a strategy, and count the values in them.** Both
+the length of a result and the number of values buried in it decide whether a record can be
+trusted. Below roughly 10,000 tokens per result,
 having the model record the values and dropping the originals is both cheapest and lossless.
 Above that, keep a fixed proportion of each result and do not trust a summary.
 
@@ -214,11 +234,13 @@ Design notes for whoever builds it:
 - **It gives the fallback something better to do.** With per-result records, a thin or missing
   record loses that result rather than everything the band held.
 
-**And settle which axis the degradation follows.** The window series scaled per-result size
-and total tool output together -- 8,000 to 25,200 and 48,000 to 151,200 -- so the two cannot
-be told apart from it. Sixteen 8,000-token results reaching a comparable total is what
-separates them, and until that is done the recommendation in section 6 is provisional on this
-point.
+**Settle whether compaction should keep running while the model is being scored.** It
+currently does: the closing turns go through the same loop as every other turn, so the first
+scope is asked from a fuller context than the last, and the combined question -- the hardest --
+is asked from the most compacted context of all. Each closing answer also lists codes, putting
+them back into history, which offsets that in an uncontrolled direction. A
+`--freeze-during-answers` flag and both arms at 272,000 would settle it, and it is a live
+candidate for the 39-78 point accuracy spread that nothing else has explained.
 
 ## 8. Limits
 

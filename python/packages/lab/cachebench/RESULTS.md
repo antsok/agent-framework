@@ -51,6 +51,8 @@ between runs, which moves both axes for reasons unrelated to compaction. Runs ma
 | 16 | `gpt-5.4-mini` | Azure Foundry | Responses | yes | `tool_summary_anchored` (60K, unsupported) |
 | 17 | `gpt-5.4-mini` | Azure Foundry | Responses | yes | *(120K, crossover)* |
 | 18 | `gpt-5.4-mini` | Azure Foundry | Responses | yes | `none` (272K, `anchored` best on accuracy) |
+| 19 | `gpt-5.4-mini` | Azure Foundry | Responses | yes | *(16 calls, confounded -- kept as a series point)* |
+| 20 | `gpt-5.4-mini` | Azure Foundry | Responses | yes | `none` (16 calls, controlled with code-free asides) |
 
 Runs 7 to 9 are a **separate experiment** on the harness agent at wider windows, with 53
 planted facts instead of 17. The shared configuration above does not describe them; their own
@@ -949,6 +951,52 @@ reported 18 records for one, because the pre-call check never sees the history.
 **Unpinned runs cannot be measured at this scale.** Five repeats of the uncompacted control
 varied **102%** in cost, and the strategy row gathered eight fewer facts than the control.
 Three repeats had shown 3%, which was luck.
+
+---
+
+## Runs 19 and 20 — what actually breaks the record
+
+Run 18 showed `tool_summary_anchored` preserving 18 of 53 facts where run 16 preserved all 53,
+and the window series had scaled per-result size and total tool output together. Two more runs
+separate them.
+
+**Run 19 raised the call count the cheap way and is confounded.** Sixteen tool calls of 8,000
+tokens, but `--markers-per-tool` dropped from 8 to 3 to hold the fact count at 53. That changed
+the number of calls, the size of each result *and* the codes each result carried. The record
+scored 53/53 -- but three variables had moved.
+
+**Run 20 is the honest form.** `--filler-tool-turns` adds lookups whose results carry no codes,
+so six code-bearing results with eight codes each stay exactly as they were and ten code-free
+asides supply the extra calls and bulk. Closing questions skip the code-free scopes, so the
+denominator is unchanged at 53.
+
+| run | bearing results | codes each | per result | asides | material | facts recalled |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 18 | 6 | 8 | 25,200 | 0 | 228,400 | 18/53 |
+| **20** | **6** | **8** | **8,000** | **10** | 220,690 | **36/53** |
+| 19 | 16 | 3 | 8,000 | 0 | 221,130 | 53/53 |
+
+**Both variables matter.** Shrinking each result from 25,200 to 8,000 with the code count held
+at eight lifts recall from 18 to 36. Dropping the codes per result from eight to three lifts it
+from 36 to 53. Neither alone accounts for the collapse, and **total tool output is ruled out**
+as the driver: runs 19 and 20 carry comparable totals to run 18 and score very differently.
+
+### Run 20 — 272,000-token window, 16 calls, six of them bearing
+
+| strategy | cost | vs none | +- | hit% | peak | facts | correct | c+- | all |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| tool_summary_anchored | $0.5930 | **-18%** | 4% | 94% | 162,881 | 36/53 | 61% | 39pp | 60% |
+| **none** | $0.7244 | — | 5% | 97% | 228,556 | 53/53 | 100% | 15pp | 100% |
+| truncation | $0.7387 | +2% | 14% | 94% | 207,822 | 21/53 | 41% | 2pp | 40% |
+| anchored | $0.7701 | +6% | 2% | 94% | 209,030 | 43/53 | 78% | 4pp | 77% |
+| tool_result | $0.8720 | +20% | 7% | 83% | 141,348 | 53/53 | 100% | 52pp | 100% |
+
+`tool_result` reaching 53/53 here is worth noting: with sixteen groups it keeps the last four
+verbatim and head-truncates the rest, which happens to suit this shape. Its poor showings
+elsewhere were about result size rather than the mechanism.
+
+A longer session is expensive whatever the strategy: sixteen calls mean 61-62 model calls
+against 29, and every row costs more than the equivalent six-call run.
 
 ---
 
