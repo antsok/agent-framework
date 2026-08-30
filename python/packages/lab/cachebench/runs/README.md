@@ -28,6 +28,13 @@ they are copied, not recomputed.
 | `run-17-120k-final.*` | 17 | 120,000 | harness | 53 | 1 h 10 min |
 | `run-18-272k-final.*` | 18 | 272,000 | harness | 53 | 2 h |
 | `run-x-unpinned-void.*` | — | 60,000 | harness | 53 | **void** |
+| `run-19-16calls-confounded.*` | 19 | 272,000 | harness | 53 | 2 h |
+| `run-20-16calls-controlled.*` | 20 | 272,000 | harness | 53 | 1 h 45 min |
+
+Run 19 raised the call count to sixteen by dropping the codes per result from eight to three,
+so it changed call count, result size and code count together. Run 20 is the honest form: six
+code-bearing results unchanged, plus ten code-free asides supplying the extra calls. Read
+together with run 18 they separate the two things that break a model-written record.
 
 Runs 16 to 18 are the final configuration: five repeats, pinned, values spread on labelled
 lines, a 12,000-token reply cap, per-scope scoring and a combined closing question. They are
