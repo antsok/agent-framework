@@ -1038,6 +1038,92 @@ undiscoverable. Now covered by a test that formats the help.
 
 ---
 
+## Run 22 — the freeze hypothesis, refuted, and a worse problem behind it
+
+Paired arms at 272,000, three repeats each, run back to back. The profile is run 18's exactly
+apart from the flag and the dropped `tool_result` row, so **the unfrozen arm is also a
+replication of run 18**. That turned out to matter more than the flag.
+
+### Unfrozen (the default, and a replication of run 18)
+
+| strategy | cost | vs none | +- | facts | correct | c+- | all |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| tool_summary_anchored | $0.4402 | -3% | 9% | 53/53 | 100% | **0pp** | 100% |
+| truncation | $0.4472 | -1% | 2% | 30/53 | 17% | 59pp | 17% |
+| **none** | $0.4527 | — | 1% | 53/53 | 100% | 26pp | 100% |
+| anchored | $0.4873 | +8% | 11% | 39/53 | 70% | 13pp | 72% |
+
+### Frozen
+
+| strategy | cost | vs none | +- | facts | correct | c+- | all |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| tool_summary_anchored | $0.4055 | -10% | 4% | 18/53 | 35% | 13pp | 34% |
+| truncation | $0.4434 | -2% | 1% | 30/53 | 30% | 59pp | 30% |
+| **none** | $0.4505 | — | 1% | 53/53 | 81% | 19pp | 85% |
+| anchored | $0.4911 | +9% | 2% | 44/53 | 54% | 37pp | 57% |
+
+### The hypothesis is dead
+
+Freezing was supposed to narrow the correctness spread, on the theory that eviction firing
+mid-sequence in some repeats and not others produced the bimodality. **It narrowed nothing.**
+
+| strategy | c+- unfrozen | c+- frozen |
+| --- | ---: | ---: |
+| none | 26pp | 19pp |
+| truncation | 59pp | 59pp |
+| anchored | 13pp | **37pp** |
+| tool_summary_anchored | 0pp | **13pp** |
+
+Two rows widened, one was unchanged, and the control moved less than its own repeat range.
+Mid-answer eviction is not the source of the spread. The confound is real — compaction does
+keep firing through the closing turns, 16 suppressed calls per strategy prove it — but it is
+not what makes the accuracy figure jump.
+
+### The finding that displaces it: the same configuration does not reproduce
+
+The unfrozen arm and run 18 are the same command. They disagree by more than the freeze does:
+
+| strategy | run 18 (5 repeats) | run 22 unfrozen (3 repeats) | run 22 frozen |
+| --- | ---: | ---: | ---: |
+| tool_summary_anchored | 18/53, **31%** | 53/53, **100%** | 18/53, 35% |
+| truncation | 30/53, **56%** | 30/53, **17%** | 30/53, 30% |
+| none | 53/53, **76%** | 53/53, **100%** | 53/53, 81% |
+| anchored | 53/53, **100%** | 39/53, **70%** | 44/53, 54% |
+
+Every row moves, in both directions, by up to 69 points. Note where the frozen arm lands: on
+`tool_summary_anchored` it matches run 18 — 18/53 facts, ~1/3 correct, -10% cost — while the
+*unfrozen* arm is the outlier on all three. If the freeze were driving this, the frozen arm
+should be the one that differs from run 18. It is not.
+
+**So `c+-` understates the real error bar.** It measures repeats inside one invocation, and
+those repeats are correlated: `tool_summary_anchored` scored 100% three times running in one
+arm and ~35% three times running in the other. Whatever selects the mode operates at the level
+of the invocation, not the repeat, so adding repeats inside a run cannot see it and cannot
+average it out.
+
+The proximate mechanism is visible in the output column. `tool_summary_anchored` emitted
+**10,941** output tokens in the unfrozen arm against 4,603 in run 18 and 4,873 frozen. The
+model either enumerates exhaustively or it answers tersely, and it does so for a whole
+invocation at a time. `survived` then follows the answers rather than leading them: each
+closing reply puts its codes back into the history as assistant text, so an arm that enumerates
+well scores 53/53 on facts *because* it answered well, not the other way round.
+
+### What this costs the rest of this file
+
+Any accuracy claim at 272,000 resting on a single invocation is unsafe, which includes the
+per-run tables in runs 16 to 20 and the crossover they describe. The cost columns are not
+affected: `+-` runs 1-11% and the cost ordering is stable across all three runs. The CLI's own
+guard caught this in the unfrozen arm — *"ACCURACY NOT RANKABLE: repeats of the uncompacted
+control varied by 26 points"* — and it should be believed.
+
+Fixing it needs invocation-level repetition, not repeat-level: the same command run N times and
+the correctness distribution taken across invocations. At about EUR 5 per 272,000 invocation
+that is expensive, and cheaper windows may not exhibit the same bimodality.
+
+Cost: about $10.9, roughly EUR 10, for both arms.
+
+---
+
 ## Models that could not be measured
 
 **`google/gemini-3.7-flash` — excluded.** Its turns fail partway through a conversation

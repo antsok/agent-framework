@@ -10,6 +10,15 @@ This is a single-model deep dive and it stands apart from the six-model work in
 [`REPORT.md`](REPORT.md), which used a different agent, 17 planted facts instead of 53, and a
 control too unstable to rank against. **Nothing here should be averaged with it.**
 
+> **Correction pending, added after run 22.** Every accuracy figure below comes from a single
+> invocation of its configuration, and run 22 showed that is not enough. Re-running run 18's
+> exact command moved every row by up to 69 points, in both directions, because the model
+> settles into either exhaustive enumeration or terse answering for a whole invocation at a
+> time. The `c+-` column cannot see this: it measures repeats *within* an invocation, and those
+> repeats are correlated. **Read the accuracy claims here as one sample each, not as measured
+> values.** The cost claims are unaffected — cost spread runs 1-11% and the ordering held
+> across all three 272,000-token runs. See [`RESULTS.md`](RESULTS.md), run 22.
+
 ---
 
 ## 1. The headline
