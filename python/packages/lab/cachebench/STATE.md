@@ -102,9 +102,11 @@ two spreads are separate columns: `seed+-` between seeds (compaction's reliabili
 one column: seeding plus every probe, summed. `out` has its own column so a total driven by
 verbosity is visible.
 
-**Unverified against a live model.** Everything above was built and validated offline against
-the stub. No live run has been made under the new design, so the numbers in `RESULTS.md` and
-`REPORT-GPT-5-4-MINI.md` all predate it and none of them are disqualification-checked.
+**Verified live in run 24** (60K/0.86, five strategies): fill landed at +0.0%, probes hit 94-96%
+cache, no disqualifications and no drift. The numbers in `RESULTS.md` and
+`REPORT-GPT-5-4-MINI.md` all predate the rebuild, so none of them are disqualification-checked
+and their `all` column is inflated -- the combined question used to be asked last, after seven
+answers had re-listed the codes into the context it read.
 
 ## 3b. Stage 1 sweep — paused mid-run, how to resume
 
