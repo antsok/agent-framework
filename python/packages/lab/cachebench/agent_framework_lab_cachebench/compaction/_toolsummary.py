@@ -12,6 +12,11 @@ Truncation preserves *positions*. What is needed is something that preserves *in
 after which the bulk it came from is genuinely redundant and can be dropped outright rather
 than sampled.
 
+**Four parts, and all four are the design rather than harness around it.** The strategy
+cannot work without a tool for the model to call (:func:`make_recall_tool`) or without
+something keeping that tool inert when nobody asked for a record (:class:`RecallGate`), so
+both live here beside the middleware that arms them.
+
 **Two phases, split across a middleware and this strategy.**
 
 1. :class:`ToolResultRecallMiddleware` forces ``tool_choice`` to the recall tool on one call.
@@ -44,14 +49,25 @@ could not pin ``tool_choice`` -- and unpinned, the uncompacted control's cost va
 between identical runs while the strategy's row gathered eight fewer facts than the control.
 Forcing the call keeps every other turn pinned, so the comparison stays measurable, and makes
 phase 1 deterministic rather than a compliance rate to be estimated.
+
+**How the record is bounded, and why it takes two numbers rather than one.** The instructions
+ask for everything, so the record wants to grow. A ``max_tokens`` cap does not answer that: a
+model does not plan to fit a cap, it writes until it is cut, and on a *tool call* the cut
+lands inside the arguments JSON, so a cap set where the record should end produces no record
+instead of a shorter one. The two bounds therefore do different jobs.
+:data:`DEFAULT_RECORD_TARGET_TOKENS` is stated in the tool's own description, which is the
+only channel that reaches the model before it writes, since the middleware sends no message.
+:data:`DEFAULT_RECORD_MAX_TOKENS` is set on the forced call alone and is roughly twice the
+target, so it bounds the bill without ever being the thing that stops the writing. When it is
+the thing that stops it, ``ToolResultRecallMiddleware.records_truncated`` says so.
 """
 
 from __future__ import annotations
 
 from collections.abc import Awaitable, Callable, Sequence
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
-from agent_framework import ChatContext, ChatMiddleware, Message
+from agent_framework import ChatContext, ChatMiddleware, ChatResponse, Message
 from agent_framework._compaction import (
     EXCLUDED_KEY,
     annotate_message_groups,
@@ -67,11 +83,15 @@ if TYPE_CHECKING:
     from agent_framework import CompactionStrategy, TokenizerProtocol
 
 __all__ = [
+    "DEFAULT_RECORD_MAX_TOKENS",
+    "DEFAULT_RECORD_TARGET_TOKENS",
     "RECALL_TOOL_NAME",
     "RECORD_MARKER",
+    "RecallGate",
     "ToolResultAnchoredSummarizationCompactionStrategy",
     "ToolResultRecallMiddleware",
     "find_record_index",
+    "make_recall_tool",
 ]
 
 #: Name of the tool the agent must call. The strategy looks for this name in the history, so
@@ -90,6 +110,54 @@ RECALL_TOOL_NAME: Final[str] = "recall_earlier_tool_results"
 #: has armed it, and a result without this marker is not a record. The model may still call
 #: it; calling it uninvited simply achieves nothing.
 RECORD_MARKER: Final[str] = "[recorded by compaction]"
+
+#: Hard ceiling put on the forced call's response, so a runaway record cannot cost more than
+#: intended.
+#:
+#: A cap is not a plan. The model does not shorten to fit one; it writes until it is cut, and
+#: on a *tool call* the cut lands inside the arguments JSON, so what a too-low cap produces is
+#: not a shorter record but no record at all. That makes this the wrong instrument for sizing
+#: the record and the right one for bounding the bill, and the two numbers here are set
+#: accordingly: this is roughly twice :data:`DEFAULT_RECORD_TARGET_TOKENS`, so a model that
+#: overshoots its stated target still finishes inside the cap.
+DEFAULT_RECORD_MAX_TOKENS: Final[int] = 4_000
+
+#: Record length stated in the tool's own description, which is the only channel that makes
+#: the model aim for a size.
+#:
+#: The middleware deliberately sends no message -- an appended instruction would be persisted
+#: into the caller's own conversation -- so the description and the ``values`` parameter are
+#: the entire prompt, and a target has to be baked into them at construction.
+DEFAULT_RECORD_TARGET_TOKENS: Final[int] = 2_000
+
+#: What the recall tool is for, as the model reads it.
+#:
+#: Deliberately not "identifiers and values": that phrasing was fitted to one benchmark's hex
+#: codes and would drop prose, findings and conclusions from any real tool output, which is
+#: most of what a real tool returns.
+RECALL_DESCRIPTION: Final[str] = (
+    "Record what must survive from earlier tool results, so it remains available after those "
+    "results are removed from the conversation to save space."
+)
+
+#: What to put in the ``values`` argument, as the model reads it.
+#:
+#: The four instructions after the opening sentence partition the content, so that nothing in
+#: a tool result falls outside all of them: values that cannot be reconstructed are quoted,
+#: findings and conclusions are kept as stated, a summary the tool already wrote is carried
+#: over rather than rewritten, and whatever remains is summarised. Removing one of the four
+#: opens a gap that the model is then free to drop silently, which is the failure this whole
+#: strategy exists to avoid.
+RECALL_VALUES_DESCRIPTION: Final[str] = (
+    "Everything from earlier tool results, grouped by the tool that produced it, so that "
+    "nothing is lost without being noticed. Quote verbatim any value that cannot be "
+    "reconstructed or guessed: identifiers, codes, names, numbers, paths, URLs, versions, "
+    "states, timestamps. Keep findings and conclusions as they were stated, shortening only "
+    "those long enough to need it. Carry over any summary a tool already produced as it "
+    "stands, rather than rewriting it. Summarise the remaining content briefly, so its "
+    "substance is still represented. Record only what the results actually contained, and "
+    "where you must choose, keep exactness over brevity."
+)
 
 
 def find_record_index(messages: Sequence[Message]) -> int | None:
@@ -130,6 +198,99 @@ def find_record_index(messages: Sequence[Message]) -> int | None:
             if RECORD_MARKER in result:
                 newest = index
     return newest
+
+
+class RecallGate:
+    """One-shot permission for the recall tool.
+
+    The tool cannot be hidden from the model. It has to be registered with the agent for the
+    function-invocation layer to execute it, and that layer wraps the middleware layer, so a
+    tool supplied per call reaches the model but never the executor: measured, the model's
+    call simply went unanswered. A registered tool is advertised on every request, and this
+    one was called uninvited on the unpinned follow-up call in every run.
+
+    Permission is therefore separated from visibility. The middleware arms the gate
+    immediately before the request it forces, and the tool records only while armed. An
+    uninvited call still runs and still answers honestly; it just produces no record.
+    """
+
+    def __init__(self) -> None:
+        """Start disarmed, so nothing is recorded until something asks for it."""
+        self._armed = False
+
+    def arm(self) -> None:
+        """Permit the next call to record."""
+        self._armed = True
+
+    def take(self) -> bool:
+        """Consume the permission.
+
+        Returns:
+            True if this call may record. One-shot: a single arming cannot licence a second
+            record, which would drop results the first had already replaced.
+        """
+        armed, self._armed = self._armed, False
+        return armed
+
+
+def make_recall_tool(
+    gate: RecallGate | None = None,
+    *,
+    target_tokens: int | None = DEFAULT_RECORD_TARGET_TOKENS,
+) -> Callable[[str], str]:
+    """Build the tool :class:`ToolResultAnchoredSummarizationCompactionStrategy` anchors on.
+
+    It echoes what it is given straight back. That is the whole point: the value of the call
+    is not what the tool computes but that the model's own recollection ends up in the
+    transcript as a tool result, which the provider issued and which survives strategies that
+    shed assistant prose.
+
+    The docstring built here is the entire prompt for the record. The middleware sends no
+    message -- one appended there would carry no history provider's source tag, so per-call
+    persistence would store it and an instruction of ours would surface in the conversation
+    the application replays to its user -- so the description, the ``values`` guidance and the
+    stated target are the only three things steering what the model writes.
+
+    Args:
+        gate: Permission to record. Without one the tool always records, which is only right
+            for a caller driving it deliberately.
+
+    Keyword Args:
+        target_tokens: Length to aim the record at, stated in the description. ``None`` states
+            none. This is the only bound that makes the model *plan* to fit: the middleware's
+            cap merely truncates, and truncating a tool call destroys the arguments JSON
+            rather than shortening the record it carries.
+
+    Returns:
+        A callable named :data:`RECALL_TOOL_NAME`.
+    """
+
+    def tool(values: str) -> str:
+        if gate is not None and not gate.take():
+            return "Not required right now: nothing was recorded, and no results have been removed."
+        return (
+            f"{RECORD_MARKER} Earlier tool results may have been shortened, and this is their "
+            "compaction record. Treat values in this record as authoritative for the tool it "
+            "names, and treat information as absent only if it appears nowhere, including "
+            f"here.\n{values}"
+        )
+
+    tool.__name__ = RECALL_TOOL_NAME
+    sections = [RECALL_DESCRIPTION]
+    if target_tokens is not None:
+        # Spent where it is needed, rather than as a flat budget: the four clauses below are
+        # not equally compressible, and a bare length would be read as licence to shorten the
+        # verbatim half, which is the half that cannot be rewritten from anything else.
+        sections.append(
+            f"Aim for about {target_tokens:,} tokens in total, spent on what cannot be "
+            "reconstructed rather than on the summaries."
+        )
+    sections.append(f"Args:\n    values: {RECALL_VALUES_DESCRIPTION}")
+    # The whole docstring becomes the tool description: the framework builds the parameter
+    # schema from the annotations and does not lift the Args section into it, so the guidance
+    # for ``values`` only reaches the model as part of this text.
+    tool.__doc__ = "\n\n".join(sections)
+    return tool
 
 
 class ToolResultAnchoredSummarizationCompactionStrategy:
@@ -282,6 +443,10 @@ class ToolResultRecallMiddleware(ChatMiddleware):
         trigger_fraction: Fraction of the ceiling at which the record is forced. Comfortably
             below the strategy's fallback threshold, because the decision is made one call
             late -- see :meth:`process`.
+        record_max_tokens: Cap put on the forced call's response, and on no other call.
+            ``None`` leaves whatever cap the run already sets, which is what this did before
+            the parameter existed: the record inherited the cap sized for an ordinary answer,
+            so a record asked to summarise everything had no bound of its own at all.
     """
 
     def __init__(
@@ -291,6 +456,7 @@ class ToolResultRecallMiddleware(ChatMiddleware):
         tokenizer: TokenizerProtocol,
         arm: Callable[[], None],
         trigger_fraction: float = 0.6,
+        record_max_tokens: int | None = DEFAULT_RECORD_MAX_TOKENS,
     ) -> None:
         """Validate and store the configuration.
 
@@ -301,14 +467,18 @@ class ToolResultRecallMiddleware(ChatMiddleware):
             raise ValueError("max_input_tokens must be positive.")
         if not 0.0 < trigger_fraction <= 1.0:
             raise ValueError("trigger_fraction must be in (0.0, 1.0].")
+        if record_max_tokens is not None and record_max_tokens <= 0:
+            raise ValueError("record_max_tokens must be positive, or None to leave the run's cap in place.")
         self.max_input_tokens = max_input_tokens
         self.tokenizer = tokenizer
         self.arm = arm
         self.trigger_fraction = trigger_fraction
+        self.record_max_tokens = record_max_tokens
         self._force_next = False
         self._forced = 0
         self._records_forced = 0
         self._records_volunteered = 0
+        self._records_truncated = 0
         self._seen_record = False
 
     def forget_pending(self) -> None:
@@ -344,6 +514,20 @@ class ToolResultRecallMiddleware(ChatMiddleware):
         """
         return self._records_volunteered
 
+    @property
+    def records_truncated(self) -> int:
+        """Forced calls the provider cut short because they reached the cap.
+
+        Non-zero means a record may be partial, and a partial record is the one failure mode
+        this design does not otherwise show. A tool call cut mid-arguments produces no record
+        at all, which is loud: the strategy waits, falls back and flags ``FALLBACK``. A call
+        cut just after a closing brace, or repaired by the provider, yields a record that
+        parses and looks complete -- and the strategy then drops every tool group behind
+        something that covers only part of them, scoring the loss as compaction damage rather
+        than as an instrument that ran out of room.
+        """
+        return self._records_truncated
+
     async def process(self, context: ChatContext, call_next: Callable[[], Awaitable[None]]) -> None:
         """Force the recall tool when the last call showed the conversation is large enough.
 
@@ -367,14 +551,31 @@ class ToolResultRecallMiddleware(ChatMiddleware):
             # rather than adding to it, so offering it here also hides everything else, which
             # is harmless on a call whose only purpose is to make this one call.
             self.arm()
-            context.options = {
+            options: dict[str, Any] = {
                 **dict(context.options or {}),
                 "tool_choice": {"mode": "required", "required_function_name": RECALL_TOOL_NAME},
             }
+            if self.record_max_tokens is not None:
+                # Only here. The run's own cap is sized for an answer to the user and every
+                # other call needs it; this one call writes a record instructed to summarise
+                # everything, which is the only place a runaway is affordable at all.
+                options["max_tokens"] = self.record_max_tokens
+            context.options = options
             self._force_next = False
             self._forced += 1
 
         await call_next()
+
+        if forced_this_call and isinstance(context.result, ChatResponse) and context.result.finish_reason == "length":
+            # Taken from the provider rather than inferred from the record's length: the model
+            # is free to write a short record, and a short record is not a cut one. This is
+            # the provider saying it stopped generating because it hit the ceiling, which is
+            # the only statement that separates the two.
+            #
+            # A streamed result is not a ChatResponse yet, so it is not read here. Recording is
+            # a one-shot forced call whose answer nobody displays, so there is nothing to
+            # stream it for -- but a caller that did would lose this count, not get a wrong one.
+            self._records_truncated += 1
 
         messages = list(context.messages)
         if not messages:

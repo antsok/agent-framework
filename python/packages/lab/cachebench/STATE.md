@@ -292,12 +292,61 @@ adds code-free lookups so call count varies without varying what must be remembe
 
 ## 5. Strategies built here
 
+**They live in a subpackage now, so they can be lifted out whole.**
+`agent_framework_lab_cachebench/compaction/` holds all four, plus `make_recall_tool` and
+`RecallGate`, which moved out of `_live.py`: the tool the model calls and the gate keeping it
+inert when unasked are part of the design, not benchmark scaffolding. Their tests moved with
+them to `tests/compaction/`. Nothing in the subpackage imports from the lab, and
+`tests/compaction/test_boundary.py` walks every module's imports with `ast` and fails if that
+changes -- including relative forms, deferred imports and `TYPE_CHECKING` ones, none of which a
+text search would find. `_strategies.py` stays in the lab: it is the `--strategies` registry,
+which is benchmark configuration. `compaction/__init__.py` carries what an extractor needs --
+the dependency on the private `agent_framework._compaction`, PR #7912 having just rewritten it,
+and the rename out of the `agent_framework` namespace that has to happen before publication.
+
 | row | file | mechanism |
 | --- | --- | --- |
-| `anchored` | `_anchored.py` | fixed head and tail verbatim, band between shortened to a share of the ceiling, decisions from position alone so they never change on a later turn |
+| `anchored` | `compaction/_anchored.py` | fixed head and tail verbatim, band between shortened to a share of the ceiling, decisions from position alone so they never change on a later turn |
 | `anchored_no_assistant` | same | as above, forbidden from shedding assistant prose |
 | `anchored_min_gain` | same | as `anchored`, but projects the reduction before mutating anything and declines any collapse worth less than 23% of the included prompt. **Built and tested offline, never run live.** The floor is the break-even `R > B / (1 + T*c/(p-c))` at the 60K/0.86 cell, where `anchored` removed 263 tokens and cost 11% more than the control. Declines are counted and surface as `NOGAIN:<n>` in the flags column, so "never fired" and "fired to no effect" are distinguishable |
-| `tool_summary_anchored` | `_toolsummary.py` | `ToolResultRecallMiddleware` forces one recall tool call; the strategy drops every tool group in front of the resulting record |
+| `tool_summary_anchored` | `compaction/_toolsummary.py` | `ToolResultRecallMiddleware` forces one recall tool call; the strategy drops every tool group in front of the resulting record |
+
+### 5a. The recall prompt was rewritten, and the record now has two bounds
+
+**Not yet run live.** Built and tested offline; every cell measured so far used the old prompt
+and the inherited cap, so a re-run is needed before any of it can be compared with what is in
+`RESULTS.md`.
+
+**The prompt was overfitted.** The tool asked only for "identifiers and values seen in earlier
+tool results", which is this scenario's hex codes and nothing else -- prose, findings and
+conclusions from a real tool result all fell outside it and would be dropped silently. The
+description and the `values` text are the *entire* prompt, deliberately: the middleware sends
+no message, because an appended one carries no history provider's source tag and would be
+persisted into the user's own conversation. The replacement partitions the content in four, so
+nothing falls outside all of them -- quote what cannot be reconstructed, keep findings and
+conclusions as stated, carry over a summary the tool already wrote, summarise the rest -- and
+resolves ties towards exactness. A parametrised test pins each clause, because a lost one is a
+class of content dropped with nothing else in the design to notice.
+
+**Asking for everything makes the record longer, so it needed bounding twice.** A `max_tokens`
+cap does not make a model plan to fit; it writes until it is cut, and on a *tool call* the cut
+lands inside the arguments JSON, so a cap set where the record should end produces no record
+rather than a shorter one.
+
+| | flag | default | what it does |
+| --- | --- | --- | --- |
+| cap | `--record-max-tokens` | 4,000 | `max_tokens` on the forced call **only**. It used to inherit `--answer-max-tokens` (12,000 in the runs), so the one call asked to summarise everything was the one call with no bound of its own. `0` restores that |
+| target | `--record-target-tokens` | 2,000 | stated in the tool description at construction (`make_recall_tool(target_tokens=...)`), which is the only channel that reaches the model before it writes. `0` states none |
+
+Roughly 2:1 on purpose, so overshooting the target is not the same event as being cut.
+
+**Truncation is detected and reported.** A record that stopped early while still parsing was
+the one silent failure left: the strategy anchors on it and drops every tool group behind
+something that covers only part of them, and the loss is then scored as compaction damage.
+`ToolResultRecallMiddleware.records_truncated` counts forced calls the provider ended with
+`finish_reason == "length"` -- its own statement, rather than an inference from the record's
+size -- and it surfaces as `TRUNCATED:<n>` in the flags column through the same duck-typed
+`_strategy_notes` path as `REC`, `FORCED` and `FALLBACK`.
 
 **Not built, and the best next idea:** summarise each tool result *individually* rather than
 all in one call. Design notes are in `REPORT-GPT-5-4-MINI.md` section 7. The three-point result
@@ -341,10 +390,11 @@ Each of these produced a plausible wrong number first.
 - Branch `python-lab-cachebench`, ~40 commits ahead of `origin`, **not pushed**. Pushing needs
   its own go-ahead.
 - `dev/` is untracked Git-LFS junk. **Never stage it.**
-- 266 tests pass; ruff, pyright and bandit are clean. The measurement rebuild, the per-seed
+- 301 tests pass; ruff, pyright and bandit are clean. The measurement rebuild, the per-seed
   results file (`_records.py`, `--results-jsonl`, `--from-jsonl`) and the rate-limit retry are
-  all committed now; the snapshot-and-restore fix to that retry (§3b) and the
-  `acc1`/`acc2`/`--combined-repeats` work (§3) are **uncommitted**.
+  all committed now; the snapshot-and-restore fix to that retry (§3b), the
+  `acc1`/`acc2`/`--combined-repeats` work (§3) and the `compaction/` subpackage with the
+  rewritten recall prompt and its two bounds (§5, §5a) are **uncommitted**.
 - `REPORT.md` and `ARTICLE.md` still describe only the six-model cross-provider work and
   predate everything from run 7 onward. They do not mention the 272,000 input limit, the
   crossover, or either new strategy.

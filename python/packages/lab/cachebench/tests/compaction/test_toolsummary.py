@@ -1,10 +1,15 @@
 # Copyright (c) Microsoft. All rights reserved.
 
-"""Tests for the record-then-drop strategy.
+"""Tests for the record-then-drop strategy, its tool, and the middleware that forces it.
 
 Two phases, and the tests separate them: phase 1 must ask without inserting anything into the
 cached prefix, and phase 2 must act only on a record the *provider* issued -- never on one the
 client invented, which is unsafe on routes that track tool calls server-side.
+
+The tool's own text is tested here as well, because the middleware sends no message: the
+description and the ``values`` guidance are the entire prompt for the record, so a clause
+lost from them is a class of content silently dropped, with nothing else in the design to
+catch it.
 """
 
 from __future__ import annotations
@@ -14,12 +19,16 @@ from typing import Any
 import pytest
 from agent_framework import CharacterEstimatorTokenizer, Message
 from agent_framework._compaction import project_included_messages
-from agent_framework_lab_cachebench._toolsummary import (
+from agent_framework_lab_cachebench.compaction._toolsummary import (
+    DEFAULT_RECORD_MAX_TOKENS,
+    DEFAULT_RECORD_TARGET_TOKENS,
     RECALL_TOOL_NAME,
     RECORD_MARKER,
+    RecallGate,
     ToolResultAnchoredSummarizationCompactionStrategy,
     ToolResultRecallMiddleware,
     find_record_index,
+    make_recall_tool,
 )
 
 TOKENIZER = CharacterEstimatorTokenizer()
@@ -197,21 +206,31 @@ async def test_a_record_that_does_not_free_enough_still_falls_back() -> None:
 class _Recorder:
     """Stands in for the rest of the pipeline, capturing the options a call went out with."""
 
-    def __init__(self, messages: list[Message]) -> None:
+    def __init__(self, messages: list[Message], finish_reason: str | None = None) -> None:
         self.messages = messages
+        self.finish_reason = finish_reason
         self.seen: list[dict[str, Any]] = []
 
     async def __call__(self) -> None:
+        from agent_framework import ChatResponse
+
         self.seen.append(dict(self.context.options or {}))
         self.context.messages = self.messages
+        # What the provider says about why it stopped, which is the only thing that separates
+        # a record the model chose to keep short from one it was cut off in the middle of.
+        self.context.result = ChatResponse(
+            messages=Message(role="assistant", contents=["ok"]), finish_reason=self.finish_reason
+        )
 
 
-async def _run(middleware: ToolResultRecallMiddleware, messages: list[Message]) -> dict[str, Any]:
+async def _run(
+    middleware: ToolResultRecallMiddleware, messages: list[Message], finish_reason: str | None = None
+) -> dict[str, Any]:
     """Drive one middleware pass and return the options the call went out with."""
     from agent_framework import ChatContext
 
     context = ChatContext(client=None, messages=[Message(role="user", contents=["q"])], options={"temperature": 0})
-    recorder = _Recorder(messages)
+    recorder = _Recorder(messages, finish_reason)
     recorder.context = context
     await middleware.process(context, recorder)
     return recorder.seen[0]
@@ -313,3 +332,223 @@ async def test_a_single_record_is_attributed_exactly_once() -> None:
         await _run(middleware, with_record)
 
     assert middleware.records_forced + middleware.records_volunteered == 1
+
+
+# region the tool, which is the whole of the prompt
+
+
+def _recall_exchange(result: str) -> list[Message]:
+    """Return a matched recall call and result carrying ``result``."""
+    return [
+        Message(
+            role="assistant",
+            contents=[{"type": "function_call", "call_id": "r", "name": RECALL_TOOL_NAME, "arguments": "{}"}],
+        ),
+        Message(role="tool", contents=[{"type": "function_result", "call_id": "r", "result": result}]),
+    ]
+
+
+def test_the_recall_tool_records_only_while_armed() -> None:
+    """The tool cannot be hidden, so it has to be inert instead.
+
+    MAF requires it to be registered with the agent: the function-invocation layer wraps the
+    middleware layer and builds its tool map first, so a tool supplied through per-call
+    options reaches the model but never the executor, and the model's call goes unanswered.
+    A registered tool is advertised on every request, and this one was called uninvited on
+    every unpinned follow-up call. Permission is therefore separated from visibility.
+    """
+    gate = RecallGate()
+    tool = make_recall_tool(gate)
+
+    uninvited = tool("AA-1")
+    gate.arm()
+    armed = tool("AA-1")
+    reused = tool("AA-2")
+
+    assert RECORD_MARKER not in uninvited
+    assert RECORD_MARKER in armed
+    assert RECORD_MARKER not in reused, "one arming cannot licence a second record"
+    # The scorer must agree, or an uninvited call would look like a record and the strategy
+    # would drop results that nothing had preserved.
+    assert find_record_index(_recall_exchange(uninvited)) is None
+    assert find_record_index(_recall_exchange(armed)) is not None
+
+
+@pytest.mark.parametrize(
+    "clause",
+    [
+        pytest.param("grouped by the tool that produced it", id="attribution"),
+        pytest.param("Quote verbatim any value that cannot be reconstructed or guessed", id="unreconstructable"),
+        pytest.param("Keep findings and conclusions as they were stated", id="findings"),
+        pytest.param("Carry over any summary a tool already produced as it stands", id="existing-summary"),
+        pytest.param("Summarise the remaining content briefly", id="the-rest"),
+        pytest.param("keep exactness over brevity", id="tie-break"),
+    ],
+)
+def test_the_tool_asks_for_every_kind_of_content_a_result_can_hold(clause: str) -> None:
+    """The four instructions partition the content, and a missing one is a silent hole.
+
+    The description and the ``values`` guidance are the entire prompt: the middleware sends no
+    message, because one appended there would be persisted into the caller's own conversation.
+    So whatever these do not name is content the model may drop without anything noticing, and
+    the earlier text named only "identifiers and values seen in earlier tool results" -- fitted
+    to this benchmark's hex codes, and blind to the prose, findings and conclusions that are
+    most of what a real tool returns.
+    """
+    assert clause in (make_recall_tool().__doc__ or "")
+
+
+def test_the_tool_says_what_the_call_is_for_before_it_says_what_to_pass() -> None:
+    """The description has to stand on its own: a model reading the schema sees it first."""
+    doc = make_recall_tool().__doc__ or ""
+
+    assert doc.startswith("Record what must survive from earlier tool results")
+    assert "after those results are removed from the conversation to save space" in doc
+
+
+def test_the_target_length_is_stated_when_one_is_given() -> None:
+    """The description is the only channel that makes the model plan for a size.
+
+    A ``max_tokens`` cap cannot do it: a model does not shorten to fit one, it writes until it
+    is cut, and on a tool call the cut lands inside the arguments JSON -- so a cap set where
+    the record should end produces no record rather than a shorter one. The middleware cannot
+    send an instruction message either, which leaves this text.
+    """
+    stated = make_recall_tool(target_tokens=1_500).__doc__ or ""
+    default = make_recall_tool().__doc__ or ""
+    silent = make_recall_tool(target_tokens=None).__doc__ or ""
+
+    assert "1,500 tokens" in stated
+    assert f"{DEFAULT_RECORD_TARGET_TOKENS:,} tokens" in default
+    assert "Aim for about" not in silent
+    # Stating a length must not cost a clause: the two bounds are independent instructions.
+    assert "Quote verbatim any value that cannot be reconstructed or guessed" in silent
+
+
+def test_the_target_sits_well_under_the_cap() -> None:
+    """Overshooting the stated length must not be the same event as being cut off.
+
+    They measure different things -- one is what the model aims for, the other is what the
+    provider enforces -- and a default pair close together would make every slightly long
+    record a truncated one.
+    """
+    assert DEFAULT_RECORD_TARGET_TOKENS < DEFAULT_RECORD_MAX_TOKENS
+
+
+# region bounding the record
+
+
+async def test_the_cap_is_set_on_the_forced_call_and_on_no_other() -> None:
+    """Every other call needs the run's own cap; only this one is asked to write a record.
+
+    Left to inherit ``--answer-max-tokens``, the single call instructed to summarise every
+    earlier tool result is the one call in the run with no bound of its own.
+    """
+    _armings.clear()
+    middleware = ToolResultRecallMiddleware(
+        max_input_tokens=1_000,
+        tokenizer=TOKENIZER,
+        arm=lambda: _armings.append(1),
+        trigger_fraction=0.1,
+        record_max_tokens=777,
+    )
+    big = _conversation(tool_turns=8)
+    recorded = _conversation(tool_turns=8, record="CODE-0")
+
+    calls = [
+        # Nothing is known about the history before the first call, so it cannot be forced.
+        await _run(middleware, big),
+        await _run(middleware, big),
+        # The middleware keeps asking until a record exists, so the record has to arrive
+        # before an unforced call can happen again.
+        await _run(middleware, recorded),
+        await _run(middleware, recorded),
+    ]
+
+    assert [("tool_choice" in options) for options in calls] == [False, True, True, False]
+    for options in calls:
+        assert ("max_tokens" in options) is ("tool_choice" in options), options
+        assert options.get("max_tokens", 777) == 777
+        # The call's other options survive: this replaces the option set, it does not discard it.
+        assert options["temperature"] == 0
+
+
+async def test_no_cap_leaves_the_runs_own_ceiling_in_place() -> None:
+    """None has to mean what it meant before the parameter existed, or a run cannot opt out."""
+    _armings.clear()
+    middleware = ToolResultRecallMiddleware(
+        max_input_tokens=1_000,
+        tokenizer=TOKENIZER,
+        arm=lambda: _armings.append(1),
+        trigger_fraction=0.1,
+        record_max_tokens=None,
+    )
+    big = _conversation(tool_turns=8)
+
+    await _run(middleware, big)
+    forced = await _run(middleware, big)
+
+    assert "tool_choice" in forced
+    assert "max_tokens" not in forced
+
+
+def test_a_cap_that_cannot_hold_a_record_is_refused() -> None:
+    """Zero is not "no cap": it is a call that can produce nothing, which None expresses."""
+    with pytest.raises(ValueError, match="record_max_tokens"):
+        ToolResultRecallMiddleware(max_input_tokens=1_000, tokenizer=TOKENIZER, arm=lambda: None, record_max_tokens=0)
+
+
+async def test_a_record_cut_short_is_counted_rather_than_read_as_complete() -> None:
+    """A partial record is the one failure this design does not otherwise show.
+
+    A tool call cut mid-arguments produces no record at all, which is loud: the strategy waits,
+    falls back, and the row carries FALLBACK. A call cut just after a closing brace yields a
+    record that parses and looks whole -- and the strategy then drops every tool group behind
+    something covering only part of them, so the loss is scored as compaction damage.
+    """
+    _armings.clear()
+    middleware = ToolResultRecallMiddleware(
+        max_input_tokens=1_000, tokenizer=TOKENIZER, arm=lambda: _armings.append(1), trigger_fraction=0.1
+    )
+    big = _conversation(tool_turns=8)
+
+    await _run(middleware, big, finish_reason="tool_calls")
+    await _run(middleware, big, finish_reason="length")
+
+    assert middleware.forced_calls == 1
+    assert middleware.records_truncated == 1
+
+
+async def test_only_the_forced_call_can_truncate_a_record() -> None:
+    """Every call in a long run can hit its own ceiling; only one of them writes the record.
+
+    Counting the rest would put an ordinary long answer in the column that says the record is
+    partial, which is the reading the count exists to prevent.
+    """
+    _armings.clear()
+    middleware = ToolResultRecallMiddleware(
+        max_input_tokens=1_000, tokenizer=TOKENIZER, arm=lambda: _armings.append(1), trigger_fraction=0.1
+    )
+    big = _conversation(tool_turns=8)
+
+    # Every call stops at its ceiling, forced or not.
+    for _ in range(4):
+        await _run(middleware, big, finish_reason="length")
+
+    assert middleware.forced_calls > 0
+    assert middleware.records_truncated == middleware.forced_calls
+
+
+async def test_a_forced_call_that_finished_is_not_reported_as_truncated() -> None:
+    """A short record is a choice the model is allowed to make, and is not a cut one."""
+    _armings.clear()
+    middleware = ToolResultRecallMiddleware(
+        max_input_tokens=1_000, tokenizer=TOKENIZER, arm=lambda: _armings.append(1), trigger_fraction=0.1
+    )
+    big = _conversation(tool_turns=8)
+
+    await _run(middleware, big, finish_reason="stop")
+    await _run(middleware, big, finish_reason="tool_calls")
+
+    assert middleware.forced_calls == 1
+    assert middleware.records_truncated == 0

@@ -19,7 +19,7 @@ from agent_framework._compaction import (
     included_token_count,
     project_included_messages,
 )
-from agent_framework_lab_cachebench._anchored import (
+from agent_framework_lab_cachebench.compaction._anchored import (
     DEFAULT_MIN_GAIN_FRACTION,
     REMOVAL_MARKER,
     AnchoredCompactionStrategy,

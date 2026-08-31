@@ -36,6 +36,7 @@ from ._records import CellParams, SeedRecord, append_seed_record, group_by_cell,
 from ._strategies import StrategyOptions, build_strategy, needs_summarizer, strategy_names
 from ._summary import DEFAULT_MIN_CORRECTNESS, JointOutcome, JointVerdict, recommend, relative_correctness
 from ._tokenizers import TOKENIZER_NAMES, build_tokenizer
+from .compaction import DEFAULT_RECORD_MAX_TOKENS, DEFAULT_RECORD_TARGET_TOKENS
 
 if TYPE_CHECKING:
     from agent_framework._clients import SupportsChatGetResponse
@@ -280,6 +281,32 @@ def build_parser() -> argparse.ArgumentParser:
             "truncated answer is scored as lost facts and reads as compaction damage. Raising "
             "it is nearly free, since replies average ~150 tokens and models do not pad to "
             "the cap."
+        ),
+    )
+    parser.add_argument(
+        "--record-max-tokens",
+        type=int,
+        default=DEFAULT_RECORD_MAX_TOKENS,
+        help=(
+            "Cap sent as max_tokens on the one call tool_summary_anchored forces, and on no "
+            "other. Without it that call inherits --answer-max-tokens, so the one call asked "
+            "to summarise every earlier tool result is the one call with no bound of its own. "
+            "It bounds the bill and nothing else: a model does not plan to fit a cap, and a "
+            "tool call cut at one loses its arguments rather than shortening them, which is "
+            "why the size is asked for by --record-target-tokens instead. 0 to leave "
+            "--answer-max-tokens in place."
+        ),
+    )
+    parser.add_argument(
+        "--record-target-tokens",
+        type=int,
+        default=DEFAULT_RECORD_TARGET_TOKENS,
+        help=(
+            "Length the recall tool's own description asks the record to aim for. The only "
+            "channel that makes the model plan for a size: the middleware sends no message, "
+            "because one appended there would be persisted into the user's own conversation. "
+            "Keep it comfortably under --record-max-tokens, so overshooting the target is not "
+            "the same event as being cut. 0 to state no target."
         ),
     )
     parser.add_argument(
@@ -1072,7 +1099,10 @@ _LEGEND: Final[tuple[str, ...]] = (
     "            carrying this overstates what reached the model. S<n> summarizer failures,",
     "            <n>/<n>t turns",
     "            completed, REC:<n> records the strategy found, FORCED:<n> times it asked for",
-    "            one, FALLBACK:<n> times it gave up and compacted another way. A row with",
+    "            one, TRUNCATED:<n> forced calls the provider cut at --record-max-tokens, so",
+    "            that record may cover only part of what it was asked to preserve and the",
+    "            missing part is scored as compaction damage. FALLBACK:<n> times it gave up",
+    "            and compacted another way. A row with",
     "            FALLBACK is measuring that other strategy, not the one named. NO:<opt> the",
     "            provider rejected that option so it was dropped; a run that dropped",
     "            tool_choice chose its own tool calls and is not comparable with one that did",
@@ -1668,6 +1698,11 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
                 fact_placement=args.fact_placement,
                 probe_repeats=args.probe_repeats,
                 combined_repeats=args.combined_repeats,
+                # 0 means "no bound of my own", for both: the cap falls back to the run's
+                # --answer-max-tokens and the description states no target. Same convention as
+                # --fill 0, which hands sizing back to the manual flags.
+                record_max_tokens=args.record_max_tokens or None,
+                record_target_tokens=args.record_target_tokens or None,
             )
             # Scored, written and reported here rather than when the cell ends. A seed that
             # has been paid for is durable the moment it exists, and the line that follows is

@@ -444,3 +444,22 @@ poe test-cachebench
 ```
 
 Tests are offline; the provider call is stubbed.
+
+### The strategies are a subpackage, not part of the lab
+
+`agent_framework_lab_cachebench/compaction/` holds the strategies written here — `anchored`,
+`anchored_no_assistant`, `anchored_min_gain` and `tool_summary_anchored`, together with the
+recall tool and the gate that last one cannot work without. They are the thing this benchmark
+measures rather than a part of it, and they are meant to leave for a repository of their own,
+so the subpackage is kept liftable: nothing in it imports from the benchmark, its tests sit
+beside it in `tests/compaction/`, and `tests/compaction/test_boundary.py` walks every module's
+imports and fails if either stops being true.
+
+`_strategies.py` stays in the lab. It is the registry that puts ours and the framework's behind
+one `--strategies` name each and builds them all from one `StrategyOptions`, which is benchmark
+configuration rather than a strategy.
+
+The subpackage depends on `agent_framework._compaction`, which is **private API** and which
+upstream PR [#7912](https://github.com/microsoft/agent-framework/pull/7912) has just rewritten.
+`compaction/__init__.py` says what that means for whoever extracts it, and what has to be
+renamed before anything is published from there.
