@@ -66,10 +66,8 @@ from agent_framework_lab_cachebench._live import (
     RATE_LIMIT_MAX_DELAY,
     RATE_LIMIT_MAX_WAIT,
     RETRIEVAL_GUIDANCE,
-    RecallGate,
     _strategy_notes,
     _turn_text,
-    make_recall_tool,
     make_scope_tools,
     probe_count,
     resolve_instructions,
@@ -102,10 +100,13 @@ from agent_framework_lab_cachebench._records import (
     group_by_cell,
     read_seed_records,
 )
-from agent_framework_lab_cachebench._toolsummary import (
+from agent_framework_lab_cachebench.compaction import (
+    DEFAULT_RECORD_MAX_TOKENS,
+    DEFAULT_RECORD_TARGET_TOKENS,
     RECALL_TOOL_NAME,
-    RECORD_MARKER,
-    find_record_index,
+    ToolResultAnchoredSummarizationCompactionStrategy,
+    ToolResultRecallMiddleware,
+    make_recall_tool,
 )
 
 TOKENIZER = CharacterEstimatorTokenizer()
@@ -179,6 +180,7 @@ class StubChatClient(FunctionInvocationLayer[Any], ChatMiddlewareLayer[Any], Bas
         usage: UsageDetails | None = None,
         reply: str = "a reply with some body to it",
         obey_tool_choice: bool = False,
+        finish_reason: str | None = None,
         **kwargs: Any,
     ) -> None:
         """Create the stub.
@@ -193,6 +195,9 @@ class StubChatClient(FunctionInvocationLayer[Any], ChatMiddlewareLayer[Any], Bas
                 Off by default so that the tests written against ``tool_turns`` keep choosing
                 which calls use a tool; on, the conversation actually gathers every tool result,
                 which is the only way an offline test can see how large a real run gets.
+            finish_reason: Reported on every response. ``"length"`` is a provider saying it
+                stopped because the answer reached its cap, which is the only signal that
+                separates a record the model kept short from one it was cut off in.
         """
         super().__init__(**kwargs)
         self.seen: list[int] = []
@@ -201,6 +206,7 @@ class StubChatClient(FunctionInvocationLayer[Any], ChatMiddlewareLayer[Any], Bas
         self.usage = usage
         self.reply = reply
         self.obey_tool_choice = obey_tool_choice
+        self.finish_reason = finish_reason
 
     def _inner_get_response(
         self,
@@ -233,6 +239,7 @@ class StubChatClient(FunctionInvocationLayer[Any], ChatMiddlewareLayer[Any], Bas
             return ChatResponse(
                 messages=Message(role="assistant", contents=contents),
                 usage_details=self.usage,
+                finish_reason=self.finish_reason,
             )
 
         return _go()
@@ -2557,13 +2564,6 @@ async def test_the_recall_middleware_forces_the_call_inside_the_real_pipeline() 
     that: what matters is whether the middleware sees the loaded history at the point it
     looks, and the history is only assembled inside the pipeline.
     """
-    from agent_framework_lab_cachebench._live import build_live_agent
-    from agent_framework_lab_cachebench._toolsummary import (
-        RECALL_TOOL_NAME,
-        ToolResultAnchoredSummarizationCompactionStrategy,
-        ToolResultRecallMiddleware,
-    )
-
     ceiling = 2_000
     strategy = ToolResultAnchoredSummarizationCompactionStrategy(
         max_input_tokens=ceiling, tokenizer=TOKENIZER, trigger_fraction=0.1, fallback_fraction=0.99
@@ -2595,6 +2595,97 @@ async def test_the_recall_middleware_forces_the_call_inside_the_real_pipeline() 
     assert any(
         options["tool_choice"] == {"mode": "required", "required_function_name": RECALL_TOOL_NAME} for options in forced
     ), "tool_choice never reached the client"
+
+
+async def test_a_truncated_record_reaches_the_flags_column() -> None:
+    """A record cut at the cap must be visible in the table, or it reads as a complete one.
+
+    Every other failure of this strategy is loud. No record at all leaves the row carrying
+    FALLBACK, and a tool call cut mid-arguments produces exactly that, because the arguments
+    JSON is where the cut lands. A record cut after a closing brace is the quiet one: it
+    parses, the strategy anchors on it and drops every tool group behind it, and the part that
+    never got written is scored as compaction damage. So the count has to travel all the way
+    to the column a reader actually looks at.
+
+    Driven through the real pipeline rather than the middleware alone, because what is being
+    checked is that the middleware reads the provider's finish reason off a response the
+    pipeline produced -- the same thing that made a standalone-verified middleware report a
+    record found with zero forced calls in a live run.
+    """
+    ceiling = 2_000
+    strategy = ToolResultAnchoredSummarizationCompactionStrategy(
+        max_input_tokens=ceiling, tokenizer=TOKENIZER, trigger_fraction=0.1, fallback_fraction=0.99
+    )
+    middleware = ToolResultRecallMiddleware(
+        max_input_tokens=ceiling,
+        tokenizer=TOKENIZER,
+        arm=lambda: None,
+        trigger_fraction=0.1,
+        record_max_tokens=512,
+    )
+    client = StubChatClient(finish_reason="length")
+    agent = build_live_agent(
+        cast(Any, SimpleNamespace(client=client, model="stub", options={})),
+        kind="harness",
+        strategy=strategy,
+        tokenizer=TOKENIZER,
+        tools=[make_recall_tool()],
+        recorder=UsageRecorder(),
+        extra_middleware=[middleware],
+        max_context_window_tokens=ceiling,
+        max_output_tokens=100,
+    )
+    session = agent.create_session()
+    for _ in range(4):
+        await agent.run("x" * 4_000, session=session)
+
+    assert middleware.forced_calls > 0, "the middleware never fired inside the pipeline"
+    assert middleware.records_truncated == middleware.forced_calls
+    # The cap rides on the pinned call and on no other, so the rest of the run keeps the
+    # ceiling sized for an answer to the user. Pinned means a named function: every call in
+    # this run carries a tool_choice, and all but these say "auto".
+    caps = {
+        isinstance(options.get("tool_choice"), Mapping): options.get("max_tokens") for options in client.options_seen
+    }
+    assert caps[True] == 512
+    assert caps[False] == 100, "the run's own ceiling, unchanged by the record's"
+
+    notes = _strategy_notes(middleware)
+    assert f"TRUNCATED:{middleware.forced_calls}" in notes
+
+    outcome, scenario = await _probed(StubChatClient(usage=UsageDetails(input_token_count=1_000)), repeats=1)
+    record = replace(_record(outcome, scenario, strategy="tool_summary_anchored"), strategy_notes=notes)
+    cell = _aggregate("tool_summary_anchored", [record])
+
+    assert f"TRUNCATED:{middleware.forced_calls}" in _flags(cell, None)
+    assert f"TRUNCATED:{middleware.forced_calls}" in _render(None, [cell], set(), show_answers=False)
+
+
+async def test_a_run_that_was_not_cut_short_says_nothing() -> None:
+    """A clean run must add no flag, or the column stops meaning anything."""
+    ceiling = 2_000
+    middleware = ToolResultRecallMiddleware(
+        max_input_tokens=ceiling, tokenizer=TOKENIZER, arm=lambda: None, trigger_fraction=0.1
+    )
+    agent = build_live_agent(
+        cast(Any, SimpleNamespace(client=StubChatClient(), model="stub", options={})),
+        kind="harness",
+        strategy=ToolResultAnchoredSummarizationCompactionStrategy(
+            max_input_tokens=ceiling, tokenizer=TOKENIZER, trigger_fraction=0.1, fallback_fraction=0.99
+        ),
+        tokenizer=TOKENIZER,
+        tools=[make_recall_tool()],
+        recorder=UsageRecorder(),
+        extra_middleware=[middleware],
+        max_context_window_tokens=ceiling,
+        max_output_tokens=100,
+    )
+    session = agent.create_session()
+    for _ in range(4):
+        await agent.run("x" * 4_000, session=session)
+
+    assert middleware.forced_calls > 0
+    assert not [note for note in _strategy_notes(middleware) if note.startswith("TRUNCATED")]
 
 
 async def test_a_pinned_tool_choice_does_not_survive_the_follow_up_call() -> None:
@@ -2630,43 +2721,6 @@ async def test_a_pinned_tool_choice_does_not_survive_the_follow_up_call() -> Non
     assert len(pins) >= 2, "a tool turn makes at least two calls"
     assert pins[0] is not None, "the first call carries the pin"
     assert pins[1] is None, "the follow-up call does not, so the model may call anything"
-
-
-def test_the_recall_tool_records_only_while_armed() -> None:
-    """The tool cannot be hidden, so it has to be inert instead.
-
-    MAF requires it to be registered with the harness: FunctionInvocationLayer wraps the
-    middleware layer and builds its tool map first, so a tool supplied through per-call
-    options reaches the model but never the executor, and the model's call goes unanswered.
-    A registered tool is advertised on every request, and this one was called uninvited on
-    every unpinned follow-up call. Permission is therefore separated from visibility.
-    """
-    gate = RecallGate()
-    tool = make_recall_tool(gate)
-
-    uninvited = tool("AA-1")
-    gate.arm()
-    armed = tool("AA-1")
-    reused = tool("AA-2")
-
-    assert RECORD_MARKER not in uninvited
-    assert RECORD_MARKER in armed
-    assert RECORD_MARKER not in reused, "one arming cannot licence a second record"
-    # The scorer must agree, or an uninvited call would look like a record and the strategy
-    # would drop results that nothing had preserved.
-    assert find_record_index(_recall_exchange(uninvited)) is None
-    assert find_record_index(_recall_exchange(armed)) is not None
-
-
-def _recall_exchange(result: str) -> list[Message]:
-    """Return a matched recall call and result carrying ``result``."""
-    return [
-        Message(
-            role="assistant",
-            contents=[{"type": "function_call", "call_id": "r", "name": RECALL_TOOL_NAME, "arguments": "{}"}],
-        ),
-        Message(role="tool", contents=[{"type": "function_result", "call_id": "r", "result": result}]),
-    ]
 
 
 # region the results file
@@ -2764,6 +2818,39 @@ async def test_every_finished_seed_is_on_disk_before_the_cell_is(
         ("truncation", 1),
     ], "a completed seed was still in memory when the process died"
     assert all(record.correctness_samples for record in records), "records were written before they were scored"
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        pytest.param([], (DEFAULT_RECORD_MAX_TOKENS, DEFAULT_RECORD_TARGET_TOKENS), id="defaults"),
+        pytest.param(["--record-max-tokens", "900", "--record-target-tokens", "450"], (900, 450), id="set"),
+        pytest.param(["--record-max-tokens", "0", "--record-target-tokens", "0"], (None, None), id="zero-is-unset"),
+    ],
+)
+async def test_the_record_bounds_reach_the_run(
+    monkeypatch: pytest.MonkeyPatch, argv: list[str], expected: tuple[int | None, int | None]
+) -> None:
+    """Both numbers have to be settable per run, since neither has a knowable right value yet.
+
+    Zero means "no bound of my own" for each: the cap falls back to --answer-max-tokens and
+    the description states no target. The same convention as --fill 0, which hands sizing back
+    to the manual flags.
+    """
+    _stub_provider(monkeypatch)
+    live = run_live
+    seen: list[tuple[int | None, int | None]] = []
+
+    async def capturing(*args: Any, **kwargs: Any) -> LiveOutcome:
+        seen.append((kwargs["record_max_tokens"], kwargs["record_target_tokens"]))
+        return await live(*args, **kwargs)
+
+    monkeypatch.setattr("agent_framework_lab_cachebench._live_cli.run_live", capturing)
+
+    await run_live_comparison(build_parser().parse_args(_live_argv(*argv)))
+
+    assert seen
+    assert set(seen) == {expected}
 
 
 async def test_the_combined_count_reaches_the_record_and_the_cell_it_identifies(

@@ -1,9 +1,16 @@
 # Copyright (c) Microsoft. All rights reserved.
 
-"""The compaction strategies under test.
+"""The registry of strategies under test, and the parameters they are all built from.
 
-Each entry wraps a strategy from ``agent_framework`` so that the benchmark can select it
-by name. ``context_window`` is the strategy the agent harness installs by default when
+This is benchmark configuration rather than a strategy of its own, which is why it stays in
+the lab while :mod:`.compaction` -- the strategies written here, meant to leave for a
+repository of their own -- does not. What it does is put ours and the framework's behind one
+name each, so ``--strategies`` selects between them on equal terms and every row is built
+from the same :class:`StrategyOptions`.
+
+Each entry wraps a strategy from ``agent_framework`` or from :mod:`.compaction` so that the
+benchmark can select it by name. ``context_window`` is the strategy the agent harness
+installs by default when
 ``create_harness_agent`` is given ``max_context_window_tokens``; the ``*_aggressive`` and
 ``*_lazy`` variants are the same strategy at different trigger thresholds and exist to
 answer whether compacting early and often costs more in lost cache reads than it saves in
@@ -40,8 +47,11 @@ from agent_framework import (
     TruncationStrategy,
 )
 
-from ._anchored import AnchoredCompactionStrategy, MinimumGainAnchoredCompactionStrategy
-from ._toolsummary import ToolResultAnchoredSummarizationCompactionStrategy
+from .compaction import (
+    AnchoredCompactionStrategy,
+    MinimumGainAnchoredCompactionStrategy,
+    ToolResultAnchoredSummarizationCompactionStrategy,
+)
 
 if TYPE_CHECKING:
     from agent_framework._clients import SupportsChatGetResponse
@@ -167,7 +177,7 @@ def _build_anchored(options: StrategyOptions) -> CompactionStrategy:
     Its ceiling is the full input budget rather than a fraction of it, because unlike the
     threshold-driven strategies it does not need headroom to trip: it collapses the middle
     band from the first turn there is one, and only removes groups outright when shortening
-    has not brought the prompt under. See :mod:`._anchored`.
+    has not brought the prompt under. See :mod:`.compaction._anchored`.
     """
     return AnchoredCompactionStrategy(
         max_input_tokens=options.input_budget_tokens,
@@ -201,7 +211,7 @@ def _build_anchored_min_gain(options: StrategyOptions) -> CompactionStrategy:
     repay the prompt cache they invalidate is worth the information they would have removed.
     At the 60,000-token cell the unfloored row removed 263 tokens and cost 11% more than the
     uncompacted control, so the pair is a direct test of whether a strategy is better off
-    doing nothing than doing a little. See :mod:`._anchored`.
+    doing nothing than doing a little. See :mod:`.compaction._anchored`.
     """
     return MinimumGainAnchoredCompactionStrategy(
         max_input_tokens=options.input_budget_tokens,

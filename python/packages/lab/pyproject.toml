@@ -102,6 +102,7 @@ packages = [
   "agent_framework_lab_tau2",
   "agent_framework_lab_common",
   "agent_framework_lab_cachebench",
+  "agent_framework_lab_cachebench.compaction",
   "agent_framework.lab.gaia",
   "agent_framework.lab.lightning",
   "agent_framework.lab.tau2",
