@@ -1,0 +1,386 @@
+# Copyright (c) Microsoft. All rights reserved.
+
+"""Per-seed results, written when they exist rather than when the cell ends.
+
+A cell is five strategies times ``--repeats`` seeds and runs for hours, and its table was
+printed only once every one of them had finished. So anything that stopped the process in
+between threw away every seed that had already completed and already been paid for. That is
+not hypothetical: the 60,000/0.86 cell ran all fifteen strategy-seeds over three and a half
+hours, died before printing, and left nothing at all behind.
+
+A seed's result is therefore appended here the moment it is scored. The record carries the
+scored numbers rather than a reference to the objects that produced them, because those
+objects are what the run cannot keep: the scenario is salted per seed and dies with the
+process, and re-scoring later would need it. What is stored is what the table reads, so a
+table rebuilt from the file is the same aggregation over the same inputs as the live one.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import asdict, dataclass, fields
+from statistics import fmean
+from typing import TYPE_CHECKING, Any, Final
+
+from ._advisor import ModelPricing
+from ._fill import FillPlan
+from ._summary import DEFAULT_MIN_CORRECTNESS
+
+if TYPE_CHECKING:
+    from collections.abc import Mapping, Sequence
+    from pathlib import Path
+
+__all__ = [
+    "SCHEMA_VERSION",
+    "CellParams",
+    "SeedRecord",
+    "append_seed_record",
+    "group_by_cell",
+    "read_seed_records",
+]
+
+#: Format of the records this module writes.
+#:
+#: Bumped whenever a field changes meaning, not merely whenever one is added: the point is
+#: that a reader can tell a record describing the current measurement from one describing an
+#: older one. Runs before this file existed have no records at all, and runs from before the
+#: seed/snapshot/probe rebuild measured `survived` against a different prompt, so mixing their
+#: numbers into one table would produce a mean over two different questions.
+SCHEMA_VERSION: Final[int] = 1
+
+#: The parameters that make two records the same cell, and so aggregable into one row.
+#:
+#: Deliberately excludes ``strategies`` and ``repeats``, which say what a run *intended* to
+#: measure rather than what it measured: a cell abandoned after three strategies and resumed
+#: for the other two is one cell, and has to aggregate as one. Includes the prices, because
+#: two runs priced differently produce costs that cannot go in one column.
+_CELL_KEY_FIELDS: Final[tuple[str, ...]] = (
+    "provider",
+    "model",
+    "agent_kind",
+    "context_window",
+    "fill",
+    "probe_repeats",
+    "narration",
+    "fact_placement",
+    "tool_result_tokens",
+    "filler_turns",
+    "filler_tokens",
+    "tool_turns",
+    "filler_tool_turns",
+    "markers_per_tool",
+    "price_input",
+    "price_cached",
+    "price_output",
+)
+
+
+def _plan_from_dict(data: Mapping[str, Any]) -> FillPlan:
+    """Rebuild the solved sizing from its serialized form.
+
+    Field by field rather than by splatting the mapping, so a file carrying a key this version
+    does not know about is refused here instead of raising somewhere less obvious.
+
+    Args:
+        data: The ``plan`` object from a record's cell parameters.
+
+    Returns:
+        The plan.
+    """
+    return FillPlan(
+        filler_turns=int(data["filler_turns"]),
+        filler_tokens=int(data["filler_tokens"]),
+        context_limit=int(data["context_limit"]),
+        fill_fraction=float(data["fill_fraction"]),
+        target_tokens=int(data["target_tokens"]),
+        predicted_tokens=int(data["predicted_tokens"]),
+        payload_tokens=int(data["payload_tokens"]),
+        tool_payload_tokens=int(data["tool_payload_tokens"]),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class CellParams:
+    """What was being measured, carried on every record rather than written once as a header.
+
+    A header is a thing a partial file can be missing, and a file that needs one to be read is
+    back to losing the seeds a crash left behind. Repeating the parameters per line also keeps
+    two runs appended to one path separable, since the cell is read off the line rather than
+    off the file.
+    """
+
+    provider: str
+    model: str
+    agent_kind: str
+    context_window: int
+    """The limit the cell stands in for, which is simulated and enforced in our own code."""
+    fill: float
+    """Share of that limit the seeded conversation was sized to reach, 0 for manual sizing."""
+    probe_repeats: int
+    repeats: int
+    """Seeds per strategy the run set out to take.
+
+    Stored so that a short cell reads as unfinished rather than as a cell whose strategies
+    happened to disagree. Without it, three seeds of a five-seed cell are indistinguishable
+    from a complete three-seed one, and every spread in the table is a spread over less
+    material than it claims.
+    """
+    strategies: tuple[str, ...]
+    """The strategies the run set out to measure, for the same reason."""
+    narration: str
+    fact_placement: str
+    tool_result_tokens: int
+    filler_turns: int
+    filler_tokens: int
+    tool_turns: int
+    filler_tool_turns: int
+    markers_per_tool: int
+    price_input: float
+    price_cached: float
+    price_output: float
+    min_correctness: float = DEFAULT_MIN_CORRECTNESS
+    """The correctness bar the verdict applied.
+
+    Recorded because it is the one input to the verdict that is not otherwise on the record: a
+    table rebuilt under a different bar would rank rows the original never ranked while every
+    column above the verdict stayed identical, which is the hardest kind of disagreement to see.
+    """
+    plan: FillPlan | None = None
+    """The solved sizing, when ``--fill`` was used.
+
+    Kept whole rather than reduced to its target, so the achieved fill can be checked against
+    it from the file exactly as the live run checks it.
+    """
+
+    @property
+    def key(self) -> tuple[Any, ...]:
+        """Return what identifies this cell, for grouping records that belong in one table."""
+        return tuple(getattr(self, name) for name in _CELL_KEY_FIELDS)
+
+    @property
+    def pricing(self) -> ModelPricing:
+        """Return the rates the costs on these records were computed at."""
+        return ModelPricing(
+            input_per_million=self.price_input,
+            cached_read_per_million=self.price_cached,
+            output_per_million=self.price_output,
+        )
+
+    @property
+    def label(self) -> str:
+        """Return a one-line description of the cell, for a file holding more than one."""
+        fill = f"fill {self.fill:.0%}" if self.fill > 0 else "fill manual"
+        return (
+            f"{self.provider}:{self.model}  agent {self.agent_kind}  "
+            f"window {self.context_window:,}  {fill}  "
+            f"payload {self.tool_result_tokens:,}x{self.tool_turns}  probes {self.probe_repeats}"
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serializable mapping of these parameters."""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> CellParams:
+        """Rebuild parameters from a mapping read back out of a record.
+
+        Args:
+            data: One record's ``cell`` object.
+
+        Returns:
+            The parameters.
+        """
+        known = {field.name for field in fields(cls)}
+        values = {key: value for key, value in data.items() if key in known}
+        values["strategies"] = tuple(values.get("strategies") or ())
+        plan: dict[str, Any] | None = values.get("plan")
+        values["plan"] = _plan_from_dict(plan) if plan is not None else None
+        return cls(**values)
+
+
+#: Fields stored as JSON arrays, which come back as lists and have to be re-tupled.
+#: A list here would compare unequal to the tuple the live path produces, which is exactly
+#: the kind of difference that makes "the file reproduces the table" untestable.
+_TUPLE_FIELDS: Final[tuple[str, ...]] = (
+    "correctness_samples",
+    "ignored_samples",
+    "combined_samples",
+    "strategy_notes",
+    "dropped_options",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class SeedRecord:
+    """One seed of one strategy, reduced to everything a table needs and nothing else.
+
+    Not a serialized ``LiveOutcome``. The outcome carries every prompt of every call, which is
+    the bulk of a run and none of what the table reads, and it is unscored -- rebuilding a
+    table from it would mean re-scoring against a scenario whose markers are salted per seed
+    and which is gone the moment the process is. Scoring happens once, here, and both the live
+    table and one rebuilt months later aggregate the result of it.
+    """
+
+    cell: CellParams
+    strategy: str
+    seed: int
+    """1-based index of this seed within its strategy."""
+    cost: float
+    """The whole seed: seeding, every probe, and the strategy's own summarizer calls."""
+    summarizer_cost: float
+    input_tokens: int
+    cached_tokens: int
+    output_tokens: int
+    calls: int
+    messages_left: int
+    messages_peak: int
+    prompt_tokens_final: int
+    prompt_tokens_peak: int
+    seed_prompt_tokens: int
+    """Billed size of the last seeding prompt: the achieved fill."""
+    facts_total: int
+    facts_left: int
+    """Planted facts that survived compaction into the snapshot, which is recall's ceiling."""
+    facts_lost: int
+    """Facts compaction removed: the total, less what survived, less what was never fetched.
+
+    Stored per seed although the table derives its own ``lost`` column from the cell's means.
+    The two agree whenever every seed planted the same number of facts, which is every cell
+    this package builds; they can differ only if a seed's scenario had a different size.
+    """
+    nofetch: int
+    """Facts the agent never fetched, so compaction never had them to lose."""
+    correctness_samples: tuple[float, ...]
+    """One reading per probe repeat, each scored against the same snapshot.
+
+    A tuple rather than a mean, because the mean of the seed and the spread within it are
+    different findings and the cell needs both. Flattened across seeds, these are also what
+    the verdict ranks on.
+    """
+    ignored_samples: tuple[int, ...]
+    """Facts still in the snapshot the model did not use, per probe repeat."""
+    combined_samples: tuple[float, ...]
+    """Share of all planted values present in the single combined answer, per repeat."""
+    disqualified: bool
+    """Whether any call sent a prompt larger than the limit this cell stands in for."""
+    context_drift: int
+    turns_completed: int
+    turns_total: int
+    probe_repeats: int
+    summarizer_calls: int
+    summarizer_failures: int
+    strategy_notes: tuple[str, ...]
+    dropped_options: tuple[str, ...]
+    answer: str
+    error: str | None = None
+    schema: int = SCHEMA_VERSION
+
+    @property
+    def correctness(self) -> float:
+        """Mean correctness over this seed's probe repeats."""
+        return fmean(self.correctness_samples) if self.correctness_samples else 0.0
+
+    @property
+    def hit_rate(self) -> float | None:
+        """Share of input tokens served from the provider's cache, None when nothing was billed."""
+        return self.cached_tokens / self.input_tokens if self.input_tokens > 0 else None
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serializable mapping of this record."""
+        return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Mapping[str, Any]) -> SeedRecord:
+        """Rebuild a record from one parsed line.
+
+        Args:
+            data: The parsed JSON object.
+
+        Returns:
+            The record.
+
+        Raises:
+            ValueError: If the record was written by a different schema version, or is missing
+                fields this one requires.
+        """
+        version = data.get("schema")
+        if version != SCHEMA_VERSION:
+            raise ValueError(
+                f"schema {version!r}, but this reader understands {SCHEMA_VERSION}. Records from "
+                "another version describe a different measurement and must not be averaged with these."
+            )
+        known = {field.name for field in fields(cls)} - {"cell"}
+        values = {key: value for key, value in data.items() if key in known}
+        for name in _TUPLE_FIELDS:
+            values[name] = tuple(values.get(name) or ())
+        try:
+            return cls(cell=CellParams.from_dict(data["cell"]), **values)
+        except (KeyError, TypeError) as error:
+            raise ValueError(f"record is not readable: {error}") from error
+
+
+def append_seed_record(path: Path, record: SeedRecord) -> None:
+    """Append one seed's record to a JSON Lines file, closing the file again immediately.
+
+    Opened and closed per record rather than held open across the cell. A handle held open
+    buffers, and the record sitting in that buffer is exactly the one an interruption takes --
+    which is the whole failure this file exists to prevent. Appending rather than truncating is
+    load-bearing for the same reason: a run resumed after a crash has to extend the file, and
+    two cells written to one path have to both survive.
+
+    Args:
+        path: Destination file. Parent directories are created as needed.
+        record: The seed to append.
+    """
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as handle:
+        handle.write(json.dumps(record.to_dict(), ensure_ascii=False) + "\n")
+
+
+def read_seed_records(path: Path) -> tuple[SeedRecord, ...]:
+    """Read every record in a JSON Lines file.
+
+    Args:
+        path: The file to read.
+
+    Returns:
+        The records, in the order they were written.
+
+    Raises:
+        ValueError: If any line is not a record this reader understands. Refused rather than
+            skipped: a line that cannot be read is a seed that was paid for, and dropping it
+            silently would leave a mean over fewer seeds than the table claims. A run killed
+            mid-write can leave the last line half-finished, and that one line is safe to
+            delete by hand.
+    """
+    records: list[SeedRecord] = []
+    for number, line in enumerate(path.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            records.append(SeedRecord.from_dict(json.loads(line)))
+        except (ValueError, TypeError) as error:
+            raise ValueError(f"{path}, line {number}: {error}") from error
+    return tuple(records)
+
+
+def group_by_cell(records: Sequence[SeedRecord]) -> list[tuple[CellParams, tuple[SeedRecord, ...]]]:
+    """Group records into the cells they were measured in.
+
+    In first-appearance order rather than sorted, so a file written by a sweep reads back in
+    the order the sweep ran.
+
+    Args:
+        records: Records from one or more cells.
+
+    Returns:
+        One entry per cell: its parameters, taken from the first record that named it, and
+        every record belonging to it.
+    """
+    grouped: dict[tuple[Any, ...], list[SeedRecord]] = {}
+    params: dict[tuple[Any, ...], CellParams] = {}
+    for record in records:
+        key = record.cell.key
+        params.setdefault(key, record.cell)
+        grouped.setdefault(key, []).append(record)
+    return [(params[key], tuple(entries)) for key, entries in grouped.items()]

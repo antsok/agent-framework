@@ -9,6 +9,7 @@ import asyncio
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from statistics import fmean
 from typing import TYPE_CHECKING, Any, Final, cast
 
@@ -29,6 +30,7 @@ from ._live import (
 )
 from ._providers import build_provider, parse_provider_selector, provider_names
 from ._recall import RecallScenario, RecallScore
+from ._records import CellParams, SeedRecord, append_seed_record, group_by_cell, read_seed_records
 from ._strategies import StrategyOptions, build_strategy, needs_summarizer, strategy_names
 from ._summary import DEFAULT_MIN_CORRECTNESS, JointOutcome, JointVerdict, recommend
 from ._tokenizers import TOKENIZER_NAMES, build_tokenizer
@@ -69,7 +71,12 @@ def build_parser() -> argparse.ArgumentParser:
             "differ per model, so these numbers do not compare across models."
         ),
     )
-    parser.add_argument("provider", help="Provider or provider:model.")
+    parser.add_argument(
+        "provider",
+        nargs="?",
+        default=None,
+        help="Provider or provider:model. Omitted only with --from-jsonl, which runs nothing.",
+    )
     parser.add_argument("--strategies", default=_DEFAULT_STRATEGIES, help=f"Available: {','.join(strategy_names())}")
     parser.add_argument("--agent", default="plain", choices=list(AGENT_KINDS), help="How to assemble the agent.")
     parser.add_argument(
@@ -81,6 +88,19 @@ def build_parser() -> argparse.ArgumentParser:
             "that measures compaction's own reliability, since a different seed puts the facts "
             "in a different place relative to a retention boundary. 3 or more is what makes a "
             "ranking defensible."
+        ),
+    )
+    parser.add_argument(
+        "--seed-offset",
+        type=int,
+        default=0,
+        help=(
+            "Number the seeds from here instead of 1. The seed number goes into the scenario "
+            "salt, so two invocations of one cell that both start at seed 1 build byte-identical "
+            "conversations -- the salt's other term is a whole-second timestamp, which concurrent "
+            "processes share. Offsetting is what makes several single-seed invocations of the "
+            "same cell into different seeds rather than one seed measured repeatedly, which is "
+            "the difference between measuring compaction's reliability and not."
         ),
     )
     parser.add_argument(
@@ -267,8 +287,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--min-correctness",
         type=float,
-        default=DEFAULT_MIN_CORRECTNESS,
-        help="Fraction of the control's correctness a strategy must retain to be eligible.",
+        default=None,
+        help=(
+            "Fraction of the control's correctness a strategy must retain to be eligible. "
+            f"Defaults to {DEFAULT_MIN_CORRECTNESS}, and under --from-jsonl to whatever the run "
+            "that wrote the records used, so a rebuilt verdict is the verdict that was measured."
+        ),
     )
     parser.add_argument("--summarizer-provider", default=None, help="Provider for summarization strategies.")
     parser.add_argument("--price-input", type=float, default=None, help="Input price per million tokens.")
@@ -295,6 +319,27 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--no-temperature", action="store_true", help="Omit temperature for models that reject it.")
     parser.add_argument("--show-answers", action="store_true", help="Print each final answer in full.")
+    parser.add_argument(
+        "--results-jsonl",
+        default=None,
+        help=(
+            "Append one JSON record per seed to this file, as each seed is scored rather than "
+            "when the cell finishes. A cell is every strategy times --repeats seeds and can run "
+            "for hours; without this, anything that stops the process before the table prints "
+            "discards every seed already completed and already paid for. The file is appended "
+            "to, never truncated, so a resumed run extends it. Rebuild the table with --from-jsonl."
+        ),
+    )
+    parser.add_argument(
+        "--from-jsonl",
+        default=None,
+        help=(
+            "Render the table and verdict from a --results-jsonl file instead of running "
+            "anything. Handles a file whose cells are incomplete, and states which strategies "
+            "and how many seeds each cell holds, so a partial result cannot be read as a "
+            "finished one."
+        ),
+    )
     parser.add_argument("--dry-run", action="store_true", help="Print the plan and its rough size, call nothing.")
     return parser
 
@@ -384,48 +429,101 @@ def _sample_scores(outcome: LiveOutcome, scenario: RecallScenario) -> tuple[Reca
     )
 
 
-def _correctness_samples(outcome: LiveOutcome, scenario: RecallScenario) -> tuple[float, ...]:
-    """Return the correctness of each independent reading of one seed's snapshot.
+def _seed_record(
+    outcome: LiveOutcome,
+    scenario: RecallScenario,
+    pricing: ModelPricing,
+    cell: CellParams,
+    seed: int,
+) -> SeedRecord:
+    """Reduce one finished seed to the durable record everything downstream reads.
 
-    Correctness lives on the *scored* outcome, not on the raw run. Reading it off the run
-    passes ruff, pyright and the whole suite and then raises ``AttributeError`` on the first
-    live call, after the run has been paid for. That has happened twice, so it is a function
-    with a test rather than a line inside the run loop.
+    This is where scoring happens, and it happens once. The live table and a table rebuilt
+    from the file months later are the same aggregation over the same records, so the two
+    cannot quietly disagree about what a cell means -- there is only one path, and this is
+    its input.
+
+    Scoring needs the scenario, whose markers are salted per seed, so it has to happen while
+    the seed is still in hand. That is also why the record stores results rather than the run:
+    the scenario is gone the moment the process is.
+
+    Note that correctness comes off the *scored* result and is not an attribute of the run.
+    Reading it from ``LiveOutcome`` passes ruff, pyright and the whole suite, then raises
+    ``AttributeError`` on the first live call, after the run has been paid for -- which has
+    happened twice, and is why this is a function with a test rather than a line in the loop.
 
     Args:
         outcome: The finished run.
         scenario: The scenario it was driven from.
+        pricing: Rates to cost it at.
+        cell: The parameters the seed was measured under.
+        seed: 1-based index of this seed within its strategy.
 
     Returns:
-        One fraction per probe repeat.
+        The record, ready to be appended to the results file.
     """
-    return tuple(score.correctness_score for score in _sample_scores(outcome, scenario))
+    scores = _sample_scores(outcome, scenario)
+    facts_total = len(scores[0].outcomes) if scores else 0
+    facts_left = scores[0].facts_left if scores else 0
+    nofetch = len(unretrieved_facts(outcome, scenario))
+    return SeedRecord(
+        cell=cell,
+        strategy=outcome.strategy,
+        seed=seed,
+        cost=_cost(outcome, pricing),
+        summarizer_cost=_summarizer_cost(outcome, pricing),
+        input_tokens=outcome.input_tokens,
+        cached_tokens=outcome.cached_tokens,
+        output_tokens=outcome.output_tokens,
+        calls=len(outcome.calls),
+        messages_left=outcome.messages_left,
+        messages_peak=outcome.messages_peak,
+        prompt_tokens_final=outcome.prompt_tokens_final,
+        prompt_tokens_peak=outcome.prompt_tokens_peak,
+        seed_prompt_tokens=outcome.seed_prompt_tokens,
+        facts_total=facts_total,
+        # Survival is a property of the snapshot, which every probe was answered from, so it
+        # is the same in every sample of a seed and the first one speaks for all of them.
+        facts_left=facts_left,
+        facts_lost=max(facts_total - facts_left - nofetch, 0),
+        nofetch=nofetch,
+        correctness_samples=tuple(score.correctness_score for score in scores),
+        ignored_samples=tuple(score.ignored_by_model for score in scores),
+        combined_samples=score_combined_samples(outcome, scenario),
+        disqualified=outcome.disqualified(cell.context_window),
+        context_drift=outcome.context_drift,
+        turns_completed=outcome.turns_completed,
+        turns_total=outcome.turns_total,
+        probe_repeats=outcome.probe_repeats,
+        summarizer_calls=outcome.summarizer_calls,
+        summarizer_failures=outcome.summarizer_failures,
+        strategy_notes=outcome.strategy_notes,
+        dropped_options=outcome.dropped_options,
+        answer=outcome.answer,
+        error=outcome.error,
+    )
 
 
-def _seed_spread(outcomes: Sequence[LiveOutcome], scenarios: dict[int, RecallScenario]) -> float:
+def _seed_spread(samples: Sequence[Sequence[float]]) -> float:
     """Return the points between the least and most correct seed.
 
     Compaction's own reliability. A different seed is a different conversation, so this is
     where "the strategy cleared a retention boundary this time and not last time" shows up:
     measured at 78 points for one strategy while the uncompacted control moved 7.
 
-    Each seed has to be scored against the scenario it was actually driven from -- markers are
-    salted per seed, so scoring one seed's answers against another's facts finds nothing.
-
     Args:
-        outcomes: Every seed of one strategy.
-        scenarios: Scenario per seed, keyed by ``id(outcome)``.
+        samples: One group of per-repeat correctness readings per seed.
 
     Returns:
         The gap in percentage points, or 0.0 for a single seed, where nothing is known.
     """
-    if len(outcomes) < 2:
+    if len(samples) < 2:
         return 0.0
-    means = [fmean(_correctness_samples(outcome, scenarios[id(outcome)]) or (0.0,)) for outcome in outcomes]
+    means = [fmean(seed or (0.0,)) for seed in samples]
     return (max(means) - min(means)) * 100
 
 
-def _probe_spread(outcomes: Sequence[LiveOutcome], scenarios: dict[int, RecallScenario]) -> float:
+def _probe_spread(samples: Sequence[Sequence[float]]) -> float:
     """Return the average points between the least and most correct probe repeat within a seed.
 
     The model's own enumeration variance, and nothing else: the repeats averaged here were all
@@ -438,27 +536,21 @@ def _probe_spread(outcomes: Sequence[LiveOutcome], scenarios: dict[int, RecallSc
     them; the between-seed column is where an unlucky seed belongs.
 
     Args:
-        outcomes: Every seed of one strategy.
-        scenarios: Scenario per seed, keyed by ``id(outcome)``.
+        samples: One group of per-repeat correctness readings per seed.
 
     Returns:
         The mean within-seed gap in percentage points, or 0.0 when each seed was read once.
     """
-    ranges: list[float] = []
-    for outcome in outcomes:
-        samples = _correctness_samples(outcome, scenarios[id(outcome)])
-        if len(samples) > 1:
-            ranges.append((max(samples) - min(samples)) * 100)
+    ranges = [(max(seed) - min(seed)) * 100 for seed in samples if len(seed) > 1]
     return fmean(ranges) if ranges else 0.0
 
 
-def _spread(outcomes: Sequence[LiveOutcome], pricing: ModelPricing) -> float:
+def _spread(costs: Sequence[float]) -> float:
     """Return the relative gap between the cheapest and dearest seed.
 
     Zero for a single seed, which is exactly when nothing is known about stability, so the
     report says so rather than showing a reassuring 0%.
     """
-    costs = [_cost(outcome, pricing) for outcome in outcomes]
     median = sorted(costs)[len(costs) // 2]
     return (max(costs) - min(costs)) / median if len(costs) > 1 and median > 0 else 0.0
 
@@ -474,7 +566,13 @@ class CellStats:
     """
 
     strategy: str
-    runs: tuple[LiveOutcome, ...]
+    records: tuple[SeedRecord, ...]
+    """The seeds this row is a mean over.
+
+    Records rather than runs, so that the row a live cell prints and the row rebuilt from the
+    results file are produced by one function from one kind of input. Anything the table needs
+    that is not here is a way for the two to disagree.
+    """
     cost: float
     cost_spread: float
     summarizer_cost: float
@@ -506,56 +604,55 @@ class CellStats:
         return self.cached_tokens / self.input_tokens if self.input_tokens > 0 else None
 
 
-def _aggregate(
-    strategy: str,
-    outcomes: Sequence[LiveOutcome],
-    scenarios: dict[int, RecallScenario],
-    pricing: ModelPricing,
-    tried_limit: int,
-) -> CellStats:
+def _aggregate(strategy: str, records: Sequence[SeedRecord]) -> CellStats:
     """Reduce every seed of one strategy to the row the table shows.
 
+    The only aggregation in the package. A live run reaches it through records it has just
+    written; ``--from-jsonl`` reaches it through records it has just read; there is no second
+    implementation for the two to drift apart in.
+
     Args:
-        strategy: The strategy these runs measured.
-        outcomes: Every seed of it.
-        scenarios: Scenario per seed, keyed by ``id(outcome)``.
-        pricing: Rates.
-        tried_limit: The context limit the run stands in for.
+        strategy: The strategy these seeds measured.
+        records: Every seed of it, in any order.
 
     Returns:
         The aggregated cell.
+
+    Raises:
+        ValueError: If no seeds were supplied, since a row is a mean over something.
     """
-    samples = tuple(_correctness_samples(run, scenarios[id(run)]) for run in outcomes)
+    if not records:
+        raise ValueError(f"No seeds recorded for {strategy!r}; a row is a mean over at least one.")
+    samples = tuple(record.correctness_samples for record in records)
     flat = [value for seed in samples for value in seed]
-    scored = [_sample_scores(run, scenarios[id(run)]) for run in outcomes]
-    facts_total = max((len(score[0].outcomes) for score in scored if score), default=0)
-    combined = [value for run in outcomes for value in score_combined_samples(run, scenarios[id(run)])]
+    ignored = [float(value) for record in records for value in record.ignored_samples]
+    combined = [value for record in records for value in record.combined_samples]
     return CellStats(
         strategy=strategy,
-        runs=tuple(outcomes),
-        cost=fmean(_cost(run, pricing) for run in outcomes),
-        cost_spread=_spread(outcomes, pricing),
-        summarizer_cost=fmean(_summarizer_cost(run, pricing) for run in outcomes),
-        input_tokens=fmean(run.input_tokens for run in outcomes),
-        cached_tokens=fmean(run.cached_tokens for run in outcomes),
-        output_tokens=fmean(run.output_tokens for run in outcomes),
-        calls=fmean(len(run.calls) for run in outcomes),
-        messages_left=fmean(run.messages_left for run in outcomes),
-        messages_peak=fmean(run.messages_peak for run in outcomes),
-        prompt_tokens_final=fmean(run.prompt_tokens_final for run in outcomes),
-        prompt_tokens_peak=fmean(run.prompt_tokens_peak for run in outcomes),
-        seed_prompt_tokens=fmean(run.seed_prompt_tokens for run in outcomes),
-        # Survival is a property of the snapshot, so it is the same in every sample of a seed
-        # and only the seeds are averaged here.
-        facts_left=fmean(score[0].facts_left for score in scored if score) if any(scored) else 0.0,
-        facts_total=facts_total,
-        nofetch=fmean(len(unretrieved_facts(run, scenarios[id(run)])) for run in outcomes),
-        ignored=fmean([score.ignored_by_model for seed in scored for score in seed] or [0.0]),
+        records=tuple(records),
+        cost=fmean(record.cost for record in records),
+        cost_spread=_spread([record.cost for record in records]),
+        summarizer_cost=fmean(record.summarizer_cost for record in records),
+        input_tokens=fmean(record.input_tokens for record in records),
+        cached_tokens=fmean(record.cached_tokens for record in records),
+        output_tokens=fmean(record.output_tokens for record in records),
+        calls=fmean(record.calls for record in records),
+        messages_left=fmean(record.messages_left for record in records),
+        messages_peak=fmean(record.messages_peak for record in records),
+        prompt_tokens_final=fmean(record.prompt_tokens_final for record in records),
+        prompt_tokens_peak=fmean(record.prompt_tokens_peak for record in records),
+        seed_prompt_tokens=fmean(record.seed_prompt_tokens for record in records),
+        facts_left=fmean(record.facts_left for record in records),
+        # The largest, not the mean: every seed of a cell plants the same number of facts, so
+        # a smaller one is a seed that failed before scoring rather than an easier scenario.
+        facts_total=max((record.facts_total for record in records), default=0),
+        nofetch=fmean(record.nofetch for record in records),
+        ignored=fmean(ignored or [0.0]),
         correctness=fmean(flat) if flat else 0.0,
-        seed_spread=_seed_spread(outcomes, scenarios),
-        probe_spread=_probe_spread(outcomes, scenarios),
+        seed_spread=_seed_spread(samples),
+        probe_spread=_probe_spread(samples),
         combined=fmean(combined) if combined else 0.0,
-        disqualified=fmean(1.0 if run.disqualified(tried_limit) else 0.0 for run in outcomes),
+        disqualified=fmean(1.0 if record.disqualified else 0.0 for record in records),
         samples=samples,
     )
 
@@ -577,20 +674,22 @@ def _excluded_cells(cells: Sequence[CellStats]) -> tuple[set[str], set[str]]:
     Returns:
         The names that did not finish, and the names that were disqualified.
     """
-    incomplete = {cell.strategy for cell in cells if any(run.turns_completed < run.turns_total for run in cell.runs)}
+    incomplete = {
+        cell.strategy for cell in cells if any(record.turns_completed < record.turns_total for record in cell.records)
+    }
     oversized = {cell.strategy for cell in cells if cell.disqualified > 0}
     return incomplete, oversized
 
 
-def _to_joint(stats: CellStats, scenarios: dict[int, RecallScenario]) -> JointOutcome:
+def _to_joint(stats: CellStats) -> JointOutcome:
     """Convert an aggregated cell into the shape the joint verdict already understands.
 
     The verdict ranks on ``correctness``, which here is the mean over every sample of every
-    seed rather than one run's score. The ``score`` it carries is the first seed's first
-    reading, kept only so the verdict has a populated object; every count the table prints
-    comes from :class:`CellStats`.
+    seed. ``score`` carries no outcomes: every count the table prints comes from
+    :class:`CellStats`, and ``JointOutcome`` consults its score only when there are no samples
+    to rank on -- which cannot happen here, since scoring yields at least one reading even for
+    a seed that never answered. The field exists for the replay paths, which read a cell once.
     """
-    first = _sample_scores(stats.runs[0], scenarios[id(stats.runs[0])])
     return JointOutcome(
         strategy=stats.strategy,
         cost=stats.cost,
@@ -600,9 +699,13 @@ def _to_joint(stats: CellStats, scenarios: dict[int, RecallScenario]) -> JointOu
         # The peak, not an uncompacted total: with real replies there is no single "what it
         # would have been" shared across rows, and the peak is what this run actually reached.
         messages_total=round(stats.messages_peak),
-        score=first[0]
-        if first
-        else RecallScore(outcomes=(), answer="", messages_left=0, messages_total=0, error=stats.runs[0].error),
+        score=RecallScore(
+            outcomes=(),
+            answer=stats.records[0].answer,
+            messages_left=round(stats.messages_left),
+            messages_total=round(stats.messages_peak),
+            error=stats.records[0].error,
+        ),
         correctness_samples=tuple(value for seed in stats.samples for value in seed),
     )
 
@@ -708,40 +811,53 @@ def _stability_note(verdict: JointVerdict, spread: dict[str, float], repeats: in
     return []
 
 
-def _flags(stats: CellStats, control: CellStats) -> list[str]:
-    """Return the short tokens the flags column carries for one row."""
+def _flags(stats: CellStats, control: CellStats | None) -> list[str]:
+    """Return the short tokens the flags column carries for one row.
+
+    Args:
+        stats: The row.
+        control: The uncompacted baseline, or None when the file being read does not hold it.
+    """
     flags: list[str] = []
     # A row that gathered a different set of facts than the control is not comparable to
     # it on either axis: it has a different denominator for correctness and a different
     # token volume for cost. Measured at 25% more input for runs that fetched every tool.
-    if round(stats.nofetch) != round(control.nofetch):
+    if control is not None and round(stats.nofetch) != round(control.nofetch):
         flags.append("FETCH")
-    dropped = {option for run in stats.runs for option in run.dropped_options}
+    dropped = {option for record in stats.records for option in record.dropped_options}
     if dropped:
         flags.append("NO:" + ",".join(sorted(option[:4] for option in dropped)))
-    if any(run.error for run in stats.runs):
+    if any(record.error for record in stats.records):
         flags.append("ERR")
-    drift = sum(run.context_drift for run in stats.runs)
+    drift = sum(record.context_drift for record in stats.records)
     if drift:
         flags.append(f"DRIFT:{drift}")
-    failures = sum(run.summarizer_failures for run in stats.runs)
+    failures = sum(record.summarizer_failures for record in stats.records)
     if failures:
         flags.append(f"S{failures}")
-    for note in sorted({note for run in stats.runs for note in run.strategy_notes}):
+    for note in sorted({note for record in stats.records for note in record.strategy_notes}):
         flags.append(note)
-    incomplete = [run for run in stats.runs if run.turns_completed < run.turns_total]
+    incomplete = [record for record in stats.records if record.turns_completed < record.turns_total]
     if incomplete:
         flags.append(f"{incomplete[0].turns_completed}/{incomplete[0].turns_total}t")
     return flags
 
 
-def _row(stats: CellStats, control: CellStats, excluded: bool) -> str:
-    """Render one strategy's line of the table."""
-    if stats.strategy == control.strategy or control.cost <= 0:
+def _row(stats: CellStats, control: CellStats | None, excluded: bool) -> str:
+    """Render one strategy's line of the table.
+
+    Args:
+        stats: The row.
+        control: The uncompacted baseline, or None when the file being read does not hold it,
+            in which case both relative columns read as unknown rather than being computed
+            against whichever row happened to be first.
+        excluded: Whether this row is out of the ranking.
+    """
+    if control is None or stats.strategy == control.strategy or control.cost <= 0:
         cost_delta = "-"
     else:
         cost_delta = f"{stats.cost / control.cost - 1:+.0%}"
-    if stats.strategy == control.strategy or control.correctness <= 0:
+    if control is None or stats.strategy == control.strategy or control.correctness <= 0:
         relative = "-"
     else:
         relative = f"{stats.correctness / control.correctness:.0%}"
@@ -760,7 +876,7 @@ def _row(stats: CellStats, control: CellStats, excluded: bool) -> str:
         f"{('-' if not summ else '$' + format(summ, '.4f')):>8}{cost_delta:>9}"
         f"{f'{stats.facts_left:.0f}/{stats.facts_total}':>9}{lost:>6.0f}"
         f"{stats.nofetch:>8.0f}{stats.ignored:>8.0f}"
-        f"{stats.correctness:>8.0%}{'*' if stats.strategy == control.strategy else ' '}"
+        f"{stats.correctness:>8.0%}{'*' if control is not None and stats.strategy == control.strategy else ' '}"
         f"{f'{stats.seed_spread:.0f}pp':>7}{f'{stats.probe_spread:.0f}pp':>7}"
         f"{stats.combined:>5.0%} {relative:>8}{stats.disqualified:>5.0%}"
         f"{(','.join(flags) or '-'):>10}"
@@ -829,20 +945,36 @@ _LEGEND: Final[tuple[str, ...]] = (
 
 
 def _render(
-    verdict: JointVerdict,
+    verdict: JointVerdict | None,
     cells: Sequence[CellStats],
     excluded: set[str],
-    control: str,
-    repeats: int,
-    pricing: ModelPricing,
-    model: str,
-    agent_kind: str,
-    plan: FillPlan | None,
+    control: str = "none",
     *,
     show_answers: bool,
 ) -> str:
-    """Render cost and correctness side by side, then the recommendation."""
-    baseline = next(cell for cell in cells if cell.strategy == control)
+    """Render cost and correctness side by side, then the recommendation.
+
+    Everything about the run itself -- the model, the rates, the sizing, how many seeds were
+    asked for -- is read off the cells rather than passed in beside them. A caller cannot then
+    label a table with a model or a price the numbers were not produced under, which is the
+    one way a rebuilt table could have lied while every column in it was correct.
+
+    Args:
+        verdict: The recommendation, or None when the records hold no admissible control and
+            there is therefore nothing to recommend against.
+        cells: The rows, in the order they should appear.
+        excluded: Strategies that are out of the ranking.
+        control: Name of the uncompacted baseline.
+
+    Keyword Args:
+        show_answers: Print each cell's first answer in full.
+
+    Returns:
+        The rendered table.
+    """
+    baseline = next((cell for cell in cells if cell.strategy == control), None)
+    cell_params = cells[0].records[0].cell
+    pricing = cell_params.pricing
     header = (
         f"{'strategy':<28}{'msgs':>9}{'tok left/peak':>16}{'calls':>7}{'in':>12}{'hit%':>6}"
         f"{'out':>10}{'cost':>10}{'+-':>6}{'summ$':>8}{'vs none':>9}"
@@ -851,7 +983,7 @@ def _render(
     )
     lines = [
         "",
-        f"Model: {model}   agent: {agent_kind}   probe repeats: {baseline.runs[0].probe_repeats}",
+        (f"Model: {cell_params.model}   agent: {cell_params.agent_kind}   probe repeats: {cell_params.probe_repeats}"),
         (
             f"Pricing: ${pricing.input_per_million:.2f}/M in, "
             f"${pricing.cached_read_per_million:.3f}/M cached, ${pricing.output_per_million:.2f}/M out"
@@ -865,15 +997,24 @@ def _render(
     for cell in cells:
         groups = "  ".join("[" + " ".join(f"{value:.0%}" for value in seed) + "]" for seed in cell.samples if seed)
         lines.append(f"  {cell.strategy:<28}{groups}")
-    lines += _fill_note({cell.strategy: cell for cell in cells}, plan, control)
-    lines += [
-        "",
-        f"VERDICT: {verdict.recommended}",
-        verdict.rationale,
-        *_stability_note(verdict, {cell.strategy: cell.cost_spread for cell in cells}, repeats),
-        *_accuracy_note({cell.strategy: cell.seed_spread for cell in cells}, control, repeats),
-    ]
-    failed = [cell.strategy for cell in cells if any(run.summarizer_failures for run in cell.runs)]
+    lines += _fill_note({cell.strategy: cell for cell in cells}, cell_params.plan, control)
+    if verdict is None:
+        lines += [
+            "",
+            (
+                f"NO VERDICT: these records hold no admissible {control!r} row, and every ranking "
+                "here is relative to one. The columns above still describe what was measured."
+            ),
+        ]
+    else:
+        lines += [
+            "",
+            f"VERDICT: {verdict.recommended}",
+            verdict.rationale,
+            *_stability_note(verdict, {cell.strategy: cell.cost_spread for cell in cells}, cell_params.repeats),
+            *_accuracy_note({cell.strategy: cell.seed_spread for cell in cells}, control, cell_params.repeats),
+        ]
+    failed = [cell.strategy for cell in cells if any(record.summarizer_failures for record in cell.records)]
     if failed:
         lines += [
             "",
@@ -883,7 +1024,7 @@ def _render(
         ]
     if show_answers:
         for cell in cells:
-            lines += ["", f"--- {cell.strategy} ---", cell.runs[0].answer or "(no answer)"]
+            lines += ["", f"--- {cell.strategy} ---", cell.records[0].answer or "(no answer)"]
     return "\n".join(lines)
 
 
@@ -917,6 +1058,165 @@ def _plan_or_exit(args: argparse.Namespace, tokenizer: Any) -> FillPlan | None:
         raise SystemExit(str(error)) from error
 
 
+def _progress(record: SeedRecord) -> str:
+    """Return the line printed the moment a seed lands.
+
+    A cell prints its table only at the end and takes hours to get there, so without this the
+    only difference between a run that is working and one whose rows have collapsed is elapsed
+    time. Cost, facts and accuracy are the three that move first: a strategy that has stopped
+    preserving anything shows it here, hours before the table would.
+
+    Args:
+        record: The seed that just finished.
+
+    Returns:
+        One line, already indented to sit under the strategy heading.
+    """
+    parts = [
+        f"   {record.strategy} seed {record.seed}/{record.cell.repeats}",
+        f"${record.cost:.4f}",
+        f"facts {record.facts_left}/{record.facts_total}",
+        f"acc {record.correctness:.0%}",
+    ]
+    if record.disqualified:
+        parts.append("DQ")
+    if record.context_drift:
+        parts.append(f"DRIFT:{record.context_drift}")
+    if record.error:
+        parts.append(record.error)
+    return "  ".join(parts)
+
+
+def _exclusion_notes(incomplete: set[str], oversized: set[str], limit: int) -> list[str]:
+    """Return the lines naming what was dropped from the ranking, and why.
+
+    Args:
+        incomplete: Strategies that did not finish their turns.
+        oversized: Strategies that overran the tried limit.
+        limit: The context limit the cell stands in for.
+
+    Returns:
+        Zero or more lines.
+    """
+    lines: list[str] = []
+    if incomplete:
+        lines += ["", f"Excluded from the verdict ({len(incomplete)} did not finish): " + ", ".join(sorted(incomplete))]
+    if oversized:
+        lines += [
+            "",
+            f"Excluded from the verdict ({len(oversized)} exceeded the {limit:,}-token "
+            "limit this run stands in for): " + ", ".join(sorted(oversized)),
+        ]
+    return lines
+
+
+def _coverage(cell: CellParams, records: Sequence[SeedRecord]) -> list[str]:
+    """Return what a cell read back from file actually holds, and whether that is all of it.
+
+    A file is written seed by seed precisely so that an interrupted cell keeps what it had, so
+    an incomplete cell is the normal case here rather than the exception. Every mean in the
+    table below is over whatever is present, and the difference between a mean over fifteen
+    strategy-seeds and one over four is invisible in the table itself -- so it is stated here,
+    against what the run said it was going to take.
+
+    Args:
+        cell: The cell's parameters.
+        records: Its records.
+
+    Returns:
+        The heading, what is present, and a PARTIAL line when something is missing.
+    """
+    seeds: dict[str, list[int]] = {}
+    for record in records:
+        seeds.setdefault(record.strategy, []).append(record.seed)
+    # Intent is unioned over the records rather than read off the first, because a cell
+    # abandoned partway and resumed for the rest is written by two runs that each asked for
+    # part of it. Taking the first record's list would report the resumed half as unwanted.
+    intended = sorted({name for record in records for name in record.cell.strategies} | set(seeds))
+    wanted = max(record.cell.repeats for record in records)
+    present = ", ".join(f"{name} {len(seeds.get(name, ()))}/{wanted}" for name in intended)
+    lines = ["", f"Cell: {cell.label}", f"  seeds present: {present}"]
+    missing = [name for name in intended if name not in seeds]
+    short = [name for name, found in seeds.items() if len(found) < wanted]
+    if not missing and not short:
+        return lines
+    detail: list[str] = []
+    if missing:
+        detail.append(f"{len(missing)} of {len(intended)} strategies never recorded a seed ({', '.join(missing)})")
+    if short:
+        detail.append(f"{', '.join(sorted(short))} recorded fewer than the {wanted} seeds asked for")
+    lines.append(f"  PARTIAL: {'; '.join(detail)}. Every mean below is over what is present.")
+    return lines
+
+
+def _cells_from_records(records: Sequence[SeedRecord]) -> list[CellStats]:
+    """Aggregate one cell's records into rows, cheapest first.
+
+    Args:
+        records: Every record of one cell.
+
+    Returns:
+        One row per strategy present, ordered as the live table orders them.
+    """
+    by_strategy: dict[str, list[SeedRecord]] = {}
+    for record in records:
+        by_strategy.setdefault(record.strategy, []).append(record)
+    cells = [_aggregate(strategy, seeds) for strategy, seeds in by_strategy.items()]
+    cells.sort(key=lambda cell: cell.cost)
+    return cells
+
+
+def _render_from_records(args: argparse.Namespace) -> int:
+    """Rebuild the table from a results file, running nothing.
+
+    Args:
+        args: Parsed command line arguments.
+
+    Returns:
+        A process exit code.
+
+    Raises:
+        SystemExit: If the file cannot be read or holds no records.
+    """
+    path = Path(args.from_jsonl)
+    if not path.is_file():
+        raise SystemExit(f"No results file at {path}.")
+    try:
+        records = read_seed_records(path)
+    except (OSError, ValueError) as error:
+        raise SystemExit(str(error)) from error
+    if not records:
+        raise SystemExit(f"{path} holds no records.")
+
+    groups = group_by_cell(records)
+    print(f"{len(records)} seed records from {path}, in {len(groups)} cell(s).")
+    for cell_params, cell_records in groups:
+        cells = _cells_from_records(cell_records)
+        incomplete, oversized = _excluded_cells(cells)
+        excluded = incomplete | oversized
+        for line in _coverage(cell_params, cell_records):
+            print(line)
+        for line in _exclusion_notes(incomplete, oversized, cell_params.context_window):
+            print(line)
+        ranked = [_to_joint(cell) for cell in cells if cell.strategy not in excluded]
+        verdict: JointVerdict | None = None
+        if any(outcome.strategy == "none" for outcome in ranked):
+            try:
+                # The bar the run set, unless this invocation names one: a rebuilt verdict
+                # that silently applied a different threshold would rank rows the original
+                # never ranked, while every column above it stayed identical.
+                verdict = recommend(
+                    ranked,
+                    min_correctness=(
+                        cell_params.min_correctness if args.min_correctness is None else args.min_correctness
+                    ),
+                )
+            except ValueError as error:
+                print(f"Cannot summarize: {error}")
+        print(_render(verdict, cells, excluded, show_answers=args.show_answers))
+    return 0
+
+
 async def run_live_comparison(args: argparse.Namespace) -> int:
     """Run every selected strategy against a live agent and print the comparison.
 
@@ -925,7 +1225,14 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
 
     Returns:
         A process exit code.
+
+    Raises:
+        SystemExit: If the arguments do not describe a runnable cell.
     """
+    if args.from_jsonl is not None:
+        return _render_from_records(args)
+    if args.provider is None:
+        raise SystemExit("A provider is required, unless --from-jsonl is rebuilding a table from a results file.")
     provider, model_override = parse_provider_selector(args.provider)
     if provider not in provider_names():
         raise SystemExit(f"Unknown provider {provider!r}. Available: {', '.join(provider_names())}")
@@ -933,6 +1240,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
     if "none" not in strategies:
         raise SystemExit("The 'none' control must be included; every comparison is relative to it.")
 
+    min_correctness = DEFAULT_MIN_CORRECTNESS if args.min_correctness is None else args.min_correctness
     tokenizer = build_tokenizer(args.tokenizer)
     retained = args.keep_last_tool_groups
     plan = _plan_or_exit(args, tokenizer)
@@ -1050,7 +1358,31 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
             sum_provider, temperature=0.0, response_max_tokens=1_024, model=sum_model
         ).client
 
-    scenarios: dict[int, RecallScenario] = {}
+    cell_params = CellParams(
+        provider=provider,
+        model=runtime.model,
+        agent_kind=args.agent,
+        context_window=args.context_window,
+        fill=args.fill,
+        probe_repeats=args.probe_repeats,
+        repeats=args.repeats,
+        strategies=tuple(strategies),
+        narration=args.narration,
+        fact_placement=args.fact_placement,
+        tool_result_tokens=args.tool_result_tokens,
+        filler_turns=filler_turns,
+        filler_tokens=filler_tokens,
+        tool_turns=args.tool_turns,
+        filler_tool_turns=args.filler_tool_turns,
+        markers_per_tool=args.markers_per_tool,
+        price_input=pricing.input_per_million,
+        price_cached=pricing.cached_read_per_million,
+        price_output=pricing.output_per_million,
+        min_correctness=min_correctness,
+        plan=plan,
+    )
+    results_path = Path(args.results_jsonl) if args.results_jsonl is not None else None
+
     cells: list[CellStats] = []
     for name in strategies:
         print(f"-> {name}", flush=True)
@@ -1058,10 +1390,10 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
         # summarizer spend into every later row: measured as a flat +$0.0172 on all five
         # strategies that happened to run after 'summarization', which is invisible in a
         # total and inverted the ranking of the whole token_budget family.
-        seeds: list[LiveOutcome] = []
-        for repeat in range(1, args.repeats + 1):
-            if args.repeats > 1:
-                print(f"   seed {repeat}/{args.repeats}", flush=True)
+        seeds: list[SeedRecord] = []
+        for repeat in range(args.seed_offset + 1, args.seed_offset + args.repeats + 1):
+            if args.repeats > 1 or args.seed_offset:
+                print(f"   seed {repeat}", flush=True)
             summarizer = MeteredClient(summarizer_client) if summarizer_client is not None else None
             scenario = build_live_scenario(
                 salt=f"{time.strftime('%Y%m%d-%H%M%S')}-{name}-{repeat}",
@@ -1095,18 +1427,22 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
                 fact_placement=args.fact_placement,
                 probe_repeats=args.probe_repeats,
             )
-            seeds.append(outcome)
-            scenarios[id(outcome)] = scenario
-            if outcome.error:
-                print(f"   {outcome.error}", flush=True)
-        cells.append(_aggregate(name, seeds, scenarios, pricing, args.context_window))
+            # Scored, written and reported here rather than when the cell ends. A seed that
+            # has been paid for is durable the moment it exists, and the line that follows is
+            # the only sign of progress a cell gives in the hours before its table.
+            record = _seed_record(outcome, scenario, pricing, cell_params, repeat)
+            if results_path is not None:
+                append_seed_record(results_path, record)
+            seeds.append(record)
+            print(_progress(record), flush=True)
+        cells.append(_aggregate(name, seeds))
 
     # A run that stopped early spent almost nothing and answered almost nothing. Ranking it
     # produces "100% cheaper" for a strategy that simply died, and counts it as clearing the
     # correctness bar because a near-zero control makes every ratio look enormous.
     incomplete, oversized = _excluded_cells(cells)
-    if all(any(run.error for run in cell.runs) for cell in cells):
-        first = next(run.error for cell in cells for run in cell.runs if run.error)
+    if all(any(record.error for record in cell.records) for cell in cells):
+        first = next(record.error for cell in cells for record in cell.records if record.error)
         raise SystemExit(
             f"Every strategy failed. First error: {first}"
             + chr(10)
@@ -1116,17 +1452,10 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
         raise SystemExit("No strategy reported any billed tokens, so there is nothing to compare.")
 
     excluded = incomplete | oversized
-    if incomplete:
-        print()
-        print(f"Excluded from the verdict ({len(incomplete)} did not finish): " + ", ".join(sorted(incomplete)))
-    if oversized:
-        print()
-        print(
-            f"Excluded from the verdict ({len(oversized)} exceeded the {args.context_window:,}-token "
-            "limit this run stands in for): " + ", ".join(sorted(oversized))
-        )
+    for line in _exclusion_notes(incomplete, oversized, args.context_window):
+        print(line)
     cells.sort(key=lambda cell: cell.cost)
-    ranked = [_to_joint(cell, scenarios) for cell in cells if cell.strategy not in excluded]
+    ranked = [_to_joint(cell) for cell in cells if cell.strategy not in excluded]
 
     if not any(outcome.strategy == "none" for outcome in ranked):
         reason = "exceeded the tried limit" if "none" in oversized else "did not finish"
@@ -1137,7 +1466,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
             "conversation fits in."
         )
     try:
-        verdict = recommend(ranked, min_correctness=args.min_correctness)
+        verdict = recommend(ranked, min_correctness=min_correctness)
     except ValueError as error:
         raise SystemExit(f"Cannot summarize: {error}") from error
     if tool_strategies_inert:
@@ -1148,20 +1477,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
             f"retain the last {retained}, so {affected} evicted nothing. Their scores measure "
             "a no-op, not information preservation. Raise --tool-turns above the retention."
         )
-    print(
-        _render(
-            verdict,
-            cells,
-            excluded,
-            "none",
-            args.repeats,
-            pricing,
-            runtime.model,
-            args.agent,
-            plan,
-            show_answers=args.show_answers,
-        )
-    )
+    print(_render(verdict, cells, excluded, show_answers=args.show_answers))
     return 0
 
 

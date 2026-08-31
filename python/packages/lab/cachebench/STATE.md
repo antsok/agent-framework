@@ -128,15 +128,62 @@ Command: `runs/run-25-stage1.sh` — 60K and 120K, fills 0.50/0.70/0.86, five st
 | 60K / 0.86 | ran all 15 strategy-seeds over 3.5 hours, then **died before printing its table** |
 | 120K / 0.50, 0.70, 0.86 | never ran — the first pass hit `APIConnectionError` on every call |
 
-**Fix this before resuming.** A cell prints its table only when the whole cell finishes, so an
-interruption anywhere in 3.5 hours loses every seed. Results should be written per seed as they
-complete. The 60K/0.86 cell was lost to exactly this, having already been paid for.
+**Fixed, and to be used when resuming.** A cell used to print its table only when the whole
+cell finished, so an interruption anywhere in 3.5 hours lost every seed; the 60K/0.86 cell was
+lost to exactly that, having already been paid for. `--results-jsonl PATH` now appends one JSON
+record per seed, written and closed as that seed is scored, and `--from-jsonl PATH` rebuilds the
+table and verdict from the file with no provider and no calls. It is the same aggregation over
+the same records, so a recovered cell is the cell that was measured. The file is appended to, so
+one path can hold a whole sweep and a resumed run extends it; a cell missing strategies or seeds
+renders and is marked `PARTIAL` with what it holds. Each seed also prints a one-line summary
+(strategy, seed, cost, facts, accuracy) as it lands. **Add `--results-jsonl` to every command in
+`runs/run-25-stage1.sh` before resuming.**
 
 **The result that changes the remaining plan:** `rep+-` came out at 0-2 points on every row
 while `seed+-` ran to 30-78 points. Re-asking the same snapshot is almost perfectly repeatable;
 the variance is nearly all in *which seed*, meaning where the facts fall against a retention
 boundary. So `--probe-repeats 3` is buying very little and `--repeats` is buying everything:
 the remaining cells should trade probe repeats for seeds at roughly 3:1 within the same budget.
+
+## 3c. The before/after of upstream PR #7912
+
+Upstream merged [#7912](https://github.com/microsoft/agent-framework/pull/7912) on
+2026-08-31, which changes the behaviour this package measures. The plan agreed is to keep the
+current sweep as the **before** arm and re-run it after rebasing as the **after** arm, so the
+pair says whether the fix improved the shipped default on cost and on recall.
+
+**What it changes.** `ContextWindowCompactionStrategy`'s tool-eviction phase was
+`TokenBudgetComposedStrategy(token_budget=tool_eviction_tokens)` called unconditionally; it is
+now `ToolResultCompactionStrategy(compact_to=tool_eviction_tokens)` called only when
+`included_token_count(messages) > tool_eviction_tokens`. So the phase both gained its threshold
+and lost its destructive oldest-first fallback — exactly the behaviour the `context_window` row
+has been penalised for in every run here. It also adds `preserve_first_user_group`, which
+protects the turn carrying the requirements.
+
+`_middleware.py` additionally reconciles compaction summaries at the pipeline boundary, so
+compaction done inside the client now persists back into the caller's message list instead of
+being dropped there. **That one reaches every compacting row**, because it changes whether
+exclusions accumulate across turns — `anchored` makes position-only decisions precisely so its
+choices stay stable across turns, which was a workaround for this.
+
+**Arm identity.**
+
+| arm | framework | lab code |
+| --- | --- | --- |
+| before | `3dbaaea3e` (our merge-base) | `5d3b998d0` plus the records/seed-offset work |
+| after | `6a0773ba2` (upstream main) | the same, rebased |
+
+We modify no framework file, so the before arm measures upstream compaction verbatim. Our 93
+changed files and upstream's 244 **do not intersect**, so the rebase should be conflict-free.
+#7918 is `[BREAKING]` for middleware but only enforces sequence-only inputs, which is what we
+already pass.
+
+**Honest framing:** the after arm advances 40 upstream commits, not one. #7912 is the
+compaction-relevant change among them, and the pair should be reported as "upstream main before
+and after #7912", not as an isolated bisect of that PR.
+
+**Do not rebase while a sweep is running.** The venv is an editable install from this worktree,
+so the framework would change under processes that have already started.
 
 ## 4. The finding the report does not yet state correctly
 
@@ -207,7 +254,8 @@ Each of these produced a plausible wrong number first.
 - Branch `python-lab-cachebench`, ~40 commits ahead of `origin`, **not pushed**. Pushing needs
   its own go-ahead.
 - `dev/` is untracked Git-LFS junk. **Never stage it.**
-- 211 tests pass; ruff and pyright are clean. The measurement rebuild above is **uncommitted**.
+- 227 tests pass; ruff and pyright are clean. The measurement rebuild above is **uncommitted**,
+  as is the per-seed results file (`_records.py`, `--results-jsonl`, `--from-jsonl`).
 - `REPORT.md` and `ARTICLE.md` still describe only the six-model cross-provider work and
   predate everything from run 7 onward. They do not mention the 272,000 input limit, the
   crossover, or either new strategy.

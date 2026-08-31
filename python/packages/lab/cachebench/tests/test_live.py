@@ -14,6 +14,8 @@ from __future__ import annotations
 import contextlib
 import re
 from collections.abc import Mapping, Sequence
+from dataclasses import replace
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -37,6 +39,7 @@ from agent_framework import (
 )
 from agent_framework_lab_cachebench import (
     AGENT_KINDS,
+    FillPlan,
     LiveOutcome,
     MeteredClient,
     ModelCall,
@@ -68,14 +71,26 @@ from agent_framework_lab_cachebench._live_cli import (
     _accuracy_note,
     _aggregate,
     _cost,
+    _coverage,
     _excluded_cells,
     _probe_spread,
+    _progress,
     _render,
+    _seed_record,
     _seed_spread,
     _spread,
     _summarizer_cost,
     _to_joint,
     build_parser,
+    run_live_comparison,
+)
+from agent_framework_lab_cachebench._records import (
+    SCHEMA_VERSION,
+    CellParams,
+    SeedRecord,
+    append_seed_record,
+    group_by_cell,
+    read_seed_records,
 )
 from agent_framework_lab_cachebench._toolsummary import (
     RECALL_TOOL_NAME,
@@ -84,6 +99,59 @@ from agent_framework_lab_cachebench._toolsummary import (
 )
 
 TOKENIZER = CharacterEstimatorTokenizer()
+PRICING = ModelPricing(input_per_million=1.0, cached_read_per_million=0.1, output_per_million=1.0)
+
+
+def _cell_params(**overrides: Any) -> CellParams:
+    """Return the cell parameters a record carries, shaped like the ones a live run writes."""
+    defaults: dict[str, Any] = {
+        "provider": "stub",
+        "model": "stub-model",
+        "agent_kind": "plain",
+        "context_window": 60_000,
+        "fill": 0.0,
+        "probe_repeats": 3,
+        "repeats": 1,
+        "strategies": ("none",),
+        "narration": "neutral",
+        "fact_placement": "spread",
+        "tool_result_tokens": 50,
+        "filler_turns": 3,
+        "filler_tokens": 50,
+        "tool_turns": 6,
+        "filler_tool_turns": 0,
+        "markers_per_tool": 2,
+        "price_input": PRICING.input_per_million,
+        "price_cached": PRICING.cached_read_per_million,
+        "price_output": PRICING.output_per_million,
+    }
+    return CellParams(**{**defaults, **overrides})
+
+
+def _record(
+    outcome: LiveOutcome,
+    scenario: Any,
+    *,
+    strategy: str | None = None,
+    cell: CellParams | None = None,
+    seed: int = 1,
+) -> SeedRecord:
+    """Score one outcome into the record every table is built from.
+
+    Args:
+        outcome: The finished run.
+        scenario: The scenario it was driven from.
+
+    Keyword Args:
+        strategy: Name the row under, when the test drove the outcome with a different one.
+        cell: Cell parameters, defaulting to the shared test cell.
+        seed: 1-based seed index.
+
+    Returns:
+        The record.
+    """
+    record = _seed_record(outcome, scenario, PRICING, cell or _cell_params(), seed)
+    return replace(record, strategy=strategy) if strategy is not None else record
 
 
 class StubChatClient(FunctionInvocationLayer[Any], ChatMiddlewareLayer[Any], BaseChatClient[Any]):
@@ -891,14 +959,14 @@ def test_spread_reports_the_gap_between_repeats() -> None:
     pricing = ModelPricing(input_per_million=1.0, cached_read_per_million=0.1, output_per_million=1.0)
     repeats = [_priced("s", 8_000), _priced("s", 10_000), _priced("s", 12_000)]
 
-    assert _spread(repeats, pricing) == pytest.approx(0.4)
+    assert _spread([_cost(outcome, pricing) for outcome in repeats]) == pytest.approx(0.4)
 
 
 def test_spread_is_zero_for_a_single_repeat() -> None:
     """One repeat measures nothing about stability, and must not imply otherwise."""
     pricing = ModelPricing(input_per_million=1.0, cached_read_per_million=0.1, output_per_million=1.0)
 
-    assert _spread([_priced("s", 5_000)], pricing) == 0.0
+    assert _spread([_cost(_priced("s", 5_000), pricing)]) == 0.0
 
 
 def test_cached_tokens_are_discounted() -> None:
@@ -1355,13 +1423,10 @@ async def test_a_disqualified_cell_is_excluded_from_the_ranking() -> None:
     Ranked with an asterisk it still sets the baseline every other row is compared against,
     which is the failure the asterisk was supposed to warn about.
     """
-    pricing = ModelPricing(input_per_million=1.0, cached_read_per_million=0.1, output_per_million=1.0)
-    scenarios: dict[int, Any] = {}
     cells = []
     for name, usage in (("none", 1_000), ("truncation", 90_000)):
         outcome, scenario = await _probed(StubChatClient(usage=UsageDetails(input_token_count=usage)), repeats=1)
-        scenarios[id(outcome)] = scenario
-        cells.append(_aggregate(name, [outcome], scenarios, pricing, 60_000))
+        cells.append(_aggregate(name, [_record(outcome, scenario, strategy=name)]))
 
     incomplete, oversized = _excluded_cells(cells)
     ranked = [cell.strategy for cell in cells if cell.strategy not in incomplete | oversized]
@@ -1381,18 +1446,15 @@ async def test_the_table_renders_every_column_it_declares() -> None:
     against the parser -- a column that appears with no explanation is how "correct" was read
     as the median-cost repeat for three matrices running.
     """
-    pricing = ModelPricing(input_per_million=1.0, cached_read_per_million=0.1, output_per_million=1.0)
-    scenarios: dict[int, Any] = {}
     cells = []
     for name, usage in (("none", 1_000), ("truncation", 900)):
         outcome, scenario = await _probed(
             StubChatClient(usage=UsageDetails(input_token_count=usage, output_token_count=20)), repeats=2
         )
-        scenarios[id(outcome)] = scenario
-        cells.append(_aggregate(name, [outcome], scenarios, pricing, 60_000))
-    verdict = recommend([_to_joint(cell, scenarios) for cell in cells])
+        cells.append(_aggregate(name, [_record(outcome, scenario, strategy=name)]))
+    verdict = recommend([_to_joint(cell) for cell in cells])
 
-    table = _render(verdict, cells, set(), "none", 1, pricing, "stub", "plain", None, show_answers=False)
+    table = _render(verdict, cells, set(), show_answers=False)
 
     header = next(line for line in table.splitlines() if line.strip().startswith("strategy"))
     # Split on the padding between fields, not on spaces: two columns have a space in the name.
@@ -1434,14 +1496,15 @@ async def test_the_two_spreads_are_reported_apart() -> None:
 
     # One seed answered thoroughly every time, one that wandered: identical facts in front of
     # the model in both, so all of this belongs to the within-seed column.
-    steady = outcome_with([" ".join(codes)] * 3)
-    wandering = outcome_with([" ".join(codes), " ".join(codes[:2]), " ".join(codes)])
-    scenarios = {id(steady): scenario, id(wandering): scenario}
+    steady = _record(outcome_with([" ".join(codes)] * 3), scenario).correctness_samples
+    wandering = _record(
+        outcome_with([" ".join(codes), " ".join(codes[:2]), " ".join(codes)]), scenario
+    ).correctness_samples
 
-    assert _probe_spread([wandering], scenarios) > 0
-    assert _seed_spread([wandering], scenarios) == 0.0, "one seed cannot show a between-seed spread"
-    assert _probe_spread([steady], scenarios) == 0.0
-    assert _seed_spread([steady, wandering], scenarios) > 0
+    assert _probe_spread([wandering]) > 0
+    assert _seed_spread([wandering]) == 0.0, "one seed cannot show a between-seed spread"
+    assert _probe_spread([steady]) == 0.0
+    assert _seed_spread([steady, wandering]) > 0
 
 
 # endregion
@@ -1548,12 +1611,12 @@ def test_seed_spread_reads_the_scored_outcome_not_the_raw_run() -> None:
 
     perfect = outcome_with(" ".join(codes))
     partial = outcome_with(" ".join(codes[: len(codes) // 4]))
-    scenarios = {id(perfect): scenario, id(partial): scenario}
+    scored = [_record(perfect, scenario).correctness_samples, _record(partial, scenario).correctness_samples]
 
     assert not hasattr(perfect, "correctness")
-    assert _seed_spread([perfect, partial], scenarios) > 0
+    assert _seed_spread(scored) > 0
     # A single seed says nothing about compaction's reliability, and must not claim to.
-    assert _seed_spread([perfect], {id(perfect): scenario}) == 0.0
+    assert _seed_spread(scored[:1]) == 0.0
 
 
 def test_an_unstable_control_disables_the_accuracy_ranking() -> None:
@@ -1782,3 +1845,435 @@ def _recall_exchange(result: str) -> list[Message]:
         ),
         Message(role="tool", contents=[{"type": "function_result", "call_id": "r", "result": result}]),
     ]
+
+
+# region the results file
+
+
+def _live_argv(*extra: str) -> list[str]:
+    """Return a command line driving a small comparison the stub can answer.
+
+    Sized down to the smallest cell that still has two strategies and two seeds, since the
+    questions here are about what reaches the file rather than about what compaction does.
+
+    Args:
+        extra: Further flags, appended after the defaults so they win.
+
+    Returns:
+        The argument vector.
+    """
+    return [
+        "azure",
+        "--price-input",
+        "1",
+        "--price-cached",
+        "0.1",
+        "--price-output",
+        "1",
+        "--strategies",
+        "none,truncation",
+        "--repeats",
+        "2",
+        "--probe-repeats",
+        "2",
+        "--fill",
+        "0",
+        "--filler-turns",
+        "2",
+        "--filler-tokens",
+        "50",
+        "--tool-result-tokens",
+        "50",
+        "--context-window",
+        "60000",
+        "--tokenizer",
+        "estimator",
+        *extra,
+    ]
+
+
+def _stub_provider(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Point the live CLI at the stub client, so a whole comparison runs offline."""
+
+    def build(name: str, **_: Any) -> ProviderRuntime:
+        usage = UsageDetails(input_token_count=1_000, output_token_count=20, cache_read_input_token_count=300)
+        return ProviderRuntime(client=StubChatClient(usage=usage), model="stub-model")
+
+    monkeypatch.setattr("agent_framework_lab_cachebench._live_cli.build_provider", build)
+
+
+def _table(printed: str) -> str:
+    """Return just the rendered table from a run's output, dropping the progress before it."""
+    return printed[printed.index("Model:") :]
+
+
+async def test_every_finished_seed_is_on_disk_before_the_cell_is(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """A cell killed partway must leave behind every seed it had already completed.
+
+    This is the whole reason the file exists. The 60,000/0.86 cell ran all fifteen
+    strategy-seeds over three and a half hours, died before printing its table, and left
+    nothing at all -- work that had already been paid for. Writing when the cell ends cannot
+    survive that, so a record is written and closed as each seed is scored.
+    """
+    _stub_provider(monkeypatch)
+    path = tmp_path / "results.jsonl"
+    live = run_live
+    seeds = 0
+
+    async def dying(*args: Any, **kwargs: Any) -> LiveOutcome:
+        nonlocal seeds
+        seeds += 1
+        if seeds > 3:
+            raise KeyboardInterrupt("the process died mid-cell")
+        return await live(*args, **kwargs)
+
+    monkeypatch.setattr("agent_framework_lab_cachebench._live_cli.run_live", dying)
+    args = build_parser().parse_args(_live_argv("--results-jsonl", str(path)))
+
+    with pytest.raises(KeyboardInterrupt):
+        await run_live_comparison(args)
+
+    records = read_seed_records(path)
+    assert [(record.strategy, record.seed) for record in records] == [
+        ("none", 1),
+        ("none", 2),
+        ("truncation", 1),
+    ], "a completed seed was still in memory when the process died"
+    assert all(record.correctness_samples for record in records), "records were written before they were scored"
+
+
+async def test_the_table_rebuilt_from_the_file_matches_the_live_one(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """--from-jsonl must reproduce the live table exactly, not approximately.
+
+    A rebuilt table that differs anywhere is a second measurement, and the point of recovering
+    a dead cell is that its numbers are the numbers it would have printed. Both paths reach one
+    aggregation over one kind of input, and this is what says so.
+    """
+    _stub_provider(monkeypatch)
+    path = tmp_path / "results.jsonl"
+
+    await run_live_comparison(build_parser().parse_args(_live_argv("--results-jsonl", str(path))))
+    live = capsys.readouterr().out
+    await run_live_comparison(build_parser().parse_args(["--from-jsonl", str(path)]))
+    rebuilt = capsys.readouterr().out
+
+    assert "VERDICT:" in live
+    assert _table(rebuilt) == _table(live)
+
+
+async def test_aggregation_survives_the_round_trip_through_the_file(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Records read back must aggregate to the identical cell, field for field.
+
+    Stronger than comparing the rendered tables, which round every number they print: a
+    difference in the fourth decimal of a cost, or a tuple that came back as a list, is
+    invisible there and is exactly the kind of thing that makes two paths disagree later.
+    """
+    _stub_provider(monkeypatch)
+    path = tmp_path / "results.jsonl"
+    await run_live_comparison(build_parser().parse_args(_live_argv("--results-jsonl", str(path))))
+    capsys.readouterr()
+
+    written = read_seed_records(path)
+    again = tmp_path / "again.jsonl"
+    for record in written:
+        append_seed_record(again, record)
+    reread = read_seed_records(again)
+
+    for name in ("none", "truncation"):
+        assert _aggregate(name, [record for record in written if record.strategy == name]) == _aggregate(
+            name, [record for record in reread if record.strategy == name]
+        )
+
+
+async def test_a_partial_file_renders_and_says_it_is_partial(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A cell missing strategies or seeds must render, and must not read as finished.
+
+    Every mean in the table is over whatever is present, and nothing in the table itself
+    distinguishes a mean over four strategy-seeds from one over fifteen. So the coverage is
+    stated against what the run said it was going to take.
+    """
+    _stub_provider(monkeypatch)
+    full = tmp_path / "full.jsonl"
+    await run_live_comparison(build_parser().parse_args(_live_argv("--results-jsonl", str(full))))
+    capsys.readouterr()
+
+    partial = tmp_path / "partial.jsonl"
+    for record in read_seed_records(full):
+        if record.strategy == "none" or record.seed == 1:
+            append_seed_record(partial, record)
+    await run_live_comparison(build_parser().parse_args(["--from-jsonl", str(partial)]))
+    printed = capsys.readouterr().out
+
+    assert "seeds present: none 2/2, truncation 1/2" in printed
+    assert "PARTIAL" in printed
+    assert "fewer than the 2 seeds asked for" in printed
+    assert "VERDICT:" in printed, "a partial cell that still holds the control can still be ranked"
+
+
+async def test_a_file_without_the_control_renders_without_a_verdict(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Every ranking is relative to the uncompacted control, so without it there is none.
+
+    It must still print what it has. A cell that died before reaching the control is exactly
+    the cell whose surviving rows are worth reading, and refusing to show them would repeat
+    the loss the file exists to prevent.
+    """
+    _stub_provider(monkeypatch)
+    full = tmp_path / "full.jsonl"
+    await run_live_comparison(build_parser().parse_args(_live_argv("--results-jsonl", str(full))))
+    capsys.readouterr()
+
+    headless = tmp_path / "headless.jsonl"
+    for record in read_seed_records(full):
+        if record.strategy != "none":
+            append_seed_record(headless, record)
+    await run_live_comparison(build_parser().parse_args(["--from-jsonl", str(headless)]))
+    printed = capsys.readouterr().out
+
+    assert "NO VERDICT" in printed
+    assert "truncation" in printed
+    assert "never recorded a seed (none)" in printed
+
+
+async def test_two_runs_into_one_path_keep_both(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Appending must not clobber, and two cells in one file must stay two cells.
+
+    A sweep points every cell at one results file, and a resumed run points at the file it
+    already half-filled. Truncating on open would lose the run that was being recovered.
+    """
+    _stub_provider(monkeypatch)
+    path = tmp_path / "sweep.jsonl"
+    await run_live_comparison(build_parser().parse_args(_live_argv("--results-jsonl", str(path))))
+    await run_live_comparison(
+        build_parser().parse_args(_live_argv("--results-jsonl", str(path), "--context-window", "40000"))
+    )
+    capsys.readouterr()
+
+    records = read_seed_records(path)
+    cells = group_by_cell(records)
+    await run_live_comparison(build_parser().parse_args(["--from-jsonl", str(path)]))
+    printed = capsys.readouterr().out
+
+    assert len(records) == 8, "the second run overwrote the first"
+    assert len(cells) == 2, "two context windows are two cells and cannot share a row"
+    assert {params.context_window for params, _ in cells} == {40_000, 60_000}
+    assert printed.count("Cell: ") == 2
+    assert printed.count("VERDICT") == 2, "each cell needs its own table"
+
+
+async def test_a_resumed_cell_reads_back_as_one_cell(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The strategies a run asked for are intent, not identity.
+
+    Resuming a dead cell for the strategies it never reached writes records naming a different
+    ``--strategies`` list. Treating that as a different cell would put the recovered half in a
+    table of its own, which is the opposite of recovering it.
+    """
+    _stub_provider(monkeypatch)
+    path = tmp_path / "resumed.jsonl"
+    await run_live_comparison(
+        build_parser().parse_args(_live_argv("--results-jsonl", str(path), "--strategies", "none,truncation"))
+    )
+    await run_live_comparison(
+        build_parser().parse_args(_live_argv("--results-jsonl", str(path), "--strategies", "none,sliding_window"))
+    )
+    capsys.readouterr()
+
+    await run_live_comparison(build_parser().parse_args(["--from-jsonl", str(path)]))
+    printed = capsys.readouterr().out
+
+    assert len(group_by_cell(read_seed_records(path))) == 1
+    assert "none 4/2, sliding_window 2/2, truncation 2/2" in printed
+
+
+async def test_each_finished_seed_prints_a_line_of_its_own(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A cell that runs for hours has to show progress, or a collapsed row is invisible.
+
+    Cost, facts and accuracy are what move first when a strategy stops preserving anything,
+    and they are readable here hours before the table would have printed them.
+    """
+    _stub_provider(monkeypatch)
+    await run_live_comparison(build_parser().parse_args(_live_argv()))
+    printed = capsys.readouterr().out
+
+    lines = [line for line in printed.splitlines() if " seed " in line and "acc " in line]
+    assert len(lines) == 4, "one line per strategy-seed"
+    assert "none seed 1/2" in lines[0]
+    for line in lines:
+        assert "$" in line
+        assert "facts " in line
+
+
+def test_a_progress_line_shows_what_a_watcher_needs() -> None:
+    """The line must carry the four numbers, and flag a seed that disqualified."""
+    record = SeedRecord(
+        cell=_cell_params(repeats=3),
+        strategy="truncation",
+        seed=2,
+        cost=0.0412,
+        summarizer_cost=0.0,
+        input_tokens=1_000,
+        cached_tokens=300,
+        output_tokens=20,
+        calls=4,
+        messages_left=6,
+        messages_peak=12,
+        prompt_tokens_final=900,
+        prompt_tokens_peak=1_000,
+        seed_prompt_tokens=800,
+        facts_total=53,
+        facts_left=27,
+        facts_lost=20,
+        nofetch=6,
+        correctness_samples=(0.5, 0.54),
+        ignored_samples=(1, 2),
+        combined_samples=(0.4,),
+        disqualified=True,
+        context_drift=1,
+        turns_completed=10,
+        turns_total=10,
+        probe_repeats=2,
+        summarizer_calls=0,
+        summarizer_failures=0,
+        strategy_notes=(),
+        dropped_options=(),
+        answer="",
+    )
+
+    line = _progress(record)
+
+    assert "truncation seed 2/3" in line
+    assert "$0.0412" in line
+    assert "facts 27/53" in line
+    assert "acc 52%" in line
+    assert "DQ" in line
+    assert "DRIFT:1" in line
+
+
+def test_records_from_another_schema_are_refused() -> None:
+    """A reader must be able to tell an old record from a new one.
+
+    The measurement itself has been rebuilt once. Before the seed/snapshot/probe design,
+    ``survived`` was scored against a prompt the closing answers had written, and the same
+    strategy read 53/53 on one run and 18/53 on another. Averaging records from either side of
+    that into one row would be a mean over two different questions.
+    """
+    payload = {"schema": SCHEMA_VERSION + 1, "cell": _cell_params().to_dict(), "strategy": "none"}
+
+    with pytest.raises(ValueError, match="schema"):
+        SeedRecord.from_dict(payload)
+
+
+def test_the_solved_sizing_survives_the_file() -> None:
+    """The fill check has to be reproducible from the file.
+
+    Without the plan, a rebuilt cell cannot say whether it landed on the fraction it is
+    labelled with, which is the one thing that makes the fill a variable rather than a wish.
+    """
+    plan = FillPlan(
+        filler_turns=7,
+        filler_tokens=2_000,
+        context_limit=60_000,
+        fill_fraction=0.86,
+        target_tokens=51_600,
+        predicted_tokens=51_500,
+        payload_tokens=30_000,
+        tool_payload_tokens=21_000,
+    )
+    params = _cell_params(plan=plan, fill=0.86)
+
+    assert CellParams.from_dict(params.to_dict()) == params
+
+
+async def test_a_complete_cell_is_not_marked_partial(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:
+    """A complete cell must say so by saying nothing, or PARTIAL means nothing either."""
+    _stub_provider(monkeypatch)
+    path = tmp_path / "complete.jsonl"
+    await run_live_comparison(build_parser().parse_args(_live_argv("--results-jsonl", str(path))))
+
+    params, records = group_by_cell(read_seed_records(path))[0]
+    lines = _coverage(params, records)
+
+    assert any("none 2/2, truncation 2/2" in line for line in lines)
+    assert not any("PARTIAL" in line for line in lines)
+
+
+async def test_a_rebuilt_verdict_applies_the_bar_the_run_applied(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The correctness bar is an input to the verdict, so it has to travel with the records.
+
+    It is the one input that leaves no trace in the columns. A rebuild under the default bar
+    would rank rows the original run never ranked while every number above the verdict stayed
+    identical, which is the hardest kind of disagreement to notice. Naming the flag on the
+    rebuild still overrides it, since asking a measured cell a different question is a
+    legitimate thing to want.
+    """
+    _stub_provider(monkeypatch)
+    path = tmp_path / "bar.jsonl"
+    await run_live_comparison(
+        build_parser().parse_args(_live_argv("--results-jsonl", str(path), "--min-correctness", "0.4"))
+    )
+    capsys.readouterr()
+    seen: list[float] = []
+
+    def capturing(outcomes: Any, *, min_correctness: float) -> Any:
+        seen.append(min_correctness)
+        return recommend(outcomes, min_correctness=min_correctness)
+
+    monkeypatch.setattr("agent_framework_lab_cachebench._live_cli.recommend", capturing)
+    await run_live_comparison(build_parser().parse_args(["--from-jsonl", str(path)]))
+    await run_live_comparison(build_parser().parse_args(["--from-jsonl", str(path), "--min-correctness", "0.9"]))
+    capsys.readouterr()
+
+    assert {record.cell.min_correctness for record in read_seed_records(path)} == {0.4}
+    assert seen == [0.4, 0.9]
+
+
+def test_from_jsonl_needs_no_provider() -> None:
+    """Rebuilding a table calls nothing, so demanding a provider would misdescribe it."""
+    args = build_parser().parse_args(["--from-jsonl", "results.jsonl"])
+
+    assert args.provider is None
+    assert args.from_jsonl == "results.jsonl"
+
+
+async def test_a_run_without_a_provider_is_refused() -> None:
+    """Making the provider optional must not make it optional for a run that measures."""
+    args = build_parser().parse_args(["--repeats", "1"])
+
+    with pytest.raises(SystemExit, match="provider is required"):
+        await run_live_comparison(args)
+
+
+# endregion
+
+
+def test_seed_numbering_can_be_offset() -> None:
+    """Concurrent invocations of one cell must not build the same conversation.
+
+    The scenario salt is a whole-second timestamp plus the strategy name and the seed number.
+    Several single-seed invocations launched together share the first two, so without an
+    offset they all seed at 1 and produce byte-identical conversations -- five records that
+    look like five seeds and are one, which is exactly the spread the seed axis exists to
+    measure being reported as zero.
+    """
+    args = build_parser().parse_args(["openrouter:some/model"])
+    assert args.seed_offset == 0, "the default must not renumber anything"
+
+    offset = build_parser().parse_args(["openrouter:some/model", "--seed-offset", "4"])
+    assert offset.seed_offset == 4
