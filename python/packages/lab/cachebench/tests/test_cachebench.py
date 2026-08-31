@@ -9,8 +9,9 @@ the prefix oracle, and the aggregation can be verified without spending anything
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from agent_framework import CharacterEstimatorTokenizer, Content, Message, SlidingWindowStrategy
@@ -37,7 +38,7 @@ from agent_framework_lab_cachebench import (
     write_records_jsonl,
     write_summary_csv,
 )
-from agent_framework_lab_cachebench._runner import unsupported_option
+from agent_framework_lab_cachebench._runner import is_rate_limited, retry_after_seconds, unsupported_option
 from agent_framework_lab_cachebench._strategies import STRATEGIES_NEEDING_SUMMARIZER, StrategyOptions
 from agent_framework_lab_cachebench._types import TurnRecord
 
@@ -450,6 +451,80 @@ async def test_caller_drops_a_rejected_option_and_retries() -> None:
     assert "temperature" in client.seen[0] and "temperature" not in client.seen[1]
     # The retry must not mutate the shared runtime options other cells still use.
     assert "temperature" in runtime.options
+
+
+# region rate limits
+
+
+class _Throttled(Exception):
+    """A 429 shaped the way an SDK raises one: a status on the error, headers on a response."""
+
+    def __init__(self, headers: Mapping[str, str] | None = None) -> None:
+        super().__init__("Error code: 429 - {'error': {'code': 'rate_limit_exceeded'}}")
+        self.status_code = 429
+        self.response = SimpleNamespace(headers=dict(headers or {}))
+
+
+class _Refused(RuntimeError):
+    """A provider SDK's own 429, with nothing in its text to say so."""
+
+    status_code = 429
+
+
+def test_a_429_is_found_through_the_wrapper_that_hides_it() -> None:
+    """The class that knows it was a 429 is never the class that is caught.
+
+    The framework wraps the provider SDK's error, and each provider raises a different one, so
+    classifying by exception type would work for exactly one of them. The status on the cause
+    is the signal that does not depend on wording, and the wrapper used here says nothing
+    about rates -- so nothing but the chain walk can classify it.
+    """
+    wrapped = Exception("<class 'FoundryChatClient'> service failed to complete the prompt")
+    wrapped.__cause__ = _Refused("refused")
+
+    assert is_rate_limited(wrapped)
+
+
+def test_a_429_is_found_in_the_text_when_the_wrapper_kept_no_object() -> None:
+    """A wrapper that rendered its cause to a string still has to be classifiable.
+
+    This is the shape the sweep actually failed on: ``ChatClientException`` carrying
+    ``Error code: 429`` and ``rate_limit_exceeded`` as text and nothing else.
+    """
+    assert is_rate_limited(Exception("Error code: 429 - {'error': {'code': 'rate_limit_exceeded'}}"))
+    assert is_rate_limited(Exception("HTTP 503: Too Many Requests"))
+
+
+def test_a_status_number_inside_a_token_count_is_not_throttling() -> None:
+    """A deterministic refusal must not be retried as though the limit would lift.
+
+    A prompt-too-large error names the size that was refused, and 274,293 tokens contains the
+    digits 429. Read as a status, a wall becomes a spike: six attempts and minutes of waiting
+    before the same failure arrives anyway.
+    """
+    assert not is_rate_limited(Exception("Error code: 400 - supports at most 272000 tokens, got 274293"))
+    assert not is_rate_limited(Exception("Error code: 500 - internal"))
+
+
+def test_the_wait_a_provider_asks_for_is_read_off_its_response() -> None:
+    """A named delay beats any schedule invented here, because it knows when the window refills."""
+    assert retry_after_seconds(_Throttled({"Retry-After": "12"})) == 12.0
+    # Case-insensitively: the header arrives capitalised from one provider and not another.
+    assert retry_after_seconds(_Throttled({"retry-after": "12"})) == 12.0
+
+
+def test_a_millisecond_retry_after_is_scaled_to_seconds() -> None:
+    """``retry-after-ms`` is the same instruction in different units, not a different one."""
+    assert retry_after_seconds(_Throttled({"retry-after-ms": "1500"})) == 1.5
+
+
+def test_a_retry_after_that_is_not_a_count_leaves_the_schedule_to_decide() -> None:
+    """An HTTP-date ``Retry-After`` is not parsed, so the exponential schedule answers instead.
+
+    Misparsing a date is a wait of hours or of nothing; falling back is neither.
+    """
+    assert retry_after_seconds(_Throttled({"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"})) is None
+    assert retry_after_seconds(_Throttled()) is None
 
 
 # region provider selectors

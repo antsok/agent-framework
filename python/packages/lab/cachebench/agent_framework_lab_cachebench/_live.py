@@ -29,6 +29,8 @@ after phase belongs on the provider.
 
 from __future__ import annotations
 
+import asyncio
+import random
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
@@ -60,7 +62,7 @@ from ._recall import (
     score_answer,
     score_scoped,
 )
-from ._runner import unsupported_option
+from ._runner import is_rate_limited, retry_after_seconds, unsupported_option
 from ._strategies import StrategyOptions, build_strategy
 from ._toolsummary import (
     RECALL_TOOL_NAME,
@@ -81,6 +83,11 @@ __all__ = [
     "DEFAULT_PROBE_REPEATS",
     "DEFAULT_TOOL_RESULT_TOKENS",
     "NEUTRAL_INSTRUCTIONS",
+    "RATE_LIMIT_ATTEMPTS",
+    "RATE_LIMIT_BASE_DELAY",
+    "RATE_LIMIT_JITTER",
+    "RATE_LIMIT_MAX_DELAY",
+    "RATE_LIMIT_MAX_WAIT",
     "RETRIEVAL_GUIDANCE",
     "TERSE_INSTRUCTIONS",
     "LiveOutcome",
@@ -125,6 +132,53 @@ DEFAULT_PROBE_REPEATS: Final[int] = 3
 #: trace tool output is usually the bulk of the context, and a benchmark whose tool
 #: results are a rounding error cannot say anything about tool-oriented compaction.
 DEFAULT_TOOL_RESULT_TOKENS: Final[int] = 4_000
+
+#: Attempts one call makes against provider throttling before the turn is failed.
+#:
+#: Six, which with the schedule below spans about two minutes of waiting and, under the
+#: bounds, at most five. The deployment these runs are made against is a 200,000 TPM /
+#: 200 RPM quota, and a quota window refills on a fixed period rather than gradually, so the
+#: question a retry asks is only ever "has the next window started". Five minutes covers
+#: several of them, which is far more than a spike and short enough that a quota that is
+#: genuinely exhausted fails its turn in minutes rather than absorbing hours of a sweep.
+#:
+#: Not free to raise: every attempt re-sends the whole prompt, and at the sizes measured here
+#: that is 50,000 to 230,000 tokens the provider will charge for if it accepts it.
+RATE_LIMIT_ATTEMPTS: Final[int] = 6
+
+#: First backoff in seconds, doubled per attempt: 2, 4, 8, 16, 32.
+#:
+#: Small on purpose. Most 429s here are one call arriving inside a window another call has
+#: just filled, and the window is seconds wide; starting at a minute would turn a two-second
+#: problem into a two-minute one on every occurrence.
+RATE_LIMIT_BASE_DELAY: Final[float] = 2.0
+
+#: Ceiling on any single wait, in seconds, including one the provider asked for.
+#:
+#: One minute, because the quota window is one minute. Waiting longer than the window cannot
+#: buy more headroom than waiting for the window, and a provider that answers ``Retry-After:
+#: 3600`` -- which is what a daily cap looks like -- should fail the turn honestly rather
+#: than silently park a sweep for an hour.
+RATE_LIMIT_MAX_DELAY: Final[float] = 60.0
+
+#: Ceiling on the total one turn may spend waiting, in seconds.
+#:
+#: Bounded per turn rather than per run: a long sweep that meets throttling on many turns
+#: should survive all of them, but no single turn should be able to stall indefinitely by
+#: being handed a large delay repeatedly. The seconds are counted and reported either way, so
+#: a run that spent its wall clock here says so instead of looking merely slow.
+RATE_LIMIT_MAX_WAIT: Final[float] = 300.0
+
+#: Share of each computed wait that is randomised away, so waits land between 75% and 100%.
+#:
+#: The quota is per deployment, not per process, and it is shared with whatever else is
+#: running against the same account. A fixed schedule makes two throttled clients re-collide
+#: on every attempt; this is enough to break that without making the schedule unreadable.
+#: Not applied to a delay the provider asked for, which is an instruction rather than a guess.
+RATE_LIMIT_JITTER: Final[float] = 0.25
+
+#: Source of the jitter above. Not a security control; see ``_throttle_delay``.
+_JITTER_SOURCE: Final[random.SystemRandom] = random.SystemRandom()
 
 TERSE_INSTRUCTIONS: Final[str] = (
     "You are a meticulous engineering assistant. Follow every stated requirement exactly. "
@@ -440,6 +494,21 @@ class LiveOutcome:
     Survival is scored against the snapshot, so those probes would be credited with facts the
     model was not shown. Counted rather than assumed away: it is zero whenever the strategy is
     already at rest by the end of seeding, which is the usual case and not one to rely on.
+    """
+    rate_limit_retries: int = 0
+    """Calls re-sent after the provider refused them for rate reasons.
+
+    Counted because a throttled run is not the same measurement as an unthrottled one even
+    when every number above it matches. Each retry re-sends the whole prompt after a wait, and
+    a prompt cache that expired during the wait is a miss the hit-rate column would otherwise
+    charge to compaction.
+    """
+    throttled_seconds: float = 0.0
+    """Seconds this run spent waiting out those refusals.
+
+    The count alone does not say whether the run was inconvenienced or shaped by throttling:
+    six retries of two seconds and six of a minute are different runs. This is the one that
+    is comparable with the run's wall clock.
     """
     seed_prompt_tokens: int = 0
     """Billed size of the last prompt the seeding phase sent.
@@ -1014,6 +1083,27 @@ def restore_state(
         recall_middleware.forget_pending()
 
 
+def _throttle_delay(attempt: int, requested: float | None) -> float:
+    """Return how long to wait before re-sending a call the provider refused for rate reasons.
+
+    Args:
+        attempt: 0-based index of the attempt that was refused.
+        requested: Seconds the provider asked for, if it named any.
+
+    Returns:
+        Seconds to wait, never more than :data:`RATE_LIMIT_MAX_DELAY`.
+    """
+    if requested is not None:
+        # Taken as given, only capped. The provider knows when its window refills and we do
+        # not, so jittering an instruction downwards just spends an attempt early.
+        return min(requested, RATE_LIMIT_MAX_DELAY)
+    delay = min(RATE_LIMIT_BASE_DELAY * 2**attempt, RATE_LIMIT_MAX_DELAY)
+    # SystemRandom only because both linters reject the ordinary generator on sight, and a
+    # backoff wait is worth neither an argument nor a pair of suppression comments.
+    jitter = _JITTER_SOURCE.random()
+    return delay * (1.0 - RATE_LIMIT_JITTER * jitter)
+
+
 async def run_live(
     runtime: ProviderRuntime,
     *,
@@ -1028,6 +1118,7 @@ async def run_live(
     fact_placement: str = "spread",
     allow_server_history: bool = False,
     probe_repeats: int = DEFAULT_PROBE_REPEATS,
+    sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> LiveOutcome:
     """Seed a conversation against a real agent, snapshot it, then probe the snapshot.
 
@@ -1087,6 +1178,8 @@ async def run_live(
             reading is a draw rather than a measurement: one strategy scored 52, 52, 52 and 22
             on runs that preserved exactly the same 27 facts. Repeating the question against
             unchanged material is what separates that from compaction's own spread.
+        sleep: How the backoff between throttled attempts is taken. Injectable only so that
+            a test can prove the retry is bounded without spending the bound in wall clock.
 
     Returns:
         The outcome. A turn that fails sets ``error`` and stops the run rather than raising,
@@ -1162,6 +1255,42 @@ async def run_live(
     replies: list[str] = []
     forced: dict[int, str] = dict(scenario.tool_turn_scopes) if force_tool_calls else {}
     dropped: list[str] = []
+    retries = 0
+    throttled = 0.0
+
+    async def _attempt(text: str, turn_options: dict[str, Any]) -> Any:
+        """Send one turn, waiting out provider throttling for as long as the bounds allow.
+
+        Args:
+            text: The user turn.
+            turn_options: Per-call request options.
+
+        Returns:
+            The agent response.
+
+        Raises:
+            Exception: Whatever the provider raised, once it is not throttling or the
+                attempt and wait budgets are spent. Failing here is deliberate: the caller
+                fails the turn and abandons the seed, which is the honest outcome for a limit
+                that did not lift. Continuing with a short conversation would report a cheap,
+                forgetful strategy that was never run.
+        """
+        nonlocal retries, throttled
+        waited = 0.0
+        attempt = 0
+        while True:
+            try:
+                return await agent.run(text, session=session, options=turn_options)
+            except Exception as exc:
+                remaining = RATE_LIMIT_MAX_WAIT - waited
+                if attempt + 1 >= RATE_LIMIT_ATTEMPTS or remaining <= 0 or not is_rate_limited(exc):
+                    raise
+                delay = min(_throttle_delay(attempt, retry_after_seconds(exc)), remaining)
+                await sleep(delay)
+                waited += delay
+                attempt += 1
+                retries += 1
+                throttled += delay
 
     async def _send(text: str, *, turn_index: int, label: str) -> Any:
         """Send one turn, dropping an option the provider rejects and retrying once.
@@ -1175,6 +1304,12 @@ async def run_live(
         # with an unusual surface be measured at all instead of returning an empty run:
         # measured on two of five models, one rejecting temperature and one rejecting any
         # pinned tool choice.
+        #
+        # Throttling is retried inside each of these attempts rather than beside them, so the
+        # two compose: an option rejected on the third attempt after two 429s still drops the
+        # option and goes round again, with a fresh wait budget for the new option set. The
+        # sweep this was built for lost 100 seeds and EUR 4.17 because a rate limit fell
+        # through a loop that only knew how to drop an option it was never given.
         for _ in range(2):
             # Per-turn options carry the runtime's own options too: this replaces the
             # per-call option set rather than adding to it.
@@ -1194,7 +1329,7 @@ async def run_live(
                     # against the 6 asked for, on one repeat in three.
                     turn_options["tool_choice"] = "none"
             try:
-                return await agent.run(text, session=session, options=turn_options)
+                return await _attempt(text, turn_options)
             except Exception as exc:
                 option = unsupported_option(exc)
                 if option is None or option in dropped:
@@ -1276,6 +1411,8 @@ async def run_live(
         probes=tuple(probes),
         probe_repeats=max(probe_repeats, 1),
         context_drift=drift,
+        rate_limit_retries=retries,
+        throttled_seconds=throttled,
         seed_prompt_tokens=seed_prompt_tokens,
         summarizer_failures=summarizer.failures if summarizer else 0,
         strategy_notes=_strategy_notes(strategy) + _strategy_notes(recall_middleware),

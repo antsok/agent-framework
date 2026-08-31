@@ -19,9 +19,9 @@ import asyncio
 import logging
 import re
 import time
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
-from typing import TYPE_CHECKING, Any, Protocol
+from typing import TYPE_CHECKING, Any, Final, Protocol
 
 from agent_framework import Message, apply_compaction
 
@@ -38,13 +38,21 @@ __all__ = [
     "CallOutcome",
     "ProviderCaller",
     "TurnCaller",
+    "is_rate_limited",
+    "retry_after_seconds",
     "run_cell",
     "unsupported_option",
 ]
 
 logger = logging.getLogger("agent_framework_lab_cachebench")
 
-_RATE_LIMIT_MARKERS: tuple[str, ...] = ("429", "rate limit", "rate_limit", "too many requests", "throttl")
+_RATE_LIMIT_MARKERS: Final[tuple[str, ...]] = ("rate limit", "rate_limit", "too many requests", "throttl")
+
+# The bare status number, matched on a digit boundary rather than as a substring. "429" also
+# sits inside plenty of token counts -- a prompt-too-large error reporting 274,293 tokens
+# contains it -- and a deterministic 400 retried as if it were throttling wastes the attempt
+# budget and delays the honest failure by minutes.
+_STATUS_429: Final[re.Pattern[str]] = re.compile(r"(?<!\d)429(?!\d)")
 
 # Reasoning models reject sampling parameters outright. The wording differs by provider,
 # and some gateways silently strip the field instead of failing, so the same model can 400
@@ -72,6 +80,118 @@ def unsupported_option(error: BaseException) -> str | None:
     for pattern in _UNSUPPORTED_PARAM_PATTERNS:
         if match := pattern.search(text):
             return match.group(1) or "tool_choice"
+    return None
+
+
+def _error_chain(error: BaseException) -> Iterator[BaseException]:
+    """Yield an exception and everything it was raised from, outermost first.
+
+    The framework wraps a provider's error in ``ChatClientException``, so the object that
+    knows which HTTP status arrived is never the object a caller catches. Guarded against a
+    cycle, because ``__context__`` is set implicitly and two exceptions raised inside each
+    other's handlers point at one another.
+    """
+    seen: set[int] = set()
+    current: BaseException | None = error
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def _status_code(error: BaseException) -> int | None:
+    """Return the HTTP status an exception carries, wherever it happens to carry it.
+
+    Providers disagree on the attribute name and on whether it sits on the error or on a
+    response hanging off it, and one of them reports it as a string.
+    """
+    for holder in (error, getattr(error, "response", None)):
+        if holder is None:
+            continue
+        for name in ("status_code", "status", "http_status", "code"):
+            value = getattr(holder, name, None)
+            if isinstance(value, int) and not isinstance(value, bool):
+                return value
+            # ``code`` is a string on the OpenAI SDK and carries ``rate_limit_exceeded``
+            # rather than a number, so only a numeric one is a status.
+            if isinstance(value, str) and value.isdigit():
+                return int(value)
+    return None
+
+
+def is_rate_limited(error: BaseException) -> bool:
+    """Return whether a provider refused this call for rate reasons rather than for content.
+
+    Structure before wording. A 429 reaches us as ``ChatClientException`` wrapping the
+    provider SDK's own error, and every provider wraps it differently, so matching on the
+    exception class would work for exactly one of them. A status of 429 anywhere in the chain
+    is the one signal that does not depend on phrasing; the markers are the fallback for a
+    wrapper that rendered its cause to a string and dropped the object it came from.
+
+    Args:
+        error: The exception a call raised.
+
+    Returns:
+        True when waiting and re-sending is the right response.
+    """
+    if any(_status_code(exc) == 429 for exc in _error_chain(error)):
+        return True
+    text = " ".join(f"{type(exc).__name__} {exc}" for exc in _error_chain(error)).lower()
+    return bool(_STATUS_429.search(text)) or any(marker in text for marker in _RATE_LIMIT_MARKERS)
+
+
+def _header(headers: Any, name: str) -> str | None:
+    """Return one header by name, case-insensitively, from whatever shape it arrived in.
+
+    Scanned rather than looked up. ``httpx.Headers`` is already case-insensitive and a plain
+    dict is not, and which of the two arrives depends on how far up the chain the object was
+    found -- so the case handling has to live here rather than be assumed of the caller.
+    """
+    try:
+        pairs: Iterable[tuple[Any, Any]] = headers.items()
+    except (AttributeError, TypeError):
+        # Not a mapping at all: this walks whatever objects the chain happens to hang off an
+        # exception, so "no headers here" is the ordinary case rather than an error.
+        return None
+    return next((str(value) for key, value in pairs if str(key).lower() == name), None)
+
+
+def _seconds(raw: Any) -> float | None:
+    """Return a non-negative number of seconds, or None when the value is not one.
+
+    ``Retry-After`` is allowed to be an HTTP date rather than a count, and a date is not worth
+    parsing here: the exponential schedule is a safe answer for one, whereas a misparsed date
+    is a wait of hours or of nothing.
+    """
+    try:
+        value = float(raw)
+    except (TypeError, ValueError):
+        return None
+    return value if value >= 0 else None
+
+
+def retry_after_seconds(error: BaseException) -> float | None:
+    """Return the wait the provider asked for, if anything in the chain named one.
+
+    Preferred over any schedule invented here, because the provider knows when its own window
+    refills. Guessing shorter spends an attempt against a limit that has not moved.
+
+    Args:
+        error: The exception a call raised.
+
+    Returns:
+        Seconds to wait, or None when no delay was named.
+    """
+    for exc in _error_chain(error):
+        for holder in (exc, getattr(exc, "response", None)):
+            if holder is None:
+                continue
+            if (named := _seconds(getattr(holder, "retry_after", None))) is not None:
+                return named
+            headers = getattr(holder, "headers", None)
+            for name, scale in (("retry-after", 1.0), ("retry-after-ms", 0.001)):
+                if (value := _seconds(_header(headers, name))) is not None:
+                    return value * scale
     return None
 
 
@@ -124,12 +244,6 @@ def _merge_options(base: Mapping[str, Any], overlay: Mapping[str, Any]) -> dict[
         else:
             merged[key] = value
     return merged
-
-
-def _is_rate_limited(error: BaseException) -> bool:
-    """Return whether an exception looks like provider throttling."""
-    text = f"{type(error).__name__} {error}".lower()
-    return any(marker in text for marker in _RATE_LIMIT_MARKERS)
 
 
 class ProviderCaller:
@@ -200,7 +314,7 @@ class ProviderCaller:
                 )
             except Exception as exc:
                 last_error = exc
-                if attempt < self.max_retries and _is_rate_limited(exc):
+                if attempt < self.max_retries and is_rate_limited(exc):
                     await asyncio.sleep(self.retry_base_delay * (2**attempt))
                     continue
                 # A rejected sampling parameter is deterministic, not transient: drop the
