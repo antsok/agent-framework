@@ -46,7 +46,11 @@ __all__ = [
 #: older one. Runs before this file existed have no records at all, and runs from before the
 #: seed/snapshot/probe rebuild measured `survived` against a different prompt, so mixing their
 #: numbers into one table would produce a mean over two different questions.
-SCHEMA_VERSION: Final[int] = 1
+#:
+#: 2 adds the throttling counters. Additive, and bumped anyway: a version 1 record cannot say
+#: whether it was throttled or merely never asked, and reading its absent counters as zero
+#: would put "not measured" and "did not happen" in the same column.
+SCHEMA_VERSION: Final[int] = 2
 
 #: The parameters that make two records the same cell, and so aggregable into one row.
 #:
@@ -264,6 +268,15 @@ class SeedRecord:
     disqualified: bool
     """Whether any call sent a prompt larger than the limit this cell stands in for."""
     context_drift: int
+    rate_limit_retries: int
+    """Calls this seed re-sent after the provider refused them for rate reasons."""
+    throttled_seconds: float
+    """Seconds this seed spent waiting those refusals out.
+
+    Recorded beside the count because the two answer different questions. The count says the
+    limit was met; this says how much of the seed's wall clock went into meeting it, which is
+    what makes a cache hit rate comparable with a cell that never waited at all.
+    """
     turns_completed: int
     turns_total: int
     probe_repeats: int

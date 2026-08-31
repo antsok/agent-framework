@@ -60,6 +60,10 @@ from agent_framework_lab_cachebench import (
 )
 from agent_framework_lab_cachebench._advisor import ModelPricing
 from agent_framework_lab_cachebench._live import (
+    RATE_LIMIT_ATTEMPTS,
+    RATE_LIMIT_BASE_DELAY,
+    RATE_LIMIT_MAX_DELAY,
+    RATE_LIMIT_MAX_WAIT,
     RETRIEVAL_GUIDANCE,
     RecallGate,
     _turn_text,
@@ -73,9 +77,11 @@ from agent_framework_lab_cachebench._live_cli import (
     _cost,
     _coverage,
     _excluded_cells,
+    _flags,
     _probe_spread,
     _progress,
     _render,
+    _row,
     _seed_record,
     _seed_spread,
     _spread,
@@ -1037,6 +1043,225 @@ async def test_dropping_tool_choice_also_stops_forcing() -> None:
     assert outcome.turns_completed == outcome.turns_total
 
 
+class _Throttled(Exception):
+    """A 429 shaped the way a provider SDK raises one, and the way one reached the sweep.
+
+    A status on the error, a response carrying the headers, and text naming both the code and
+    the reason -- so a test can take away whichever of the three it wants to prove is enough.
+    """
+
+    def __init__(self, retry_after: str | None = None) -> None:
+        """Create the refusal.
+
+        Args:
+            retry_after: Seconds to advertise in the ``Retry-After`` header, if any.
+        """
+        super().__init__("Error code: 429 - {'error': {'code': 'rate_limit_exceeded'}}")
+        self.status_code = 429
+        self.response = SimpleNamespace(headers={"Retry-After": retry_after} if retry_after else {})
+
+
+class ThrottlingStub(StubChatClient):
+    """A stub that refuses its first calls with a 429 and then answers normally."""
+
+    def __init__(self, *, refusals: int, retry_after: str | None = None, **kwargs: Any) -> None:
+        """Create the stub.
+
+        Keyword Args:
+            refusals: How many calls to refuse before answering.
+            retry_after: Seconds to advertise in the ``Retry-After`` header of each refusal.
+        """
+        super().__init__(**kwargs)
+        self.refusals = refusals
+        self.refused = 0
+        self.retry_after = retry_after
+
+    def _inner_get_response(self, *, messages: Any, stream: Any, options: Any, **kwargs: Any) -> Any:
+        if self.refused < self.refusals:
+            self.refused += 1
+            raise _Throttled(self.retry_after)
+        return super()._inner_get_response(messages=messages, stream=stream, options=options, **kwargs)
+
+
+class _Waits:
+    """A stand-in for ``asyncio.sleep`` that records what it was asked for and returns at once.
+
+    The bound on the retry is five minutes of waiting, and a test that proved it by waiting is
+    a test nobody runs. Recording the schedule checks the same thing and checks it exactly: a
+    delay that was capped wrongly is visible here and invisible in an elapsed time.
+    """
+
+    def __init__(self) -> None:
+        self.delays: list[float] = []
+
+    async def __call__(self, delay: float) -> None:
+        """Record a wait instead of taking it."""
+        self.delays.append(delay)
+
+
+async def test_a_throttled_call_is_waited_out_and_re_sent() -> None:
+    """A transient 429 must cost a wait, not the seed.
+
+    The sweep this was built for lost 100 seeds and EUR 4.17 to exactly this: ``run_live`` had
+    a two-attempt loop, but it existed only to drop an option the provider had named, so a
+    rate limit fell straight through it and abandoned the whole seed at 0 of 32 turns.
+    """
+    waits = _Waits()
+    scenario = build_live_scenario(salt="429", filler_turns=3, filler_tokens=50, tool_turns=6)
+
+    outcome = await run_live(
+        ProviderRuntime(client=ThrottlingStub(refusals=2), model="stub"),
+        strategy_name="none",
+        options=_options(),
+        scenario=scenario,
+        sleep=waits,
+    )
+
+    assert outcome.error is None
+    assert outcome.turns_completed == outcome.turns_total
+    assert outcome.rate_limit_retries == 2
+    assert outcome.throttled_seconds == pytest.approx(sum(waits.delays))
+    # Exponential from the base and jittered downwards, so each wait sits inside its own step
+    # and is larger than the one before it.
+    assert len(waits.delays) == 2
+    assert 0 < waits.delays[0] <= RATE_LIMIT_BASE_DELAY
+    assert waits.delays[0] < waits.delays[1] <= RATE_LIMIT_BASE_DELAY * 2
+
+
+async def test_a_limit_that_does_not_lift_fails_the_turn_rather_than_looping() -> None:
+    """Retries are for surviving a spike, not for hiding a wall.
+
+    A quota that is genuinely exhausted has to end the seed, and end it in minutes: continuing
+    with whatever turns got through would report a cheap, forgetful strategy that was never
+    run, and looping would park a multi-hour sweep indefinitely.
+    """
+    waits = _Waits()
+    scenario = build_live_scenario(salt="wall", filler_turns=3, filler_tokens=50, tool_turns=6)
+
+    outcome = await run_live(
+        ProviderRuntime(client=ThrottlingStub(refusals=1_000), model="stub"),
+        strategy_name="none",
+        options=_options(),
+        scenario=scenario,
+        sleep=waits,
+    )
+
+    assert outcome.error is not None
+    assert "429" in outcome.error
+    assert outcome.turns_completed == 0
+    assert outcome.rate_limit_retries == len(waits.delays) == RATE_LIMIT_ATTEMPTS - 1
+    assert max(waits.delays) <= RATE_LIMIT_MAX_DELAY
+    assert sum(waits.delays) <= RATE_LIMIT_MAX_WAIT
+    # And the schedule really would have waited, so it is the injected sleep keeping this test
+    # instant rather than the bounds being trivially small.
+    assert sum(waits.delays) > RATE_LIMIT_BASE_DELAY
+
+
+async def test_the_wait_a_provider_asks_for_is_taken_verbatim() -> None:
+    """A named ``Retry-After`` is an instruction, not an input to a guess.
+
+    The provider knows when its own window refills. Jittering it downwards, as the invented
+    schedule is jittered, spends an attempt against a limit that has not moved.
+    """
+    waits = _Waits()
+    scenario = build_live_scenario(salt="ra", filler_turns=3, filler_tokens=50, tool_turns=6)
+
+    outcome = await run_live(
+        ProviderRuntime(client=ThrottlingStub(refusals=1, retry_after="7"), model="stub"),
+        strategy_name="none",
+        options=_options(),
+        scenario=scenario,
+        sleep=waits,
+    )
+
+    assert outcome.error is None
+    assert waits.delays == [7.0]
+    assert outcome.throttled_seconds == 7.0
+
+
+async def test_a_wait_longer_than_the_quota_window_is_capped() -> None:
+    """An hour-long ``Retry-After`` is a daily cap, and parking a sweep on one is not surviving it."""
+    waits = _Waits()
+    scenario = build_live_scenario(salt="cap", filler_turns=3, filler_tokens=50, tool_turns=6)
+
+    await run_live(
+        ProviderRuntime(client=ThrottlingStub(refusals=1, retry_after="3600"), model="stub"),
+        strategy_name="none",
+        options=_options(),
+        scenario=scenario,
+        sleep=waits,
+    )
+
+    assert waits.delays == [RATE_LIMIT_MAX_DELAY]
+
+
+async def test_an_error_that_is_not_throttling_is_not_retried() -> None:
+    """A deterministic refusal must fail at once.
+
+    The prompt-too-large error used here names the size that was refused, and 274,293 tokens
+    contains the digits 429. Retried as though that were a status, a wall costs six attempts
+    and minutes of waiting before failing exactly as it would have failed immediately.
+    """
+    waits = _Waits()
+
+    class TooLarge(StubChatClient):
+        def _inner_get_response(self, *, messages: Any, stream: Any, options: Any, **kwargs: Any) -> Any:
+            raise RuntimeError("Error code: 400 - supports at most 272000 tokens, got 274293")
+
+    scenario = build_live_scenario(salt="big", filler_turns=3, filler_tokens=50, tool_turns=6)
+    outcome = await run_live(
+        ProviderRuntime(client=TooLarge(), model="stub"),
+        strategy_name="none",
+        options=_options(),
+        scenario=scenario,
+        sleep=waits,
+    )
+
+    assert outcome.error is not None
+    assert waits.delays == []
+    assert outcome.rate_limit_retries == 0
+
+
+async def test_dropping_an_option_and_waiting_out_a_limit_compose() -> None:
+    """Both retries have to survive meeting each other.
+
+    They are nested rather than placed side by side: throttling is waited out inside each
+    attempt, so an option rejected on the attempt after two 429s still gets dropped and still
+    gets another go. Written flat, whichever loop was outermost would swallow the other -- and
+    the outermost one was the option drop, which is how a rate limit reached a handler that
+    only knew what to do with an option the provider had named.
+    """
+    waits = _Waits()
+
+    class Awkward(StubChatClient):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.refused = 0
+
+        def _inner_get_response(self, *, messages: Any, stream: Any, options: Any, **kwargs: Any) -> Any:
+            if self.refused < 2:
+                self.refused += 1
+                raise _Throttled
+            if "temperature" in options:
+                raise RuntimeError("Unsupported parameter: 'temperature' is not supported with this model.")
+            return super()._inner_get_response(messages=messages, stream=stream, options=options, **kwargs)
+
+    scenario = build_live_scenario(salt="both", filler_turns=3, filler_tokens=50, tool_turns=6)
+    outcome = await run_live(
+        ProviderRuntime(client=Awkward(), model="stub", options={"temperature": 0.0}),
+        strategy_name="none",
+        options=_options(),
+        scenario=scenario,
+        sleep=waits,
+    )
+
+    assert outcome.error is None
+    assert outcome.turns_completed == outcome.turns_total
+    assert outcome.dropped_options == ("temperature",)
+    assert outcome.rate_limit_retries == 2
+    assert len(waits.delays) == 2
+
+
 async def test_every_probe_answer_reaches_the_score() -> None:
     """Every question, asked every time, must reach the scorer.
 
@@ -1435,6 +1660,57 @@ async def test_a_disqualified_cell_is_excluded_from_the_ranking() -> None:
     assert cells[1].disqualified == 1.0
     assert oversized == {"truncation"}
     assert ranked == ["none"]
+
+
+async def test_the_dq_flag_says_what_the_dq_column_says() -> None:
+    """Two exclusions must not share one name.
+
+    The flag used to read "excluded from the ranking", which is the wider set: a row that
+    failed a turn leaves the ranking too. The last sweep printed every row flagged DQ beside a
+    dq of 0%, because every row had died on a rate limit and none had oversent -- so the flag
+    said the one thing that had not happened. ``dq`` still means what it always meant: the
+    share of a cell's seeds that sent a prompt over the tried limit.
+    """
+    outcome, scenario = await _probed(StubChatClient(usage=UsageDetails(input_token_count=1_000)), repeats=1)
+    base = _record(outcome, scenario)
+    unfinished = _aggregate("none", [replace(base, turns_completed=0, disqualified=False)])
+    oversized = _aggregate("none", [replace(base, disqualified=True)])
+
+    assert "EXCL" in _row(unfinished, None, True)
+    assert "DQ" not in _row(unfinished, None, True)
+    assert "DQ" in _row(oversized, None, True)
+    # Both are out of the ranking, and for different reasons: the notes under the table name
+    # each of them, so the flag only has to say which kind this row is.
+    assert _excluded_cells([unfinished, oversized]) == ({"none"}, {"none"})
+
+
+async def test_a_throttled_row_says_so_in_the_table() -> None:
+    """A run that spent its wall clock backing off is a different run, and had to say so.
+
+    Nothing else in the table can show it. Every column reads the same as an unthrottled run
+    except hit%, which can move for a reason that is not compaction's: a cached prefix that
+    expired during a minute of waiting is a miss the row would otherwise be charged for.
+    """
+    waits = _Waits()
+    scenario = build_live_scenario(salt="flag", filler_turns=3, filler_tokens=50, tool_turns=6)
+    outcome = await run_live(
+        ProviderRuntime(client=ThrottlingStub(refusals=2, usage=UsageDetails(input_token_count=1_000)), model="stub"),
+        strategy_name="none",
+        options=_options(),
+        scenario=scenario,
+        probe_repeats=1,
+        sleep=waits,
+    )
+    cell = _aggregate("none", [_record(outcome, scenario)])
+
+    assert cell.rate_limit_retries == 2
+    assert cell.throttled_seconds == pytest.approx(sum(waits.delays))
+    assert "THROTTLED:2" in _flags(cell, None)
+
+    table = _render(None, [cell], set(), show_answers=False)
+
+    assert "THROTTLED:2" in table
+    assert "Throttled:" in table, "the seconds are the point, and the flag cannot carry them"
 
 
 async def test_the_table_renders_every_column_it_declares() -> None:
@@ -2119,7 +2395,7 @@ async def test_each_finished_seed_prints_a_line_of_its_own(
 
 
 def test_a_progress_line_shows_what_a_watcher_needs() -> None:
-    """The line must carry the four numbers, and flag a seed that disqualified."""
+    """The line must carry the four numbers, and flag a seed that disqualified or waited."""
     record = SeedRecord(
         cell=_cell_params(repeats=3),
         strategy="truncation",
@@ -2144,6 +2420,8 @@ def test_a_progress_line_shows_what_a_watcher_needs() -> None:
         combined_samples=(0.4,),
         disqualified=True,
         context_drift=1,
+        rate_limit_retries=4,
+        throttled_seconds=37.5,
         turns_completed=10,
         turns_total=10,
         probe_repeats=2,
@@ -2162,6 +2440,7 @@ def test_a_progress_line_shows_what_a_watcher_needs() -> None:
     assert "acc 52%" in line
     assert "DQ" in line
     assert "DRIFT:1" in line
+    assert "THROTTLED:4 (38s)" in line
 
 
 def test_records_from_another_schema_are_refused() -> None:

@@ -139,6 +139,26 @@ renders and is marked `PARTIAL` with what it holds. Each seed also prints a one-
 (strategy, seed, cost, facts, accuracy) as it lands. **Add `--results-jsonl` to every command in
 `runs/run-25-stage1.sh` before resuming.**
 
+**Also fixed, and the reason a later sweep died.** A sweep lost 100 seeds and about EUR 4.17
+to HTTP 429. `run_live` had a two-attempt loop, but it existed only to drop a request option
+the provider had named; a rate limit is not an unsupported option, so it fell through, failed
+the turn, and abandoned the whole seed — every row came back `ERR` with `0/32t`. Throttled
+calls are now waited out and re-sent, inside the option-drop loop rather than beside it, so
+the two compose. The bounds are named constants in `_live.py`: 6 attempts, 2s base doubling
+per attempt, 60s per wait (the quota window is one minute), 300s total per turn, jittered 25%
+downwards except when the provider names a `Retry-After`, which is taken verbatim and only
+capped. Exhausting them still fails the turn — the point is to survive a spike, not to hide a
+wall. Throttling is counted: `LiveOutcome.rate_limit_retries` and `throttled_seconds`, the
+same two on `SeedRecord`, a `THROTTLED:<n>` flag in the table and a per-row seconds line under
+it. **Records are `schema` 2 as a result; a version 1 file will be refused rather than
+averaged in, and there are none on disk to lose.**
+
+**The flags column said `DQ` for two different things.** It read "excluded from the ranking",
+which covers both a row that oversent and a row that never finished, while the `dq` column
+means only the first — which is why the last table showed rows flagged `DQ` beside a `dq` of
+`0%`: they had all died on the rate limit. `DQ` now means exactly what `dq` measures and the
+other exclusion prints `EXCL`. `dq` itself is unchanged.
+
 **The result that changes the remaining plan:** `rep+-` came out at 0-2 points on every row
 while `seed+-` ran to 30-78 points. Re-asking the same snapshot is almost perfectly repeatable;
 the variance is nearly all in *which seed*, meaning where the facts fall against a retention
@@ -254,8 +274,9 @@ Each of these produced a plausible wrong number first.
 - Branch `python-lab-cachebench`, ~40 commits ahead of `origin`, **not pushed**. Pushing needs
   its own go-ahead.
 - `dev/` is untracked Git-LFS junk. **Never stage it.**
-- 227 tests pass; ruff and pyright are clean. The measurement rebuild above is **uncommitted**,
-  as is the per-seed results file (`_records.py`, `--results-jsonl`, `--from-jsonl`).
+- 243 tests pass; ruff and pyright are clean. The measurement rebuild above is **uncommitted**,
+  as is the per-seed results file (`_records.py`, `--results-jsonl`, `--from-jsonl`) and the
+  rate-limit retry.
 - `REPORT.md` and `ARTICLE.md` still describe only the six-model cross-provider work and
   predate everything from run 7 onward. They do not mention the 272,000 input limit, the
   crossover, or either new strategy.

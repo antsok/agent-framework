@@ -492,6 +492,8 @@ def _seed_record(
         combined_samples=score_combined_samples(outcome, scenario),
         disqualified=outcome.disqualified(cell.context_window),
         context_drift=outcome.context_drift,
+        rate_limit_retries=outcome.rate_limit_retries,
+        throttled_seconds=outcome.throttled_seconds,
         turns_completed=outcome.turns_completed,
         turns_total=outcome.turns_total,
         probe_repeats=outcome.probe_repeats,
@@ -595,6 +597,14 @@ class CellStats:
     combined: float
     disqualified: float
     """Share of this cell's seeds that sent a prompt larger than the tried limit."""
+    rate_limit_retries: int
+    """Calls this cell re-sent after the provider refused them for rate reasons."""
+    throttled_seconds: float
+    """Seconds this cell spent waiting those refusals out.
+
+    Summed over its seeds rather than averaged: this is time the cell took, and a sweep
+    reading its logs back wants the total it paid, not a per-seed rate.
+    """
     samples: tuple[tuple[float, ...], ...]
     """Per-sample correctness: one tuple per seed, one value per probe repeat."""
 
@@ -653,6 +663,8 @@ def _aggregate(strategy: str, records: Sequence[SeedRecord]) -> CellStats:
         probe_spread=_probe_spread(samples),
         combined=fmean(combined) if combined else 0.0,
         disqualified=fmean(1.0 if record.disqualified else 0.0 for record in records),
+        rate_limit_retries=sum(record.rate_limit_retries for record in records),
+        throttled_seconds=sum(record.throttled_seconds for record in records),
         samples=samples,
     )
 
@@ -787,6 +799,35 @@ def _fill_note(stats: dict[str, CellStats], plan: FillPlan | None, control: str)
     return lines
 
 
+def _throttle_note(cells: Sequence[CellStats]) -> list[str]:
+    """Return the lines reporting what throttling cost this cell in time.
+
+    The flag says a row met a rate limit; this says how much of the row's wall clock went
+    into it. Worth its own lines because the retries are invisible in every other column
+    while being able to move one of them: a prompt cache that expired during a minute of
+    backoff is a miss the hit-rate column reads as compaction breaking the prefix.
+
+    Args:
+        cells: The rows, in the order they appear in the table.
+
+    Returns:
+        Zero lines when nothing was throttled, otherwise a heading and one line per row.
+    """
+    throttled = [cell for cell in cells if cell.rate_limit_retries]
+    if not throttled:
+        return []
+    return [
+        "",
+        "Throttled: the provider refused these calls for rate reasons and they were re-sent",
+        "after a wait. The measurement is unchanged; the wall clock is not, and neither is the",
+        "cache hit rate if a prefix expired while a call was waiting.",
+        *(
+            f"  {cell.strategy:<28}{cell.rate_limit_retries} retries, {cell.throttled_seconds:,.0f}s waiting"
+            for cell in throttled
+        ),
+    ]
+
+
 def _stability_note(verdict: JointVerdict, spread: dict[str, float], repeats: int) -> list[str]:
     """Return a warning when the recommendation's margin is inside the measured noise.
 
@@ -832,6 +873,8 @@ def _flags(stats: CellStats, control: CellStats | None) -> list[str]:
     drift = sum(record.context_drift for record in stats.records)
     if drift:
         flags.append(f"DRIFT:{drift}")
+    if stats.rate_limit_retries:
+        flags.append(f"THROTTLED:{stats.rate_limit_retries}")
     failures = sum(record.summarizer_failures for record in stats.records)
     if failures:
         flags.append(f"S{failures}")
@@ -863,8 +906,15 @@ def _row(stats: CellStats, control: CellStats | None, excluded: bool) -> str:
         relative = f"{stats.correctness / control.correctness:.0%}"
     hit = "n/a" if stats.hit_rate is None else f"{stats.hit_rate:.0%}"
     flags = _flags(stats, control)
-    if excluded:
+    # ``DQ`` is the dq column crossing zero and nothing else. It used to be "excluded from the
+    # ranking", which is a wider set: a row that failed a turn is excluded too, and the last
+    # sweep printed rows flagged DQ beside a dq of 0% because every one of them had died on a
+    # rate limit. Two exclusions with one name make the flag unreadable exactly when it
+    # matters, so the other reason has its own token.
+    if stats.disqualified > 0:
         flags.insert(0, "DQ")
+    elif excluded:
+        flags.insert(0, "EXCL")
     summ = stats.summarizer_cost
     lost = max(stats.facts_total - stats.facts_left - stats.nofetch, 0.0)
     return (
@@ -930,7 +980,14 @@ _LEGEND: Final[tuple[str, ...]] = (
     "            The limit is simulated, so it is enforced here or not at all. A cell that",
     "            disqualifies at all is excluded from the ranking rather than starred: a row",
     "            a model that size would have refused is not a baseline for anything",
-    "flags     = DQ disqualified, ERR failed turn, DRIFT:<n> probes whose prompt was not the",
+    "flags     = DQ the dq column above is not zero, so this row sent a prompt a model of",
+    "            this size would have refused. EXCL out of the ranking for the other reason:",
+    "            it did not finish its turns. The two used to share the name DQ, which is how",
+    "            a table came to show rows flagged DQ beside a dq of 0%. ERR failed turn,",
+    "            THROTTLED:<n> calls re-sent after the provider refused them for rate",
+    "            reasons; the seconds spent waiting are printed below the table, and they",
+    "            matter because a cached prefix that expired during a wait is a miss the hit%",
+    "            column charges to compaction. DRIFT:<n> probes whose prompt was not the",
     "            snapshot verbatim, because the strategy acted again on the restored state.",
     "            Those probes saw slightly less than survival was scored against, so a row",
     "            carrying this overstates what reached the model. S<n> summarizer failures,",
@@ -998,6 +1055,7 @@ def _render(
         groups = "  ".join("[" + " ".join(f"{value:.0%}" for value in seed) + "]" for seed in cell.samples if seed)
         lines.append(f"  {cell.strategy:<28}{groups}")
     lines += _fill_note({cell.strategy: cell for cell in cells}, cell_params.plan, control)
+    lines += _throttle_note(cells)
     if verdict is None:
         lines += [
             "",
@@ -1082,6 +1140,8 @@ def _progress(record: SeedRecord) -> str:
         parts.append("DQ")
     if record.context_drift:
         parts.append(f"DRIFT:{record.context_drift}")
+    if record.rate_limit_retries:
+        parts.append(f"THROTTLED:{record.rate_limit_retries} ({record.throttled_seconds:,.0f}s)")
     if record.error:
         parts.append(record.error)
     return "  ".join(parts)
