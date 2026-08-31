@@ -211,12 +211,13 @@ class StubChatClient(FunctionInvocationLayer[Any], ChatMiddlewareLayer[Any], Bas
         self.options_seen.append(dict(options))
         choice = options.get("tool_choice")
         pinned = choice.get("required_function_name") if isinstance(choice, Mapping) else None
+        stamp = self._stamp(index, messages)
 
         async def _go() -> ChatResponse[Any]:
             if index in self.tool_turns or (self.obey_tool_choice and pinned):
                 contents: list[Any] = [
                     Content.from_function_call(
-                        call_id=f"call_{index}",
+                        call_id=f"call_{stamp}",
                         # One no-argument tool per scope: the turn's scope is pinned by which
                         # function is called, not by an argument the model chooses.
                         name=pinned or "lookup_early",
@@ -224,17 +225,27 @@ class StubChatClient(FunctionInvocationLayer[Any], ChatMiddlewareLayer[Any], Bas
                     )
                 ]
             else:
-                # Numbered, because the history provider hashes messages to decide what is
-                # new: byte-identical replies after the first are dropped as duplicates, and
-                # a stub that answered the same words every time built a history a third the
-                # size it appeared to be.
-                contents = [f"{self.reply} #{index}"]
+                contents = [f"{self.reply} #{stamp}"]
             return ChatResponse(
                 messages=Message(role="assistant", contents=contents),
                 usage_details=self.usage,
             )
 
         return _go()
+
+    def _stamp(self, index: int, messages: Sequence[Message]) -> str:
+        """Return what makes this call's output distinguishable from every other call's.
+
+        It reaches the reply text and the tool call id, and the replies are the reason it
+        exists: the history provider hashes messages to decide what is new, so byte-identical
+        replies after the first are dropped as duplicates, and a stub that answered the same
+        words every time built a history a third the size it appeared to be.
+
+        Keyed on the call index, which is right for a stub whose every call lands once. A test
+        that re-sends a turn keys it on the request instead, so that the same conversation
+        produces the same output whichever attempt sent it -- see :class:`_ToolLoopStub`.
+        """
+        return str(index)
 
     def service_url(self) -> str:
         """Return a placeholder URL."""
@@ -1260,6 +1271,205 @@ async def test_dropping_an_option_and_waiting_out_a_limit_compose() -> None:
     assert outcome.dropped_options == ("temperature",)
     assert outcome.rate_limit_retries == 2
     assert len(waits.delays) == 2
+
+
+def _dangling_calls(messages: Sequence[Message]) -> tuple[str, ...]:
+    """Return the function calls a request carries and never answers.
+
+    This is the provider's own check. A call with no result beside it is refused with
+    ``400 No tool output found for function call``, and that is exactly what a re-sent turn
+    carries when the retry starts from a session the failed attempt has already written to.
+    """
+    calls: set[str] = set()
+    answered: set[str] = set()
+    for message in messages:
+        for content in message.contents:
+            if content.type == "function_call" and content.call_id:
+                calls.add(content.call_id)
+            elif content.type == "function_result" and content.call_id:
+                answered.add(content.call_id)
+    return tuple(sorted(calls - answered))
+
+
+class _ToolLoopStub(StubChatClient):
+    """A stub that fails a turn *inside* its tool-calling loop, the way the live sweep failed.
+
+    The interleaving is the whole point, and a 429 on a plain text turn does not reproduce it.
+    The model returns a function call; history is persisted per model call, so that assistant
+    message is already durable; the follow-up call carrying the tool result is then refused,
+    so the result never lands and the session is left holding a call nothing answers.
+
+    The consequence is enforced here too: any request carrying a dangling call is refused with
+    the provider's own 400, so a retry that re-sends one fails loudly rather than passing.
+    """
+
+    def __init__(self, *, throttle_once: bool = False, reject_option: str | None = None, **kwargs: Any) -> None:
+        """Create the stub.
+
+        Keyword Args:
+            throttle_once: Refuse the first call that carries a tool result with a 429.
+            reject_option: Name of a request option to refuse, and refuse only on a call
+                carrying a tool result -- so the option-drop retry meets a half-finished turn
+                exactly as the rate limit does.
+        """
+        super().__init__(obey_tool_choice=True, **kwargs)
+        self.requests: list[tuple[Message, ...]] = []
+        self.throttle_once = throttle_once
+        self.reject_option = reject_option
+        self.throttled = 0
+        self.rejected = 0
+
+    def _inner_get_response(
+        self,
+        *,
+        messages: Sequence[Message],
+        stream: bool,
+        options: Mapping[str, Any],
+        **kwargs: Any,
+    ) -> Any:
+        self.requests.append(tuple(messages))
+        if dangling := _dangling_calls(messages):
+            raise RuntimeError(
+                f"Error code: 400 - {{'error': {{'message': 'No tool output found for function call "
+                f"{dangling[0]}.', 'type': 'invalid_request_error', 'param': 'input'}}}}"
+            )
+        after_tool_result = any(
+            content.type == "function_result" for message in messages for content in message.contents
+        )
+        if after_tool_result and self.throttle_once and not self.throttled:
+            self.throttled += 1
+            raise _Throttled
+        if after_tool_result and self.reject_option is not None and self.reject_option in options:
+            self.rejected += 1
+            raise RuntimeError(f"Unsupported parameter: '{self.reject_option}' is not supported with this model.")
+        return super()._inner_get_response(messages=messages, stream=stream, options=options, **kwargs)
+
+    def _stamp(self, index: int, messages: Sequence[Message]) -> str:
+        """Key the reply and the call id on the request rather than on the call index.
+
+        A retried turn costs an extra call, so index-keyed output would differ from a clean
+        run's from that point onwards and the two histories could not be compared at all. The
+        request is the same request whichever attempt sent it, and it grows with the
+        conversation, so keying on its length keeps replies distinct between turns and
+        identical between two runs that reached the same place.
+        """
+        return str(len(messages))
+
+
+async def test_a_turn_throttled_inside_the_tool_loop_is_re_sent_from_where_it_started() -> None:
+    """``agent.run`` is not idempotent, so a retry has to put the conversation back first.
+
+    Measured live: 7 turns in one cell were refused with "No tool output found for function
+    call", every one of them on a row that had been throttled and including the uncompacted
+    ``none`` control -- which is what proves it was the retry and not compaction. The turn
+    then failed and the seed was abandoned, so the retry written to save seeds was destroying
+    them.
+    """
+    waits = _Waits()
+    scenario = build_live_scenario(salt="midloop", filler_turns=3, filler_tokens=50, tool_turns=6)
+    client = _ToolLoopStub(throttle_once=True)
+
+    outcome = await run_live(
+        ProviderRuntime(client=client, model="stub"),
+        strategy_name="none",
+        options=_options(),
+        scenario=scenario,
+        sleep=waits,
+    )
+
+    assert client.throttled == 1, "the stub never reached the call it was written to refuse"
+    assert outcome.error is None
+    assert outcome.turns_completed == outcome.turns_total
+    assert outcome.rate_limit_retries == 1
+    assert [request for request in client.requests if _dangling_calls(request)] == []
+
+
+async def test_a_retried_turn_leaves_the_history_a_clean_attempt_would_have_left() -> None:
+    """Surviving the limit is not enough: the seed has to be the seed that was asked for.
+
+    A retry that appended to a half-written turn could still complete every turn and report no
+    error, having measured a conversation containing a stray call, a repeated question, or an
+    orphaned tool result. Every strategy is scored against this history, so a difference here
+    is a difference in the measurement, not in its bookkeeping.
+    """
+    scenario = build_live_scenario(salt="cleanstate", filler_turns=3, filler_tokens=50, tool_turns=6)
+
+    async def _seed(client: _ToolLoopStub) -> LiveOutcome:
+        return await run_live(
+            ProviderRuntime(client=client, model="stub"),
+            strategy_name="none",
+            options=_options(),
+            scenario=scenario,
+            sleep=_Waits(),
+        )
+
+    throttled = await _seed(_ToolLoopStub(throttle_once=True))
+    clean = await _seed(_ToolLoopStub())
+
+    assert clean.error is None
+    assert throttled.error is None
+    assert throttled.rate_limit_retries == 1
+    assert clean.rate_limit_retries == 0
+    assert clean.snapshot_prompt, "the control seeded nothing, so matching it proves nothing"
+    assert throttled.snapshot_prompt == clean.snapshot_prompt
+
+
+async def test_dropping_an_option_inside_the_tool_loop_also_re_sends_from_the_start() -> None:
+    """Both retries re-send, so both have to restore, and they have to survive meeting.
+
+    A provider names an unsupported option on the call that carries it, and after a tool
+    result that is the second call of the turn -- so this path reaches a half-finished turn
+    exactly as throttling does. Here the same turn hits both: a 429 on the follow-up, then the
+    refused option on the follow-up of the attempt after it.
+    """
+    waits = _Waits()
+    scenario = build_live_scenario(salt="bothmidloop", filler_turns=3, filler_tokens=50, tool_turns=6)
+    client = _ToolLoopStub(throttle_once=True, reject_option="temperature")
+
+    outcome = await run_live(
+        ProviderRuntime(client=client, model="stub", options={"temperature": 0.0}),
+        strategy_name="none",
+        options=_options(),
+        scenario=scenario,
+        sleep=waits,
+    )
+
+    assert client.throttled == 1
+    assert client.rejected == 1
+    assert outcome.error is None
+    assert outcome.turns_completed == outcome.turns_total
+    assert outcome.dropped_options == ("temperature",)
+    assert outcome.rate_limit_retries == 1
+    assert [request for request in client.requests if _dangling_calls(request)] == []
+
+
+async def test_a_throttled_probe_is_also_re_sent_from_the_snapshot() -> None:
+    """The probe phase restores before its first attempt, which is not the same as before each.
+
+    A probe that calls a tool and is throttled on the follow-up leaves the same dangling call
+    a seeding turn does, and the restore that ran before the probe started has already
+    happened. Unpinned here, because the pinned ``tool_choice: "none"`` of an ordinary run
+    makes tool calls during a probe rare rather than impossible.
+    """
+    waits = _Waits()
+    scenario = build_live_scenario(salt="probeloop", filler_turns=3, filler_tokens=50, tool_turns=6)
+    seed_calls = len(scenario.transcript.turns) - scenario.answer_turn_count
+    client = _ToolLoopStub(throttle_once=True, tool_turns=(seed_calls,))
+
+    outcome = await run_live(
+        ProviderRuntime(client=client, model="stub"),
+        strategy_name="none",
+        options=_options(),
+        scenario=scenario,
+        force_tool_calls=False,
+        probe_repeats=1,
+        sleep=waits,
+    )
+
+    assert client.throttled == 1, "the tool call landed somewhere other than the first probe"
+    assert outcome.error is None
+    assert outcome.turns_completed == outcome.turns_total
+    assert [request for request in client.requests if _dangling_calls(request)] == []
 
 
 async def test_every_probe_answer_reaches_the_score() -> None:

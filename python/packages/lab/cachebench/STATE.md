@@ -153,6 +153,25 @@ same two on `SeedRecord`, a `THROTTLED:<n>` flag in the table and a per-row seco
 it. **Records are `schema` 2 as a result; a version 1 file will be refused rather than
 averaged in, and there are none on disk to lose.**
 
+**The retry then had a bug of its own, and it destroyed the seeds it was built to save.**
+`agent.run` is not idempotent. When a 429 landed *inside* the tool-calling loop -- after the
+model had returned a function call, which per-service-call history persistence had already
+written to the session, but before the matching tool result existed -- the retry re-sent against
+a history holding a call with no output, and the provider refused it outright: `400 ... No tool
+output found for function call call_<id>`. Measured at 7 occurrences in one cell, every one on a row
+that had been throttled and **including the uncompacted `none` control**, which is what rules
+compaction out. The turn then failed and the seed was abandoned. `_send` now snapshots the
+session before the first attempt and restores it before every re-send, reusing the same
+`snapshot_state`/`restore_state` pair the probe phase uses. Both retries restore, because both
+re-send: an unsupported option is named on the call that carries it, and after a tool result
+that is the turn's second call, so the option-drop path reaches a half-finished turn exactly as
+throttling does. **The probe phase had the same exposure** -- it restored before a probe, not
+before each of that probe's attempts -- and is covered by the same fix; an offline test drives a
+tool call inside a probe and fails without it. Snapshotting every turn costs **6ms at 230,000
+tokens**: `deepcopy` returns the immutable strings as themselves, so the copy rebuilds the 232
+message objects around the payloads rather than the payloads, against a call that spends tens of
+seconds sending them.
+
 **The flags column said `DQ` for two different things.** It read "excluded from the ranking",
 which covers both a row that oversent and a row that never finished, while the `dq` column
 means only the first — which is why the last table showed rows flagged `DQ` beside a `dq` of
@@ -274,9 +293,9 @@ Each of these produced a plausible wrong number first.
 - Branch `python-lab-cachebench`, ~40 commits ahead of `origin`, **not pushed**. Pushing needs
   its own go-ahead.
 - `dev/` is untracked Git-LFS junk. **Never stage it.**
-- 243 tests pass; ruff and pyright are clean. The measurement rebuild above is **uncommitted**,
-  as is the per-seed results file (`_records.py`, `--results-jsonl`, `--from-jsonl`) and the
-  rate-limit retry.
+- 247 tests pass; ruff, pyright and bandit are clean. The measurement rebuild, the per-seed
+  results file (`_records.py`, `--results-jsonl`, `--from-jsonl`) and the rate-limit retry are
+  all committed now; the snapshot-and-restore fix to that retry (§3b) is **uncommitted**.
 - `REPORT.md` and `ARTICLE.md` still describe only the six-model cross-provider work and
   predate everything from run 7 onward. They do not mention the 272,000 input limit, the
   crossover, or either new strategy.
