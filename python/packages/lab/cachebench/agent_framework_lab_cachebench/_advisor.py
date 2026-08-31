@@ -60,6 +60,23 @@ class ModelPricing:
             return 0.0
         return max(0.0, 1.0 - self.cached_read_per_million / self.input_per_million)
 
+    def input_cost(self, input_tokens: int, cached_tokens: int) -> float:
+        """Return what a prompt cost, cached and uncached together and output excluded.
+
+        Here rather than at each caller because a total and its input half that were computed
+        by two expressions could disagree about the cached share, and the whole use of the
+        input half is that it is the same money read on one axis.
+
+        Args:
+            input_tokens: Every token billed on the prompt side, cached ones included.
+            cached_tokens: How many of those the provider served from its cache.
+
+        Returns:
+            Cost in the pricing's currency units.
+        """
+        fresh = max(input_tokens - cached_tokens, 0)
+        return (fresh * self.input_per_million + cached_tokens * self.cached_read_per_million) / 1_000_000
+
 
 @dataclass(frozen=True, slots=True)
 class StrategyCost:

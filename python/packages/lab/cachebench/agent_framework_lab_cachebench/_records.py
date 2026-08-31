@@ -298,6 +298,16 @@ class SeedRecord:
         """Share of input tokens served from the provider's cache, None when nothing was billed."""
         return self.cached_tokens / self.input_tokens if self.input_tokens > 0 else None
 
+    @property
+    def input_cost(self) -> float:
+        """What this seed's prompt side cost: uncached plus cached, with output left out.
+
+        Derived rather than stored, so no record already on disk is missing it and the schema
+        does not move: the tokens and the rates are both here, and the arithmetic is the same
+        one ``cost`` uses for its input half.
+        """
+        return self.cell.pricing.input_cost(self.input_tokens, self.cached_tokens)
+
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable mapping of this record."""
         return asdict(self)
