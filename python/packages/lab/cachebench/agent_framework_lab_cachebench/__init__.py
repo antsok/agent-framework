@@ -61,6 +61,14 @@ from ._recall import (
     score_answer,
 )
 from ._recall_cli import main as recall_main
+from ._records import (
+    SCHEMA_VERSION,
+    CellParams,
+    SeedRecord,
+    append_seed_record,
+    group_by_cell,
+    read_seed_records,
+)
 from ._report import render_summary_table, write_records_jsonl, write_summary_csv
 from ._runner import CallOutcome, ProviderCaller, TurnCaller, run_cell, unsupported_option
 from ._strategies import (
@@ -87,12 +95,14 @@ __all__ = [
     "DEFAULT_PROBE_REPEATS",
     "DEFAULT_SYSTEM_TOKENS",
     "PROVIDER_SPECS",
+    "SCHEMA_VERSION",
     "STRATEGIES_NEEDING_SUMMARIZER",
     "STRATEGY_BUILDERS",
     "TOKENIZER_NAMES",
     "TRANSCRIPT_PRESETS",
     "CallOutcome",
     "CellKey",
+    "CellParams",
     "CellSummary",
     "Contradiction",
     "FactOutcome",
@@ -110,6 +120,7 @@ __all__ = [
     "ProviderSpec",
     "RecallScenario",
     "RecallScore",
+    "SeedRecord",
     "StrategyCost",
     "StrategyOptions",
     "Transcript",
@@ -122,6 +133,7 @@ __all__ = [
     "__version__",
     "advise",
     "advise_main",
+    "append_seed_record",
     "build_live_agent",
     "build_live_scenario",
     "build_parser",
@@ -134,6 +146,7 @@ __all__ = [
     "common_message_prefix",
     "cost_of",
     "fetch_openrouter_pricing",
+    "group_by_cell",
     "live_main",
     "main",
     "make_lookup_tool",
@@ -143,6 +156,7 @@ __all__ = [
     "prompt_cache_key",
     "prompt_cache_key_options",
     "provider_names",
+    "read_seed_records",
     "recall_main",
     "recommend",
     "relative_correctness",

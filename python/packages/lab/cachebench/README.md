@@ -170,6 +170,39 @@ conversation. Each answer re-listed codes into the history as assistant text, so
 was scored against a prompt the previous answers had written: the same strategy read 53/53 on
 a run that emitted 10,941 output tokens and 18/53 on one that emitted 4,873.
 
+#### Results are durable per seed
+
+A cell is every strategy times `--repeats` seeds, and at realistic sizes it runs for hours.
+Its table only exists once all of it has finished, so anything that stops the process in
+between used to discard every seed that had already completed — and already been paid for.
+The 60,000/0.86 cell ran all fifteen strategy-seeds over three and a half hours, died before
+printing, and left nothing.
+
+`--results-jsonl PATH` appends one JSON object per seed, written and closed the moment that
+seed is scored. Each line carries the cell parameters, the cost and token components, what
+survived and what was lost, every per-probe correctness sample, and any error — everything the
+table reads, so nothing has to be re-scored later against a scenario that is salted per seed
+and gone with the process.
+
+```bash
+cachebench-live foundry --results-jsonl runs/stage1.jsonl ...
+cachebench-live --from-jsonl runs/stage1.jsonl
+```
+
+`--from-jsonl` rebuilds the table and the verdict from that file and runs nothing, so it needs
+no provider. It is the same aggregation the live path uses, over the same records, which is
+what makes a recovered cell the cell that was measured rather than a second reading of it.
+
+The file is appended to, never truncated: a sweep can point every cell at one path, and a run
+resumed after a crash extends what is already there. Records are grouped back into cells by
+what they measured, so one file holds a whole sweep and each cell gets its own table. A cell
+that is missing strategies or seeds still renders, and says which of each it holds against
+what the run set out to take — every mean in the table is over what is present, and nothing in
+the table itself would otherwise distinguish four strategy-seeds from fifteen.
+
+Each seed also prints a one-line summary as it lands: strategy, seed, cost, facts, accuracy.
+A row that has stopped preserving anything shows up there hours before the table would.
+
 #### Fill and the tried limit
 
 `--context-window` is the limit the run stands in for. It is simulated — the model itself
