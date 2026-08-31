@@ -106,6 +106,36 @@ verbosity is visible.
 the stub. No live run has been made under the new design, so the numbers in `RESULTS.md` and
 `REPORT-GPT-5-4-MINI.md` all predate it and none of them are disqualification-checked.
 
+## 3b. Stage 1 sweep — paused mid-run, how to resume
+
+Running on the **second Foundry account** (`-002`, project `proj-default`), which is where the
+EUR 100 budget sits. That deployment is **DataZoneStandard, capacity 200 — a hard 200,000 TPM
+and 200 RPM**, and its subscription quota is fully allocated (GlobalStandard limit is 0), so it
+cannot be raised without an Azure quota request. Measured throughput is 85,000-121,000 TPM, and
+Stage 1's 225M prompt tokens therefore take roughly 40 hours. `-001` runs the same model build
+as GlobalStandard 6000 and is about 30x faster, if throughput ever matters more than which
+subscription is billed.
+
+Command: `runs/run-25-stage1.sh` — 60K and 120K, fills 0.50/0.70/0.86, five strategies,
+3 seeds, 3 probe repeats, payload fixed at 3,500-token tool results.
+
+| cell | state |
+| --- | --- |
+| 60K / 0.50 | **done**, `runs/run-25-stage1-60k-fill50.txt` |
+| 60K / 0.70 | **done**, `runs/run-25-stage1-60k-fill70.txt` |
+| 60K / 0.86 | ran all 15 strategy-seeds over 3.5 hours, then **died before printing its table** |
+| 120K / 0.50, 0.70, 0.86 | never ran — the first pass hit `APIConnectionError` on every call |
+
+**Fix this before resuming.** A cell prints its table only when the whole cell finishes, so an
+interruption anywhere in 3.5 hours loses every seed. Results should be written per seed as they
+complete. The 60K/0.86 cell was lost to exactly this, having already been paid for.
+
+**The result that changes the remaining plan:** `rep+-` came out at 0-2 points on every row
+while `seed+-` ran to 30-78 points. Re-asking the same snapshot is almost perfectly repeatable;
+the variance is nearly all in *which seed*, meaning where the facts fall against a retention
+boundary. So `--probe-repeats 3` is buying very little and `--repeats` is buying everything:
+the remaining cells should trade probe repeats for seeds at roughly 3:1 within the same budget.
+
 ## 4. The finding the report does not yet state correctly
 
 `REPORT-GPT-5-4-MINI.md` section 1 and finding 1 index the crossover on **tool result size
