@@ -140,7 +140,13 @@ DEFAULT_PROBE_REPEATS: Final[int] = 3
 #: sample per seed against seven, which is why it was the noisier of the two. The runs that
 #: matter use ``--probe-repeats 1``, the per-scope repeat spread having measured 0 to 2
 #: points, and this keeps the combined question sampled while that is true.
-DEFAULT_COMBINED_REPEATS: Final[int] = 3
+#:
+#: Five rather than three, because three was measured to be too few. Asked of a byte-identical
+#: restored snapshot the combined question is close to pass or fail: one attempt in fifteen
+#: collapsed from 100% to 21% on the uncompacted control, and ``rep2+-`` read 12 to 16 points
+#: on four of six rows. Two runs of one cell reported the control at 37% and at 95%. Nothing
+#: about the context differs between those attempts, so the sampling has to absorb it.
+DEFAULT_COMBINED_REPEATS: Final[int] = 5
 
 #: Default size of each tool result, in tokens. Set high on purpose: in a real agent
 #: trace tool output is usually the bulk of the context, and a benchmark whose tool

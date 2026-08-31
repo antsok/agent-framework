@@ -61,6 +61,7 @@ from agent_framework_lab_cachebench import (
 )
 from agent_framework_lab_cachebench._advisor import ModelPricing
 from agent_framework_lab_cachebench._live import (
+    DEFAULT_COMBINED_REPEATS,
     RATE_LIMIT_ATTEMPTS,
     RATE_LIMIT_BASE_DELAY,
     RATE_LIMIT_MAX_DELAY,
@@ -1507,8 +1508,12 @@ async def test_every_probe_answer_reaches_the_score() -> None:
     )
 
     assert outcome.answer, "no probe answer reached the scorer"
-    assert len(outcome.probes) == scenario.answer_turn_count * 3
-    assert outcome.answer.count("a reply with some body to it") == scenario.answer_turn_count * 3
+    assert len(outcome.probes) == probe_count(
+        scenario.answer_scopes, probe_repeats=3, combined_repeats=DEFAULT_COMBINED_REPEATS
+    )
+    assert outcome.answer.count("a reply with some body to it") == probe_count(
+        scenario.answer_scopes, probe_repeats=3, combined_repeats=DEFAULT_COMBINED_REPEATS
+    )
 
 
 async def test_run_live_reports_a_failed_turn_without_raising() -> None:
@@ -1655,7 +1660,7 @@ async def _probed(
     return outcome, scenario
 
 
-async def test_each_question_is_asked_three_times_by_default() -> None:
+async def test_each_question_is_asked_its_default_number_of_times() -> None:
     """The default must be several readings of one snapshot, not one.
 
     A single reading of a two-valued accuracy distribution is a draw, and the whole point of
@@ -1670,13 +1675,18 @@ async def test_each_question_is_asked_three_times_by_default() -> None:
     )
 
     assert outcome.probe_repeats == 3
-    assert len(outcome.probes) == scenario.answer_turn_count * 3
+    assert len(outcome.probes) == probe_count(
+        scenario.answer_scopes, probe_repeats=3, combined_repeats=DEFAULT_COMBINED_REPEATS
+    )
     for scope in scenario.answer_scopes:
         asked = [probe for probe in outcome.probes if probe.scope == scope]
-        assert [probe.repeat for probe in asked] == [1, 2, 3], f"{scope} was not asked exactly three times"
+        wanted = DEFAULT_COMBINED_REPEATS if scope == "*" else 3
+        assert [probe.repeat for probe in asked] == list(range(1, wanted + 1)), (
+            f"{scope} was not asked its own number of times"
+        )
 
 
-async def test_the_combined_question_keeps_its_three_attempts_when_the_others_drop_to_one() -> None:
+async def test_the_combined_question_keeps_its_own_attempts_when_the_others_drop_to_one() -> None:
     """acc2's repeat count must not follow --probe-repeats.
 
     One acc1 reading averages every scoped question; one acc2 reading is a single answer. The runs
@@ -1694,15 +1704,19 @@ async def test_the_combined_question_keeps_its_three_attempts_when_the_others_dr
     )
 
     assert outcome.error is None
-    assert outcome.combined_repeats == 3
+    assert outcome.combined_repeats == DEFAULT_COMBINED_REPEATS
     combined = [probe for probe in outcome.probes if probe.scope == COMBINED_SCOPE]
-    assert [probe.repeat for probe in combined] == [1, 2, 3], "the combined question followed --probe-repeats"
+    assert [probe.repeat for probe in combined] == list(range(1, DEFAULT_COMBINED_REPEATS + 1)), (
+        "the combined question followed --probe-repeats"
+    )
     for scope in scenario.answer_scopes:
         if scope != COMBINED_SCOPE:
             asked = [probe for probe in outcome.probes if probe.scope == scope]
             assert [probe.repeat for probe in asked] == [1], f"{scope} was asked more than once"
     # The count the dry run prices the cell on, against the probes the runner actually sent.
-    assert probe_count(scenario.answer_scopes, probe_repeats=1, combined_repeats=3) == len(outcome.probes)
+    assert probe_count(scenario.answer_scopes, probe_repeats=1, combined_repeats=DEFAULT_COMBINED_REPEATS) == len(
+        outcome.probes
+    )
 
 
 async def test_the_combined_repeat_count_is_the_one_that_is_asked_for() -> None:
