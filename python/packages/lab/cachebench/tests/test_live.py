@@ -1886,9 +1886,9 @@ async def test_the_dq_flag_says_what_the_dq_column_says() -> None:
     unfinished = _aggregate("none", [replace(base, turns_completed=0, disqualified=False)])
     oversized = _aggregate("none", [replace(base, disqualified=True)])
 
-    assert "EXCL" in _row(unfinished, None, True)
-    assert "DQ" not in _row(unfinished, None, True)
-    assert "DQ" in _row(oversized, None, True)
+    assert "EXCL" in _row(unfinished, None, True, 60_000)
+    assert "DQ" not in _row(unfinished, None, True, 60_000)
+    assert "DQ" in _row(oversized, None, True, 60_000)
     # Both are out of the ranking, and for different reasons: the notes under the table name
     # each of them, so the flag only has to say which kind this row is.
     assert _excluded_cells([unfinished, oversized]) == ({"none"}, {"none"})
