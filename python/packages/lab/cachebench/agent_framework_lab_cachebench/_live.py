@@ -1048,6 +1048,11 @@ def snapshot_state(session: AgentSession) -> dict[str, Any]:
     so a snapshot sharing those objects would be silently rewritten by the first probe and
     every later probe would start somewhere else.
 
+    Cheap enough to take on every turn, which is what the retry path does. ``deepcopy``
+    returns immutable strings as themselves, so the copy rebuilds the message objects around
+    the payloads rather than the payloads: measured at 6ms for a 232-message, 230,000-token
+    conversation, against a call that spends tens of seconds sending it.
+
     Args:
         session: The session to snapshot.
 
@@ -1062,16 +1067,19 @@ def restore_state(
     snapshot: Mapping[str, Any],
     recall_middleware: ToolResultRecallMiddleware | None = None,
 ) -> None:
-    """Put a session back to a snapshot, before the next probe is asked.
+    """Put a session back to a snapshot, before the next probe is asked or a turn re-sent.
 
-    Copied again on every restore rather than assigned once: the probe about to run will
-    mutate what it is given, and a shared copy would leak that into the probe after it.
+    Copied again on every restore rather than assigned once: the run about to happen will
+    mutate what it is given, and a shared copy would leak that into the one after it.
 
     The middleware is reset for the same reason the state is. Its pending decision to force a
     recall call is conversation state -- it is made on one call and applied to the next -- so a
     decision taken during seeding would fire on the first probe and on no other, giving that
     one probe a different prompt from the rest. That is precisely the difference between
-    probes this design exists to remove.
+    probes this design exists to remove. A retried turn wants it for the same reason: the
+    decision standing after a failed attempt was taken by that attempt, and the middleware
+    re-takes it at the end of the next call anyway, so clearing defers a forced record by one
+    call rather than losing it.
 
     Args:
         session: The session to restore.
@@ -1129,6 +1137,8 @@ async def run_live(
     a real tool, the model writing its own replies, the strategy compacting throughout. Only
     the user-side turn list is shared between strategies; the replies, and therefore the
     histories, diverge from the first turn, and that divergence is part of what is measured.
+    A turn that has to be re-sent is re-sent from the state it started in, which is not an
+    optimisation: see ``_send``.
 
     **Snapshot.** The session state is deep-copied. It has to be a real deep copy:
     ``apply_compaction`` marks exclusions by mutating ``additional_properties`` on the
@@ -1258,12 +1268,13 @@ async def run_live(
     retries = 0
     throttled = 0.0
 
-    async def _attempt(text: str, turn_options: dict[str, Any]) -> Any:
+    async def _attempt(text: str, turn_options: dict[str, Any], before: Mapping[str, Any]) -> Any:
         """Send one turn, waiting out provider throttling for as long as the bounds allow.
 
         Args:
             text: The user turn.
             turn_options: Per-call request options.
+            before: The session state this turn started from, restored before each re-send.
 
         Returns:
             The agent response.
@@ -1287,6 +1298,7 @@ async def run_live(
                     raise
                 delay = min(_throttle_delay(attempt, retry_after_seconds(exc)), remaining)
                 await sleep(delay)
+                restore_state(session, before, recall_middleware)
                 waited += delay
                 attempt += 1
                 retries += 1
@@ -1299,6 +1311,15 @@ async def run_live(
             The agent response, or None when the turn could not be sent at all.
         """
         nonlocal error, forced
+        # ``agent.run`` is not idempotent, so every retry below starts from here rather than
+        # from wherever the failed attempt stopped. A 429 that lands inside the tool-calling
+        # loop leaves the session holding an assistant function call whose result never
+        # arrived -- history is persisted per model call, so the call is durable and the
+        # result that was still in flight is not -- and re-sending against that state is
+        # refused outright: "No tool output found for function call". Measured live at 7
+        # occurrences in one cell, every one on a throttled row and including the uncompacted
+        # control, so the retry that exists to save seeds was destroying them instead.
+        before = snapshot_state(session)
         # Two attempts. Providers differ in which request options they accept, and one that
         # rejects an option names it. Dropping that option and retrying is what lets a model
         # with an unusual surface be measured at all instead of returning an empty run:
@@ -1310,6 +1331,11 @@ async def run_live(
         # option and goes round again, with a fresh wait budget for the new option set. The
         # sweep this was built for lost 100 seeds and EUR 4.17 because a rate limit fell
         # through a loop that only knew how to drop an option it was never given.
+        #
+        # Both loops restore, because both re-send. An option is named on the call that
+        # carries it, and after a tool result that is the second call of the turn -- so this
+        # one reaches a half-finished turn exactly as the rate limit does, and a run that
+        # restored only the throttled path would still send a dangling call down the other.
         for _ in range(2):
             # Per-turn options carry the runtime's own options too: this replaces the
             # per-call option set rather than adding to it.
@@ -1329,7 +1355,7 @@ async def run_live(
                     # against the 6 asked for, on one repeat in three.
                     turn_options["tool_choice"] = "none"
             try:
-                return await _attempt(text, turn_options)
+                return await _attempt(text, turn_options, before)
             except Exception as exc:
                 option = unsupported_option(exc)
                 if option is None or option in dropped:
@@ -1338,6 +1364,7 @@ async def run_live(
                 dropped.append(option)
                 if option == "tool_choice":
                     forced = {}
+                restore_state(session, before, recall_middleware)
         return None
 
     seeded = 0
