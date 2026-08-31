@@ -248,6 +248,29 @@ and after #7912", not as an isolated bisect of that PR.
 **Do not rebase while a sweep is running.** The venv is an editable install from this worktree,
 so the framework would change under processes that have already started.
 
+## 3d. Known bug: the output reservation is not the output cap
+
+**Fix this after the `gpt-5.4-mini` series is finished and before any other model is run.**
+Agreed 2026-08-31. Fixing it mid-series would move every strategy's trigger threshold and make
+the cells already measured incomparable with the ones after; leaving it past the series would
+put the same flaw into a second model's baseline.
+
+**What is wrong.** Strategies size their input budget as `--context-window` minus
+`--max-output-tokens`, which the runs set to 2,048. But the value actually sent on the request
+is `--answer-max-tokens`, which the runs set to **12,000** (`_providers.py` builds
+`{"max_tokens": response_max_tokens}` from it). So at a 60,000 window the strategies believe
+57,952 tokens of input are available when a reply may consume 12,000, leaving 48,000. The
+budget every threshold is a fraction of is overstated by about 10,000 tokens.
+
+**Why it does not bite yet.** `gpt-5.4-mini` has independent ceilings -- 272,000 input and
+128,000 output -- so a long reply cannot push a legal prompt over the limit, and
+`LiveOutcome.disqualified` checks the prompt alone. On a model whose window is shared between
+input and output the instrument would report an overflowing run as clean.
+
+**The fix** is to make the number used for the arithmetic the number actually sent, rather than
+having two. Whichever way round, it needs a clean re-baseline of every cell, which is why it
+waits for a model boundary.
+
 ## 4. The finding the report does not yet state correctly
 
 `REPORT-GPT-5-4-MINI.md` section 1 and finding 1 index the crossover on **tool result size
