@@ -21,6 +21,7 @@ from ._cli import build_parser, main, run_benchmark
 from ._fill import FillPlan, plan_fill
 from ._live import (
     AGENT_KINDS,
+    DEFAULT_COMBINED_REPEATS,
     DEFAULT_PROBE_REPEATS,
     LiveOutcome,
     MeteredClient,
@@ -30,6 +31,7 @@ from ._live import (
     build_live_agent,
     build_live_scenario,
     make_lookup_tool,
+    probe_count,
     restore_state,
     run_live,
     score_combined_samples,
@@ -92,6 +94,7 @@ except importlib.metadata.PackageNotFoundError:
 
 __all__ = [
     "AGENT_KINDS",
+    "DEFAULT_COMBINED_REPEATS",
     "DEFAULT_PROBE_REPEATS",
     "DEFAULT_SYSTEM_TOKENS",
     "PROVIDER_SPECS",
@@ -153,6 +156,7 @@ __all__ = [
     "parse_provider_selector",
     "percentile",
     "plan_fill",
+    "probe_count",
     "prompt_cache_key",
     "prompt_cache_key_options",
     "provider_names",

@@ -16,6 +16,7 @@ import re
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
 from pathlib import Path
+from statistics import fmean
 from types import SimpleNamespace
 from typing import Any, cast
 
@@ -70,6 +71,7 @@ from agent_framework_lab_cachebench._live import (
     _turn_text,
     make_recall_tool,
     make_scope_tools,
+    probe_count,
     resolve_instructions,
 )
 from agent_framework_lab_cachebench._live_cli import (
@@ -91,6 +93,7 @@ from agent_framework_lab_cachebench._live_cli import (
     build_parser,
     run_live_comparison,
 )
+from agent_framework_lab_cachebench._recall import COMBINED_SCOPE
 from agent_framework_lab_cachebench._records import (
     SCHEMA_VERSION,
     CellParams,
@@ -659,6 +662,7 @@ def test_every_argument_the_runner_reads_is_defined() -> None:
         "dry_run",
         "fill",
         "probe_repeats",
+        "combined_repeats",
     ):
         assert hasattr(args, name), f"--{name.replace('_', '-')} is read by the runner but not declared"
 
@@ -670,7 +674,10 @@ def test_the_help_can_actually_be_printed() -> None:
     parsing works, runs work, and the CLI is simply undiscoverable. Two help strings quoting
     percentages had broken it, found only because someone ran ``--help``.
     """
-    assert "--probe-repeats" in build_parser().format_help()
+    help_text = build_parser().format_help()
+
+    assert "--probe-repeats" in help_text
+    assert "--combined-repeats" in help_text
 
 
 # endregion
@@ -1662,6 +1669,61 @@ async def test_each_question_is_asked_three_times_by_default() -> None:
         assert [probe.repeat for probe in asked] == [1, 2, 3], f"{scope} was not asked exactly three times"
 
 
+async def test_the_combined_question_keeps_its_three_attempts_when_the_others_drop_to_one() -> None:
+    """acc2's repeat count must not follow --probe-repeats.
+
+    One acc1 reading averages every scoped question; one acc2 reading is a single answer. The runs
+    that matter set --probe-repeats to 1, the per-scope repeat spread having measured 0 to 2
+    points, and acc2 was then one sample per seed against acc1's seven -- which is the whole
+    reason it was the noisier of the two.
+    """
+    scenario = _probe_scenario()
+    outcome = await run_live(
+        ProviderRuntime(client=StubChatClient(), model="stub"),
+        strategy_name="none",
+        options=_options(),
+        scenario=scenario,
+        probe_repeats=1,
+    )
+
+    assert outcome.error is None
+    assert outcome.combined_repeats == 3
+    combined = [probe for probe in outcome.probes if probe.scope == COMBINED_SCOPE]
+    assert [probe.repeat for probe in combined] == [1, 2, 3], "the combined question followed --probe-repeats"
+    for scope in scenario.answer_scopes:
+        if scope != COMBINED_SCOPE:
+            asked = [probe for probe in outcome.probes if probe.scope == scope]
+            assert [probe.repeat for probe in asked] == [1], f"{scope} was asked more than once"
+    # The count the dry run prices the cell on, against the probes the runner actually sent.
+    assert probe_count(scenario.answer_scopes, probe_repeats=1, combined_repeats=3) == len(outcome.probes)
+
+
+async def test_the_combined_repeat_count_is_the_one_that_is_asked_for() -> None:
+    """Neither count may be quietly clamped to the other.
+
+    The pair is the point: three probe repeats and two combined attempts is a legitimate cell,
+    and a run that silently asked one of them the other's number of times would report a spread
+    over material it never gathered.
+    """
+    scenario = _probe_scenario()
+    outcome = await run_live(
+        ProviderRuntime(client=StubChatClient(), model="stub"),
+        strategy_name="none",
+        options=_options(),
+        scenario=scenario,
+        probe_repeats=3,
+        combined_repeats=2,
+    )
+
+    assert outcome.error is None
+    assert (outcome.probe_repeats, outcome.combined_repeats) == (3, 2)
+    asked = {scope: 0 for scope in scenario.answer_scopes}
+    for probe in outcome.probes:
+        asked[probe.scope] += 1
+    assert asked.pop(COMBINED_SCOPE) == 2
+    assert set(asked.values()) == {3}
+
+
 async def test_a_probe_never_sees_another_probes_answer() -> None:
     """No probe's answer may reach any other probe's prompt.
 
@@ -1997,7 +2059,8 @@ async def test_the_table_renders_every_column_it_declares() -> None:
             # By its first word, since a header cell can carry a "left/peak" qualifier the
             # legend explains in its body rather than in its key.
             assert column in explained or column.split()[0] in explained, f"the {column!r} column has no legend entry"
-    assert "per-sample correctness" in table
+    assert "per-sample acc1" in table
+    assert "per-sample acc2" in table
     assert "VERDICT:" in table
 
 
@@ -2084,7 +2147,7 @@ async def test_a_cheap_lossy_row_ranks_below_a_dearer_faithful_one() -> None:
     # reader working out which rows are comparable.
     assert [line.startswith("-") for line in _body(table)] == [False, False, True, False]
     assert "Ranking: 2 of 3 rows kept at least 90%" in table
-    assert "below 90% of the control's accuracy" in table
+    assert "below 90% of the control's acc1" in table
 
 
 async def test_the_split_holds_when_every_row_clears_and_when_none_does() -> None:
@@ -2156,6 +2219,114 @@ async def test_the_two_spreads_are_reported_apart() -> None:
     assert _seed_spread([wandering]) == 0.0, "one seed cannot show a between-seed spread"
     assert _probe_spread([steady]) == 0.0
     assert _seed_spread([steady, wandering]) > 0
+
+
+async def test_acc2_is_the_mean_over_every_combined_attempt_of_every_seed() -> None:
+    """Every attempt weighs the same, whatever number of them a seed made.
+
+    Not the mean of the seed means: a seed asked the combined question three times would then
+    count for as much as one asked it once, and a file merged from a run before the count
+    existed and a run after it would be weighted by which run a seed came from.
+    """
+    outcome, scenario = await _probed(
+        StubChatClient(usage=UsageDetails(input_token_count=1_000, output_token_count=20)), repeats=1
+    )
+    base = _record(outcome, scenario)
+    three = replace(base, seed=1, combined_samples=(1.0, 0.5, 0.6))
+    one = replace(base, seed=2, combined_samples=(0.2,))
+
+    cell = _aggregate("none", [three, one])
+
+    assert cell.combined == pytest.approx(fmean([1.0, 0.5, 0.6, 0.2]))
+    assert cell.combined != pytest.approx(fmean([fmean((1.0, 0.5, 0.6)), 0.2])), "the seed means were averaged"
+    # The seed read once contributes no spread rather than a spread against a missing value:
+    # 50 points is the three-attempt seed alone, which is the only one that was read twice.
+    assert cell.combined_spread == pytest.approx(50.0)
+    assert cell.combined_samples == ((1.0, 0.5, 0.6), (0.2,))
+
+
+async def test_a_seed_recorded_before_the_combined_count_still_aggregates_as_one_attempt() -> None:
+    """A record on disk holds one combined sample, and it is one answer, not a failed three.
+
+    Read as a third of three it would be scaled down to nothing; read as its own count it is
+    exactly the acc2 the file has always rendered. The count itself is recoverable too: back
+    then the combined question was one of the closing questions, so it was asked probe_repeats
+    times.
+    """
+    outcome, scenario = await _probed(
+        StubChatClient(usage=UsageDetails(input_token_count=1_000, output_token_count=20)), repeats=1
+    )
+    record = replace(_record(outcome, scenario, cell=_cell_params(probe_repeats=2)), combined_samples=(0.37,))
+    written = record.to_dict()
+    del written["cell"]["combined_repeats"]
+
+    old = SeedRecord.from_dict(written)
+
+    assert old.cell.combined_repeats == 2, "the count a version 2 record implies was not recovered"
+    assert old.combined == pytest.approx(0.37)
+    cell = _aggregate("none", [old])
+    assert cell.combined == pytest.approx(0.37)
+    assert cell.combined_spread == 0.0
+    row = _row(cell, None, excluded=False, limit=60_000)
+    assert " 37%" in row
+    assert "per-sample acc2" in _render(None, [cell], set(), show_answers=False)
+
+
+def test_the_two_accuracy_measures_are_named_acc1_and_acc2() -> None:
+    """One run measured two ways has to read as that, in the header and everywhere else.
+
+    ``acc`` and ``all`` named the questions rather than the measures, so nothing in the table
+    said the two columns were the same run scored twice -- one over the scoped questions, one
+    over the single combined one.
+    """
+    record = SeedRecord(
+        cell=_cell_params(),
+        strategy="none",
+        seed=1,
+        cost=0.01,
+        summarizer_cost=0.0,
+        input_tokens=1_000,
+        cached_tokens=300,
+        output_tokens=20,
+        calls=4,
+        messages_left=6,
+        messages_peak=12,
+        prompt_tokens_final=900,
+        prompt_tokens_peak=1_000,
+        seed_prompt_tokens=800,
+        facts_total=53,
+        facts_left=53,
+        facts_lost=0,
+        nofetch=0,
+        correctness_samples=(0.9, 1.0),
+        ignored_samples=(0, 0),
+        combined_samples=(0.4, 0.6, 0.5),
+        disqualified=False,
+        context_drift=0,
+        rate_limit_retries=0,
+        throttled_seconds=0.0,
+        turns_completed=10,
+        turns_total=10,
+        probe_repeats=2,
+        summarizer_calls=0,
+        summarizer_failures=0,
+        strategy_notes=(),
+        dropped_options=(),
+        answer="",
+    )
+
+    table = _render(None, [_aggregate("none", [record])], set(), show_answers=False)
+
+    header = next(line for line in table.splitlines() if line.strip().startswith("strategy"))
+    columns = set(re.split(r"\s{2,}", header.strip()))
+    assert {"acc1", "acc2", "rep2+-"} <= columns
+    assert not columns & {"acc", "all"}, "the old column names are still in the header"
+    explained = {line.split("=", 1)[0].strip() for line in table.splitlines() if "=" in line}
+    assert {"acc1", "acc2", "rep2+-"} <= explained
+    assert "per-sample acc1, one group per seed:" in table
+    assert "per-sample acc2, one group per seed:" in table
+    assert "[90% 100%]" in table, "the acc1 samples are not the per-scope repeats"
+    assert "[40% 60% 50%]" in table, "the acc2 samples are not the combined attempts"
 
 
 # endregion
@@ -2595,6 +2766,30 @@ async def test_every_finished_seed_is_on_disk_before_the_cell_is(
     assert all(record.correctness_samples for record in records), "records were written before they were scored"
 
 
+async def test_the_combined_count_reaches_the_record_and_the_cell_it_identifies(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """--combined-repeats has to arrive in the file, not just in the run.
+
+    Two things read it back. The samples are what acc2 is a mean over, so their count is the
+    measurement; the cell key is what decides whether two records belong in one row, and a
+    cell asked the combined question once does not average with a cell asked it three times.
+    """
+    _stub_provider(monkeypatch)
+    path = tmp_path / "results.jsonl"
+
+    argv = _live_argv("--results-jsonl", str(path), "--strategies", "none", "--repeats", "1")
+    await run_live_comparison(build_parser().parse_args([*argv, "--combined-repeats", "2"]))
+
+    (record,) = read_seed_records(path)
+
+    assert record.cell.combined_repeats == 2
+    assert len(record.combined_samples) == 2, "the combined question was not asked twice"
+    assert len(record.correctness_samples) == 2, "--probe-repeats 2 is what _live_argv asked for"
+    # The two counts sit in the cell key, so a differently sampled cell is a different row.
+    assert record.cell.key != replace(record.cell, combined_repeats=3).key
+
+
 async def test_the_table_rebuilt_from_the_file_matches_the_live_one(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -2632,7 +2827,7 @@ async def test_the_table_rebuilt_from_the_file_matches_the_live_one(
     rebuilt_split = capsys.readouterr().out
 
     assert "Ranking: 0 of 2 rows kept at least 150%" in live_split
-    assert "below 150% of the control's accuracy" in live_split
+    assert "below 150% of the control's acc1" in live_split
     assert _table(rebuilt_split) == _table(live_split)
 
 
@@ -2781,7 +2976,7 @@ async def test_each_finished_seed_prints_a_line_of_its_own(
     await run_live_comparison(build_parser().parse_args(_live_argv()))
     printed = capsys.readouterr().out
 
-    lines = [line for line in printed.splitlines() if " seed " in line and "acc " in line]
+    lines = [line for line in printed.splitlines() if " seed " in line and "acc1 " in line]
     assert len(lines) == 4, "one line per strategy-seed"
     assert "none seed 1/2" in lines[0]
     for line in lines:
@@ -2832,7 +3027,8 @@ def test_a_progress_line_shows_what_a_watcher_needs() -> None:
     assert "truncation seed 2/3" in line
     assert "$0.0412" in line
     assert "facts 27/53" in line
-    assert "acc 52%" in line
+    assert "acc1 52%" in line
+    assert "acc2 40%" in line
     assert "DQ" in line
     assert "DRIFT:1" in line
     assert "THROTTLED:4 (38s)" in line
@@ -2951,3 +3147,26 @@ def test_seed_numbering_can_be_offset() -> None:
 
     offset = build_parser().parse_args(["openrouter:some/model", "--seed-offset", "4"])
     assert offset.seed_offset == 4
+
+
+async def test_the_single_seed_warning_counts_seeds_not_the_flag() -> None:
+    """A merged cell holds more seeds than any one invocation asked for.
+
+    Cells are run as several concurrent single-seed invocations and merged afterwards, so
+    ``--repeats`` reads 1 on every record while the cell holds five of them. Reading the
+    request rather than the records had a five-seed cell announce that it measured nothing,
+    directly under a table showing its seed spread.
+    """
+    outcome, scenario = await _probed(
+        StubChatClient(usage=UsageDetails(input_token_count=1_000, output_token_count=20)), repeats=1
+    )
+    cells = [
+        _aggregate(name, [_record(outcome, scenario, strategy=name, seed=seed) for seed in (1, 2, 3)])
+        for name in ("none", "truncation")
+    ]
+    verdict = recommend([_to_joint(cell) for cell in cells])
+
+    table = _render(verdict, cells, set(), show_answers=False)
+
+    assert all(len(cell.records) == 3 for cell in cells)
+    assert "Single seed" not in table, "three seeds were reported as one"

@@ -50,6 +50,12 @@ __all__ = [
 #: 2 adds the throttling counters. Additive, and bumped anyway: a version 1 record cannot say
 #: whether it was throttled or merely never asked, and reading its absent counters as zero
 #: would put "not measured" and "did not happen" in the same column.
+#:
+#: ``combined_repeats`` was added later without a bump, which is the same rule applied to the
+#: opposite case: what a version 2 record did is not in doubt. The combined question was one
+#: of the closing questions then, so it was asked exactly ``probe_repeats`` times, and
+#: :meth:`CellParams.from_dict` fills that in. There is no "not measured" to confuse with a
+#: measurement, and the samples on the record say the same thing by their count.
 SCHEMA_VERSION: Final[int] = 2
 
 #: The parameters that make two records the same cell, and so aggregable into one row.
@@ -65,6 +71,7 @@ _CELL_KEY_FIELDS: Final[tuple[str, ...]] = (
     "context_window",
     "fill",
     "probe_repeats",
+    "combined_repeats",
     "narration",
     "fact_placement",
     "tool_result_tokens",
@@ -142,6 +149,17 @@ class CellParams:
     price_input: float
     price_cached: float
     price_output: float
+    combined_repeats: int = 1
+    """Times the combined question was asked per seed: the denominator of ``acc2``.
+
+    Part of what makes two records the same cell, for the same reason ``probe_repeats`` is:
+    an ``acc2`` averaged over three attempts per seed and one averaged over a single attempt
+    are readings of different precision and do not belong in one column.
+
+    Defaulted to 1 for a record written before the combined question had its own count, where
+    it was one of the closing questions and so asked ``probe_repeats`` times --
+    :meth:`from_dict` fills that in, so an old file reads as the measurement it was.
+    """
     min_correctness: float = DEFAULT_MIN_CORRECTNESS
     """The correctness bar the verdict applied.
 
@@ -177,7 +195,8 @@ class CellParams:
         return (
             f"{self.provider}:{self.model}  agent {self.agent_kind}  "
             f"window {self.context_window:,}  {fill}  "
-            f"payload {self.tool_result_tokens:,}x{self.tool_turns}  probes {self.probe_repeats}"
+            f"payload {self.tool_result_tokens:,}x{self.tool_turns}  "
+            f"probes {self.probe_repeats}  combined {self.combined_repeats}"
         )
 
     def to_dict(self) -> dict[str, Any]:
@@ -197,6 +216,12 @@ class CellParams:
         known = {field.name for field in fields(cls)}
         values = {key: value for key, value in data.items() if key in known}
         values["strategies"] = tuple(values.get("strategies") or ())
+        # A record written before the combined question had its own count asked it as one of
+        # the closing questions, so it was asked exactly probe_repeats times. Taking the
+        # field's own default of 1 instead would report a three-attempt cell as a single
+        # attempt, and taking today's default of 3 would report one attempt as three that
+        # mostly failed. Neither is what the file says; this is.
+        values.setdefault("combined_repeats", int(values.get("probe_repeats", 1)))
         plan: dict[str, Any] | None = values.get("plan")
         values["plan"] = _plan_from_dict(plan) if plan is not None else None
         return cls(**values)
@@ -290,8 +315,17 @@ class SeedRecord:
 
     @property
     def correctness(self) -> float:
-        """Mean correctness over this seed's probe repeats."""
+        """Mean correctness over this seed's probe repeats: the seed's ``acc1``."""
         return fmean(self.correctness_samples) if self.correctness_samples else 0.0
+
+    @property
+    def combined(self) -> float:
+        """Mean over this seed's combined attempts: the seed's ``acc2``.
+
+        Over the attempts the seed actually made, so a record written when the combined
+        question was asked once reads as that one answer rather than as a third of three.
+        """
+        return fmean(self.combined_samples) if self.combined_samples else 0.0
 
     @property
     def hit_rate(self) -> float | None:
