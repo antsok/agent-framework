@@ -66,6 +66,7 @@ from agent_framework_lab_cachebench._live import (
     RATE_LIMIT_MAX_WAIT,
     RETRIEVAL_GUIDANCE,
     RecallGate,
+    _strategy_notes,
     _turn_text,
     make_recall_tool,
     make_scope_tools,
@@ -1921,6 +1922,52 @@ async def test_a_throttled_row_says_so_in_the_table() -> None:
 
     assert "THROTTLED:2" in table
     assert "Throttled:" in table, "the seconds are the point, and the flag cannot carry them"
+
+
+async def test_a_declined_collapse_reaches_the_flags_column() -> None:
+    """A row that never fired and a row that fired to no effect must not read the same.
+
+    ``anchored_min_gain`` can leave a conversation untouched for two opposite reasons: there
+    was nothing in the band worth shortening, or there was and the saving would not have
+    repaid the prompt cache the edit spends. Every other column reads identically in the two
+    cases -- same size, same cost, same facts -- so without the count the table cannot say
+    which of them the run measured, and the floor is exactly the thing being measured.
+    """
+    strategy = build_strategy("anchored_min_gain", _options())
+    assert strategy is not None
+    messages: list[Message] = [
+        Message(role="system", contents=["You are an assistant."], message_id="sys"),
+        Message(role="user", contents=["Requirement: region is EU-WEST-1."], message_id="u0"),
+        Message(role="assistant", contents=["Understood."], message_id="a0"),
+    ]
+    for index in range(8):
+        call_id = f"call_{index}"
+        messages += [
+            Message(role="user", contents=[f"Look up {index}."], message_id=f"u_{index}"),
+            Message(
+                role="assistant",
+                contents=[{"type": "function_call", "call_id": call_id, "name": "lookup", "arguments": "{}"}],
+                message_id=f"a_call_{index}",
+            ),
+            Message(
+                role="tool",
+                contents=[{"type": "function_result", "call_id": call_id, "result": f"R{index} " + "x" * 5_000}],
+                message_id=f"t_res_{index}",
+            ),
+            Message(role="assistant", contents=[f"I looked up {index}."], message_id=f"a_txt_{index}"),
+        ]
+
+    assert await strategy(messages) is False
+    notes = _strategy_notes(strategy)
+
+    assert notes == ("NOGAIN:1",)
+
+    outcome, scenario = await _probed(StubChatClient(usage=UsageDetails(input_token_count=1_000)), repeats=1)
+    record = replace(_record(outcome, scenario, strategy="anchored_min_gain"), strategy_notes=notes)
+    cell = _aggregate("anchored_min_gain", [record])
+
+    assert "NOGAIN:1" in _flags(cell, None)
+    assert "NOGAIN:1" in _render(None, [cell], set(), show_answers=False)
 
 
 async def test_the_table_renders_every_column_it_declares() -> None:

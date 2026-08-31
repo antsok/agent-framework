@@ -40,7 +40,7 @@ from agent_framework import (
     TruncationStrategy,
 )
 
-from ._anchored import AnchoredCompactionStrategy
+from ._anchored import AnchoredCompactionStrategy, MinimumGainAnchoredCompactionStrategy
 from ._toolsummary import ToolResultAnchoredSummarizationCompactionStrategy
 
 if TYPE_CHECKING:
@@ -191,6 +191,23 @@ def _build_anchored_no_assistant(options: StrategyOptions) -> CompactionStrategy
         keep_head_groups=options.keep_head_groups,
         keep_tail_groups=options.keep_tail_groups,
         collapse_assistant_text=False,
+    )
+
+
+def _build_anchored_min_gain(options: StrategyOptions) -> CompactionStrategy:
+    """Return the anchored strategy with a break-even floor under every collapse.
+
+    Pairs with ``anchored`` to measure one setting: whether declining collapses too small to
+    repay the prompt cache they invalidate is worth the information they would have removed.
+    At the 60,000-token cell the unfloored row removed 263 tokens and cost 11% more than the
+    uncompacted control, so the pair is a direct test of whether a strategy is better off
+    doing nothing than doing a little. See :mod:`._anchored`.
+    """
+    return MinimumGainAnchoredCompactionStrategy(
+        max_input_tokens=options.input_budget_tokens,
+        tokenizer=options.tokenizer,
+        keep_head_groups=options.keep_head_groups,
+        keep_tail_groups=options.keep_tail_groups,
     )
 
 
@@ -356,6 +373,7 @@ STRATEGY_BUILDERS: Final[dict[str, Callable[[StrategyOptions], CompactionStrateg
     "anchored": _build_anchored,
     "tool_summary_anchored": _build_tool_summary_anchored,
     "anchored_no_assistant": _build_anchored_no_assistant,
+    "anchored_min_gain": _build_anchored_min_gain,
     "sliding_window": _build_sliding_window,
     "tool_result": _build_tool_result,
     "selective_tool_call": _build_selective_tool_call,

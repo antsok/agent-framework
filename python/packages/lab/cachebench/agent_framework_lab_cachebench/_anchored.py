@@ -36,9 +36,10 @@ the mechanism allows.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final
 
-from agent_framework import Message
+from agent_framework import Content, Message
 from agent_framework._compaction import (
     EXCLUDED_KEY,
     GROUP_ANNOTATION_KEY,
@@ -54,7 +55,14 @@ from agent_framework._compaction import (
 if TYPE_CHECKING:
     from agent_framework import TokenizerProtocol
 
-__all__ = ["DEFAULT_KEEP_TOKENS", "MARKER_ID_PREFIX", "REMOVAL_MARKER", "AnchoredCompactionStrategy"]
+__all__ = [
+    "DEFAULT_KEEP_TOKENS",
+    "DEFAULT_MIN_GAIN_FRACTION",
+    "MARKER_ID_PREFIX",
+    "REMOVAL_MARKER",
+    "AnchoredCompactionStrategy",
+    "MinimumGainAnchoredCompactionStrategy",
+]
 
 #: Reason recorded on every message this strategy excludes, so a caller inspecting the
 #: history can tell our removals apart from the framework's.
@@ -96,10 +104,50 @@ MARKER_ID_PREFIX: Final[str] = "anchored_"
 #: termination condition cannot become an infinite loop inside a chat client.
 _MAX_SHED_PASSES: Final[int] = 4
 
+#: Share of the currently included prompt a collapse must remove before it is worth making.
+#:
+#: Derived rather than chosen. Prompt caching is strict-prefix, so an edit at position K makes
+#: the provider re-read everything behind K once at the uncached price; the edit then saves
+#: the tokens it removed on every turn that follows, at the cached price. Write ``R`` for the
+#: tokens removed, ``B`` for the included tokens sitting behind the edit, ``T`` for the turns
+#: still to come, and ``p`` and ``c`` for the uncached and cached prices. On the turn after
+#: the edit the compacted arm pays ``(B - R) * p`` where the uncompacted arm pays ``B * c``,
+#: and on each of the ``T - 1`` turns after that it pays ``R * c`` less. So the edit repays
+#: itself when ``T * R * c > (B - R) * (p - c)``, which is::
+#:
+#:     R > B / (1 + T * c / (p - c))
+#:
+#: At the measured prices -- 0.66 and 0.07 per million, so ``c / (p - c)`` is 0.1186 -- and at
+#: the cell where the anchored row was measured (``B`` about 40,000 tokens behind the edit,
+#: ``T`` about 20 turns left) that is ``R > 11,859`` tokens against a 52,322-token snapshot:
+#: 22.7% of the included prompt, rounded up here so the floor is never *below* the break-even
+#: it is derived from. What the anchored row actually removed at that cell was 263 tokens,
+#: 0.5%, and it cost 11% more than not compacting at all -- 46,471 tokens re-read at full
+#: price to save 263, which is 177 to 1 against.
+#:
+#: ``T`` is the term nobody knows at decision time, and it divides: ten remaining turns need
+#: 35% and forty need 13%. This default is the twenty-turn figure, so a caller who expects
+#: shorter conversations should raise it rather than trust it.
+DEFAULT_MIN_GAIN_FRACTION: Final[float] = 0.23
+
 
 def _is_marker(message: Message) -> bool:
     """Return whether ``message`` is a note this strategy left in place of a dropped group."""
     return bool(message.message_id and message.message_id.startswith(MARKER_ID_PREFIX))
+
+
+@dataclass(frozen=True, slots=True)
+class _Shortening:
+    """One tool result a collapse would rewrite, and what rewriting it would save.
+
+    ``saved_tokens`` is measured on the result text rather than on the serialized message, so
+    it omits the few tokens of JSON envelope that the rewrite does not change. The two agree
+    to within a token per result, and the text is what the reduction is actually made of.
+    """
+
+    content: Content
+    text: str
+    saved_tokens: int
 
 
 class AnchoredCompactionStrategy:
@@ -243,8 +291,26 @@ class AnchoredCompactionStrategy:
         Returns:
             True if any result was shortened.
         """
+        return self._apply_shortenings(self._plan_shortenings(messages, band))
+
+    def _plan_shortenings(self, messages: list[Message], band: list[dict[str, Any]]) -> list[_Shortening]:
+        """Return the rewrites a collapse would make, without making any of them.
+
+        Split out from applying them so a subclass can price a collapse before it happens.
+        Nothing here writes: ``_shorten`` is a pure function of the text and the budget, so
+        the plan *is* what the collapse does and the two cannot drift apart. A dry run that
+        instead mutated and rolled back would have to unwind ``additional_properties``
+        exactly, and one flag missed there is a wrong measurement that looks like a right one.
+
+        Args:
+            messages: The message list, read but not modified.
+            band: The middle groups, as returned by :meth:`_middle_band`.
+
+        Returns:
+            One entry per tool result whose text would change, in band order.
+        """
         budget = self._keep_tokens_for(band)
-        changed = False
+        plan: list[_Shortening] = []
         for group in band:
             if group.get("kind") != "tool_call":
                 continue
@@ -256,10 +322,25 @@ class AnchoredCompactionStrategy:
                         continue
                     text = content.result if isinstance(content.result, str) else str(content.result)
                     shortened = self._shorten(text, budget)
-                    if shortened != text:
-                        content.result = shortened
-                        changed = True
-        return changed
+                    if shortened == text:
+                        continue
+                    saved = self.tokenizer.count_tokens(text) - self.tokenizer.count_tokens(shortened)
+                    plan.append(_Shortening(content=content, text=shortened, saved_tokens=saved))
+        return plan
+
+    @staticmethod
+    def _apply_shortenings(plan: list[_Shortening]) -> bool:
+        """Write a plan out, in place.
+
+        Args:
+            plan: What :meth:`_plan_shortenings` returned.
+
+        Returns:
+            True if the plan held anything at all.
+        """
+        for item in plan:
+            item.content.result = item.text
+        return bool(plan)
 
     def _keep_tokens_for(self, band: list[dict[str, Any]]) -> int:
         """Return how many characters each collapsed tool result may keep.
@@ -413,3 +494,119 @@ class AnchoredCompactionStrategy:
                 },
             ),
         )
+
+
+class MinimumGainAnchoredCompactionStrategy(AnchoredCompactionStrategy):
+    """The anchored strategy, refusing any collapse too small to repay the cache it spends.
+
+    Anchored compaction is cheap per edit but not free, and at one measured cell it was
+    almost entirely cost. At a 60,000-token window, 0.86 fill and 3,500-token tool results,
+    the ``anchored`` row removed **263 tokens** -- 0.5% of a 52,322-token snapshot -- and came
+    out 11% more expensive than not compacting at all. Its prompt-cache hit rate fell from
+    92% to 88%, which is 46,471 tokens re-read at the uncached price. Nothing was wrong with
+    *what* it shortened. The edit was simply too small to be worth making, at 177 to 1
+    against, and the strategy had no way to notice that because it never asked.
+
+    This one asks. Before any result is rewritten it prices the whole collapse against the
+    break-even in :data:`DEFAULT_MIN_GAIN_FRACTION`, and when the projected reduction falls
+    under that floor it leaves the conversation exactly as it found it and counts the refusal.
+    Everything else -- the anchors, the position-only band, the shed order, the markers -- is
+    inherited unchanged, so a run of this row beside ``anchored`` measures the floor and
+    nothing else.
+
+    **The projection is dry, not undone.** It is :meth:`_plan_shortenings`, the same call the
+    collapse itself makes, so the number the floor is compared against is the reduction the
+    collapse would produce rather than an estimate of it. Compaction records its decisions by
+    mutating ``additional_properties`` in place; a projection that mutated and rolled back
+    would have to unwind every one of those flags, and a single missed flag is a silent wrong
+    measurement rather than a failure.
+
+    **The floor does not apply when the prompt will not fit.** Over the ceiling, shortening is
+    not an optimisation whose saving has to beat a cache cost -- it is what keeps the
+    conversation admissible at all, and declining it would only push the work onto the shed
+    step, which drops whole groups instead of trimming them. So the floor governs the case
+    the measurement was about, a prompt that already fits and is being tidied, and the
+    last-resort shedding behind it is untouched.
+
+    Keyword Args:
+        min_gain_fraction: Share of the currently included prompt a collapse must be
+            projected to remove before it is allowed to happen. Zero disables the floor,
+            which makes this row identical to ``anchored``. See
+            :data:`DEFAULT_MIN_GAIN_FRACTION` for where the default comes from and for the
+            one term in it -- the turns remaining -- that no strategy can know.
+
+    See :class:`AnchoredCompactionStrategy` for every other parameter.
+    """
+
+    def __init__(
+        self,
+        *,
+        max_input_tokens: int,
+        tokenizer: TokenizerProtocol,
+        keep_head_groups: int = 3,
+        keep_tail_groups: int = 4,
+        keep_tokens: int | None = None,
+        band_share: float = DEFAULT_BAND_SHARE,
+        collapse_assistant_text: bool = True,
+        min_gain_fraction: float = DEFAULT_MIN_GAIN_FRACTION,
+    ) -> None:
+        """Validate and store the configuration.
+
+        Raises:
+            ValueError: If ``min_gain_fraction`` is negative or at least 1.0 -- a floor of one
+                whole prompt can never be met, so the strategy would silently never act -- or
+                if any bound the anchored strategy validates is out of range.
+        """
+        super().__init__(
+            max_input_tokens=max_input_tokens,
+            tokenizer=tokenizer,
+            keep_head_groups=keep_head_groups,
+            keep_tail_groups=keep_tail_groups,
+            keep_tokens=keep_tokens,
+            band_share=band_share,
+            collapse_assistant_text=collapse_assistant_text,
+        )
+        if not 0.0 <= min_gain_fraction < 1.0:
+            raise ValueError("min_gain_fraction must be in [0.0, 1.0).")
+        self.min_gain_fraction = min_gain_fraction
+        self._declined = 0
+
+    @property
+    def declined_collapses(self) -> int:
+        """Passes that had a collapse available and refused it as too small to pay for itself.
+
+        Read by the runner and surfaced in the table's flags column, because the two rows this
+        strategy can produce are otherwise indistinguishable there: a run with nothing to
+        compact and a run that decided compacting was not worth it both report no reduction,
+        and they are opposite findings. A non-zero count says the floor is what is being
+        measured; a zero count on a row that also removed nothing says the conversation never
+        gave it anything to remove.
+        """
+        return self._declined
+
+    def _collapse_tool_results(self, messages: list[Message], band: list[dict[str, Any]]) -> bool:
+        """Collapse the band's tool results, unless doing so would not pay for itself.
+
+        Relies on the token annotations :meth:`AnchoredCompactionStrategy.__call__` refreshes
+        before it calls this, which is the only caller.
+
+        Args:
+            messages: The message list, mutated in place only if the collapse goes ahead.
+            band: The middle groups, as returned by :meth:`_middle_band`.
+
+        Returns:
+            True if any result was shortened.
+        """
+        plan = self._plan_shortenings(messages, band)
+        if not plan:
+            return False
+        included = included_token_count(messages)
+        # Over the ceiling the collapse is not being judged on its saving: it is the cheapest
+        # way left to make the conversation fit, and refusing it here would hand the work to
+        # the shed step, which removes whole groups rather than trimming them.
+        if included > self.max_input_tokens:
+            return self._apply_shortenings(plan)
+        if sum(item.saved_tokens for item in plan) < int(included * self.min_gain_fraction):
+            self._declined += 1
+            return False
+        return self._apply_shortenings(plan)

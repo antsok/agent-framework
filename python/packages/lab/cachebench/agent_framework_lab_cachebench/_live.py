@@ -644,6 +644,7 @@ def _strategy_notes(strategy: Any) -> tuple[str, ...]:
         ("forced_calls", "FORCED"),
         ("records_forced", "RECFORCED"),
         ("records_volunteered", "RECVOLUNTEERED"),
+        ("declined_collapses", "NOGAIN"),
     ):
         value = getattr(strategy, attribute, None)
         if isinstance(value, int) and value:
