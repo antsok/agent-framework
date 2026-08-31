@@ -886,13 +886,14 @@ def _flags(stats: CellStats, control: CellStats | None) -> list[str]:
     return flags
 
 
-def _row(stats: CellStats, control: CellStats | None, excluded: bool) -> str:
+def _row(stats: CellStats, control: CellStats | None, excluded: bool, limit: int) -> str:
     """Render one strategy's line of the table.
 
     Args:
         stats: The row.
         control: The uncompacted baseline, or None when the file being read does not hold it,
             in which case both relative columns read as unknown rather than being computed
+        limit: The tried context window, which ``snap%`` is a share of
             against whichever row happened to be first.
         excluded: Whether this row is out of the ranking.
     """
@@ -917,9 +918,15 @@ def _row(stats: CellStats, control: CellStats | None, excluded: bool) -> str:
         flags.insert(0, "EXCL")
     summ = stats.summarizer_cost
     lost = max(stats.facts_total - stats.facts_left - stats.nofetch, 0.0)
+    # What compaction actually left standing when the questions began, as a share of the
+    # window the strategies were configured against. The absolute token counts beside it do
+    # not say that on their own: a strategy is only reading as "compacted hard" relative to
+    # the ceiling it was told about, and that ceiling differs per cell.
+    snap = f"{stats.seed_prompt_tokens / limit:.0%}" if limit else "n/a"
     return (
         f"{stats.strategy:<28}{f'{stats.messages_left:.0f}/{stats.messages_peak:.0f}':>9}"
         f"{f'{stats.prompt_tokens_final:,.0f}/{stats.prompt_tokens_peak:,.0f}':>16}"
+        f"{snap:>7}"
         f"{stats.calls:>7.0f}{stats.input_tokens:>12,.0f}{hit:>6}"
         f"{stats.output_tokens:>10,.0f}{'$' + format(stats.cost, '.4f'):>10}"
         f"{stats.cost_spread:>6.0%}"
@@ -937,6 +944,9 @@ _LEGEND: Final[tuple[str, ...]] = (
     "msgs      = messages in a probe's prompt, out of the most any call carried. Every probe",
     "            is asked from the same restored snapshot, so this no longer drifts downwards",
     "            through the questions the way it did when they were ordinary turns",
+    "snap%     = the snapshot every question was asked from, as a share of the tried context",
+    "            window. This is how hard compaction acted: the control sits at the fill the",
+    "            cell was sized to, and a strategy below it removed that difference",
     "tok       = billed tokens in that same prompt, and at the peak. Watch this rather than",
     "            msgs: a strategy that rewrites content in place removes tokens without",
     "            removing messages, and msgs cannot see it",
@@ -1033,7 +1043,7 @@ def _render(
     cell_params = cells[0].records[0].cell
     pricing = cell_params.pricing
     header = (
-        f"{'strategy':<28}{'msgs':>9}{'tok left/peak':>16}{'calls':>7}{'in':>12}{'hit%':>6}"
+        f"{'strategy':<28}{'msgs':>9}{'tok left/peak':>16}{'snap%':>7}{'calls':>7}{'in':>12}{'hit%':>6}"
         f"{'out':>10}{'cost':>10}{'+-':>6}{'summ$':>8}{'vs none':>9}"
         f"{'facts':>9}{'lost':>6}{'nofetch':>8}{'ignored':>8}{'acc':>9}{'seed+-':>7}{'rep+-':>7}"
         f"{'all':>6}{'vs none':>9}{'dq':>5}{'flags':>10}"
@@ -1049,7 +1059,7 @@ def _render(
         header,
         "-" * len(header),
     ]
-    lines.extend(_row(cell, baseline, cell.strategy in excluded) for cell in cells)
+    lines.extend(_row(cell, baseline, cell.strategy in excluded, cell_params.context_window) for cell in cells)
     lines += ["", *_LEGEND, "", "per-sample correctness, one group per seed:"]
     for cell in cells:
         groups = "  ".join("[" + " ".join(f"{value:.0%}" for value in seed) + "]" for seed in cell.samples if seed)
