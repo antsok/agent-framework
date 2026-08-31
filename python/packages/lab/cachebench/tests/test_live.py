@@ -2001,6 +2001,124 @@ async def test_the_table_renders_every_column_it_declares() -> None:
     assert "VERDICT:" in table
 
 
+def _body(table: str) -> list[str]:
+    """Return the table's rows, the split line included, and nothing above or below them."""
+    lines = table.splitlines()
+    start = next(index for index, line in enumerate(lines) if line.startswith("strategy")) + 2
+    end = next(index for index, line in enumerate(lines[start:], start) if not line.strip())
+    return lines[start:end]
+
+
+def _order(table: str) -> list[str]:
+    """Return the strategy of each row, in the order the table printed them."""
+    return [line.split()[0] for line in _body(table) if not line.startswith("-")]
+
+
+def _ranked_cell(record: SeedRecord, *, strategy: str, cost: float, correctness: float) -> Any:
+    """Return a one-seed row carrying the cost and the accuracy the ordering is tested on."""
+    return _aggregate(strategy, [replace(record, strategy=strategy, cost=cost, correctness_samples=(correctness,))])
+
+
+async def test_the_input_cost_column_prices_the_prompt_side_and_nothing_else() -> None:
+    """The new column has to be the input half of the money, at the cell's own rates.
+
+    It exists because the total is dominated by something compaction does not touch: on a
+    clean five-seed control the total moved 38% while input tokens moved 13% and the hit rate
+    4 points, all of it output, which is priced 57 times a cache read here. Three of five rows
+    then differed from the control by less than the control's own spread. Priced any other way
+    -- output folded in, the cached share at the full rate -- it would be a second cost column
+    rather than the quiet reading of the one already there.
+    """
+    outcome, scenario = await _probed(
+        StubChatClient(
+            usage=UsageDetails(input_token_count=1_000, output_token_count=20, cache_read_input_token_count=300)
+        ),
+        repeats=1,
+    )
+    record = _record(outcome, scenario)
+    fresh = record.input_tokens - record.cached_tokens
+    expected = (fresh * PRICING.input_per_million + record.cached_tokens * PRICING.cached_read_per_million) / 1_000_000
+
+    assert record.cached_tokens > 0, "with nothing cached the discounted rate is never exercised"
+    assert record.input_cost == pytest.approx(expected)
+    # The whole difference is output and the summarizer, which is what "input alone" means.
+    assert record.output_tokens > 0
+    assert record.input_cost < record.cost
+    assert record.cost - record.input_cost == pytest.approx(
+        record.output_tokens * PRICING.output_per_million / 1_000_000 + record.summarizer_cost
+    )
+    # Derived from tokens and rates the record already carries, so nothing about the format
+    # moved and every file on disk gains the column.
+    assert "input_cost" not in record.to_dict()
+    assert record.schema == SCHEMA_VERSION
+    assert SeedRecord.from_dict(record.to_dict()).input_cost == pytest.approx(expected)
+
+    cell = _aggregate("none", [record])
+
+    assert cell.input_cost == pytest.approx(expected)
+    assert f"${expected:.4f}" in _render(None, [cell], set(), show_answers=False)
+
+
+async def test_a_cheap_lossy_row_ranks_below_a_dearer_faithful_one() -> None:
+    """Cost ascending on its own promotes whichever strategy destroyed the most.
+
+    That is not a stray case: the cheapest row of a cell is reliably the one that threw the
+    conversation away, and it sorted above a strategy that kept the conversation and cost a
+    little more. So the rows that still answer are ranked first, and the reader is not asked
+    to infer the difference from a column eleven places to the right.
+    """
+    outcome, scenario = await _probed(
+        StubChatClient(usage=UsageDetails(input_token_count=1_000, output_token_count=20)), repeats=1
+    )
+    record = _record(outcome, scenario)
+    control = _ranked_cell(record, strategy="none", cost=0.10, correctness=1.0)
+    lossy = _ranked_cell(record, strategy="threw_it_away", cost=0.01, correctness=0.2)
+    faithful = _ranked_cell(record, strategy="kept_it", cost=0.05, correctness=0.95)
+    cells = [control, lossy, faithful]
+
+    table = _render(None, cells, set(), show_answers=False)
+
+    assert min(cells, key=lambda cell: cell.cost).strategy == "threw_it_away", "the old order put this first"
+    assert _order(table) == ["kept_it", "none", "threw_it_away"]
+    # Cheapest first inside each group, and the group boundary between them rather than a
+    # reader working out which rows are comparable.
+    assert [line.startswith("-") for line in _body(table)] == [False, False, True, False]
+    assert "Ranking: 2 of 3 rows kept at least 90%" in table
+    assert "below 90% of the control's accuracy" in table
+
+
+async def test_the_split_holds_when_every_row_clears_and_when_none_does() -> None:
+    """A cell where nothing is separated must still say what the order means.
+
+    Both degenerate cases render as one block of rows, and they mean opposite things: every
+    strategy usable, or none of them. Left to the line alone the two are indistinguishable,
+    which is why the threshold and the count are stated above the table whether or not the
+    line is drawn.
+    """
+    outcome, scenario = await _probed(
+        StubChatClient(usage=UsageDetails(input_token_count=1_000, output_token_count=20)), repeats=1
+    )
+    record = _record(outcome, scenario)
+    control = _ranked_cell(record, strategy="none", cost=0.10, correctness=1.0)
+    faithful = _ranked_cell(record, strategy="kept_it", cost=0.05, correctness=0.95)
+    lossy = _ranked_cell(record, strategy="threw_it_away", cost=0.01, correctness=0.2)
+
+    every = _render(None, [control, faithful], set(), show_answers=False)
+
+    assert _order(every) == ["kept_it", "none"]
+    assert not [line for line in _body(every) if line.startswith("-")], "there are no two groups to separate"
+    assert "Ranking: 2 of 2 rows kept at least 90%" in every
+
+    # A control that scored nothing is a cell in which no row can be shown to have retained
+    # anything, the control included: the line then sits above every row rather than vanishing.
+    dead = _ranked_cell(record, strategy="none", cost=0.10, correctness=0.0)
+    nothing = _render(None, [dead, faithful, lossy], set(), show_answers=False)
+
+    assert _order(nothing) == ["threw_it_away", "kept_it", "none"]
+    assert _body(nothing)[0].startswith("-")
+    assert "Ranking: 0 of 3 rows kept at least 90%" in nothing
+
+
 async def test_the_two_spreads_are_reported_apart() -> None:
     """Between-seed and within-seed disagreement must not arrive as one number.
 
@@ -2485,6 +2603,10 @@ async def test_the_table_rebuilt_from_the_file_matches_the_live_one(
     A rebuilt table that differs anywhere is a second measurement, and the point of recovering
     a dead cell is that its numbers are the numbers it would have printed. Both paths reach one
     aggregation over one kind of input, and this is what says so.
+
+    The order the rows come out in is part of that. Two rows of equal cost are ordered by name
+    precisely so the two paths cannot differ here: the live run builds them in the order the
+    strategies ran, and the file is grouped in the order the records were written.
     """
     _stub_provider(monkeypatch)
     path = tmp_path / "results.jsonl"
@@ -2495,7 +2617,23 @@ async def test_the_table_rebuilt_from_the_file_matches_the_live_one(
     rebuilt = capsys.readouterr().out
 
     assert "VERDICT:" in live
+    assert "Ranking: 2 of 2 rows kept at least 90%" in live, "both rows clear the bar, so there is no line"
     assert _table(rebuilt) == _table(live)
+
+    # Again with a bar nothing can clear, so that the split itself is part of what has to
+    # match. The threshold rides on the records, and the rebuilt table reads it from there
+    # rather than from its own default -- otherwise the two would split at different places
+    # while every column in them stayed identical.
+    split = tmp_path / "split.jsonl"
+    argv = _live_argv("--results-jsonl", str(split), "--min-correctness", "1.5")
+    await run_live_comparison(build_parser().parse_args(argv))
+    live_split = capsys.readouterr().out
+    await run_live_comparison(build_parser().parse_args(["--from-jsonl", str(split)]))
+    rebuilt_split = capsys.readouterr().out
+
+    assert "Ranking: 0 of 2 rows kept at least 150%" in live_split
+    assert "below 150% of the control's accuracy" in live_split
+    assert _table(rebuilt_split) == _table(live_split)
 
 
 async def test_aggregation_survives_the_round_trip_through_the_file(

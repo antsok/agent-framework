@@ -239,6 +239,27 @@ code actually calls. Its optional providers are switched off, because each one a
 system-prompt text to every measured prompt and would shift the trigger points without saying
 anything about compaction.
 
+#### The table is ranked on both axes, and priced on both
+
+Rows used to be ordered by cost ascending, which puts the strategy that threw the conversation
+away above the one that kept it: the cheapest row of a cell is reliably the one that destroyed
+the most. Rows that retain at least `--min-correctness` of the control's accuracy — the same
+relative test the verdict applies, default 0.9 — now come first, cheapest **total** cost first,
+and the rest follow below a line naming the threshold, in that same order. The count and the
+threshold are printed above the table, so a cell where every row clears reads differently from
+one where none does even though neither draws a line. The control is ordered by the same rule
+as everything else and is marked with a star in the `acc` column wherever it lands.
+
+`in$` prices the prompt side alone — uncached plus cached, with output and the summarizer left
+out — beside the total. On a clean five-seed cell the control's total cost varied 38% while its
+input tokens varied 13% and its hit rate 4 points: the whole gap was output, priced at $3.96/M
+against $0.07/M for a cache read. That variance is the model's verbosity rather than anything
+compaction did, and it swamps the axis compaction acts on — three of five rows differed from
+the control by less than the control's own spread. So `in$` is the low-variance view of what a
+strategy changed, and `cost` remains the number that is actually billed and the one the rows
+are ranked on. It is derived from tokens and rates the records already carry, so every results
+file already on disk gains the column.
+
 ### The token_budget family
 
 Every other strategy decides *when* to compact from its own trigger, so different strategies

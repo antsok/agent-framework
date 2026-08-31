@@ -32,7 +32,7 @@ from ._providers import build_provider, parse_provider_selector, provider_names
 from ._recall import RecallScenario, RecallScore
 from ._records import CellParams, SeedRecord, append_seed_record, group_by_cell, read_seed_records
 from ._strategies import StrategyOptions, build_strategy, needs_summarizer, strategy_names
-from ._summary import DEFAULT_MIN_CORRECTNESS, JointOutcome, JointVerdict, recommend
+from ._summary import DEFAULT_MIN_CORRECTNESS, JointOutcome, JointVerdict, recommend, relative_correctness
 from ._tokenizers import TOKENIZER_NAMES, build_tokenizer
 
 if TYPE_CHECKING:
@@ -379,12 +379,10 @@ def _cost(outcome: LiveOutcome, pricing: ModelPricing) -> float:
     the strategy which spends money to preserve information is not scored as though preserving
     it were free.
     """
-    fresh = max(outcome.input_tokens - outcome.cached_tokens, 0)
     agent_cost = (
-        fresh * pricing.input_per_million
-        + outcome.cached_tokens * pricing.cached_read_per_million
-        + outcome.output_tokens * pricing.output_per_million
-    ) / 1_000_000
+        pricing.input_cost(outcome.input_tokens, outcome.cached_tokens)
+        + outcome.output_tokens * pricing.output_per_million / 1_000_000
+    )
     return agent_cost + _summarizer_cost(outcome, pricing)
 
 
@@ -577,6 +575,13 @@ class CellStats:
     """
     cost: float
     cost_spread: float
+    input_cost: float
+    """What the prompt side of this cell cost, output excluded.
+
+    The same money as ``cost`` minus its output and summarizer halves, and the one worth
+    ranking a mechanism on: output is priced 57 times a cache read here, so a reply the model
+    happened to run long on moves the total further than compaction does.
+    """
     summarizer_cost: float
     input_tokens: float
     cached_tokens: float
@@ -642,6 +647,7 @@ def _aggregate(strategy: str, records: Sequence[SeedRecord]) -> CellStats:
         records=tuple(records),
         cost=fmean(record.cost for record in records),
         cost_spread=_spread([record.cost for record in records]),
+        input_cost=fmean(record.input_cost for record in records),
         summarizer_cost=fmean(record.summarizer_cost for record in records),
         input_tokens=fmean(record.input_tokens for record in records),
         cached_tokens=fmean(record.cached_tokens for record in records),
@@ -928,7 +934,8 @@ def _row(stats: CellStats, control: CellStats | None, excluded: bool, limit: int
         f"{f'{stats.prompt_tokens_final:,.0f}/{stats.prompt_tokens_peak:,.0f}':>16}"
         f"{snap:>7}"
         f"{stats.calls:>7.0f}{stats.input_tokens:>12,.0f}{hit:>6}"
-        f"{stats.output_tokens:>10,.0f}{'$' + format(stats.cost, '.4f'):>10}"
+        f"{stats.output_tokens:>10,.0f}{'$' + format(stats.input_cost, '.4f'):>9}"
+        f"{'$' + format(stats.cost, '.4f'):>10}"
         f"{stats.cost_spread:>6.0%}"
         f"{('-' if not summ else '$' + format(summ, '.4f')):>8}{cost_delta:>9}"
         f"{f'{stats.facts_left:.0f}/{stats.facts_total}':>9}{lost:>6.0f}"
@@ -957,6 +964,12 @@ _LEGEND: Final[tuple[str, ...]] = (
     "out       = output tokens billed across the whole run. Its own column because a total",
     "            driven by how much the model wrote is a different finding from one driven",
     "            by how much context it was sent, and one number cannot show which",
+    "in$       = what those input tokens cost, uncached and cached together, with output and",
+    "            the summarizer left out. The low-variance view of what compaction changes:",
+    "            on a clean five-seed control the total moved 38% while the input side moved",
+    "            13%, because output is priced 57x a cache read and the model's verbosity",
+    "            swamps the axis compaction acts on. Read this to see what a mechanism did;",
+    "            cost is still the number that gets billed, and the ranking is on cost",
     "cost      = the whole run: seeding, plus what every probe added, summed. Not split into",
     "            a seed and a probe column, because half of it is not a price anyone pays",
     "+-        = spread between the cheapest and dearest seed. A gap smaller than this is not",
@@ -974,7 +987,9 @@ _LEGEND: Final[tuple[str, ...]] = (
     "            all. Not compaction damage: an uncompacted run shows these too",
     "ignored   = still in the snapshot but unused: the model's failing, not compaction's",
     "acc       = mean share of checks passed across every probe repeat of every seed, each",
-    "            reply scored only against the values its own question asked for",
+    "            reply scored only against the values its own question asked for. A star",
+    "            marks the uncompacted control, which is ordered by the same rule as every",
+    "            other row and can therefore land below the line",
     "seed+-    = points between the least and most correct seed. Different conversations, so",
     "            this is compaction's own reliability: whether it cleared a retention",
     "            boundary this time and not last time",
@@ -1011,6 +1026,70 @@ _LEGEND: Final[tuple[str, ...]] = (
 )
 
 
+def _table_order(
+    cells: Sequence[CellStats], control: CellStats | None, min_correctness: float
+) -> tuple[list[CellStats], int]:
+    """Return the rows in the order the table prints them, and how many cleared the bar.
+
+    Cost ascending used to be the whole order, and on its own it ranks the strategy that threw
+    the conversation away above the one that kept it: the cheapest row of a cell is reliably
+    the one that destroyed the most. So the rows that still answer come first and the rest
+    follow, each group cheapest first on *total* cost -- the input-only column is the quieter
+    reading of the same money, but it is not what anyone is charged.
+
+    The bar is the verdict's own eligibility test applied to the verdict's own numbers, so the
+    split and the recommendation underneath it cannot disagree about which rows are usable.
+
+    Args:
+        cells: The rows, in any order.
+        control: The uncompacted baseline, or None when the records do not hold it -- in which
+            case no row can be judged against it and cost is the whole order again.
+        min_correctness: Share of the control's correctness a row must retain to rank first.
+
+    Returns:
+        The ordered rows, and how many leading rows cleared the bar.
+    """
+    # Without a control there is nothing to be accurate *relative to*, so every row stays in
+    # one group and the order is cost alone, as it was before there were two groups.
+    base = None if control is None else _to_joint(control)
+    cleared = {
+        cell.strategy
+        for cell in cells
+        if base is None or relative_correctness(_to_joint(cell), base) >= min_correctness
+    }
+    # The strategy name settles a tie in cost, so that a file read back in a different order
+    # from the one the run wrote it in cannot order two rows differently from the live table.
+    ordered = sorted(cells, key=lambda cell: (cell.strategy not in cleared, cell.cost, cell.strategy))
+    return ordered, len(cleared)
+
+
+def _ranking_note(cleared: int, total: int, control: CellStats | None, min_correctness: float) -> str:
+    """Return the line that says what the table's order means.
+
+    Printed whether or not the split line appears below it: a cell where every row clears the
+    bar and one where none does both render as a single block, and without this the reader
+    cannot tell which of the two they are looking at, or on what threshold.
+
+    Args:
+        cleared: How many rows cleared the bar.
+        total: How many rows there are.
+        control: The uncompacted baseline, or None when the records do not hold it.
+        min_correctness: The bar those rows were judged against.
+
+    Returns:
+        One line.
+    """
+    if control is None:
+        return (
+            "Ranking: total cost ascending. These records hold no uncompacted control, so no row "
+            "can be judged accurate enough to rank above another."
+        )
+    return (
+        f"Ranking: {cleared} of {total} rows kept at least {min_correctness:.0%} of the control's "
+        "accuracy and are ranked first, cheapest total cost first; the rest follow below the line."
+    )
+
+
 def _render(
     verdict: JointVerdict | None,
     cells: Sequence[CellStats],
@@ -1018,6 +1097,7 @@ def _render(
     control: str = "none",
     *,
     show_answers: bool,
+    min_correctness: float = DEFAULT_MIN_CORRECTNESS,
 ) -> str:
     """Render cost and correctness side by side, then the recommendation.
 
@@ -1029,22 +1109,26 @@ def _render(
     Args:
         verdict: The recommendation, or None when the records hold no admissible control and
             there is therefore nothing to recommend against.
-        cells: The rows, in the order they should appear.
+        cells: The rows, in any order. Ordering them is this function's own job, so that the
+            live table and one rebuilt from a file cannot be ordered by two different rules.
         excluded: Strategies that are out of the ranking.
         control: Name of the uncompacted baseline.
 
     Keyword Args:
         show_answers: Print each cell's first answer in full.
+        min_correctness: Share of the control's correctness a row must retain to rank above
+            the split line. The bar the verdict applied, so the two agree.
 
     Returns:
         The rendered table.
     """
     baseline = next((cell for cell in cells if cell.strategy == control), None)
+    ordered, cleared = _table_order(cells, baseline, min_correctness)
     cell_params = cells[0].records[0].cell
     pricing = cell_params.pricing
     header = (
         f"{'strategy':<28}{'msgs':>9}{'tok left/peak':>16}{'snap%':>7}{'calls':>7}{'in':>12}{'hit%':>6}"
-        f"{'out':>10}{'cost':>10}{'+-':>6}{'summ$':>8}{'vs none':>9}"
+        f"{'out':>10}{'in$':>9}{'cost':>10}{'+-':>6}{'summ$':>8}{'vs none':>9}"
         f"{'facts':>9}{'lost':>6}{'nofetch':>8}{'ignored':>8}{'acc':>9}{'seed+-':>7}{'rep+-':>7}"
         f"{'all':>6}{'vs none':>9}{'dq':>5}{'flags':>10}"
     )
@@ -1055,17 +1139,21 @@ def _render(
             f"Pricing: ${pricing.input_per_million:.2f}/M in, "
             f"${pricing.cached_read_per_million:.3f}/M cached, ${pricing.output_per_million:.2f}/M out"
         ),
+        _ranking_note(cleared, len(ordered), baseline, min_correctness),
         "",
         header,
         "-" * len(header),
     ]
-    lines.extend(_row(cell, baseline, cell.strategy in excluded, cell_params.context_window) for cell in cells)
+    for index, cell in enumerate(ordered):
+        if index == cleared:
+            lines.append(f" below {min_correctness:.0%} of the control's accuracy ".center(len(header), "-"))
+        lines.append(_row(cell, baseline, cell.strategy in excluded, cell_params.context_window))
     lines += ["", *_LEGEND, "", "per-sample correctness, one group per seed:"]
-    for cell in cells:
+    for cell in ordered:
         groups = "  ".join("[" + " ".join(f"{value:.0%}" for value in seed) + "]" for seed in cell.samples if seed)
         lines.append(f"  {cell.strategy:<28}{groups}")
-    lines += _fill_note({cell.strategy: cell for cell in cells}, cell_params.plan, control)
-    lines += _throttle_note(cells)
+    lines += _fill_note({cell.strategy: cell for cell in ordered}, cell_params.plan, control)
+    lines += _throttle_note(ordered)
     if verdict is None:
         lines += [
             "",
@@ -1079,10 +1167,10 @@ def _render(
             "",
             f"VERDICT: {verdict.recommended}",
             verdict.rationale,
-            *_stability_note(verdict, {cell.strategy: cell.cost_spread for cell in cells}, cell_params.repeats),
-            *_accuracy_note({cell.strategy: cell.seed_spread for cell in cells}, control, cell_params.repeats),
+            *_stability_note(verdict, {cell.strategy: cell.cost_spread for cell in ordered}, cell_params.repeats),
+            *_accuracy_note({cell.strategy: cell.seed_spread for cell in ordered}, control, cell_params.repeats),
         ]
-    failed = [cell.strategy for cell in cells if any(record.summarizer_failures for record in cell.records)]
+    failed = [cell.strategy for cell in ordered if any(record.summarizer_failures for record in cell.records)]
     if failed:
         lines += [
             "",
@@ -1091,7 +1179,7 @@ def _render(
             "and their high correctness is not evidence that summarization preserves information.",
         ]
     if show_answers:
-        for cell in cells:
+        for cell in ordered:
             lines += ["", f"--- {cell.strategy} ---", cell.records[0].answer or "(no answer)"]
     return "\n".join(lines)
 
@@ -1220,20 +1308,21 @@ def _coverage(cell: CellParams, records: Sequence[SeedRecord]) -> list[str]:
 
 
 def _cells_from_records(records: Sequence[SeedRecord]) -> list[CellStats]:
-    """Aggregate one cell's records into rows, cheapest first.
+    """Aggregate one cell's records into one row per strategy.
+
+    Unordered on purpose: the table orders its own rows, and a second ordering here is a
+    second rule for the rebuilt table to disagree with the live one about.
 
     Args:
         records: Every record of one cell.
 
     Returns:
-        One row per strategy present, ordered as the live table orders them.
+        One row per strategy present.
     """
     by_strategy: dict[str, list[SeedRecord]] = {}
     for record in records:
         by_strategy.setdefault(record.strategy, []).append(record)
-    cells = [_aggregate(strategy, seeds) for strategy, seeds in by_strategy.items()]
-    cells.sort(key=lambda cell: cell.cost)
-    return cells
+    return [_aggregate(strategy, seeds) for strategy, seeds in by_strategy.items()]
 
 
 def _render_from_records(args: argparse.Namespace) -> int:
@@ -1269,21 +1358,17 @@ def _render_from_records(args: argparse.Namespace) -> int:
         for line in _exclusion_notes(incomplete, oversized, cell_params.context_window):
             print(line)
         ranked = [_to_joint(cell) for cell in cells if cell.strategy not in excluded]
+        # The bar the run set, unless this invocation names one: a rebuilt verdict that
+        # silently applied a different threshold would rank rows the original never ranked,
+        # while every column above it stayed identical.
+        bar = cell_params.min_correctness if args.min_correctness is None else args.min_correctness
         verdict: JointVerdict | None = None
         if any(outcome.strategy == "none" for outcome in ranked):
             try:
-                # The bar the run set, unless this invocation names one: a rebuilt verdict
-                # that silently applied a different threshold would rank rows the original
-                # never ranked, while every column above it stayed identical.
-                verdict = recommend(
-                    ranked,
-                    min_correctness=(
-                        cell_params.min_correctness if args.min_correctness is None else args.min_correctness
-                    ),
-                )
+                verdict = recommend(ranked, min_correctness=bar)
             except ValueError as error:
                 print(f"Cannot summarize: {error}")
-        print(_render(verdict, cells, excluded, show_answers=args.show_answers))
+        print(_render(verdict, cells, excluded, show_answers=args.show_answers, min_correctness=bar))
     return 0
 
 
@@ -1524,7 +1609,6 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
     excluded = incomplete | oversized
     for line in _exclusion_notes(incomplete, oversized, args.context_window):
         print(line)
-    cells.sort(key=lambda cell: cell.cost)
     ranked = [_to_joint(cell) for cell in cells if cell.strategy not in excluded]
 
     if not any(outcome.strategy == "none" for outcome in ranked):
@@ -1547,7 +1631,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
             f"retain the last {retained}, so {affected} evicted nothing. Their scores measure "
             "a no-op, not information preservation. Raise --tool-turns above the retention."
         )
-    print(_render(verdict, cells, excluded, show_answers=args.show_answers))
+    print(_render(verdict, cells, excluded, show_answers=args.show_answers, min_correctness=min_correctness))
     return 0
 
 
