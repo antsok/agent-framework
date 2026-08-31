@@ -54,6 +54,7 @@ from agent_framework._compaction import project_included_messages
 
 from ._metrics import serialize_message
 from ._recall import (
+    COMBINED_SCOPE,
     FactOutcome,
     RecallScenario,
     build_recall_scenario,
@@ -80,6 +81,7 @@ if TYPE_CHECKING:
 __all__ = [
     "AGENT_KINDS",
     "COMPACTION_GUIDANCE",
+    "DEFAULT_COMBINED_REPEATS",
     "DEFAULT_PROBE_REPEATS",
     "DEFAULT_TOOL_RESULT_TOKENS",
     "NEUTRAL_INSTRUCTIONS",
@@ -101,6 +103,7 @@ __all__ = [
     "make_lookup_tool",
     "make_recall_tool",
     "make_scope_tools",
+    "probe_count",
     "resolve_instructions",
     "restore_state",
     "run_live",
@@ -127,6 +130,17 @@ AGENT_KINDS: Final[tuple[str, ...]] = ("plain", "harness")
 #: exactly the same 27 facts. Asking repeatedly against material that cannot have changed is
 #: what separates the model's own enumeration variance from compaction's.
 DEFAULT_PROBE_REPEATS: Final[int] = 3
+
+#: How many times the one combined question is put to the same snapshot.
+#:
+#: Its own count, independent of :data:`DEFAULT_PROBE_REPEATS`, because the two accuracy
+#: measures are averages over different numbers of questions. ``acc1`` averages every scoped
+#: question per repeat -- seven of them in the cells recorded so far, one per tool lookup plus
+#: the requirements -- while ``acc2`` is one question, so at one probe repeat it was a single
+#: sample per seed against seven, which is why it was the noisier of the two. The runs that
+#: matter use ``--probe-repeats 1``, the per-scope repeat spread having measured 0 to 2
+#: points, and this keeps the combined question sampled while that is true.
+DEFAULT_COMBINED_REPEATS: Final[int] = 3
 
 #: Default size of each tool result, in tokens. Set high on purpose: in a real agent
 #: trace tool output is usually the bulk of the context, and a benchmark whose tool
@@ -476,14 +490,22 @@ class LiveOutcome:
     #: column. A strategy that can silently degrade into a different one has to say so:
     #: this package has twice read a row that scored well for having done nothing.
     strategy_notes: tuple[str, ...] = ()
-    #: Every probe, in the order they were asked: each question in turn, each asked
-    #: ``probe_repeats`` times.
+    #: Every probe, in the order they were asked: each question in turn, each asked as many
+    #: times as its own scope calls for.
     probes: tuple[ProbeOutcome, ...] = ()
     probe_repeats: int = 1
-    """How many times each closing question was asked.
+    """How many times each per-scope closing question was asked.
 
     Reported rather than assumed, because it is the denominator of the within-seed spread:
     one repeat measures nothing about the model's own enumeration variance.
+    """
+    combined_repeats: int = 1
+    """How many times the combined question was asked.
+
+    Separate from ``probe_repeats`` because the two accuracy measures average over different
+    numbers of questions: every scoped question together makes one ``acc1`` reading, and this
+    one question is the whole of an ``acc2`` reading. One is the default here rather than three,
+    so that an outcome assembled without the probe phase reads as the single attempt it is.
     """
     context_drift: int = 0
     """Probes whose prompt was not the snapshot verbatim.
@@ -1113,6 +1135,47 @@ def _throttle_delay(attempt: int, requested: float | None) -> float:
     return delay * (1.0 - RATE_LIMIT_JITTER * jitter)
 
 
+def _repeats_for_scope(scope: str, *, probe_repeats: int, combined_repeats: int) -> int:
+    """Return how many times one closing question is asked.
+
+    The one rule the probe loop, the dry run's arithmetic and the scoring all read, so a cell
+    cannot be priced for one number of probes and then run with another.
+
+    Args:
+        scope: The question's scope, as declared by ``RecallScenario.answer_scopes``.
+
+    Keyword Args:
+        probe_repeats: Repeats for a per-scope question.
+        combined_repeats: Repeats for the combined question.
+
+    Returns:
+        The repeat count, never below one.
+    """
+    return max(combined_repeats if scope == COMBINED_SCOPE else probe_repeats, 1)
+
+
+def probe_count(scopes: Sequence[str], *, probe_repeats: int, combined_repeats: int) -> int:
+    """Return how many probes one seed will send.
+
+    No longer ``questions x repeats``: the combined question has its own count, so the total
+    is a sum over the questions rather than a product. The probes are the expensive half of a
+    seed -- each carries the whole snapshot -- so this is what a cost estimate rests on.
+
+    Args:
+        scopes: The scope of each closing question, in order.
+
+    Keyword Args:
+        probe_repeats: Repeats for each per-scope question.
+        combined_repeats: Repeats for the combined question.
+
+    Returns:
+        Probes per seed.
+    """
+    return sum(
+        _repeats_for_scope(scope, probe_repeats=probe_repeats, combined_repeats=combined_repeats) for scope in scopes
+    )
+
+
 async def run_live(
     runtime: ProviderRuntime,
     *,
@@ -1127,6 +1190,7 @@ async def run_live(
     fact_placement: str = "spread",
     allow_server_history: bool = False,
     probe_repeats: int = DEFAULT_PROBE_REPEATS,
+    combined_repeats: int = DEFAULT_COMBINED_REPEATS,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> LiveOutcome:
     """Seed a conversation against a real agent, snapshot it, then probe the snapshot.
@@ -1147,8 +1211,10 @@ async def run_live(
     previous probe had already re-marked.
 
     **Probe.** Every closing question is asked from that snapshot, restored before each one,
-    and asked ``probe_repeats`` times. No probe's answer can reach another probe's context, no
-    question is asked from a context an earlier question has already compacted further, and
+    and asked as many times as its scope calls for -- ``probe_repeats`` for a per-scope
+    question, ``combined_repeats`` for the combined one, which is the only difference between
+    them. No probe's answer can reach another probe's context, no question is asked from a
+    context an earlier question has already compacted further, and
     survival is scored against the snapshot -- which is by construction exactly the context
     every probe was answered from. None of the three held when the closing questions were
     ordinary turns appended to the conversation, and each moved the numbers: the first scope
@@ -1184,11 +1250,17 @@ async def run_live(
             left to the caller: a calibration probe that forgot it reported every narration
             mode as stable, because the service was feeding the model a history the client
             had never compacted.
-        probe_repeats: How many times each closing question is asked, each time from the
-            restored snapshot. Several, because accuracy is two-valued often enough that one
-            reading is a draw rather than a measurement: one strategy scored 52, 52, 52 and 22
-            on runs that preserved exactly the same 27 facts. Repeating the question against
-            unchanged material is what separates that from compaction's own spread.
+        probe_repeats: How many times each per-scope closing question is asked, each time
+            from the restored snapshot. Several, because accuracy is two-valued often enough
+            that one reading is a draw rather than a measurement: one strategy scored 52, 52,
+            52 and 22 on runs that preserved exactly the same 27 facts. Repeating the question
+            against unchanged material is what separates that from compaction's own spread.
+        combined_repeats: How many times the combined question is asked, in exactly the same
+            way and from the same restored snapshot. Counted separately because one reading of
+            ``acc1`` averages every scoped question while one reading of ``acc2`` is one answer,
+            so the two need different numbers of attempts to be equally settled -- and the runs
+            that matter set ``probe_repeats`` to 1, the per-scope repeat spread having measured
+            0 to 2 points.
         sleep: How the backoff between throttled attempts is taken. Injectable only so that
             a test can prove the retry is bounded without spending the bound in wall clock.
 
@@ -1260,7 +1332,7 @@ async def run_live(
     probe_turns = turns[len(turns) - question_count :]
     # The declared scopes line up with the closing turns one for one. A scenario that closes
     # with a single sweeping question declares one scope, so the pairing is exact either way.
-    scopes = scenario.answer_scopes or ("*",) * question_count
+    scopes = scenario.answer_scopes or (COMBINED_SCOPE,) * question_count
 
     error: str | None = None
     replies: list[str] = []
@@ -1391,8 +1463,12 @@ async def run_live(
         # probe is sent the same restored context whatever came before it.
         for offset, (scope, turn) in enumerate(zip(scopes, probe_turns, strict=False)):
             question = _turn_text(turn.request)
+            # The combined question is asked more often than the rest, and that is the only
+            # way it differs: same restored snapshot, same loop, same scoring. Giving it its
+            # own path would be a second measurement to keep in step with this one.
+            wanted = _repeats_for_scope(scope, probe_repeats=probe_repeats, combined_repeats=combined_repeats)
             answered = 0
-            for repeat in range(1, max(probe_repeats, 1) + 1):
+            for repeat in range(1, wanted + 1):
                 restore_state(session, snapshot, recall_middleware)
                 mark = len(recorder.calls)
                 response = await _send(
@@ -1421,7 +1497,7 @@ async def run_live(
                     )
                 )
                 answered += 1
-            if answered < max(probe_repeats, 1):
+            if answered < wanted:
                 break
             questions_done += 1
 
@@ -1438,6 +1514,7 @@ async def run_live(
         summarizer_calls=summarizer.calls if summarizer else 0,
         probes=tuple(probes),
         probe_repeats=max(probe_repeats, 1),
+        combined_repeats=max(combined_repeats, 1),
         context_drift=drift,
         rate_limit_retries=retries,
         throttled_seconds=throttled,
@@ -1560,31 +1637,35 @@ def score_samples(outcome: LiveOutcome, scenario: RecallScenario) -> tuple[tuple
 
 
 def score_combined_samples(outcome: LiveOutcome, scenario: RecallScenario) -> tuple[float, ...]:
-    """Return, per repeat, the share of planted facts the single combined answer contained.
+    """Return, per attempt, the share of planted facts the combined answer contained.
 
-    The per-scope questions ask for eight values each from a nearby part of the conversation.
-    This one asks for all 53 at once from a context they are scattered through, which is a
-    materially harder task and the one a real user is more likely to pose. It is the question
+    The per-scope questions ask for a handful of values each from a nearby part of the
+    conversation. This one asks for all 53 at once from a context they are scattered through,
+    which is a materially harder task and the one a real user is more likely to pose. It is the question
     the old design punished hardest by construction, since it was asked last and so from the
     most compacted context of the run; asked from the snapshot it is on the same footing as
     every other probe.
+
+    Taken from the combined probes themselves rather than by counting up to a repeat count, so
+    a run that asked it once and a run that asked it three times both read as what they did.
+    That is what lets records written before the combined question had its own count aggregate
+    beside new ones instead of being read as a failed three.
 
     Args:
         outcome: The finished run.
         scenario: The scenario it was driven from.
 
     Returns:
-        One fraction per repeat, empty when the scenario has no combined question.
+        One fraction per combined attempt that answered, empty when the scenario has no
+        combined question.
     """
     if not scenario.facts:
         return ()
-    shares: list[float] = []
-    for repeat in range(1, outcome.probe_repeats + 1):
-        answer = chr(10).join(probe.answer for probe in outcome.probes if probe.repeat == repeat and probe.scope == "*")
-        if not answer:
-            continue
-        shares.append(sum(1 for fact in scenario.facts if fact.appears_in(answer)) / len(scenario.facts))
-    return tuple(shares)
+    return tuple(
+        sum(1 for fact in scenario.facts if fact.appears_in(probe.answer)) / len(scenario.facts)
+        for probe in outcome.probes
+        if probe.scope == COMBINED_SCOPE and probe.answer
+    )
 
 
 _INSTRUCTIONS_BY_NARRATION: Final[dict[str, str]] = {

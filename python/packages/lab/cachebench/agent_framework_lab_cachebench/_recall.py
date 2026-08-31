@@ -37,6 +37,7 @@ from ._transcripts import TRUE_CHARS_PER_TOKEN, filler_text, sized_text
 from ._types import Transcript, TranscriptTurn
 
 __all__ = [
+    "COMBINED_SCOPE",
     "Contradiction",
     "FactOutcome",
     "PlantedFact",
@@ -48,6 +49,13 @@ __all__ = [
     "score_answer",
     "score_scoped",
 ]
+
+#: The scope of the one closing question that asks for everything at once.
+#:
+#: Named rather than spelled ``"*"`` at each site, because three separate rules key off it:
+#: it is excluded from the per-scope scoring, it is scored on its own as ``acc2``, and it has
+#: its own repeat count. A literal in three files is three chances for one of them to drift.
+COMBINED_SCOPE: Final[str] = "*"
 
 _FIRST_QUESTION: Final[str] = (
     "Quote verbatim every requirement code you were given, the change-of-direction "
@@ -237,7 +245,7 @@ class RecallScenario:
     contradictions: tuple[Contradiction, ...] = ()
     answer_turn_count: int = 1
     #: Scope asked about by each closing turn, in order. ``""`` is the requirements turn and
-    #: ``"*"`` the combined one, which is asked for everything at once.
+    #: :data:`COMBINED_SCOPE` the combined one, which is asked for everything at once.
     answer_scopes: tuple[str, ...] = ()
     """Closing turns whose replies are scored, counted from the end of the transcript."""
     tool_turn_scopes: Mapping[int, str] = field(default_factory=dict[int, str])
@@ -601,7 +609,7 @@ def build_recall_scenario(
                 reply=(),
             )
         )
-        answer_scopes = ("", *[name for name in lookups if lookups[name]], "*")
+        answer_scopes = ("", *[name for name in lookups if lookups[name]], COMBINED_SCOPE)
         answer_turns = 2 + sum(1 for name in lookups if lookups[name])
     else:
         turns.append(
@@ -612,7 +620,7 @@ def build_recall_scenario(
         )
         # The sweeping form is one turn asked for everything, so it is the combined scope
         # and nothing else.
-        answer_scopes = ("*",)
+        answer_scopes = (COMBINED_SCOPE,)
         answer_turns = 1
 
     return RecallScenario(
@@ -668,7 +676,7 @@ def score_scoped(
     """
     by_scope: dict[str, str] = {}
     for scope, answer in zip(scopes, answers, strict=False):
-        if scope != "*":
+        if scope != COMBINED_SCOPE:
             by_scope[scope] = by_scope.get(scope, "") + "\n" + answer
     return tuple(
         FactOutcome(

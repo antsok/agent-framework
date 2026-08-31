@@ -17,11 +17,13 @@ from ._advisor import ModelPricing, fetch_openrouter_pricing
 from ._fill import FillPlan, plan_fill
 from ._live import (
     AGENT_KINDS,
+    DEFAULT_COMBINED_REPEATS,
     DEFAULT_PROBE_REPEATS,
     DEFAULT_TOOL_RESULT_TOKENS,
     LiveOutcome,
     MeteredClient,
     build_live_scenario,
+    probe_count,
     run_live,
     score_combined_samples,
     score_samples,
@@ -29,7 +31,7 @@ from ._live import (
     wants_client_side_history,
 )
 from ._providers import build_provider, parse_provider_selector, provider_names
-from ._recall import RecallScenario, RecallScore
+from ._recall import COMBINED_SCOPE, RecallScenario, RecallScore
 from ._records import CellParams, SeedRecord, append_seed_record, group_by_cell, read_seed_records
 from ._strategies import StrategyOptions, build_strategy, needs_summarizer, strategy_names
 from ._summary import DEFAULT_MIN_CORRECTNESS, JointOutcome, JointVerdict, recommend, relative_correctness
@@ -108,10 +110,22 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_PROBE_REPEATS,
         help=(
-            "Times each closing question is asked of the same snapshot. The facts and their "
-            "positions are identical across these, so whatever they disagree about is the "
-            "model's own willingness to enumerate rather than anything compaction did. "
-            "Default %(default)s."
+            "Times each per-scope closing question is asked of the same snapshot. The facts "
+            "and their positions are identical across these, so whatever they disagree about "
+            "is the model's own willingness to enumerate rather than anything compaction did. "
+            "This is the acc1 half of the probing. Default %(default)s."
+        ),
+    )
+    parser.add_argument(
+        "--combined-repeats",
+        type=int,
+        default=DEFAULT_COMBINED_REPEATS,
+        help=(
+            "Times the one combined question -- every value at once -- is asked of the same "
+            "snapshot, independently of --probe-repeats. Its own count because one acc1 "
+            "reading averages every scoped question while one acc2 reading is a single "
+            "answer, so at --probe-repeats 1 acc2 was one sample per seed against seven and "
+            "was the noisier of the two for that reason alone. Default %(default)s."
         ),
     )
     parser.add_argument(
@@ -535,8 +549,12 @@ def _probe_spread(samples: Sequence[Sequence[float]]) -> float:
     Averaged over seeds rather than maximised, so one unlucky seed does not stand for all of
     them; the between-seed column is where an unlucky seed belongs.
 
+    Serves both accuracy columns, since both are means over repeated readings of one snapshot:
+    the per-scope samples give ``rep+-`` and the combined ones ``rep2+-``. Seeds read once
+    contribute nothing either way, which is how a merged file holding both can be spread.
+
     Args:
-        samples: One group of per-repeat correctness readings per seed.
+        samples: One group of per-repeat readings per seed, of one accuracy measure.
 
     Returns:
         The mean within-seed gap in percentage points, or 0.0 when each seed was read once.
@@ -597,9 +615,18 @@ class CellStats:
     nofetch: float
     ignored: float
     correctness: float
+    """The ``acc1`` column: the mean over every per-scope probe repeat of every seed."""
     seed_spread: float
     probe_spread: float
     combined: float
+    """The ``acc2`` column: the mean over every combined attempt of every seed.
+
+    A mean over the attempts that happened rather than over a fixed count, so a cell holding
+    seeds asked the combined question once and seeds asked it three times weights each answer
+    once -- which is what makes a resumed or merged file aggregate as one measurement.
+    """
+    combined_spread: float
+    """The ``rep2+-`` column: ``acc2``'s within-seed spread, averaged over seeds."""
     disqualified: float
     """Share of this cell's seeds that sent a prompt larger than the tried limit."""
     rate_limit_retries: int
@@ -611,7 +638,9 @@ class CellStats:
     reading its logs back wants the total it paid, not a per-seed rate.
     """
     samples: tuple[tuple[float, ...], ...]
-    """Per-sample correctness: one tuple per seed, one value per probe repeat."""
+    """Per-sample ``acc1``: one tuple per seed, one value per probe repeat."""
+    combined_samples: tuple[tuple[float, ...], ...]
+    """Per-sample ``acc2``: one tuple per seed, one value per combined attempt."""
 
     @property
     def hit_rate(self) -> float | None:
@@ -641,7 +670,8 @@ def _aggregate(strategy: str, records: Sequence[SeedRecord]) -> CellStats:
     samples = tuple(record.correctness_samples for record in records)
     flat = [value for seed in samples for value in seed]
     ignored = [float(value) for record in records for value in record.ignored_samples]
-    combined = [value for record in records for value in record.combined_samples]
+    combined_samples = tuple(record.combined_samples for record in records)
+    combined = [value for seed in combined_samples for value in seed]
     return CellStats(
         strategy=strategy,
         records=tuple(records),
@@ -668,10 +698,12 @@ def _aggregate(strategy: str, records: Sequence[SeedRecord]) -> CellStats:
         seed_spread=_seed_spread(samples),
         probe_spread=_probe_spread(samples),
         combined=fmean(combined) if combined else 0.0,
+        combined_spread=_probe_spread(combined_samples),
         disqualified=fmean(1.0 if record.disqualified else 0.0 for record in records),
         rate_limit_retries=sum(record.rate_limit_retries for record in records),
         throttled_seconds=sum(record.throttled_seconds for record in records),
         samples=samples,
+        combined_samples=combined_samples,
     )
 
 
@@ -759,9 +791,10 @@ def _accuracy_note(correctness_range: dict[str, float], control: str, repeats: i
     return [
         "",
         (
-            f"ACCURACY NOT RANKABLE: seeds of the uncompacted control varied by {swing:.0f} "
-            f"points, over the {MAX_USABLE_CORRECTNESS_RANGE:.0f}-point limit. Nothing can be "
-            "compared against a baseline that unstable. The cost columns are unaffected."
+            f"ACCURACY NOT RANKABLE: acc1 seeds of the uncompacted control varied by "
+            f"{swing:.0f} points, over the {MAX_USABLE_CORRECTNESS_RANGE:.0f}-point limit. "
+            "Nothing can be compared against a baseline that unstable. The cost columns are "
+            "unaffected."
         ),
     ]
 
@@ -892,6 +925,18 @@ def _flags(stats: CellStats, control: CellStats | None) -> list[str]:
     return flags
 
 
+def _sample_groups(samples: Sequence[Sequence[float]]) -> str:
+    """Return one seed's readings per bracket, for the blocks printed under the table.
+
+    Args:
+        samples: One group of readings per seed.
+
+    Returns:
+        The groups, or an empty string when no seed was read.
+    """
+    return "  ".join("[" + " ".join(f"{value:.0%}" for value in seed) + "]" for seed in samples if seed)
+
+
 def _row(stats: CellStats, control: CellStats | None, excluded: bool, limit: int) -> str:
     """Render one strategy's line of the table.
 
@@ -941,8 +986,8 @@ def _row(stats: CellStats, control: CellStats | None, excluded: bool, limit: int
         f"{f'{stats.facts_left:.0f}/{stats.facts_total}':>9}{lost:>6.0f}"
         f"{stats.nofetch:>8.0f}{stats.ignored:>8.0f}"
         f"{stats.correctness:>8.0%}{'*' if control is not None and stats.strategy == control.strategy else ' '}"
-        f"{f'{stats.seed_spread:.0f}pp':>7}{f'{stats.probe_spread:.0f}pp':>7}"
-        f"{stats.combined:>5.0%} {relative:>8}{stats.disqualified:>5.0%}"
+        f"{f'{stats.seed_spread:.0f}pp':>8}{f'{stats.probe_spread:.0f}pp':>7}"
+        f"{stats.combined:>6.0%}{f'{stats.combined_spread:.0f}pp':>8}{relative:>9}{stats.disqualified:>5.0%}"
         f"{(','.join(flags) or '-'):>10}"
     )
 
@@ -975,8 +1020,9 @@ _LEGEND: Final[tuple[str, ...]] = (
     "+-        = spread between the cheapest and dearest seed. A gap smaller than this is not",
     "            a result. 0% with one seed means stability is unknown, not that it is stable",
     "summ$     = what this strategy's own summarization calls cost, of that total",
-    "vs none   = against the uncompacted control: the first is cost, the second accuracy.",
-    "            Read them together or not at all -- cheaper and less correct is not a saving",
+    "vs none   = against the uncompacted control: the first is cost, the second acc1, which",
+    "            is also what the ranking and the verdict are judged on. Read them together",
+    "            or not at all -- cheaper and less correct is not a saving",
     "facts     = planted facts surviving compaction into the snapshot: recall's ceiling.",
     "            Scored against the snapshot, which is exactly the context every probe was",
     "            answered from. Scored against a closing prompt instead, this was circular:",
@@ -986,21 +1032,29 @@ _LEGEND: Final[tuple[str, ...]] = (
     "nofetch   = the agent never called that tool, so the fact never entered the history at",
     "            all. Not compaction damage: an uncompacted run shows these too",
     "ignored   = still in the snapshot but unused: the model's failing, not compaction's",
-    "acc       = mean share of checks passed across every probe repeat of every seed, each",
-    "            reply scored only against the values its own question asked for. A star",
-    "            marks the uncompacted control, which is ordered by the same rule as every",
-    "            other row and can therefore land below the line",
-    "seed+-    = points between the least and most correct seed. Different conversations, so",
-    "            this is compaction's own reliability: whether it cleared a retention",
-    "            boundary this time and not last time",
-    "rep+-     = points between the least and most correct repeat *within* one seed, averaged",
-    "            over seeds. Identical facts in identical positions, so this is the model's",
-    "            willingness to enumerate and nothing else. The two used to arrive as one",
-    "            number, and a strategy scoring 52, 52, 52 and 22 with exactly 27 facts",
+    "acc1      = the scoped questions -- requirements plus one per tool lookup. Mean share of",
+    "            checks passed across every probe repeat of every seed, each reply scored only",
+    "            against the values its own question asked for. A star marks the uncompacted",
+    "            control, which is ordered by the same rule as every other row and can",
+    "            therefore land below the line",
+    "seed+-    = points between the least and most correct seed, on acc1. Different",
+    "            conversations, so this is compaction's own reliability: whether it cleared a",
+    "            retention boundary this time and not last time",
+    "rep+-     = points between the least and most correct acc1 repeat *within* one seed,",
+    "            averaged over seeds. Identical facts in identical positions, so this is the",
+    "            model's willingness to enumerate and nothing else. The two used to arrive as",
+    "            one number, and a strategy scoring 52, 52, 52 and 22 with exactly 27 facts",
     "            preserved every time read the same as one that lost different facts each time",
-    "all       = share of all planted values present in the combined answer, where the model",
-    "            is asked for everything at once. Asked from the snapshot like every other",
-    "            probe, so it is no longer penalised for having been asked last",
+    "acc2      = the one combined question: share of all planted values present in its answer,",
+    "            where the model is asked for everything at once, meaned over every attempt of",
+    "            every seed. The same run measured a second way, not a second run -- one",
+    "            question against acc1's seven, from a context the values are scattered",
+    "            through. Asked from the snapshot like every other probe, so it is no longer",
+    "            penalised for having been asked last, and asked --combined-repeats times",
+    "            rather than --probe-repeats, since one answer is a whole reading of it",
+    "rep2+-    = the same within-seed spread for acc2, over its own attempts. Read it beside",
+    "            rep+-: at --probe-repeats 1 that column is 0pp by construction and this one",
+    "            is the only within-seed variance the cell measures",
     "dq        = share of this cell's seeds that sent a prompt larger than the tried limit.",
     "            The limit is simulated, so it is enforced here or not at all. A cell that",
     "            disqualifies at all is excluded from the ranking rather than starred: a row",
@@ -1086,7 +1140,7 @@ def _ranking_note(cleared: int, total: int, control: CellStats | None, min_corre
         )
     return (
         f"Ranking: {cleared} of {total} rows kept at least {min_correctness:.0%} of the control's "
-        "accuracy and are ranked first, cheapest total cost first; the rest follow below the line."
+        "acc1 and are ranked first, cheapest total cost first; the rest follow below the line."
     )
 
 
@@ -1129,12 +1183,15 @@ def _render(
     header = (
         f"{'strategy':<28}{'msgs':>9}{'tok left/peak':>16}{'snap%':>7}{'calls':>7}{'in':>12}{'hit%':>6}"
         f"{'out':>10}{'in$':>9}{'cost':>10}{'+-':>6}{'summ$':>8}{'vs none':>9}"
-        f"{'facts':>9}{'lost':>6}{'nofetch':>8}{'ignored':>8}{'acc':>9}{'seed+-':>7}{'rep+-':>7}"
-        f"{'all':>6}{'vs none':>9}{'dq':>5}{'flags':>10}"
+        f"{'facts':>9}{'lost':>6}{'nofetch':>8}{'ignored':>8}{'acc1':>9}{'seed+-':>8}{'rep+-':>7}"
+        f"{'acc2':>6}{'rep2+-':>8}{'vs none':>9}{'dq':>5}{'flags':>10}"
     )
     lines = [
         "",
-        (f"Model: {cell_params.model}   agent: {cell_params.agent_kind}   probe repeats: {cell_params.probe_repeats}"),
+        (
+            f"Model: {cell_params.model}   agent: {cell_params.agent_kind}   "
+            f"probe repeats: {cell_params.probe_repeats} (acc1), {cell_params.combined_repeats} (acc2)"
+        ),
         (
             f"Pricing: ${pricing.input_per_million:.2f}/M in, "
             f"${pricing.cached_read_per_million:.3f}/M cached, ${pricing.output_per_million:.2f}/M out"
@@ -1146,12 +1203,17 @@ def _render(
     ]
     for index, cell in enumerate(ordered):
         if index == cleared:
-            lines.append(f" below {min_correctness:.0%} of the control's accuracy ".center(len(header), "-"))
+            lines.append(f" below {min_correctness:.0%} of the control's acc1 ".center(len(header), "-"))
         lines.append(_row(cell, baseline, cell.strategy in excluded, cell_params.context_window))
-    lines += ["", *_LEGEND, "", "per-sample correctness, one group per seed:"]
+    lines += ["", *_LEGEND, "", "per-sample acc1, one group per seed:"]
     for cell in ordered:
-        groups = "  ".join("[" + " ".join(f"{value:.0%}" for value in seed) + "]" for seed in cell.samples if seed)
-        lines.append(f"  {cell.strategy:<28}{groups}")
+        lines.append(f"  {cell.strategy:<28}{_sample_groups(cell.samples)}")
+    # Its own block rather than a second figure inside the acc1 groups: the two have different
+    # numbers of readings per seed, so a reader pairing them position by position would be
+    # pairing a repeat with an attempt that is not the same probe.
+    lines += ["", "per-sample acc2, one group per seed:"]
+    for cell in ordered:
+        lines.append(f"  {cell.strategy:<28}{_sample_groups(cell.combined_samples)}")
     lines += _fill_note({cell.strategy: cell for cell in ordered}, cell_params.plan, control)
     lines += _throttle_note(ordered)
     if verdict is None:
@@ -1167,7 +1229,14 @@ def _render(
             "",
             f"VERDICT: {verdict.recommended}",
             verdict.rationale,
-            *_stability_note(verdict, {cell.strategy: cell.cost_spread for cell in ordered}, cell_params.repeats),
+            *_stability_note(
+                verdict,
+                {cell.strategy: cell.cost_spread for cell in ordered},
+                # Seeds actually present, not the --repeats that was asked for. One cell is
+                # often several single-seed invocations merged, and reading the request would
+                # have this announce "single seed" over five of them.
+                min((len(cell.records) for cell in ordered), default=0),
+            ),
             *_accuracy_note({cell.strategy: cell.seed_spread for cell in ordered}, control, cell_params.repeats),
         ]
     failed = [cell.strategy for cell in ordered if any(record.summarizer_failures for record in cell.records)]
@@ -1180,7 +1249,11 @@ def _render(
         ]
     if show_answers:
         for cell in ordered:
-            lines += ["", f"--- {cell.strategy} ---", cell.records[0].answer or "(no answer)"]
+            lines += [
+                "",
+                f"--- {cell.strategy}: every probe answer of its first seed, acc1 and acc2 together ---",
+                cell.records[0].answer or "(no answer)",
+            ]
     return "\n".join(lines)
 
 
@@ -1219,8 +1292,10 @@ def _progress(record: SeedRecord) -> str:
 
     A cell prints its table only at the end and takes hours to get there, so without this the
     only difference between a run that is working and one whose rows have collapsed is elapsed
-    time. Cost, facts and accuracy are the three that move first: a strategy that has stopped
-    preserving anything shows it here, hours before the table would.
+    time. Cost, facts and the two accuracies are what move first: a strategy that has stopped
+    preserving anything shows it here, hours before the table would. Both accuracies, because
+    they disagree in the direction that matters -- one seed of ``anchored`` read 91% on acc1
+    and 21% on acc2, and a watcher told only the first would think it was fine.
 
     Args:
         record: The seed that just finished.
@@ -1232,7 +1307,8 @@ def _progress(record: SeedRecord) -> str:
         f"   {record.strategy} seed {record.seed}/{record.cell.repeats}",
         f"${record.cost:.4f}",
         f"facts {record.facts_left}/{record.facts_total}",
-        f"acc {record.correctness:.0%}",
+        f"acc1 {record.correctness:.0%}",
+        f"acc2 {record.combined:.0%}",
     ]
     if record.disqualified:
         parts.append("DQ")
@@ -1430,7 +1506,10 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
             subset_questions=not args.sweeping_question,
         )
         questions = max(scenario.answer_turn_count, 1)
-        probes = questions * args.probe_repeats
+        # The same fallback run_live applies: a scenario that declares no scopes closes with
+        # sweeping questions, so every one of them is the combined question.
+        scopes = scenario.answer_scopes or (COMBINED_SCOPE,) * questions
+        probes = probe_count(scopes, probe_repeats=args.probe_repeats, combined_repeats=args.combined_repeats)
         print(f"strategies: {len(strategies)}  turns: {len(scenario.transcript.turns)}  facts: {len(scenario.facts)}")
         print(f"tool-call groups: {planted_groups} planted, {retained} retained by tool-oriented strategies")
         if plan is not None:
@@ -1444,21 +1523,27 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
             )
         else:
             print(f"fill: manual, {filler_turns} filler turns of ~{filler_tokens:,} tokens")
-        print(f"probes: {questions} questions x {args.probe_repeats} repeats = {probes} per seed")
+        scoped = sum(1 for scope in scopes if scope != COMBINED_SCOPE)
+        print(
+            f"probes: {scoped} scoped questions x {args.probe_repeats} repeats + "
+            f"{questions - scoped} combined x {args.combined_repeats} = {probes} per seed"
+        )
         seed_calls = len(scenario.transcript.turns) - questions
         total_calls = len(strategies) * args.repeats * (seed_calls + probes)
         print(f"model calls: >= {total_calls} (more whenever a tool is used)")
         if plan is not None:
             # Every probe carries the whole snapshot, so the probes cost the full prompt each
             # while the seeding averages about half of it. Worth printing before anything is
-            # spent: raising --probe-repeats multiplies the expensive half, not the cheap one.
+            # spent: raising either repeat count multiplies the expensive half, not the cheap
+            # one -- though a combined repeat is one probe where a probe repeat is one per
+            # scoped question, so the two dials are far from the same size.
             seeding = seed_calls * plan.predicted_tokens // 2
             probing = probes * plan.predicted_tokens
             per_run = seeding + probing
             print(
                 f"prompt tokens: ~{per_run * len(strategies) * args.repeats:,} in total, "
                 f"~{per_run:,} per strategy-seed (~{seeding:,} seeding, ~{probing:,} probing). "
-                "Cache reads take most of this off; probing is the half --probe-repeats scales."
+                "Cache reads take most of this off; probing is the half the repeat counts scale."
             )
         for name in strategies:
             build_strategy(name, StrategyOptions(tokenizer, args.context_window, args.max_output_tokens))
@@ -1520,6 +1605,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
         context_window=args.context_window,
         fill=args.fill,
         probe_repeats=args.probe_repeats,
+        combined_repeats=args.combined_repeats,
         repeats=args.repeats,
         strategies=tuple(strategies),
         narration=args.narration,
@@ -1581,6 +1667,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
                 retrieval_guidance=not args.no_retrieval_guidance,
                 fact_placement=args.fact_placement,
                 probe_repeats=args.probe_repeats,
+                combined_repeats=args.combined_repeats,
             )
             # Scored, written and reported here rather than when the cell ends. A seed that
             # has been paid for is durable the moment it exists, and the line that follows is

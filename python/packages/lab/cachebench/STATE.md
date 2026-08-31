@@ -57,8 +57,9 @@ seeded conversation, and four defects followed, all measured:
   is nested per provider (`state["in_memory"]["messages"]`), so `serialize_history` finds it
   through `agent.context_providers` rather than a fixed key -- the harness installs a
   different provider instance from the plain agent.
-- **Probe** — every closing question, asked from the restored snapshot, `--probe-repeats`
-  times (default 3). `restore_state` deep-copies again per probe *and* calls
+- **Probe** — every closing question, asked from the restored snapshot: a scoped question
+  `--probe-repeats` times, the combined one `--combined-repeats` times (both default 3).
+  `restore_state` deep-copies again per probe *and* calls
   `ToolResultRecallMiddleware.forget_pending()`: a pending decision to force a recall call is
   taken on one call and applied to the next, so it is conversation state, and left in place it
   would fire on the first probe and no other.
@@ -97,16 +98,37 @@ uncompacted run and flagged beyond +-5%. `--fill 0` restores manual sizing from
 
 **Accuracy is a distribution.** `_representative()` is gone. Correctness is the mean over
 every probe repeat of every seed, the per-sample values are printed below the table, and the
-two spreads are separate columns: `seed+-` between seeds (compaction's reliability) and
-`rep+-` within one seed across probe repeats (the model's enumeration variance). `cost` stays
-one column: seeding plus every probe, summed. `out` has its own column so a total driven by
-verbosity is visible.
+spreads are separate columns: `seed+-` between seeds (compaction's reliability), `rep+-`
+within one seed across probe repeats (the model's enumeration variance) and `rep2+-` the same
+within-seed spread for the combined question. `cost` stays one column: seeding plus every
+probe, summed. `out` has its own column so a total driven by verbosity is visible.
+
+**The two accuracy columns are `acc1` and `acc2`.** They were `acc` and `all`, which named the
+questions rather than the measures and left nothing saying the two are one run scored twice:
+`acc1` is the scoped questions (requirements plus one per tool lookup, seven of them at
+`--tool-turns 6`), `acc2` is the single combined question asking for all 53 values at once.
+The rename reaches the header, the legend, both per-sample blocks, the progress line, the
+ranking and threshold lines and the README. `CellStats.correctness` and `CellStats.combined`
+keep their names -- they describe the thing, not the old column -- and say which column they
+are in their docstrings, so nothing on disk moved for the rename.
+
+**`acc2` now averages three attempts.** `--combined-repeats` (default 3) is the combined
+question's own repeat count, independent of `--probe-repeats`; it is asked that many times
+from the same restored snapshot, in the same loop, and `acc2` is the mean over every attempt
+of every seed. The reason is that one `acc1` reading averages seven answers while one `acc2`
+reading is a single answer, so at the `--probe-repeats 1` the sweep uses, `acc2` was one
+sample per seed and noisier for that reason alone. Records already on disk hold one combined
+sample per seed and still aggregate as the one answer they are: scoring reads the combined
+probes themselves rather than counting up to a repeat count, and `CellParams.from_dict` fills
+a missing `combined_repeats` from `probe_repeats`, which is exactly what an old record did.
+The schema stays at 2 -- what a version 2 record measured is not in doubt, so there is no
+"not measured" to confuse with a measurement.
 
 **Verified live in run 24** (60K/0.86, five strategies): fill landed at +0.0%, probes hit 94-96%
 cache, no disqualifications and no drift. The numbers in `RESULTS.md` and
 `REPORT-GPT-5-4-MINI.md` all predate the rebuild, so none of them are disqualification-checked
-and their `all` column is inflated -- the combined question used to be asked last, after seven
-answers had re-listed the codes into the context it read.
+and their `all` column -- now `acc2` -- is inflated: the combined question used to be asked
+last, after seven answers had re-listed the codes into the context it read.
 
 ## 3b. Stage 1 sweep — paused mid-run, how to resume
 
@@ -183,6 +205,8 @@ while `seed+-` ran to 30-78 points. Re-asking the same snapshot is almost perfec
 the variance is nearly all in *which seed*, meaning where the facts fall against a retention
 boundary. So `--probe-repeats 3` is buying very little and `--repeats` is buying everything:
 the remaining cells should trade probe repeats for seeds at roughly 3:1 within the same budget.
+That trade is what made `acc2` a single sample per seed, which is why the combined question got
+`--combined-repeats` (default 3) of its own -- three attempts of one question, not of seven.
 
 ## 3c. The before/after of upstream PR #7912
 
@@ -294,9 +318,10 @@ Each of these produced a plausible wrong number first.
 - Branch `python-lab-cachebench`, ~40 commits ahead of `origin`, **not pushed**. Pushing needs
   its own go-ahead.
 - `dev/` is untracked Git-LFS junk. **Never stage it.**
-- 247 tests pass; ruff, pyright and bandit are clean. The measurement rebuild, the per-seed
+- 266 tests pass; ruff, pyright and bandit are clean. The measurement rebuild, the per-seed
   results file (`_records.py`, `--results-jsonl`, `--from-jsonl`) and the rate-limit retry are
-  all committed now; the snapshot-and-restore fix to that retry (§3b) is **uncommitted**.
+  all committed now; the snapshot-and-restore fix to that retry (§3b) and the
+  `acc1`/`acc2`/`--combined-repeats` work (§3) are **uncommitted**.
 - `REPORT.md` and `ARTICLE.md` still describe only the six-model cross-provider work and
   predate everything from run 7 onward. They do not mention the 272,000 input limit, the
   crossover, or either new strategy.
@@ -309,8 +334,16 @@ sixteen-call variants -- **all measured under the old design, where each closing
 asked once**.
 
 **The probe phase costs more than the seeding does.** Every probe carries the whole snapshot,
-and there are `questions x --probe-repeats` of them. At the 270,000/0.86 cell with 16 tool
-groups that is 18 questions x 3 = 54 probes of ~232,000 tokens each, against ~11.6M for the
-seeding: the probes are now the larger half and `--probe-repeats` scales exactly that half.
-`--dry-run` prints the arithmetic. Price a matrix before running one; the estimates above no
-longer apply.
+and there are `scoped questions x --probe-repeats` of them plus `--combined-repeats`. At the
+270,000/0.86 cell with 16 tool groups that is 17 scoped x 3 plus 3 combined = 54 probes of
+~232,000 tokens each, against ~11.6M for the seeding: the probes are now the larger half and
+the two repeat counts scale exactly that half.
+`--dry-run` prints the arithmetic, now as a sum rather than a product. Price a matrix before
+running one; the estimates above no longer apply.
+
+**What `--combined-repeats 3` costs, measured on the 25 recorded seeds of the 60K/0.86 cell.**
+A combined probe is the snapshot plus one question and is nearly all cache reads: at each row's
+own recorded hit rate the two extra attempts add EUR 0.011-0.017 per seed, 6.6-9.3% of that
+seed's cost, and EUR 0.36 on a cell that cost EUR 4.58. Priced at the 95% hit a repeat of an
+identical prefix actually gets, EUR 0.27 on the cell, 2-8% per seed. The dominant term is the
+prompt, not the answer: the combined answer measured 112-526 output tokens.

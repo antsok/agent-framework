@@ -160,10 +160,12 @@ The **snapshot** is a deep copy of the session state taken once seeding ends. De
 compaction records its decisions by mutating the messages themselves.
 
 Every closing question is then asked as a **probe**: the snapshot is restored, the question is
-put, and the answer is thrown back into nothing. Each question is asked `--probe-repeats`
-times (3 by default). No probe's answer can reach another probe's context, no question is
-asked from a context an earlier question compacted further, and survival is scored against the
-snapshot, which is by construction exactly the context every probe was answered from.
+put, and the answer is thrown back into nothing. Each per-scope question is asked
+`--probe-repeats` times (3 by default) and the one combined question `--combined-repeats`
+times (also 3), independently — see [the two accuracy columns](#the-two-accuracy-columns) for
+why the counts are separate. No probe's answer can reach another probe's context, no question
+is asked from a context an earlier question compacted further, and survival is scored against
+the snapshot, which is by construction exactly the context every probe was answered from.
 
 None of the three held when the closing questions were ordinary turns appended to the
 conversation. Each answer re-listed codes into the history as assistant text, so `survived`
@@ -200,7 +202,8 @@ that is missing strategies or seeds still renders, and says which of each it hol
 what the run set out to take — every mean in the table is over what is present, and nothing in
 the table itself would otherwise distinguish four strategy-seeds from fifteen.
 
-Each seed also prints a one-line summary as it lands: strategy, seed, cost, facts, accuracy.
+Each seed also prints a one-line summary as it lands: strategy, seed, cost, facts, and both
+accuracies.
 A row that has stopped preserving anything shows up there hours before the table would.
 
 #### Fill and the tried limit
@@ -221,18 +224,40 @@ of facts", and a payload that will not fit inside the smallest cell is refused w
 rather than quietly overshooting. The achieved fill is measured on the uncompacted run and
 flagged if it lands more than 5% from the target.
 
+#### The two accuracy columns
+
+One run is scored twice, and the columns say so: **`acc1`** is the scoped questions —
+requirements plus one per tool lookup, seven of them in the cells recorded so far — each reply
+scored only against the values its own question asked for; **`acc2`** is the one combined
+question, which asks for all 53 values at once from a context they are scattered through.
+They were `acc` and `all`, which named the questions rather than the measures and left nothing
+in the table saying the two were the same run read two ways.
+
+The two need different numbers of attempts to be equally settled. One `acc1` reading averages
+seven answers; one `acc2` reading is a single answer. So the combined question has its own
+`--combined-repeats` (3 by default), independent of `--probe-repeats` — which the runs that
+matter set to 1, the per-scope repeat spread having measured 0 to 2 points while the
+between-seed spread ran to 78. Probes are nearly all cache reads, so the two extra attempts
+cost 6-9% of a seed measured against the recorded 60,000/0.86 cell: EUR 0.27-0.36 on a cell
+that cost EUR 4.58. `acc2` is the mean over every combined attempt of every seed, so a file
+merged from runs that asked it once and runs that asked it three times weights each answer
+once rather than each seed once.
+
 #### Accuracy is a distribution
 
-Two variance sources used to arrive as one number. They are now reported apart:
+Three variance sources used to arrive as one number. They are now reported apart:
 
 - `seed+-` is the spread between seeds — different conversations, so this is compaction's own
   reliability: whether it cleared a retention boundary this time and not last time.
-- `rep+-` is the spread between repeats *within* one seed — identical facts in identical
-  positions, so this is the model's willingness to enumerate and nothing else.
+- `rep+-` is the spread between `acc1` repeats *within* one seed — identical facts in
+  identical positions, so this is the model's willingness to enumerate and nothing else.
+- `rep2+-` is the same within-seed spread for `acc2`, over its own attempts. At
+  `--probe-repeats 1` it is the only within-seed variance the cell measures, since `rep+-` is
+  then 0 by construction.
 
-Every sample is printed below the table. A strategy that scored 52, 52, 52 and 22 while
-preserving exactly the same 27 facts every time used to read the same as one that lost
-different facts each time.
+Every sample is printed below the table, `acc1` and `acc2` in their own blocks. A strategy
+that scored 52, 52, 52 and 22 while preserving exactly the same 27 facts every time used to
+read the same as one that lost different facts each time.
 
 `--agent harness` swaps the plain agent for `create_harness_agent`, which is what production
 code actually calls. Its optional providers are switched off, because each one adds tools and
@@ -248,7 +273,8 @@ relative test the verdict applies, default 0.9 — now come first, cheapest **to
 and the rest follow below a line naming the threshold, in that same order. The count and the
 threshold are printed above the table, so a cell where every row clears reads differently from
 one where none does even though neither draws a line. The control is ordered by the same rule
-as everything else and is marked with a star in the `acc` column wherever it lands.
+as everything else and is marked with a star in the `acc1` column wherever it lands. `acc1` is
+what the ranking, the threshold and the verdict are judged on; `acc2` is reported beside it.
 
 `in$` prices the prompt side alone — uncached plus cached, with output and the summarizer left
 out — beside the total. On a clean five-seed cell the control's total cost varied 38% while its
