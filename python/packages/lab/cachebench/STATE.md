@@ -249,6 +249,7 @@ adds code-free lookups so call count varies without varying what must be remembe
 | --- | --- | --- |
 | `anchored` | `_anchored.py` | fixed head and tail verbatim, band between shortened to a share of the ceiling, decisions from position alone so they never change on a later turn |
 | `anchored_no_assistant` | same | as above, forbidden from shedding assistant prose |
+| `anchored_min_gain` | same | as `anchored`, but projects the reduction before mutating anything and declines any collapse worth less than 23% of the included prompt. **Built and tested offline, never run live.** The floor is the break-even `R > B / (1 + T*c/(p-c))` at the 60K/0.86 cell, where `anchored` removed 263 tokens and cost 11% more than the control. Declines are counted and surface as `NOGAIN:<n>` in the flags column, so "never fired" and "fired to no effect" are distinguishable |
 | `tool_summary_anchored` | `_toolsummary.py` | `ToolResultRecallMiddleware` forces one recall tool call; the strategy drops every tool group in front of the resulting record |
 
 **Not built, and the best next idea:** summarise each tool result *individually* rather than
