@@ -19,6 +19,10 @@ That gives a break-even a strategy has to clear. With `p` the input rate, `c` th
 compaction pays when   R > B(p − c) / (p + T·c)
 ```
 
+The removed tokens are not re-sent, so they are not re-read at the cached price either.
+Writing the first term as `(B − R)(p − c)` rather than `(B − R)p − Bc` drops an `R·c` and
+overstates the floor by about 3%.
+
 At a 40,000-token suffix with twenty turns left, that is about **22% of the prompt**. Removing
 less than that costs more than it saves, however sensible the removal looks. Measured: one
 strategy removed 263 tokens, dropped its cache hit rate from 92% to 88% — 46,471 extra

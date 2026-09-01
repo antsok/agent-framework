@@ -1178,8 +1178,8 @@ Cost: about $3.1, roughly EUR 2.8.
 
 The first results from the seed/snapshot/probe design, on `gpt-5.4-mini-2`. Five seeds per
 cell, one probe repeat, five attempts at the combined question, payload fixed at 3,500-token
-tool results with eight codes each. **90 records, no errors, no throttling, no
-disqualifications.** `acc1` is the seven per-scope questions, `acc2` the one combined question,
+tool results with eight codes each. **120 records across the four cells, no errors, no
+throttling, no disqualifications.** `acc1` is the seven per-scope questions, `acc2` the one combined question,
 `snap%` the share of the tried window the probes were answered from.
 
 | cell | none | truncation | anchored | anchored_min_gain | tool_summary_anchored | context_window |

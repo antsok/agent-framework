@@ -5,6 +5,19 @@
 **Routes:** Azure Foundry (Responses API), OpenRouter (Chat Completions)
 **Scale:** 6 model/route combinations x up to 14 settings x 3 repeats, ~290 conversations
 
+> **What this is, and what supersedes it.** Written 27 August 2026, this is the six-model
+> cross-provider study run under the **replay** harness, where every turn's reply is scripted
+> so that each provider and strategy replays a byte-identical conversation. That is what makes
+> the cross-provider comparison mean anything, and it is also why nothing here observes a live
+> agent: the model's real answers were discarded. Everything from run 7 onward is live-agent
+> work on `gpt-5.4-mini`, with 53 planted facts instead of 17, an instrument that has since
+> been rebuilt twice, and findings this report does not contain — the model's real 272,000-token
+> input limit, the shipped default's behaviour under fill, and three strategies written
+> against those measurements.
+> **Where this report and [`REPORT-GPT-5-4-MINI.md`](REPORT-GPT-5-4-MINI.md) disagree about live
+> behaviour, the live-agent report supersedes it.** The cache arithmetic and the cross-provider
+> cost result are unaffected and stand.
+
 ---
 
 ## 1. The question

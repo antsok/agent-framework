@@ -3,6 +3,13 @@
 *Lessons from building a benchmark for Microsoft Agent Framework, and from getting it wrong
 eight times first.*
 
+> **What this is, and what supersedes it.** Written 27 August 2026, from the six-model
+> cross-provider study run under the **replay** harness — scripted replies, byte-identical
+> conversations, no live agent. Later live-agent work on `gpt-5.4-mini` goes further, and in
+> places contradicts what this piece says about a live agent: see [`REPORT-GPT-5-4-MINI.md`](REPORT-GPT-5-4-MINI.md),
+> which supersedes any claim made here about how a live agent behaves. The cache arithmetic and
+> the cost result it rests on are unchanged.
+
 ---
 
 ## The short version
