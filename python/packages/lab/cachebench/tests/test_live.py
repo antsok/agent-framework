@@ -74,11 +74,13 @@ from agent_framework_lab_cachebench._live import (
     resolve_instructions,
 )
 from agent_framework_lab_cachebench._live_cli import (
+    CellStats,
     _accuracy_note,
     _aggregate,
     _cost,
     _coverage,
     _excluded_cells,
+    _fill_note,
     _flags,
     _probe_spread,
     _progress,
@@ -669,6 +671,7 @@ def test_every_argument_the_runner_reads_is_defined() -> None:
         "show_answers",
         "dry_run",
         "fill",
+        "tool_share",
         "probe_repeats",
         "combined_repeats",
     ):
@@ -686,6 +689,104 @@ def test_the_help_can_actually_be_printed() -> None:
 
     assert "--probe-repeats" in help_text
     assert "--combined-repeats" in help_text
+
+
+def test_the_help_says_which_of_the_two_payload_flags_wins() -> None:
+    """--tool-share and --tool-result-tokens state one quantity two ways.
+
+    A reader who sets both and is not told which is read will believe the run carried the size
+    they typed. Both help strings say it, because either one is where they will look.
+    """
+    help_text = build_parser().format_help()
+
+    assert "--tool-share" in help_text
+    assert "wins when both are given" in help_text
+    assert "Ignored when" in help_text, "--tool-result-tokens must say it loses"
+
+
+def _dry_argv(*extra: str) -> list[str]:
+    """Return a command line for a dry run at the cell the payload flags were written for.
+
+    120,000 tokens at 0.86 fill is where an absolute 3,500-token payload left
+    ``AnchoredCompactionStrategy`` inert, so it is the cell whose numbers mean something.
+
+    Args:
+        extra: Flags appended after the defaults, so they win.
+
+    Returns:
+        The argument vector.
+    """
+    return [
+        "azure",
+        "--price-input",
+        "1",
+        "--strategies",
+        "none",
+        "--tokenizer",
+        "estimator",
+        "--context-window",
+        "120000",
+        "--fill",
+        "0.86",
+        "--tool-turns",
+        "6",
+        "--markers-per-tool",
+        "8",
+        "--dry-run",
+        *extra,
+    ]
+
+
+async def test_the_dry_run_states_the_size_it_derived_and_the_share_it_reached(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """Nothing else says what a derived payload came out at before money is spent.
+
+    The size is the number the run is about to build with, and under --tool-share it appears
+    nowhere the caller typed it. The share beside it is what makes the number checkable: a
+    10,000-token result means nothing on its own, and "60.0% against 60% requested" is the
+    whole claim.
+    """
+    await run_live_comparison(build_parser().parse_args(_dry_argv("--tool-share", "0.6")))
+    printed = capsys.readouterr().out
+
+    assert "tool share: 60.0% predicted against 60% requested" in printed
+    assert re.search(r"6 tool results of ~[\d,]+ tokens", printed), "the derived size must be printed"
+
+
+async def test_a_dry_run_without_a_share_says_nothing_about_one(capsys: pytest.CaptureFixture[str]) -> None:
+    """A line reporting a share of 0 would read as a payload that vanished."""
+    await run_live_comparison(build_parser().parse_args(_dry_argv("--tool-result-tokens", "3500")))
+    printed = capsys.readouterr().out
+
+    assert "tool share:" not in printed
+    assert "6 tool results of ~3,500 tokens" in printed
+
+
+async def test_the_tool_share_overrides_the_stated_result_size_through_the_cli(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The precedence has to hold where it is actually exercised, not only in the solver.
+
+    The size the run builds with is read in four places -- the sizing print, the scenario, the
+    record's cell parameters and run_live itself -- and a flag that wins in the solver while
+    one of those still read the raw argument would build one conversation and describe another.
+    """
+    await run_live_comparison(build_parser().parse_args(_dry_argv("--tool-share", "0.6", "--tool-result-tokens", "50")))
+    printed = capsys.readouterr().out
+
+    assert "6 tool results of ~50 tokens" not in printed
+    assert "tool share: 60.0% predicted against 60% requested" in printed
+
+
+async def test_a_tool_share_without_a_fill_target_is_refused() -> None:
+    """A share of nothing is not a size, and guessing one would be a silent second cell."""
+    argv = _dry_argv("--tool-share", "0.6", "--fill", "0", "--filler-turns", "3", "--filler-tokens", "50")
+
+    with pytest.raises(SystemExit) as error:
+        await run_live_comparison(build_parser().parse_args(argv))
+
+    assert "--tool-share is a share of the fill target" in str(error.value)
 
 
 # endregion
@@ -2484,6 +2585,105 @@ def test_an_unstable_control_disables_the_accuracy_ranking() -> None:
     assert single == []
 
 
+def _control_cell(seeded: int) -> dict[str, CellStats]:
+    """Return the one row ``_fill_note`` reads, carrying the size the control actually seeded.
+
+    Args:
+        seeded: Billed size of the control's last seeding prompt.
+
+    Returns:
+        The stats mapping, keyed as the note expects.
+    """
+    record = SeedRecord(
+        cell=_cell_params(),
+        strategy="none",
+        seed=1,
+        cost=0.01,
+        summarizer_cost=0.0,
+        input_tokens=1_000,
+        cached_tokens=300,
+        output_tokens=20,
+        calls=4,
+        messages_left=6,
+        messages_peak=12,
+        prompt_tokens_final=900,
+        prompt_tokens_peak=1_000,
+        seed_prompt_tokens=seeded,
+        facts_total=53,
+        facts_left=53,
+        facts_lost=0,
+        nofetch=0,
+        correctness_samples=(1.0,),
+        ignored_samples=(0,),
+        combined_samples=(1.0,),
+        disqualified=False,
+        context_drift=0,
+        rate_limit_retries=0,
+        throttled_seconds=0.0,
+        turns_completed=10,
+        turns_total=10,
+        probe_repeats=1,
+        summarizer_calls=0,
+        summarizer_failures=0,
+        strategy_notes=(),
+        dropped_options=(),
+        answer="",
+    )
+    return {"none": _aggregate("none", [record])}
+
+
+def _shared_plan(**overrides: Any) -> FillPlan:
+    """Return a plan that asked for 60% of a 100,000-token target to be tool results."""
+    defaults: dict[str, Any] = {
+        "filler_turns": 18,
+        "filler_tokens": 2_000,
+        "context_limit": 120_000,
+        "fill_fraction": 0.86,
+        "target_tokens": 100_000,
+        "predicted_tokens": 100_000,
+        "payload_tokens": 62_500,
+        "tool_payload_tokens": 60_000,
+        "tool_result_tokens": 10_000,
+        "tool_share": 0.6,
+    }
+    return FillPlan(**{**defaults, **overrides})
+
+
+def test_the_achieved_tool_share_is_reported_beside_the_achieved_fill() -> None:
+    """The requested share is an intention; only what the run seeded says what it measured.
+
+    Reported against the same billed denominator as the fill, so the two lines can be read
+    together: a share that missed because the conversation did is a different fault from one
+    that missed because the results were sized wrong, and the fill line above says which.
+    """
+    lines = _fill_note(_control_cell(100_000), _shared_plan(), "none")
+
+    assert any("Fill: 100,000 tokens seeded" in line for line in lines)
+    assert any("Tool share: 60,000 tokens of tool results is 60.0% of what was seeded" in line for line in lines)
+    assert any("against 60% requested, +0.0%" in line for line in lines)
+    assert not any("OFF TARGET" in line for line in lines)
+
+
+def test_a_tool_share_that_missed_is_flagged_the_way_a_fill_that_missed_is() -> None:
+    """A payload that is not the share it claims does not compare with cells at other windows.
+
+    Which is the whole purpose of stating it as a share, so it is policed to the same tolerance
+    as the fill rather than left in the table as a number nobody checked.
+    """
+    lines = _fill_note(_control_cell(150_000), _shared_plan(), "none")
+
+    assert any("TOOL SHARE OFF TARGET" in line for line in lines)
+    assert any("FILL OFF TARGET" in line for line in lines)
+
+
+def test_a_run_that_asked_for_no_share_is_told_nothing_about_one() -> None:
+    """Every cell recorded so far sized its payload outright, and their notes must not change."""
+    lines = _fill_note(_control_cell(100_000), _shared_plan(tool_share=0.0), "none")
+
+    assert any("Fill: " in line for line in lines)
+    assert not any("Tool share" in line for line in lines)
+
+
 def test_narration_probe_declares_every_flag_it_reads() -> None:
     """A sample that reads an undeclared flag passes every check and dies on first use.
 
@@ -3168,6 +3368,58 @@ def test_the_solved_sizing_survives_the_file() -> None:
     params = _cell_params(plan=plan, fill=0.86)
 
     assert CellParams.from_dict(params.to_dict()) == params
+
+
+def test_a_plan_written_before_the_payload_could_be_derived_still_reads() -> None:
+    """Six cells on disk have a plan with neither sizing field, and they have to keep opening.
+
+    Their run is not in doubt: the size was stated, which is what a share of 0 means, and it is
+    on the cell beside the plan. Demanding the fields here would refuse every record already
+    recorded rather than reading it as the measurement it was.
+    """
+    stored = _cell_params(fill=0.86).to_dict()
+    stored["plan"] = {
+        "filler_turns": 39,
+        "filler_tokens": 1_874,
+        "context_limit": 120_000,
+        "fill_fraction": 0.86,
+        "target_tokens": 103_200,
+        "predicted_tokens": 103_213,
+        "payload_tokens": 24_497,
+        "tool_payload_tokens": 21_967,
+    }
+
+    params = CellParams.from_dict(stored)
+
+    assert params.plan is not None
+    assert params.tool_share == 0.0
+    assert params.plan.tool_share == 0.0
+
+
+async def test_two_tool_shares_are_two_cells(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Two payloads cannot share a row, however the payload was arrived at.
+
+    The derived size is what separates them -- it is in the identity key and two shares cannot
+    reach one size without building the same conversation -- and the share is in the key beside
+    it so the sweep reads back against the axis it was swept on.
+    """
+    _stub_provider(monkeypatch)
+    path = tmp_path / "shares.jsonl"
+    argv = _live_argv("--results-jsonl", str(path), "--fill", "0.5", "--repeats", "1", "--strategies", "none")
+    await run_live_comparison(build_parser().parse_args([*argv, "--tool-share", "0.2"]))
+    await run_live_comparison(build_parser().parse_args([*argv, "--tool-share", "0.4"]))
+    capsys.readouterr()
+
+    cells = group_by_cell(read_seed_records(path))
+
+    assert len(cells) == 2, "two shares are two workloads and cannot aggregate into one row"
+    shares = {params.tool_share for params, _ in cells}
+    assert shares == {0.2, 0.4}
+    sizes = {params.tool_result_tokens for params, _ in cells}
+    assert len(sizes) == 2, "the derived size must reach the record, or --from-jsonl rebuilds the wrong payload"
+    assert 50 not in sizes, "the record kept the --tool-result-tokens the share was supposed to override"
 
 
 async def test_a_complete_cell_is_not_marked_partial(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

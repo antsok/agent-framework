@@ -224,6 +224,23 @@ of facts", and a payload that will not fit inside the smallest cell is refused w
 rather than quietly overshooting. The achieved fill is measured on the uncompacted run and
 flagged if it lands more than 5% from the target.
 
+`--tool-share` states the payload as a share of that target instead of an absolute size, and
+derives the size of each tool result from it. Absolute is right within one window and wrong
+across two: 3,500-token results are 6% of a 60,000-token context and 3% of a 120,000-token
+one, so a sweep over window sizes is a sweep over two variables. It disabled a strategy that
+way — `AnchoredCompactionStrategy` shortens each banded result to a share of the *ceiling*, so
+its allowance grew from about 2,900 tokens to about 5,900 while the results stayed at 3,500,
+and at 120,000 it planned nothing at all while its rows were read as measurements. A share
+holds the proportions, so two window sizes are one cell at two scales.
+
+It wins when `--tool-result-tokens` is also given, needs `--fill` since it is a share of that
+target, and `0` restores the stated size the same way `--fill 0` restores manual sizing. The
+share covers *every* tool result including the code-free ones `--filler-tool-turns` adds, so
+turning those on divides one budget over more results rather than adding to it — which is
+deliberate: what the strategies act on is tool groups, bearing or not. A share the rest of the
+conversation cannot fit inside is refused with an error naming what to move, and the achieved
+share is reported and flagged beside the achieved fill, to the same 5% tolerance.
+
 #### The two accuracy columns
 
 One run is scored twice, and the columns say so: **`acc1`** is the scoped questions —

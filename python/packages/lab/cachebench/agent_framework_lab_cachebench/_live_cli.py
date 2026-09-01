@@ -168,7 +168,23 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Approximate size of each tool result, in tokens. Part of the payload, which is a "
             "run-level parameter: vary it between runs and compare across them, never inside "
-            "one matrix, or the fill fraction stops meaning what it says."
+            "one matrix, or the fill fraction stops meaning what it says. Ignored when "
+            "--tool-share is set, which derives this size from the fill target instead."
+        ),
+    )
+    parser.add_argument(
+        "--tool-share",
+        type=float,
+        default=0.0,
+        help=(
+            "Share of the seeded conversation that is tool-result text. Derives the size of "
+            "each result from the fill target instead of --tool-result-tokens stating it, so "
+            "the workload keeps its proportions as --context-window grows and two window sizes "
+            "are the same cell at two scales. It wins when both are given. Covers every tool "
+            "result including the code-free ones --filler-tool-turns adds, so turning those on "
+            "divides one budget over more results rather than adding to it. Needs --fill, "
+            "since the share is a share of its target. 0 leaves the sizing to "
+            "--tool-result-tokens, the same convention as --fill 0. Default %(default)s."
         ),
     )
     parser.add_argument(
@@ -833,13 +849,20 @@ def _fill_note(stats: dict[str, CellStats], plan: FillPlan | None, control: str)
     the uncompacted control because that is the one row whose context is whatever the
     conversation put there; every other row is by definition somewhere below it.
 
+    The tool share is reported the same way and against the same denominator, so the two lines
+    can be read together. Its numerator is the plan's count of the tool results rather than a
+    billed figure: nothing on the wire separates a tool result from the turn around it, and
+    the results are the one part of the conversation this package generates itself and can
+    therefore count exactly. The denominator is billed, so a share that misses is the same
+    kind of miss as a fill that does -- the conversation was not the size it was solved for.
+
     Args:
         stats: Aggregated cells.
         plan: The sizing that was solved for, or None when sizing was manual.
         control: Name of the uncompacted baseline.
 
     Returns:
-        One line, plus a second when the deviation is outside the tolerance.
+        One line per targeted quantity, each followed by a warning when it missed.
     """
     if plan is None or control not in stats:
         return []
@@ -861,6 +884,23 @@ def _fill_note(stats: dict[str, CellStats], plan: FillPlan | None, control: str)
             "cell is not the fill fraction it is labelled with and does not sit on the same axis as "
             "the others. The replies are the one term the sizing cannot compute; adjust "
             "--filler-tokens or re-solve against a measured reply size."
+        )
+    if plan.tool_share <= 0:
+        return lines
+    achieved_share = plan.tool_payload_tokens / achieved
+    share_deviation = (achieved_share - plan.tool_share) / plan.tool_share
+    lines.append(
+        f"Tool share: {plan.tool_payload_tokens:,} tokens of tool results is {achieved_share:.1%} of "
+        f"what was seeded, against {plan.tool_share:.0%} requested, {share_deviation:+.1%}. Each "
+        f"result was built to ~{plan.tool_result_tokens:,} tokens."
+    )
+    if abs(share_deviation) > FILL_TOLERANCE:
+        lines.append(
+            f"TOOL SHARE OFF TARGET: {share_deviation:+.1%} is outside the {FILL_TOLERANCE:.0%} "
+            "tolerance, so the payload is not the share of the context this cell is labelled with "
+            "and does not compare with cells at other window sizes. The tool results are sized "
+            "exactly; a share that misses means the conversation around them did, so read the fill "
+            "line above first."
         )
     return lines
 
@@ -1294,9 +1334,15 @@ def _plan_or_exit(args: argparse.Namespace, tokenizer: Any) -> FillPlan | None:
         The plan, or None when --fill 0 asked for manual sizing.
 
     Raises:
-        SystemExit: If the payload does not fit inside the target.
+        SystemExit: If the payload does not fit inside the target, or if the tool share was
+            asked for without a fill target to be a share of.
     """
     if args.fill <= 0:
+        if args.tool_share > 0:
+            raise SystemExit(
+                "--tool-share is a share of the fill target, and --fill 0 sets no target. Either "
+                "give --fill a fraction, or state the payload directly with --tool-result-tokens."
+            )
         return None
     try:
         return plan_fill(
@@ -1307,6 +1353,7 @@ def _plan_or_exit(args: argparse.Namespace, tokenizer: Any) -> FillPlan | None:
             filler_tool_turns=args.filler_tool_turns,
             markers_per_tool=args.markers_per_tool,
             tool_result_tokens=args.tool_result_tokens,
+            tool_share=args.tool_share,
             narration=args.narration,
             fact_placement=args.fact_placement,
             retrieval_guidance=not args.no_retrieval_guidance,
@@ -1507,6 +1554,10 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
     plan = _plan_or_exit(args, tokenizer)
     filler_turns = plan.filler_turns if plan else args.filler_turns
     filler_tokens = plan.filler_tokens if plan else args.filler_tokens
+    # The plan's size rather than the flag's, because --tool-share derives one and then this
+    # is the only place it exists. Reading the flag here would build the conversation the run
+    # was not asked for while every printed line described the one it was.
+    tool_result_tokens = plan.tool_result_tokens if plan else args.tool_result_tokens
     probe = build_live_scenario(
         salt="probe",
         filler_turns=filler_turns,
@@ -1547,9 +1598,15 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
                 f"fill: {plan.predicted_tokens:,} predicted against {plan.target_tokens:,} target "
                 f"({plan.fill_fraction:.0%} of {plan.context_limit:,}), {plan.deviation:+.1%}"
             )
+            if plan.tool_share > 0:
+                print(
+                    f"tool share: {plan.achieved_tool_share:.1%} predicted against "
+                    f"{plan.tool_share:.0%} requested, {plan.tool_share_deviation:+.1%}"
+                )
             print(
-                f"sizing: {plan.filler_turns} filler turns of ~{plan.filler_tokens:,} tokens; "
-                f"payload {plan.payload_tokens:,} tokens, tool results {plan.tool_payload_tokens:,}"
+                f"sizing: {plan.filler_turns} filler turns of ~{plan.filler_tokens:,} tokens and "
+                f"{planted_groups} tool results of ~{plan.tool_result_tokens:,} tokens; payload "
+                f"{plan.payload_tokens:,} tokens, tool results {plan.tool_payload_tokens:,}"
             )
         else:
             print(f"fill: manual, {filler_turns} filler turns of ~{filler_tokens:,} tokens")
@@ -1591,11 +1648,18 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
         # Printed on every run, not only the dry one. These logs are archived and read back
         # months later against runs made with different sizing, and a cell that cannot say
         # what it was aiming at cannot be placed on an axis with the others.
+        share = (
+            f" Tool share {plan.achieved_tool_share:.1%} predicted against {plan.tool_share:.0%} "
+            f"requested, {plan.tool_share_deviation:+.1%}."
+            if plan.tool_share > 0
+            else ""
+        )
         print(
-            f"sizing: {plan.filler_turns} filler turns of ~{plan.filler_tokens:,} tokens, "
+            f"sizing: {plan.filler_turns} filler turns of ~{plan.filler_tokens:,} tokens and "
+            f"{planted_groups} tool results of ~{plan.tool_result_tokens:,} tokens, "
             f"predicting {plan.predicted_tokens:,} against a target of {plan.target_tokens:,} "
             f"({plan.fill_fraction:.0%} of {plan.context_limit:,}); payload {plan.payload_tokens:,} "
-            f"tokens, of which {plan.tool_payload_tokens:,} is tool results.",
+            f"tokens, of which {plan.tool_payload_tokens:,} is tool results.{share}",
             flush=True,
         )
 
@@ -1640,7 +1704,8 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
         strategies=tuple(strategies),
         narration=args.narration,
         fact_placement=args.fact_placement,
-        tool_result_tokens=args.tool_result_tokens,
+        tool_result_tokens=tool_result_tokens,
+        tool_share=args.tool_share,
         filler_turns=filler_turns,
         filler_tokens=filler_tokens,
         tool_turns=args.tool_turns,
@@ -1691,7 +1756,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
                 options=options,
                 scenario=scenario,
                 agent_kind=args.agent,
-                tool_result_tokens=args.tool_result_tokens,
+                tool_result_tokens=tool_result_tokens,
                 force_tool_calls=not args.no_force_tool_calls,
                 narration=args.narration,
                 retrieval_guidance=not args.no_retrieval_guidance,
