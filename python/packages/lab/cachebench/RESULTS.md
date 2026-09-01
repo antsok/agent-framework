@@ -1259,7 +1259,7 @@ exceeds the eviction threshold. Runs 26 and 27 were taken before the change and 
 before arm.
 
 Run 29 is the controlled comparison: the same cell, the same lab code, five seeds either side,
-and 90 upstream commits between them of which one touches compaction.
+and 50 upstream commits between them of which one touches compaction.
 
 | 120,000 / 0.86 | before | after |
 | --- | ---: | ---: |
@@ -1273,17 +1273,24 @@ and 90 upstream commits between them of which one touches compaction.
 
 **The control moved 1%**, which is what makes the rest of the column readable.
 
-**Both axes improved, and `snap%` says why.** The eviction phase now fires only above its
-threshold and no longer sheds whole groups, so the strategy discards less: 57% of the window
-left standing where it was 47%. Less discarded means less prefix rewritten, which is the cache
-recovery, and it means more facts survive. This is not a strategy that got smarter; it is one
-that got less aggressive, and both columns follow from that.
+**The cost result is solid; the recall result is not.** `snap%` moved 47% to 57%, so the
+eviction phase discards less -- it fires only above its threshold now and no longer sheds whole
+groups -- and less discarded is less prefix rewritten, which is the cache recovery. That chain
+holds.
 
-The accuracy half should be read as direction only. `context_window`'s `acc1` seed spread in
-the after arm is 59 points, the widest in the cell.
+Recall does not. Run 29 shows 21/53 becoming 28/53, but **run 28 shows no such gain**: at a
+100,000-token window, also post-fix, `context_window` reads 21/53 and `acc1` 40%, exactly where
+the before arm sat. The two after-arm cells disagree, and `context_window`'s `acc1` seed spread
+in run 29 is 59 points. Treat the recall half as unresolved.
 
-Run 28, at a 100,000-token window with no before-arm counterpart, agrees: +14% against the
-control with a 90% hit rate.
+Two things about the cost figure that the number alone hides. **The distance is the result, not
+the destination**: +14% sits inside the after-arm control's own 15% cost spread and inside
+`context_window`'s 26%, so what is licensed is "no longer measurably dearer than not
+compacting", not "14% dearer". And the control moved 1% *on cost* -- its `acc1` moved 98% to
+94% with a 20-point spread, so the accuracy rows are read against a baseline that moved too.
+
+Run 28 agrees on cost and cache: +14% against its control at a 90% hit rate. It does not agree
+on recall.
 
 **It also moved a strategy of ours.** `tool_summary_anchored` went from 47/53 with `acc1` 90%
 and a 52-point seed spread to 53/53, 100%, and no spread, at +16% rather than +22%. #7912 also

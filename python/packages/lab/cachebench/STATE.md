@@ -130,7 +130,15 @@ cache, no disqualifications and no drift. The numbers in `RESULTS.md` and
 and their `all` column -- now `acc2` -- is inflated: the combined question used to be asked
 last, after seven answers had re-listed the codes into the context it read.
 
-## 3b. Stage 1 sweep — paused mid-run, how to resume
+## 3b. Stage 1 sweep — abandoned, superseded by runs 26 to 29
+
+**Read this for the account facts and the fixes it paid for, not for the plan.** Run 25's
+design — 3 seeds, 3 probe repeats — was replaced by 5 seeds and 1 probe repeat once the
+variance split at the end of this section was measured, and the sweep was replaced by the four
+cells of runs 26 and 27 (60,000/0.86 and 120,000 at 0.50, 0.70, 0.86), then extended after the
+rebase by runs 28 and 29. Its 60,000 cells at 0.50 and 0.70 have no successor and were dropped
+rather than re-taken. `runs/run-25-*` is kept because it is where the resumable-records work,
+the throttling retry and the `DQ`/`EXCL` split came from. Nothing in it needs resuming.
 
 Running on the **second Foundry account** (`-002`, project `proj-default`), which is where the
 EUR 100 budget sits. That deployment is **DataZoneStandard, capacity 200 — a hard 200,000 TPM
@@ -158,8 +166,9 @@ table and verdict from the file with no provider and no calls. It is the same ag
 the same records, so a recovered cell is the cell that was measured. The file is appended to, so
 one path can hold a whole sweep and a resumed run extends it; a cell missing strategies or seeds
 renders and is marked `PARTIAL` with what it holds. Each seed also prints a one-line summary
-(strategy, seed, cost, facts, accuracy) as it lands. **Add `--results-jsonl` to every command in
-`runs/run-25-stage1.sh` before resuming.**
+(strategy, seed, cost, facts, accuracy) as it lands. **Every script from `run-26` onward passes
+`--results-jsonl`**, which is why runs 26 to 29 have `.jsonl` records beside their tables and
+run 25 does not.
 
 **Also fixed, and the reason a later sweep died.** A sweep lost 100 seeds and about EUR 4.17
 to HTTP 429. `run_live` had a two-attempt loop, but it existed only to drop a request option
@@ -208,20 +217,33 @@ the remaining cells should trade probe repeats for seeds at roughly 3:1 within t
 That trade is what made `acc2` a single sample per seed, which is why the combined question got
 `--combined-repeats` (default 3) of its own -- three attempts of one question, not of seven.
 
-## 3c. The before/after of upstream PR #7912
+## 3c. The before/after of upstream PR #7912 — rebased, one cell pair done
+
+**Status: the rebase happened and one of the four cells has an after arm.** Runs 26 and 27 are
+the before arm; run 29 re-ran 120,000/0.86 after the rebase and run 28 added a 100,000/0.86
+cell with no before-arm counterpart. Written up in `RESULTS.md` §"Runs 28 and 29" and in
+`REPORT-GPT-5-4-MINI.md` §4.2. **Still before-arm only: 60,000/0.86, 120,000/0.50,
+120,000/0.70** — the two lower fills are the cheap ones and are the obvious next spend.
+
+**What came out.** `context_window` at 120,000/0.86 went from +141% against not compacting to
++14%, hit rate 57% to 91%, `snap%` 47% to 57%, facts 21/53 to 28/53, `acc1` 38% to 54%, on a
+control that moved 1% on cost. It discards less; every other column follows from that. The
+cost half is a large, clean move; the accuracy half is direction only, its seed spread in the
+after arm being 59 points. Run 28 agrees on cost and cache and **not on recall** — 21/53 there
+— so whether retention improved is one cell's answer, not two. `tool_summary_anchored` also
+moved, 47/53 to 53/53 at +16% rather than +22%, and that is recorded as unexplained: the
+middleware-boundary change below is a plausible cause and nothing here isolates it.
 
 Upstream merged [#7912](https://github.com/microsoft/agent-framework/pull/7912) on
-2026-08-31, which changes the behaviour this package measures. The plan agreed is to keep the
-current sweep as the **before** arm and re-run it after rebasing as the **after** arm, so the
-pair says whether the fix improved the shipped default on cost and on recall.
+2026-08-31, which changes the behaviour this package measures.
 
 **What it changes.** `ContextWindowCompactionStrategy`'s tool-eviction phase was
 `TokenBudgetComposedStrategy(token_budget=tool_eviction_tokens)` called unconditionally; it is
 now `ToolResultCompactionStrategy(compact_to=tool_eviction_tokens)` called only when
 `included_token_count(messages) > tool_eviction_tokens`. So the phase both gained its threshold
 and lost its destructive oldest-first fallback — exactly the behaviour the `context_window` row
-has been penalised for in every run here. It also adds `preserve_first_user_group`, which
-protects the turn carrying the requirements.
+was penalised for in every run up to 27, and the change the after arm measures. It also adds
+`preserve_first_user_group`, which protects the turn carrying the requirements.
 
 `_middleware.py` additionally reconciles compaction summaries at the pipeline boundary, so
 compaction done inside the client now persists back into the caller's message list instead of
@@ -229,24 +251,39 @@ being dropped there. **That one reaches every compacting row**, because it chang
 exclusions accumulate across turns — `anchored` makes position-only decisions precisely so its
 choices stay stable across turns, which was a workaround for this.
 
-**Arm identity.**
+**Arm identity, as executed.**
 
-| arm | framework | lab code |
-| --- | --- | --- |
-| before | `3dbaaea3e` (our merge-base) | `5d3b998d0` plus the records/seed-offset work |
-| after | `6a0773ba2` (upstream main) | the same, rebased |
+| arm | framework | lab code | records |
+| --- | --- | --- | --- |
+| before | `3dbaaea3e`, our old merge-base | `5d3b998d0` plus the records/seed-offset work | `runs/run-26-*.jsonl`, `runs/run-27-*.jsonl` |
+| after | `e2f7db207`, upstream `main` | the same code, rebased | `runs/run-28-100k-fill86-post7912.jsonl`, `runs/run-29-120k-fill86-post7912.jsonl` |
 
-We modify no framework file, so the before arm measures upstream compaction verbatim. Our 93
-changed files and upstream's 244 **do not intersect**, so the rebase should be conflict-free.
-#7918 is `[BREAKING]` for middleware but only enforces sequence-only inputs, which is what we
-already pass.
+**The rebase rewrote our hashes**, so `5d3b998d0` is a pre-rebase name that is on no branch any
+more; its rebased twin is `5ff29c1b6`, and the lab code the before arm ran is the tree at
+`475de5225` ("runs 26 and 27, the first results from the rebuilt instrument"). **No executable
+lab code changed between the arms**: `git diff 475de5225..HEAD` over the package reaches only
+documentation — `compaction/STRATEGIES.md`, and a corrected break-even derivation in
+`_anchored.py`'s comments — and `DEFAULT_MIN_GAIN_FRACTION` is 0.23 on both sides.
 
-**Honest framing:** the after arm advances 40 upstream commits, not one. #7912 is the
-compaction-relevant change among them, and the pair should be reported as "upstream main before
-and after #7912", not as an isolated bisect of that PR.
+`d2a934d53` is #7912 itself, in case the phase has to be looked at again. **We still modify no
+framework file** — every commit on top of `e2f7db207` touches only `python/packages/lab/`, so
+both arms measure upstream compaction verbatim.
+
+**The private imports survived the rewrite.** `compaction/_anchored.py` and
+`compaction/_toolsummary.py` import nine names from `agent_framework._compaction` —
+`EXCLUDED_KEY`, `GROUP_ANNOTATION_KEY`, `SUMMARY_OF_GROUP_IDS_KEY`,
+`SUMMARY_OF_MESSAGE_IDS_KEY`, `annotate_message_groups`, `annotate_token_counts`,
+`group_messages`, `included_token_count`, `set_excluded` — and all of them are still defined
+there after #7912. That is luck, not a guarantee: it is private API and the next rewrite of
+that module can take any of them away without notice.
+
+**Honest framing:** the after arm advances ninety upstream commits, not one. #7912 is the
+compaction-relevant change among them, and the pair is reported as "upstream main before and
+after #7912", not as an isolated bisect of that PR.
 
 **Do not rebase while a sweep is running.** The venv is an editable install from this worktree,
-so the framework would change under processes that have already started.
+so the framework would change under processes that have already started. This is why runs 28
+and 29 were taken after the rebase completed rather than around it.
 
 ## 3d. Known bug: the output reservation is not the output cap
 
@@ -271,10 +308,15 @@ input and output the instrument would report an overflowing run as clean.
 having two. Whichever way round, it needs a clean re-baseline of every cell, which is why it
 waits for a model boundary.
 
-## 4. The finding the report does not yet state correctly
+## 4. The two-variable crossover — stated in the report now, and one point of it withdrawn
 
-`REPORT-GPT-5-4-MINI.md` section 1 and finding 1 index the crossover on **tool result size
-alone**. Three controlled points now show it is **two variables**:
+**Done:** `REPORT-GPT-5-4-MINI.md` used to index the crossover on tool result size alone, and
+its section 1 and finding 2 now carry both variables. The table below is what they carry.
+
+**One caveat added since:** the *fixed-payload* version of the same failure — the record
+falling to 47/53 at 120,000/0.86 — did not reproduce after the rebase. The same cell reads
+53/53 in run 29. The three-point series below is older than both arms and is unaffected; the
+96,000-token context figure that used to be quoted beside it should not be quoted any more.
 
 | bearing results | codes each | per result | asides | facts recalled |
 | ---: | ---: | ---: | ---: | ---: |
@@ -284,7 +326,7 @@ alone**. Three controlled points now show it is **two variables**:
 
 Shrinking each result 25,200 -> 8,000 with codes held at 8 lifts recall 18 -> 36. Dropping
 codes per result 8 -> 3 lifts it 36 -> 53. **Both matter; neither alone explains the
-collapse.** The report needs its headline and finding 1 rewritten around that.
+collapse.**
 
 The third row is confounded on its own (it changed calls, size and codes together) and is kept
 only as the first point of the series. The second row is the honest one: `--filler-tool-turns`
@@ -301,21 +343,23 @@ them to `tests/compaction/`. Nothing in the subpackage imports from the lab, and
 changes -- including relative forms, deferred imports and `TYPE_CHECKING` ones, none of which a
 text search would find. `_strategies.py` stays in the lab: it is the `--strategies` registry,
 which is benchmark configuration. `compaction/__init__.py` carries what an extractor needs --
-the dependency on the private `agent_framework._compaction`, PR #7912 having just rewritten it,
-and the rename out of the `agent_framework` namespace that has to happen before publication.
+the dependency on the private `agent_framework._compaction`, which survived PR #7912's rewrite
+intact (§3c) but is still private, and the rename out of the `agent_framework` namespace that
+has to happen before publication.
 
 | row | file | mechanism |
 | --- | --- | --- |
 | `anchored` | `compaction/_anchored.py` | fixed head and tail verbatim, band between shortened to a share of the ceiling, decisions from position alone so they never change on a later turn |
 | `anchored_no_assistant` | same | as above, forbidden from shedding assistant prose |
-| `anchored_min_gain` | same | as `anchored`, but projects the reduction before mutating anything and declines any collapse worth less than 23% of the included prompt. **Built and tested offline, never run live.** The floor is the break-even `R > B / (1 + T*c/(p-c))` at the 60K/0.86 cell, where `anchored` removed 263 tokens and cost 11% more than the control. Declines are counted and surface as `NOGAIN:<n>` in the flags column, so "never fired" and "fired to no effect" are distinguishable |
+| `anchored_min_gain` | same | as `anchored`, but projects the reduction before mutating anything and declines any collapse worth less than 23% of the included prompt. **Run live in every cell from 26 onward; it only ever fired at 60,000/0.86, where its parent is not inert.** The floor is the break-even `R > B / (1 + T*c/(p-c))` at the 60K/0.86 cell, where `anchored` removed 263 tokens and cost 11% more than the control. Declines are counted and surface as `NOGAIN:<n>` in the flags column, so "never fired" and "fired to no effect" are distinguishable |
 | `tool_summary_anchored` | `compaction/_toolsummary.py` | `ToolResultRecallMiddleware` forces one recall tool call; the strategy drops every tool group in front of the resulting record |
 
 ### 5a. The recall prompt was rewritten, and the record now has two bounds
 
-**Not yet run live.** Built and tested offline; every cell measured so far used the old prompt
-and the inherited cap, so a re-run is needed before any of it can be compared with what is in
-`RESULTS.md`.
+**Live from run 26 onward.** Runs 26 to 29 all pass `--record-max-tokens 4000
+--record-target-tokens 2000` and carry the rewritten prompt, so those six cells are comparable
+with each other. **Run 25 and everything before it used the old prompt and the inherited cap**
+and is not comparable with them on anything `tool_summary_anchored` did.
 
 **The prompt was overfitted.** The tool asked only for "identifiers and values seen in earlier
 tool results", which is this scenario's hex codes and nothing else -- prose, findings and
@@ -387,24 +431,34 @@ Each of these produced a plausible wrong number first.
 
 ## 7. Repository state
 
-- Branch `python-lab-cachebench`, ~40 commits ahead of `origin`, **not pushed**. Pushing needs
-  its own go-ahead.
+- Branch `python-lab-cachebench`, **rebased onto upstream `main` at `e2f7db207`** and carrying
+  81 commits of its own on top of it. Every one of them touches only `python/packages/lab/`.
+- The rebase rewrote history, so the branch and `origin/python-lab-cachebench` have diverged:
+  the remote holds 21 commits that no longer exist locally and the local branch is 131 ahead of
+  it. **A push would not be a fast-forward.** Pushing needs its own go-ahead, and it needs a
+  decision about the rewrite first.
 - `dev/` is untracked Git-LFS junk. **Never stage it.**
-- 301 tests pass; ruff, pyright and bandit are clean. The measurement rebuild, the per-seed
-  results file (`_records.py`, `--results-jsonl`, `--from-jsonl`) and the rate-limit retry are
-  all committed now; the snapshot-and-restore fix to that retry (§3b), the
-  `acc1`/`acc2`/`--combined-repeats` work (§3) and the `compaction/` subpackage with the
-  rewritten recall prompt and its two bounds (§5, §5a) are **uncommitted**.
+- 301 tests pass against the rebased framework; ruff, pyright and bandit are clean. Everything
+  described in §3, §3b, §5 and §5a is committed — the measurement rebuild, the per-seed results
+  file, the rate-limit retry and its snapshot-and-restore fix, the `acc1`/`acc2` split and the
+  `compaction/` subpackage with the rewritten recall prompt and its two bounds.
+- The working tree is clean apart from `dev/` **and the runs 28/29 write-ups**: `RESULTS.md`
+  landed with the run, and the updates to this file, `REPORT-GPT-5-4-MINI.md` and
+  `runs/README.md` are uncommitted.
 - `REPORT.md` and `ARTICLE.md` still describe only the six-model cross-provider work and
   predate everything from run 7 onward. They do not mention the 272,000 input limit, the
   crossover, or either new strategy.
 
 ## 8. Spend
 
-About EUR 175 total. Roughly EUR 19 remains of the last top-up. A five-repeat matrix of five
-strategies costs about EUR 4 at 60K, EUR 8 at 120K, EUR 11 at 272K, and EUR 10 for the
-sixteen-call variants -- **all measured under the old design, where each closing question was
-asked once**.
+About EUR 175 through run 27, plus about EUR 22 on runs 28 and 29 — roughly EUR 11 for one cell
+of six strategies and five seeds at 100,000-120,000 and 0.86 fill. **The balance
+needs checking before the next cell**: EUR 19 was recorded as remaining before those two runs,
+which is less than they cost, so a top-up happened that is not written down here.
+
+A five-repeat matrix of five strategies costs about EUR 4 at 60K, EUR 8 at 120K, EUR 11 at
+272K, and EUR 10 for the sixteen-call variants -- **all measured under the old design, where
+each closing question was asked once**.
 
 **The probe phase costs more than the seeding does.** Every probe carries the whole snapshot,
 and there are `scoped questions x --probe-repeats` of them plus `--combined-repeats`. At the

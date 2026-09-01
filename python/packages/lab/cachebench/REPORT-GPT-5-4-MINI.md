@@ -4,18 +4,31 @@
 **Model:** `gpt-5.4-mini`, Azure Foundry (Responses API). The current sweep ran on a second
 deployment of the same model, `gpt-5.4-mini-2`; everything before it on the first.
 **Agent:** the MAF harness — `create_harness_agent`, the wiring a typical caller gets
-**Scale:** four cells of 30 seed records under the current instrument, plus roughly forty
-matrices under earlier ones; about EUR 175 of model spend in total, EUR 31 of it on the four
-current cells
+**Framework:** upstream, unmodified, on both sides of one change. Sections 4.1 and 5 measure it
+at our merge-base `3dbaaea3e`, before
+[#7912](https://github.com/microsoft/agent-framework/pull/7912); section 4.2 measures it
+rebased onto upstream `main` at `e2f7db207`, after
+**Scale:** six cells of 30 seed records under the current instrument — four before #7912 and
+two after it — plus roughly forty matrices under earlier ones; about EUR 175 of model spend
+through the before arm, EUR 31 of that on its four cells, and EUR 22 on the two after it
 
 This is a single-model deep dive and it stands apart from the six-model work in
 [`REPORT.md`](REPORT.md), which used a different agent, a replay harness, 17 planted facts
 instead of 53, and a control too unstable to rank against. **Nothing here should be averaged
 with it.**
 
-> **Which sections are historical.** Sections 4.1 and 5 report the current instrument: the
+> **Which measurements are before #7912, and which are after.** Upstream #7912 rewrote the
+> tool-eviction phase of `ContextWindowCompactionStrategy` — the strategy `create_harness_agent`
+> installs — on 2026-08-31. Sections 4.1 and 5 were measured before it and are kept as the
+> before arm; section 4.2 is the after arm. **One cell has been measured on both sides:
+> 120,000 tokens at 0.86 fill.** Everything else in sections 4.1 and 5 — findings 2 through 9
+> included — is a before-arm measurement that has not been re-taken since the rebase, so read
+> it as a statement about the framework as it was. Where the after arm says something about
+> those findings, they say so themselves.
+
+> **Which sections are historical.** Sections 4.1, 4.2 and 5 report the current instrument: the
 > conversation is seeded to a share of the window, snapshotted, and every closing question is
-> asked from that snapshot. Section 4.2 keeps the earlier window series, which is the only
+> asked from that snapshot. Section 4.3 keeps the earlier window series, which is the only
 > measurement this project has at 272,000 tokens and at large tool results. Those tables were
 > taken on the previous instrument and carry three defects: their accuracy column is the
 > *median-cost* repeat rather than a mean, so each accuracy figure is one draw from a
@@ -29,19 +42,29 @@ with it.**
 ## 1. The headline
 
 **Compaction here buys the ability to continue past the context window. It does not buy a
-smaller bill, and the setting the framework installs by default buys neither.**
+smaller bill. The setting the framework installs by default used to buy neither — upstream
+#7912 removed its cost penalty and left most of its recall penalty standing.**
 
-Three results carry that, all from the current sweep:
+Four results carry that.
 
-- **The shipped default degrades exactly where it is needed.** `context_window` compacts to a
-  fixed share of the window, so the fuller the conversation the more it discards and the more
-  of the surviving prefix it rewrites. Across the three 120,000-token fills its cost against
-  not compacting runs **+27%, +113%, +141%** while its cache hit rate falls **88% → 66% →
-  57%**, and its accuracy falls with it: 72% → 43% → 38% against a control holding 97-98%.
-- **Nothing was measurably cheaper than not compacting with its answers intact.** Every row
-  reading below the control does so by 1 or 2 points against a control whose own cost spread
-  within a cell is 9 to 21%, and the rows that are genuinely cheaper are cheaper because they
-  threw the conversation away.
+- **The shipped default no longer costs what it did, and still loses half the facts.** Measured
+  after #7912 at 120,000 tokens and 0.86 fill, `context_window` reads **+14%** against not
+  compacting at a **91%** cache hit rate, keeping **28 of 53** facts for **54%** `acc1` — 57%
+  of the control's. On cost that row is no longer distinguishable from the control: +14% sits
+  inside the cell's noise, where the control's own seed spread is 15% and `context_window`'s is
+  26% (finding 8). On recall it plainly is distinguishable, and the gap is most of what it was.
+- **The before arm is the evidence for what the fix was worth, not a description of the
+  framework today.** Before #7912 the same cell read **+141%** against not compacting at a 57%
+  hit rate, with 21 of 53 facts and 38% `acc1`; across the three 120,000-token fills the cost
+  ran **+27%, +113%, +141%** while the hit rate fell **88% → 66% → 57%** and accuracy fell with
+  it, 72% → 43% → 38% against a control holding 97-98%. The mechanism behind that series was
+  that the strategy compacted to a fixed share of the window whatever the fill. **Only the 0.86
+  cell has been re-measured, and it moved**; nothing here says what the other two fills do now.
+- **Nothing was measurably cheaper than not compacting with its answers intact**, on either
+  arm. Every row reading below the control does so by 1 or 2 points against a control whose own
+  cost spread within a cell is 9 to 21%, and the rows that are genuinely cheaper are cheaper
+  because they threw the conversation away. Both after-arm cells return the same verdict as the
+  four before them: `none`.
 - **A strategy's dial has to be sized against the payload, not the window.** `anchored`
   allows each collapsed tool result `max_input_tokens × band_share ÷ tool groups in band`.
   With 3,500-token results that allowance is about 2,900 tokens at a 60,000-token window and
@@ -66,8 +89,11 @@ accounts for the collapse, and total tool output is not the driver — the last 
 comparable total to the first and score very differently. The third row moved three variables
 at once and is kept only as the first point of the series.*
 
-The current sweep reached the same failure at a fixed payload by filling the window instead: at
+The before arm reached the same failure at a fixed payload by filling the window instead: at
 120,000 tokens and 0.86 fill the record fell to 47 of 53, at about 96,000 tokens of context.
+**That failure did not reproduce after the rebase** — the same cell reads 53 of 53 with no seed
+spread in run 29 (section 4.2). The payload series above is untouched by the rebase; the
+fixed-payload point is not, and finding 2 says what is and is not known about why.
 
 ## 2. What was measured
 
@@ -94,8 +120,8 @@ a snapshot removes all four, and survival is scored against that snapshot and no
 One residual is measured rather than assumed. Restoring stops compaction *accumulating* across
 probes; it does not stop a strategy acting once more on the restored state. `DRIFT:<n>` counts
 probes whose prompt was not the snapshot verbatim, and a row carrying it overstates what
-reached the model. It is zero on every current row except `context_window` at the two lower
-120,000 fills, which carry `DRIFT:5`.
+reached the model. It is zero on every row of both arms except `context_window` at the two
+lower 120,000 fills of the before arm, which carry `DRIFT:5`.
 
 ### The freeze question, settled in the negative
 
@@ -142,7 +168,8 @@ within-seed variance these cells measure.
 must show 53/53 facts, 0 unfetched, an empty flags column and no disqualification. A
 disqualified seed — one that sent a prompt larger than the tried window, which is simulated and
 so has to be enforced in our own code — excludes its cell from the ranking rather than being
-starred. There are none in the current sweep, and no errors and no throttling either.
+starred. There are none in either arm of the current sweep, and no errors and no throttling
+either.
 
 ## 3. The strategies compared
 
@@ -158,16 +185,16 @@ starred. There are none in the current sweep, and no errors and no throttling ei
 The last three were written for this work, against what the earlier runs measured;
 `compaction/STRATEGIES.md` documents them in full. `tool_result` — the framework's tool-result
 collapse, head-truncating at 4,096 characters — appears only in the earlier tables of
-section 4.2.
+section 4.3.
 
 ## 4. Results
 
-### 4.1 The current sweep — four cells, five seeds each
+### 4.1 The before arm — four cells, five seeds each
 
-Runs 26 and 27, on the rebuilt instrument. Five seeds per cell, one probe repeat, and the
-combined question asked three times per seed at 60,000 and five times per seed at each 120,000
-cell. Payload fixed at 24,497 tokens, of which 21,967 is tool results: six results of 3,500
-tokens carrying eight codes each. Pinned tool calls, neutral narration, values spread on
+Runs 26 and 27, on the rebuilt instrument and on the framework at our merge-base, before
+upstream #7912. Five seeds per cell, one probe repeat, and the combined question asked three
+times per seed at 60,000 and five times per seed at each 120,000 cell. Payload fixed at 24,497
+tokens, of which 21,967 is tool results: six results of 3,500 tokens carrying eight codes each. Pinned tool calls, neutral narration, values spread on
 labelled lines. 30 seed records per cell, 120 in all; no errors, no throttling, no
 disqualifications, and every row gathered every fact the control did.
 
@@ -239,9 +266,109 @@ Withdrawn the same way: a 2% gap against a 19% spread. `context_window` carries 
 
 Verdict `none`. This is the cell where `anchored` is the best faithful row in the sweep —
 everything preserved, both accuracy measures at or above the control, six percent dearer — and
-the cell where the model-written record first frays.
+the cell where the model-written record first frays. **It is also the one cell re-run after
+#7912**; section 4.2 pairs the two.
 
-### 4.2 Earlier work — the window series
+### 4.2 The after arm — upstream #7912, runs 28 and 29
+
+The branch was rebased onto upstream `main`, which carries
+[#7912](https://github.com/microsoft/agent-framework/pull/7912). That PR rewrote the
+tool-eviction phase of `ContextWindowCompactionStrategy`: it was a `TokenBudgetComposedStrategy`
+called unconditionally, whose built-in fallback evicts whole groups oldest-first, and it is now
+a `ToolResultCompactionStrategy` called only when the prompt exceeds the eviction threshold. It
+also protects the first user group, and it makes compaction results persist across the
+chat-middleware boundary instead of being dropped there.
+
+Same lab code, same flags, same five seeds per cell. Ninety upstream commits separate the arms,
+of which one touches compaction, so this is "upstream main before and after #7912" rather than
+an isolated bisect of that PR.
+
+#### 120,000-token window, 86% full, after #7912 — run 29, fill landed at -2.8%
+
+| strategy | cost | in$ | +- | vs none | hit% | snap% | facts | acc1 | seed+- | acc2 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **none** | $0.4029 | $0.3574 | 15% | — | 96% | 84% | 53/53 | 94% | 20pp | 65% |
+| anchored | $0.4195 | $0.3730 | 14% | +4% | 96% | 88% | 53/53 | 95% | 13pp | 59% |
+| anchored_min_gain | $0.4280 | $0.3726 | 16% | +6% | 97% | 89% | 53/53 | 98% | 7pp | 84% |
+| tool_summary_anchored | $0.4681 | $0.3990 | 15% | +16% | 95% | 79% | **53/53** | **100%** | **0pp** | **100%** |
+| *— below 90% of the control's `acc1` —* | | | | | | | | | | |
+| truncation | $0.3961 | $0.3541 | 5% | -2% | 94% | 58% | 22/53 | 41% | 0pp | 33% |
+| context_window | $0.4579 | $0.4099 | 26% | **+14%** | **91%** | 57% | 28/53 | 54% | **59pp** | 48% |
+
+Verdict `none`.
+
+#### The same cell, before and after
+
+| 120,000 / 0.86, `context_window` | before (run 27) | after (run 29) |
+| --- | ---: | ---: |
+| `snap%` | 47% | 57% |
+| cache hit rate | **57%** | **91%** |
+| cost | $0.9821 | $0.4579 |
+| vs none | **+141%** | **+14%** |
+| facts | 21/53 | 28/53 |
+| `acc1` | 38% | 54% |
+| *the control beside it* | *$0.4069* | *$0.4029* |
+
+**The control moved 1% on cost**, which is what makes the rest of the column readable: the
+deployment, the prices and the instrument did not shift underneath the comparison. On accuracy
+the control moved too — `acc1` 98% to 94%, against its own 20-point seed spread in the after
+arm — so the accuracy rows of this table are being read against a baseline that is itself
+noisier than the difference it is measuring in the faithful strategies.
+
+**`snap%` is the whole mechanism.** The eviction phase now fires only above its threshold and
+no longer sheds whole groups, so the strategy discards less — 57% of the window left standing
+where it left 47%. Less discarded is less prefix rewritten, which is the cache recovery, and it
+is also why more facts survive. **This is not a strategy that got smarter; it is one that got
+less aggressive**, and both columns follow from that.
+
+Read the accuracy half as direction only. `context_window`'s `acc1` seed spread in the after
+arm is **59 points** — the widest in the cell — so 54% is a mean over four seeds near 41% and
+one at 100%, not a level the strategy holds.
+
+#### 100,000-token window, 86% full, after #7912 — run 28, fill landed at -2.1%
+
+There is no before-arm cell at this window, so this table ranks strategies against each other
+and against its own control; it cannot say what #7912 changed.
+
+| strategy | cost | in$ | +- | vs none | hit% | snap% | facts | acc1 | seed+- | acc2 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **none** | $0.3199 | $0.2824 | 20% | — | 95% | 84% | 53/53 | 98% | 6pp | 52% |
+| anchored | $0.3620 | $0.3070 | 48% | +13% | 95% | 90% | 53/53 | 97% | 9pp | 68% |
+| anchored_min_gain | $0.3802 | $0.3178 | 56% | +19% | 95% | 91% | 53/53 | 96% | 15pp | 84% |
+| tool_summary_anchored | $0.4771 | $0.3731 | 117% | +49% | 91% | 82% | **53/53** | **100%** | **0pp** | 99% |
+| *— below 90% of the control's `acc1` —* | | | | | | | | | | |
+| truncation | $0.3218 | $0.2742 | 25% | +1% | 93% | 61% | 21/53 | 41% | 11pp | 30% |
+| context_window | $0.3632 | $0.3193 | 23% | **+14%** | **90%** | 57% | 21/53 | 40% | 6pp | 29% |
+
+Verdict `none`. On cost and cache this agrees with run 29 exactly — `context_window` at +14%
+with a 90% hit rate and the same 57% `snap%`. **On recall it does not**: 21 of 53 facts and 40%
+`acc1`, which is where the before arm sat at 120,000. The plain reading is that the same
+`snap%` is a smaller snapshot at a smaller window — 57,327 tokens left standing here against
+68,256 in run 29, against a payload fixed at 24,497 — so the fixed share that is now generous
+enough at 120,000 is not at 100,000. That is a reading of one cell with no counterpart, not a
+measurement of the fill-versus-window boundary, and it is worth stating that the two after-arm
+cells disagree on whether recall improved at all.
+
+This cell also has the sweep's widest cost spreads: 48%, 56% and 117% on the three faithful
+compacting rows, against the control's 20%. Nothing in its cost ordering is resolvable
+(finding 8), including `tool_summary_anchored`'s +49%.
+
+#### What else the rebase moved
+
+`tool_summary_anchored` at 120,000/0.86 went from 47/53 facts, `acc1` 90% and a 52-point seed
+spread to **53/53, 100%, and no spread**, at +16% rather than +22%. Its snapshot barely moved,
+96,134 tokens before and 95,159 after, so it is reading about as much as it was: whatever
+changed, it is not that the material got smaller.
+
+**This is recorded as unexplained rather than attributed.** #7912 also made compaction results
+persist across the chat-middleware boundary, which reaches every compacting row and is a
+plausible cause, and nothing here isolates it: five seeds, ninety commits, one arm each side.
+It is one cell, and finding 2's payload evidence is untouched by it.
+
+`truncation`, `anchored` and `anchored_min_gain` are unchanged between the arms within their
+seed spreads.
+
+### 4.3 Earlier work — the window series
 
 **These three tables predate the rebuild.** They are the only measurements this project has at
 272,000 tokens and with tool results larger than 3,500 tokens, which is why they are kept. Read
@@ -294,44 +421,74 @@ as the material grows.
 
 ## 5. Findings
 
-### Finding 1 — The shipped harness default degrades exactly where it is needed
+**Finding 1 is the only one measured on both sides of #7912.** Findings 2 to 9 were taken on
+the before arm and have not been re-measured since the rebase. Where the after arm happens to
+bear on one — findings 2, 5, 6 and 8 — it is said in place, and in finding 2's case it
+withdraws a number. The others are about the instrument, the prices, the model or strategies
+written here, and nothing in the change is known to bear on them. That is not the same as
+having checked.
 
-`context_window` is what `create_harness_agent` installs. It is the worst row on both axes in
-all four current cells, and the gap widens with fill.
+### Finding 1 — The shipped harness default cost two and a half times not compacting, until #7912
+
+`context_window` is what `create_harness_agent` installs. **The result below is historical**:
+it describes the framework at our merge-base, and upstream #7912 has since rewritten the phase
+that produced it. It is kept because it is the measurement the fix is against, and because
+only one of its three rows has been re-taken.
 
 | fill | vs none | in$ against the control's | hit% | snap% | facts | acc1 |
 | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | 120K / 0.50 | +27% | $0.2342 / $0.1682 | 88% | 46% | 41/53 | 72% |
 | 120K / 0.70 | +113% | $0.6375 / $0.2758 | 66% | 47% | 23/53 | 43% |
 | 120K / 0.86 | **+141%** | $0.9331 / $0.3543 | **57%** | 47% | 21/53 | 38% |
+| **120K / 0.86, after #7912** | **+14%** | **$0.4099 / $0.3574** | **91%** | **57%** | **28/53** | **54%** |
 
-The mechanism is visible in `snap%`. It holds its snapshot at 45-47% of the window at every
-fill, because its target is a fraction of the input budget rather than a function of how much
-conversation there is. So a fuller conversation means more discarded — and more of the
-surviving prefix rewritten, which is what the falling hit rate measures. At 0.86 it costs two
-and a half times not compacting and answers 38% of what the control answers.
+*The first three rows are runs 26 and 27, before. The last is run 29, after, and it is the only
+row of the four with a counterpart on both sides. Its control is $0.3574 on `in$` against the
+before arm's $0.3543 — the same cell, the same instrument, a control that moved 1% on cost.*
 
-This is the strongest result in the sweep, and one where the input-only column earns its place:
-the effect is on the prompt side, $0.9331 against $0.3543, not in the replies.
+The mechanism was visible in `snap%`, and so is the fix. Before, the strategy held its snapshot
+at 45-47% of the window at every fill, because its target was a fraction of the input budget
+rather than a function of how much conversation there was: a fuller conversation meant more
+discarded, and more of the surviving prefix rewritten, which is what the falling hit rate
+measures. At 0.86 that cost two and a half times not compacting for 39% of the control's `acc1`,
+and the input-only column earns its place there — the effect was on the prompt side, $0.9331
+against $0.3543, not in the replies.
 
-**Two qualifications.** The two lower-fill rows carry `DRIFT:5`, so five probes each were asked
-from a prompt the strategy had edited again after restore, and their `facts` figures overstate
-what the model saw. And this measures the strategy as of our merge-base: upstream
-[#7912](https://github.com/microsoft/agent-framework/pull/7912) rewrote exactly this phase on
-2026-08-31 — giving the tool-eviction step a threshold, removing its destructive oldest-first
-fallback and protecting the first user group. The re-run against upstream main is planned and
-has not been done, so **nothing here describes the framework after that change**.
+After #7912 the eviction phase runs only above its threshold and no longer sheds whole groups.
+`snap%` rises to 57%, the hit rate recovers to 91%, and the cost premium falls to +14% — which
+is inside the noise this sweep can resolve, the control's own seed spread in that cell being
+15%. **The strategy did not get smarter, it got less aggressive**, and every other column
+follows from the one that changed.
+
+**What the fix did not do is make it safe to leave on.** It still keeps 28 of 53 facts against
+the control's 53, for 57% of the control's `acc1`, and it is still the row the ranking puts
+below the line. Read the accuracy figures as direction only: its seed spread there is 59 points.
+
+**Three qualifications.** The two lower-fill before rows carry `DRIFT:5`, so five probes each
+were asked from a prompt the strategy had edited again after restore, and their `facts` figures
+overstate what the model saw. The after arm is one cell — 0.50 and 0.70 have not been re-run,
+and nothing here says what the fixed-share behaviour does at those fills now. And run 28, at
+100,000 tokens with no before-arm counterpart, matches run 29 on cost and cache while keeping
+21 of 53 facts for 40% `acc1`; the recall improvement is one cell's result, not two.
 
 ### Finding 2 — A model-written record degrades with the bulk it must summarise
 
 `tool_summary_anchored` is the strongest recall result this package has produced. In three of
-the four current cells it preserved every planted fact with 100% on both accuracy measures and
-zero spread on either. In each of those three it also scored full marks on the combined
-question, above the control every time.
+the four before-arm cells it preserved every planted fact with 100% on both accuracy measures
+and zero spread on either. In each of those three it also scored full marks on the combined
+question, above the control every time. Both after-arm cells read 53/53 and `acc1` 100% with no
+spread as well.
 
-At 120,000 tokens and 0.86 fill it breaks: 47 of 53 facts, `acc1` 90%, and a seed spread of 52
-points — four seeds at 100% and one at 48%. Its snapshot there is 96,134 tokens, which is where
-this failure arrives at a fixed payload.
+At 120,000 tokens and 0.86 fill, on the before arm, it breaks: 47 of 53 facts, `acc1` 90%, and
+a seed spread of 52 points — four seeds at 100% and one at 48%. Its snapshot there is 96,134
+tokens, which is where this failure arrived at a fixed payload.
+
+**That break did not reproduce after the rebase.** The same cell re-run as run 29 reads 53/53,
+`acc1` 100%, no spread, from a 95,159-token snapshot — the same material, the opposite result.
+So the fixed-payload crossover this paragraph reports is a single before-arm cell that did not
+survive re-measurement, and it should not be quoted as the point where the record fails. The
+payload evidence below did not change: those runs are older still, and the rebase does not
+touch them. What the after arm removes is one data point, not the series.
 
 The earlier series found the same thing by growing the payload instead — 53/53 at 8,000-token
 results, 46/53 at 16,000, 18/53 at 25,200 — and runs 19 and 20 separated the two causes: both
@@ -339,16 +496,19 @@ the length of a result and the number of values buried in it degrade the record,
 and total tool output is not the driver.
 
 The mechanism is not at fault. The middleware forced the call and the forced call produced a
-record in every run, `FORCED:2, REC:1, RECFORCED:1` on every current row. What degrades is the
+record in every run, `FORCED:2, REC:1, RECFORCED:1` on every row of both arms. What degrades is the
 *content*: asked to extract every value from more material, the model writes a shorter list.
 This is the fundamental limit of extraction as a compaction primitive — **what survives is the
 model's judgement, not a policy**, and that judgement gets worse exactly when compaction
 matters most.
 
 It also costs, and the premium is its own output rather than its prompt: 17,628 output tokens
-against the control's 10,417 at 120K/0.70, and 10 to 26% more in total across the four cells.
-It takes extra model calls to do it — 44 against 40 at 60,000, and 50, 62 and 71 against 45, 57
-and 66 at the three 120,000 fills — and those are included in every figure above.
+against the control's 10,417 at 120K/0.70, and 10 to 26% more in total across the four
+before-arm cells. It takes extra model calls to do it — 44 against 40 at 60,000, and 50, 62 and
+71 against 45, 57 and 66 at the three 120,000 fills — and those are included in every figure
+above. The after arm reads +16% at 120,000/0.86 and +49% at 100,000/0.86, the second against a
+117% seed spread of its own, so the premium is still there and its size at 100,000 is not
+resolvable.
 
 ### Finding 3 — Proportional retention scales with the window, not with the payload
 
@@ -388,12 +548,16 @@ that follows, at the cached price. With `R` the tokens removed, `B` the tokens b
 itself when `T·R·c > (B − R)(p − c)`, that is:
 
 ```text
-R > B / (1 + T·c/(p − c))
+R > B(p − c) / (p + T·c)
 ```
 
 At these prices, about 40,000 tokens behind the edit and about twenty turns left, that is
-**11,859 tokens against a 52,322-token snapshot — 22.7% of the prompt**, which is where
-`anchored_min_gain`'s 0.23 default comes from. `T` is the term nobody knows at decision time,
+**11,456 tokens against a 52,322-token snapshot — 21.9% of the prompt**, which is what
+`anchored_min_gain`'s 0.23 default is rounded up from.
+
+An earlier form of this wrote the first term as `(B − R)(p − c)` rather than `(B − R)p − Bc`
+and gave 22.7%. It drops an `R·c`: the removed tokens are not re-sent, so they are not re-read
+at the cached price either. The floor is conservative under both, so the default is unchanged. `T` is the term nobody knows at decision time,
 and it divides: ten remaining turns need 35%, forty need 13%.
 
 The measurement that made this concrete: at the 60,000/0.86 cell plain `anchored` removed
@@ -416,16 +580,18 @@ it makes a compacted run cheaper than an uncompacted one.
 
 ### Finding 5 — Not compacting still wins on cost
 
-**No strategy in the current sweep is cheaper than the control with its answers intact.** The
-rows reading below it — `truncation` at -1%, -1% and +0%, `anchored` at -1%,
-`anchored_min_gain` at -2% — sit inside a control spread that runs 9 to 21% within a cell, and
-the tool refused to certify both cells where it named one. The rows that are genuinely cheaper
-paid for it. `truncation` reads 1% under the control at 120,000/0.86 while keeping 23 of 53
-facts; at 60,000/0.86 it costs 2% more and keeps 30 of 53.
+**No strategy in either arm is cheaper than the control with its answers intact.** The rows
+reading below it — `truncation` at -1%, -1% and +0%, `anchored` at -1%, `anchored_min_gain` at
+-2% — sit inside a control spread that runs 9 to 21% within a cell, and the tool refused to
+certify both cells where it named one. The rows that are genuinely cheaper paid for it.
+`truncation` reads 1% under the control at 120,000/0.86 while keeping 23 of 53 facts; at
+60,000/0.86 it costs 2% more and keeps 30 of 53. The after arm repeats it exactly: `truncation`
+is the only row under the control there too, at -2% for 22 of 53 facts, and both cells return
+the verdict `none`.
 
 The reason is unchanged, and it is not about any particular strategy. Cached reads are 9.4x
 cheaper here, the discount is strict-prefix, and compaction forfeits it. The control holds
-94-97% cache across the four cells. Compacting rows match that only where they are inert —
+94-97% cache across all six cells. Compacting rows match that only where they are inert —
 `anchored_min_gain` reads 97% at 120,000/0.86, having proposed nothing to do.
 
 Compaction here buys the ability to continue past the window. It does not buy a smaller bill,
@@ -440,8 +606,12 @@ happen to be in. Per-seed `acc1`, one figure per seed:
 | --- | --- |
 | `none` at 60K/0.86 | 100, 100, 100, 100, 100 |
 | `anchored` at 60K/0.86 | 100, 85, 98, 89, 100 |
-| `tool_summary_anchored` at 120K/0.86 | 48, 100, 100, 100, 100 |
+| `tool_summary_anchored` at 120K/0.86, before | 48, 100, 100, 100, 100 |
 | `context_window` at 60K/0.86 | 41, 41, 41, 41, 41 |
+| `context_window` at 120K/0.86, after | 48, 41, 41, 100, 41 |
+
+*Before-arm rows except the last. The after-arm row is the same shape read the other way: four
+seeds where the strategy discarded what the questions needed, one where it did not.*
 
 The split between the two variance sources is the point. Earlier work measured `rep+-` — the
 same snapshot re-asked — at 0 to 2 points, while `seed+-` ran to 30-78 points. Re-asking is
@@ -452,8 +622,11 @@ values rather than scattering: across six invocations of one earlier configurati
 `tool_summary_anchored` preserved 53 facts or 39 and nothing between, and `anchored` preserved
 27, 52 or 53.
 
-`context_window`'s flat row above is the same effect with the sign reversed: it discards the
-same fraction every time, so it fails identically every time. Stability is not accuracy.
+`context_window`'s flat 60K row above is the same effect with the sign reversed: it discards the
+same fraction every time, so it fails identically every time. Stability is not accuracy. After
+#7912 that row stops being flat — 59 points at 120K/0.86, the widest spread in the cell —
+because a strategy that keeps more sometimes keeps the part the question wanted and sometimes
+does not. Its mean improved and its reliability got worse, and both are the same change.
 
 The practical form of this: **read the seed spread beside the mean.** A strategy with a
 52-point seed spread is not "usually fine"; it is fine on four conversations in five.
@@ -489,7 +662,8 @@ distrusting everywhere else.
 
 ### Finding 8 — Cost differences under about 20% are not resolvable
 
-The control's own cost spread within a cell is 17%, 21%, 19% and 9%. That is the floor on what
+The control's own cost spread within a cell is 17%, 21%, 19% and 9% on the before arm, and 15%
+and 20% on the after arm. That is the floor on what
 any cost claim in this sweep can mean, and it is driven by reply length rather than by anything
 compaction does: on one clean five-seed control cell — the sequential 60,000/0.86 records in
 `runs/raw/oldprompt-conc1-*` — the output ran from 4,134 to 11,704 tokens across the five
@@ -500,10 +674,14 @@ own note on the column: on a clean five-seed control the total moved 38% while t
 moved 13%. Rank a *mechanism* on `in$`; `cost` is still the number that gets billed, and it is
 what the ranking uses.
 
-The consequence for reading section 4.1 is blunt. `context_window`'s +113% and +141% are
-results. `tool_summary_anchored`'s +10% to +26% premium is a result, and its cause is visible
-in the output column. Everything else in those tables — every row within 20% of the control —
-is unresolved on cost, and the honest statement is that those strategies cost about what not
+The consequence for reading sections 4.1 and 4.2 is blunt. `context_window`'s +113% and +141%
+on the before arm are results, and so is the fall to +14% after #7912, because the distance
+between those two is far outside any spread here. **The +14% itself is not a result**: it sits
+inside the after-arm control's own 15%, so what run 29 licenses is "no longer measurably dearer
+than the control", not "14% dearer". `tool_summary_anchored`'s +10% to +26% premium is a
+result, and its cause is visible in the output column; its +49% at 100,000/0.86 is not, against
+a 117% spread. Everything else in those tables — every row within 20% of the control — is
+unresolved on cost, and the honest statement is that those strategies cost about what not
 compacting costs.
 
 ### Finding 9 — The advertised context window is not the input limit
@@ -522,12 +700,14 @@ limit, not the advertised window.
 
 ## 6. What to do
 
-**Do not run the shipped default at a high fill without measuring it.** `context_window` at its
-0.5/0.8 thresholds was the worst row on both axes in every cell here, and the fuller the
-conversation the worse it got: at 0.86 fill, two and a half times the cost of not compacting
-for 38% of the accuracy. If you keep it, know that it compacts to a fixed share of the window
-regardless of how much conversation there is. Upstream #7912 changes this code path, and that
-version has not been measured here.
+**Take upstream #7912, and still do not run the shipped default where the answers matter.**
+Before that change `context_window` was the worst row on both axes in every cell here and got
+worse with fill — at 0.86, two and a half times the cost of not compacting for 39% of the
+control's accuracy. After it, at the one cell measured on both sides, the cost premium is gone
+into the noise and the cache hit rate is back to 91%. What is left is the recall: 28 of 53
+facts, 57% of the control's `acc1`, on a row whose seed spread is 59 points. It is now an
+affordable way to lose half the conversation rather than an expensive one, and the two lower
+fills have not been re-measured at all.
 
 **Size a strategy's dial against the payload you have, not against the window.** A retention
 allowance expressed as a share of the ceiling goes inert once it exceeds your tool results, and
@@ -545,8 +725,10 @@ tested.
 **If you must compact and the answers matter, have the model record the values and drop the
 originals — and check the size of what it is being asked to read.** That was the only mechanism
 here to score above the uncompacted control on the hardest question, and it degrades once one
-call has to read roughly 100,000 tokens of context, or extract eight values from each of
-several large results. It costs extra model calls and materially more output.
+call has to extract eight values from each of several large results. It costs extra model calls
+and materially more output. The context-size half of that warning is now weaker than it was:
+the one cell where it frayed at about 96,000 tokens read 53/53 when the same cell was re-run
+after the rebase, so treat the payload as the term to watch and the context size as unsettled.
 
 **Configure the input limit, not the model card.** And set the request's `max_tokens`
 explicitly: the compaction reservation is arithmetic, and nothing constrains the model to it
@@ -589,12 +771,18 @@ testable at 120,000 and above, and it would put the record's degradation on a co
 rather than one confounded with the window. It is also the cheapest missing measurement: the
 payload is the term the fill solver holds fixed, so a payload sweep moves one number per run.
 
-**Run the after arm of upstream #7912.** The current sweep is a clean *before* arm — no
-framework file is modified, so it measures upstream compaction verbatim at our merge-base.
-Re-running it rebased on upstream main would say whether the fix improves the shipped default
-on cost and on recall. It should be reported as "upstream main before and after #7912" rather
-than as an isolated bisect: the rebase advances forty commits, of which #7912 is the
-compaction-relevant one.
+**Finish the after arm of upstream #7912.** One cell of four has been re-run — 120,000 at 0.86
+— plus a 100,000 cell with no counterpart. The two lower 120,000 fills and the 60,000 cell are
+still before-arm only, and they are where the pre-#7912 series had its shape: the fixed-share
+behaviour was worst at the highest fill, and it is the highest fill that has been fixed. The
+0.50 and 0.70 cells are the cheap ones and they would say whether the improvement is uniform
+or whether the strategy simply stopped acting where it used to act hardest.
+
+**Isolate what moved `tool_summary_anchored`.** It went from 47/53 to 53/53 across the rebase,
+which is a strategy of ours changing under a framework change we did not aim at it. #7912's
+middleware-boundary persistence is the obvious candidate, and one cell either side of ninety
+commits does not test it. The cheap version is to re-run that one cell with the boundary
+behaviour forced back, offline if the shape can be reproduced on the stub.
 
 ## 8. Limits
 
@@ -605,11 +793,18 @@ nothing here rules it out either.
 
 **The payload is fixed at 3,500-token results in every current cell.** Result size is the
 variable the earlier series moved and this one does not, so the two answer different questions,
-and section 4.1 does not supersede section 4.2 on shape.
+and sections 4.1 and 4.2 do not supersede section 4.3 on shape.
 
-**Only one window has more than one fill.** The sweep is 60,000 at 0.86 and 120,000 at three
-fills. There is no measurement at 272,000 under the current instrument, and the fill axis is
-untested at 60,000.
+**Only one window has more than one fill.** The before arm is 60,000 at 0.86 and 120,000 at
+three fills; the after arm is 100,000 and 120,000, both at 0.86. There is no measurement at
+272,000 under the current instrument, and the fill axis is untested at 60,000 and at 100,000.
+
+**The after arm is one cell pair.** Only 120,000/0.86 exists on both sides of #7912. Everything
+else in this report is a before-arm measurement, including all of section 4.1 and findings 2
+to 9, and the two arms are separated by ninety upstream commits rather than by that one PR. A
+change of this size in one cell is a strong result; it is not a bisect, and where the after arm
+disagrees with itself — run 28 keeping 21 of 53 facts where run 29 keeps 28 — the report says so
+rather than choosing.
 
 **Cost differences under about 20% are not resolvable** — see finding 8 — and neither are
 accuracy differences of a few points at five seeds.
@@ -631,7 +826,8 @@ re-baseline of every cell, so it waits for a model boundary.
 
 **`context_window` at the two lower 120,000 fills carries `DRIFT:5`**, so five of its probes
 per cell were asked from a prompt the strategy had edited again after restore. Those rows
-overstate what reached the model.
+overstate what reached the model. Both are before-arm cells; neither after-arm cell carries the
+flag on any row.
 
 **The scoring guidance is inert for the control.** Every row is told how to read a compaction
 record; `none` has no record, so the clause helps only the compacting strategies. It cannot

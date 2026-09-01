@@ -37,16 +37,18 @@ they are copied, not recomputed.
 | `run-25-stage1-60k-fill*` | 25 | 60,000 | harness | 53 | old prompt, superseded by 26 |
 | `run-26-60k-fill86.*` | 26 | 60,000 | harness | 53 | 60 min, 5 seeds |
 | `run-27-120k-fill*` | 27 | 120,000 | harness | 53 | 6 h, 3 fills x 5 seeds |
+| `run-28-100k-fill86-post7912.*` | 28 | 100,000 | harness | 53 | 5 seeds, after #7912 |
+| `run-29-120k-fill86-post7912.*` | 29 | 120,000 | harness | 53 | 5 seeds, after #7912 |
 
 Run 19 raised the call count to sixteen by dropping the codes per result from eight to three,
 so it changed call count, result size and code count together. Run 20 is the honest form: six
 code-bearing results unchanged, plus ten code-free asides supplying the extra calls. Read
 together with run 18 they separate the two things that break a model-written record.
 
-Runs 16 to 18 are the final configuration: five repeats, pinned, values spread on labelled
-lines, a 12,000-token reply cap, per-scope scoring and a combined closing question. They are
-the three points of the window series and the only runs whose numbers appear in
-`REPORT-GPT-5-4-MINI.md`.
+Runs 16 to 18 are the final configuration under the *old* instrument: five repeats, pinned,
+values spread on labelled lines, a 12,000-token reply cap, per-scope scoring and a combined
+closing question. They are the three points of the window series, and they are section 4.3 of
+`REPORT-GPT-5-4-MINI.md`; that report's current tables are runs 26 to 29.
 
 `run-x-unpinned-void` is kept as evidence, not as data. It is the unpinned matrix whose
 uncompacted control varied 102% in cost across five repeats while the strategy row gathered
@@ -109,7 +111,7 @@ Costs are not small. Run 7 was about EUR 8 and Run 8 about EUR 14, both at the r
 on the command line; a run that omits `--price-input` will fail rather than guess, because
 only OpenRouter pricing is auto-discoverable.
 
-Runs 26 and 27 are the first under the rebuilt instrument: the conversation is seeded to a
+Runs 26 to 29 were taken under the rebuilt instrument: the conversation is seeded to a
 share of the tried window, snapshotted, and every closing question asked from that snapshot
 rather than appended to it. Their `.jsonl` files are the records themselves -- `cachebench_live
 --from-jsonl <file>` rebuilds the table from them, which is how the `.txt` beside each was
@@ -117,11 +119,26 @@ produced. Anything earlier used the old design and its `all` column, today's `ac
 inflated: the combined question was asked last, after seven answers had already re-listed the
 codes into the context it read.
 
+**Runs 26 and 27 are before upstream #7912, runs 28 and 29 after it.** The branch was rebased
+onto upstream `main` between them, so the framework under the lab is not the same in the two
+groups; `RESULTS.md` §"Runs 28 and 29" and `REPORT-GPT-5-4-MINI.md` §4.2 report the pair.
+**Run 29 is the only cell measured on both sides** — 120,000 tokens at 0.86 fill, against run
+27's `run-27-120k-fill086.*`. Run 28 is a 100,000-token cell with no before-arm counterpart,
+so it ranks strategies against its own control and says nothing about what the change did.
+Run 29 has no `.sh` of its own. `run-28-100k.sh` takes the window and fill as arguments, and
+`run-28-100k.sh 120000 0.86` reproduces run 29's cell — same strategies, seeds, payload and
+bounds as the header of `run-29-120k-fill86-post7912.txt` records — writing to a different
+output directory than the one that run used.
+
 ## Raw records
 
-[`raw/`](raw/) holds the per-seed records from every run made under the rebuilt instrument,
-including the failed ones, with a README of its own saying what each group is evidence for.
-Those files are the measurement: `cachebench_live --from-jsonl` rebuilds any table from them
-through the same aggregation the live run uses, so nothing here has to be taken on trust.
+[`raw/`](raw/) holds per-seed records from runs made under the rebuilt instrument, including
+the failed ones, with a README of its own saying what each group is evidence for. Runs 26, 28
+and 29 are not split out there: their merged `.jsonl` beside the table in this directory is the
+whole cell, 30 records, one per strategy-seed.
+
+Either way the records are the measurement: `cachebench_live --from-jsonl` rebuilds any table
+from them through the same aggregation the live run uses, so nothing here has to be taken on
+trust.
 
 Runs before 24 predate that format and exist only as captured stdout.
