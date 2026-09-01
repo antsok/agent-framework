@@ -1,41 +1,57 @@
 # Compaction on `gpt-5.4-mini`: report
 
-**Date:** 30 August 2026
-**Model:** `gpt-5.4-mini`, Azure Foundry (Responses API), GlobalStandard
+**Date:** 1 September 2026
+**Model:** `gpt-5.4-mini`, Azure Foundry (Responses API). The current sweep ran on a second
+deployment of the same model, `gpt-5.4-mini-2`; everything before it on the first.
 **Agent:** the MAF harness — `create_harness_agent`, the wiring a typical caller gets
-**Scale:** ~40 matrices over three windows, several hundred conversations, about EUR 150 of
-model spend
+**Scale:** four cells of 30 seed records under the current instrument, plus roughly forty
+matrices under earlier ones; about EUR 175 of model spend in total, EUR 31 of it on the four
+current cells
 
 This is a single-model deep dive and it stands apart from the six-model work in
-[`REPORT.md`](REPORT.md), which used a different agent, 17 planted facts instead of 53, and a
-control too unstable to rank against. **Nothing here should be averaged with it.**
+[`REPORT.md`](REPORT.md), which used a different agent, a replay harness, 17 planted facts
+instead of 53, and a control too unstable to rank against. **Nothing here should be averaged
+with it.**
 
-> **Correction, added after runs 22 and 23.** Every accuracy figure below is a single sample of
-> its configuration, and that is not enough. Compacting strategies land on a small number of
-> discrete outcomes rather than scattering around a mean — `tool_summary_anchored` preserved
-> either 53 facts or 39 across six repeat invocations, with nothing between, and `anchored`
-> preserved 27, 52 or 53 — so a run reports whichever side of a retention boundary it happened
-> to fall on. The `c+-` column is an honest measure of this and routinely reads 26 to 78 points;
-> it should be read as the error bar it is. The instability is compaction's, not the model's:
-> the uncompacted control moves 7 points where `anchored` moves 78. **Most cost claims survive**
-> — the control and `anchored` move 6 to 8% and their ordering reproduced every time — but
-> `tool_summary_anchored`'s does not: across six invocations its cost moved 25%, and on one it
-> came out 10% dearer than the control rather than 9% cheaper. Its saving is real on average and
-> unreliable on any single run. See [`RESULTS.md`](RESULTS.md), runs 22 and 23.
+> **Which sections are historical.** Sections 4.1 and 5 report the current instrument: the
+> conversation is seeded to a share of the window, snapshotted, and every closing question is
+> asked from that snapshot. Section 4.2 keeps the earlier window series, which is the only
+> measurement this project has at 272,000 tokens and at large tool results. Those tables were
+> taken on the previous instrument and carry three defects: their accuracy column is the
+> *median-cost* repeat rather than a mean, so each accuracy figure is one draw from a
+> two-valued distribution; compaction kept running while the model was being scored; and their
+> `all` column is inflated, because the combined question was asked last, after seven per-scope
+> answers had re-listed most of the codes into the context it read. Read them for direction,
+> not for magnitude.
 
 ---
 
 ## 1. The headline
 
-**Which compaction strategy is right depends on the shape of your tool results, and the answer
-inverts between small and large ones.**
+**Compaction here buys the ability to continue past the context window. It does not buy a
+smaller bill, and the setting the framework installs by default buys neither.**
 
-Asking the model to extract the values and then dropping what it extracted is the cheapest
-approach at every size measured — 9 to 18% below not compacting — and its accuracy falls apart
-as results grow. Keeping a fixed *proportion* of each result does the opposite: poor when the
-proportion is small, near-perfect once the window makes it generous.
+Three results carry that, all from the current sweep:
 
-**Two things break the record, and both had to be measured separately:**
+- **The shipped default degrades exactly where it is needed.** `context_window` compacts to a
+  fixed share of the window, so the fuller the conversation the more it discards and the more
+  of the surviving prefix it rewrites. Across the three 120,000-token fills its cost against
+  not compacting runs **+27%, +113%, +141%** while its cache hit rate falls **88% → 66% →
+  57%**, and its accuracy falls with it: 72% → 43% → 38% against a control holding 97-98%.
+- **Nothing was measurably cheaper than not compacting with its answers intact.** Every row
+  reading below the control does so by 1 or 2 points against a control whose own cost spread
+  within a cell is 9 to 21%, and the rows that are genuinely cheaper are cheaper because they
+  threw the conversation away.
+- **A strategy's dial has to be sized against the payload, not the window.** `anchored`
+  allows each collapsed tool result `max_input_tokens × band_share ÷ tool groups in band`.
+  With 3,500-token results that allowance is about 2,900 tokens at a 60,000-token window and
+  about 5,900 at 120,000 — larger than the results — so at 120,000 it plans nothing at all.
+  It is not performing badly there; it is not performing.
+
+The earlier window series adds the shape result, which the current sweep does not test because
+it holds the payload fixed: **a model-written record degrades with the bulk it must
+summarise**, and both the length of a result and the number of values buried in it matter
+independently.
 
 | bearing results | codes each | per result | facts the record preserved |
 | ---: | ---: | ---: | ---: |
@@ -43,51 +59,200 @@ proportion is small, near-perfect once the window makes it generous.
 | 6 | 8 | **8,000** | **36 of 53** |
 | 16 | **3** | 8,000 | **53 of 53** |
 
-Shrinking each result from 25,200 to 8,000 tokens, with the code count held at eight, lifts
-recall from 18 to 36. Dropping the values per result from eight to three lifts it from 36 to
-53. **Neither variable alone accounts for the collapse**, and total tool output is not the
-driver at all — the last two rows carry a comparable total to the first and score very
-differently.
+*Earlier work — runs 18, 19 and 20, one sample per configuration. Shrinking each result from
+25,200 to 8,000 tokens with the code count held at eight lifts recall from 18 to 36; dropping
+the values per result from eight to three lifts it from 36 to 53. Neither variable alone
+accounts for the collapse, and total tool output is not the driver — the last two rows carry a
+comparable total to the first and score very differently. The third row moved three variables
+at once and is kept only as the first point of the series.*
 
-So the rule is about how much a single extraction call is asked to do: **how much text it must
-read, and how many values it must pull out of that text.** Section 7 proposes the design that
-follows from it.
+The current sweep reached the same failure at a fixed payload by filling the window instead: at
+120,000 tokens and 0.86 fill the record fell to 47 of 53, at about 96,000 tokens of context.
 
 ## 2. What was measured
 
-A real agent runs the same 22-turn conversation, changing only the compaction setting. It is
-told **53 verifiable facts** — requirements, one mid-conversation correction, and codes
-returned by six tool calls — then asked eight closing questions: one per deployment scope,
-plus one asking for everything at once.
+### The instrument: seed, snapshot, probe
 
-Scoring is exact substring matching on 6-hex-digit codes. No grader model, no partial credit.
-Each closing reply is scored **only against the values its own question asked for**, so a code
-listed under the wrong tool does not count: that distinguishes preserving a value from
-preserving the labelling that says where it came from.
+A real agent is driven through a scripted conversation — requirements, one mid-conversation
+correction, six tool lookups returning eight 6-hex-digit codes each, and filler turns sized to
+land the conversation on a target share of the window. **53 verifiable facts** in all. The
+conversation is then **snapshotted**, and every closing question is asked from the restored
+snapshot rather than appended to the conversation: seven scoped questions, one on the
+requirements and one per tool lookup (`acc1`), and one question asking for all 53 values at
+once (`acc2`).
 
-**Every run is checked against its control before anything else is read.** The uncompacted
-row must show 53/53 facts, 0 unfetched, an empty flags column, and a narrow spread. Runs that
-failed those checks are recorded as failures rather than quietly dropped.
+The snapshot matters because of what the old design measured instead. Closing questions used to
+be ordinary turns. Each answer listed codes, which became assistant text in the history, so the
+next question was asked from a prompt into which earlier answers had already written the codes
+back — and survival was scored against the *last* of those prompts. The same strategy read
+53/53 on a run that emitted 10,941 output tokens and 18/53 on one that emitted 4,873. Three
+more defects followed from the same cause: the first scope was answered from a fuller context
+than the last, the combined question from the most compacted context of the run, and compaction
+kept firing during scoring, so a fact could be evicted while it was being scored. Probing from
+a snapshot removes all four, and survival is scored against that snapshot and nothing else.
 
-## 3. The four strategies compared
+One residual is measured rather than assumed. Restoring stops compaction *accumulating* across
+probes; it does not stop a strategy acting once more on the restored state. `DRIFT:<n>` counts
+probes whose prompt was not the snapshot verbatim, and a row carrying it overstates what
+reached the model. It is zero on every current row except `context_window` at the two lower
+120,000 fills, which carry `DRIFT:5`.
+
+### The freeze question, settled in the negative
+
+Before the rebuild, the obvious suspect for the wide accuracy spreads was compaction running
+through the closing turns. A `--freeze-during-answers` flag was built and validated (run 21),
+and both arms were run at 272,000 tokens with three repeats each (run 22). **Freezing narrowed
+nothing.**
+
+| strategy | correctness spread, unfrozen | frozen |
+| --- | ---: | ---: |
+| `none` | 26pp | 19pp |
+| `truncation` | 59pp | 59pp |
+| `anchored` | 13pp | **37pp** |
+| `tool_summary_anchored` | 0pp | **13pp** |
+
+Two rows widened, one held, and the control moved less than its own repeat range. The confound
+was real — sixteen compaction calls per strategy were suppressed, so compaction had certainly
+been firing during scoring — but it was not what made the accuracy figure jump. What run 22
+found instead was that a single sample of a configuration says very little about its accuracy,
+and run 23 then measured the within- and across-invocation spreads at 60,000 and found them the
+same size.
+
+The instrument was rebuilt around that. Probing from a restored snapshot makes mid-scoring
+compaction structurally impossible, so the flag had nothing left to switch and was deleted. Its
+evidence survives in `runs/run-21-*` and `runs/run-22-*`, which no longer run because they pass
+a flag that no longer exists.
+
+### Scoring
+
+Exact substring matching on 6-hex-digit codes. No grader model, no partial credit. Each reply
+is scored **only against the values its own question asked for**, so a code listed under the
+wrong tool does not count: that distinguishes preserving a value from preserving the labelling
+that says where it came from.
+
+**Every figure is a mean over every sample**, not a representative run. Accuracy arrives as a
+distribution, and the spreads are separate columns: `seed+-` between seeds, which is
+compaction's own reliability — whether it cleared a retention boundary this time and not last
+time — and `rep+-` within one seed across probe repeats, which is the model's willingness to
+enumerate and nothing else. At `--probe-repeats 1`, which every current cell uses, `rep+-` is
+0pp by construction; `rep2+-` is the same within-seed spread for `acc2`, and is the only
+within-seed variance these cells measure.
+
+**Every run is checked against its control before anything else is read.** The uncompacted row
+must show 53/53 facts, 0 unfetched, an empty flags column and no disqualification. A
+disqualified seed — one that sent a prompt larger than the tried window, which is simulated and
+so has to be enforced in our own code — excludes its cell from the ranking rather than being
+starred. There are none in the current sweep, and no errors and no throttling either.
+
+## 3. The strategies compared
 
 | | mechanism |
 | --- | --- |
 | `none` | the uncompacted control |
-| `truncation` | oldest-first eviction at 80% of the budget, down to 50% |
-| `tool_result` | the framework's tool-result collapse, head-truncating at 4,096 characters |
-| `anchored` | keeps a fixed head and tail verbatim, shortens the band between them to a share of the ceiling, position-only decisions (`_anchored.py`) |
-| `tool_summary_anchored` | a middleware forces one recall tool call; the strategy then drops every tool group in front of the resulting record (`_toolsummary.py`) |
+| `context_window` | the framework's `ContextWindowCompactionStrategy` at its shipped 0.5/0.8 thresholds, keeping the framework's default of four retained tool-call groups. **This is what `create_harness_agent` installs** |
+| `truncation` | oldest-first eviction triggering at 80% of the input budget, compacting to 50% |
+| `anchored` | keeps a fixed head and tail verbatim, shortens the tool results in the band between them to a share of the ceiling, decisions taken from position alone so they never change on a later turn (`compaction/_anchored.py`) |
+| `anchored_min_gain` | `anchored` with a floor: it prices the collapse before mutating anything and declines any whose projected saving is under 23% of the included prompt (`compaction/_anchored.py`) |
+| `tool_summary_anchored` | a middleware forces one recall tool call; the strategy then drops every tool group in front of the resulting record (`compaction/_toolsummary.py`) |
 
-The last two were written for this work, against what the earlier runs measured.
+The last three were written for this work, against what the earlier runs measured;
+`compaction/STRATEGIES.md` documents them in full. `tool_result` — the framework's tool-result
+collapse, head-truncating at 4,096 characters — appears only in the earlier tables of
+section 4.2.
 
 ## 4. Results
 
-Five repeats each, pinned tool calls, neutral narration, values spread through each result.
-`c+-` is the gap between the least and most correct repeat; `all` is the single combined
-question.
+### 4.1 The current sweep — four cells, five seeds each
 
-### 60,000-token window (8,000-token tool results)
+Runs 26 and 27, on the rebuilt instrument. Five seeds per cell, one probe repeat, and the
+combined question asked three times per seed at 60,000 and five times per seed at each 120,000
+cell. Payload fixed at 24,497 tokens, of which 21,967 is tool results: six results of 3,500
+tokens carrying eight codes each. Pinned tool calls, neutral narration, values spread on
+labelled lines. 30 seed records per cell, 120 in all; no errors, no throttling, no
+disqualifications, and every row gathered every fact the control did.
+
+Columns: `cost` is the whole run, seeding plus every probe. `in$` is the prompt side of that
+same money, output and summarizer excluded — worth reading beside it, because output is priced
+57 times a cache read here and a reply the model ran long on moves the total further than
+compaction does. `+-` is the spread between the cheapest and dearest seed, so a gap smaller
+than it is not a result. `snap%` is the snapshot every question was asked from, as a share of
+the window: the control sits at the fill the cell was sized to, and a strategy below it removed
+that difference. Prices were passed as EUR per million (0.66 input, 0.07 cached, 3.96 output);
+the tool prints a `$` regardless, so every money figure below is EUR.
+
+#### 60,000-token window, 86% full — fill landed at +0.0%
+
+| strategy | cost | in$ | +- | vs none | hit% | snap% | facts | acc1 | seed+- | acc2 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **none** | $0.1642 | $0.1368 | 17% | — | **94%** | 86% | **53/53** | **100%** | 0pp | 95% |
+| tool_summary_anchored | $0.1812 | $0.1422 | 25% | +10% | 91% | 68% | **53/53** | **100%** | 0pp | **100%** |
+| anchored_min_gain | $0.1834 | $0.1498 | 58% | +12% | 93% | 90% | 51/53 | 96% | 20pp | 72% |
+| anchored | $0.1929 | $0.1576 | 38% | +17% | 92% | 89% | 51/53 | 94% | 15pp | 87% |
+| *— below 90% of the control's `acc1` —* | | | | | | | | | | |
+| truncation | $0.1680 | $0.1414 | 21% | +2% | 89% | 60% | 30/53 | 54% | 11pp | 39% |
+| context_window | $0.2598 | $0.2368 | 6% | **+58%** | **65%** | 45% | 21/53 | 41% | 0pp | 35% |
+
+Verdict `none`. `anchored_min_gain` declined 28 and 50 collapses on the two seeds that reported
+them (`NOGAIN`); this is the only cell in the sweep where the floor was ever consulted.
+
+#### 120,000-token window, 50% full — fill landed at +1.9%
+
+| strategy | cost | in$ | +- | vs none | hit% | snap% | facts | acc1 | seed+- | acc2 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| truncation | $0.2055 | $0.1709 | 12% | -1% | 95% | 52% | 53/53 | 98% | 6pp | 52% |
+| anchored | $0.2065 | $0.1724 | 5% | -1% | 95% | 52% | 53/53 | 96% | 7pp | 56% |
+| **none** | $0.2076 | $0.1682 | 21% | — | 95% | 51% | 53/53 | 97% | 13pp | 87% |
+| anchored_min_gain | $0.2141 | $0.1790 | 22% | +3% | 94% | 52% | 53/53 | 99% | 6pp | 81% |
+| tool_summary_anchored | $0.2613 | $0.2004 | 24% | +26% | 94% | 48% | 53/53 | **100%** | 0pp | **100%** |
+| *— below 90% of the control's `acc1` —* | | | | | | | | | | |
+| context_window | $0.2643 | $0.2342 | 21% | +27% | 88% | 46% | 41/53 | 72% | 15pp | 50% |
+
+The tool named `truncation` and then withdrew it — `NOT SUPPORTED`, because one strategy's
+seeds varied by 21% against the 1% gap the recommendation rests on. `context_window` carries
+`DRIFT:5`.
+
+#### 120,000-token window, 70% full — fill landed at -1.6%
+
+| strategy | cost | in$ | +- | vs none | hit% | snap% | facts | acc1 | seed+- | acc2 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| anchored_min_gain | $0.3110 | $0.2713 | 10% | -2% | 96% | 72% | 53/53 | 96% | 13pp | 52% |
+| **none** | $0.3171 | $0.2758 | 19% | — | 95% | 69% | 53/53 | 97% | 7pp | 46% |
+| truncation | $0.3185 | $0.2767 | 8% | +0% | 96% | 72% | 53/53 | 98% | 6pp | 68% |
+| anchored | $0.3248 | $0.2856 | 9% | +2% | 95% | 71% | 53/53 | 98% | 9pp | 68% |
+| tool_summary_anchored | $0.3809 | $0.3111 | 23% | +20% | 94% | 61% | 53/53 | **100%** | 0pp | **100%** |
+| *— below 90% of the control's `acc1` —* | | | | | | | | | | |
+| context_window | $0.6749 | $0.6375 | 26% | **+113%** | **66%** | 47% | 23/53 | 43% | 6pp | 26% |
+
+Withdrawn the same way: a 2% gap against a 19% spread. `context_window` carries `DRIFT:5`.
+
+#### 120,000-token window, 86% full — fill landed at -2.3%
+
+| strategy | cost | in$ | +- | vs none | hit% | snap% | facts | acc1 | seed+- | acc2 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **none** | $0.4069 | $0.3543 | 9% | — | **97%** | 84% | 53/53 | 98% | 7pp | 62% |
+| anchored_min_gain | $0.4207 | $0.3701 | 7% | +3% | 97% | 89% | 53/53 | 94% | 24pp | 68% |
+| anchored | $0.4333 | $0.3758 | 16% | +6% | 96% | 89% | **53/53** | **99%** | 6pp | **100%** |
+| tool_summary_anchored | $0.4953 | $0.4233 | 22% | +22% | 94% | 80% | 47/53 | 90% | **52pp** | 89% |
+| *— below 90% of the control's `acc1` —* | | | | | | | | | | |
+| truncation | $0.4032 | $0.3530 | 5% | -1% | 94% | 60% | 23/53 | 42% | 7pp | 34% |
+| context_window | $0.9821 | $0.9331 | 24% | **+141%** | **57%** | 47% | 21/53 | 38% | 4pp | 31% |
+
+Verdict `none`. This is the cell where `anchored` is the best faithful row in the sweep —
+everything preserved, both accuracy measures at or above the control, six percent dearer — and
+the cell where the model-written record first frays.
+
+### 4.2 Earlier work — the window series
+
+**These three tables predate the rebuild.** They are the only measurements this project has at
+272,000 tokens and with tool results larger than 3,500 tokens, which is why they are kept. Read
+them with three caveats. Each cell was five repeats, but the `correct` column reports the
+median-*cost* repeat, so it is a single draw from a distribution whose range is the `c+-`
+column beside it. Compaction ran while the model was being scored. And the `all` column is
+inflated, because that question was asked last, from a context seven previous answers had
+already written most of the codes into. Tool results scale with the window in this series,
+which is the variable it exists to move.
+
+#### 60,000-token window (8,000-token tool results) — run 16
 
 | strategy | cost | vs none | +- | hit% | peak | facts | correct | c+- | all |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -97,7 +262,7 @@ question.
 | anchored | $0.1939 | +18% | 13% | 82% | 54,882 | 27/53 | 22% | 78pp | 21% |
 | tool_result | $0.2115 | +28% | 9% | 85% | 63,591 | 46/53 | 85% | 63pp | 85% |
 
-### 120,000-token window (16,000-token tool results)
+#### 120,000-token window (16,000-token tool results) — run 17
 
 | strategy | cost | vs none | +- | hit% | peak | facts | correct | c+- | all |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -107,9 +272,9 @@ question.
 | **anchored** | $0.3541 | +20% | 3% | 84% | 107,562 | **53/53** | **100%** | 48pp | **100%** |
 | tool_result | $0.3758 | +28% | 6% | 85% | 118,899 | 39/53 | 67% | 41pp | 66% |
 
-### 272,000-token window, 86% full (25,200-token tool results)
+#### 272,000-token window, 86% full (25,200-token tool results) — run 18
 
-This is the model's **real input limit** — see finding 5.
+This is the model's **real input limit** — see finding 9.
 
 | strategy | cost | vs none | +- | hit% | peak | facts | correct | c+- | all |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -119,76 +284,229 @@ This is the model's **real input limit** — see finding 5.
 | **anchored** | $0.4975 | +10% | 3% | 89% | 203,654 | **53/53** | **100%** | 31pp | **100%** |
 | tool_result | $0.5740 | +27% | 3% | 86% | 184,147 | 39/53 | 22% | 78pp | 21% |
 
+Two things in this series did not survive replication and should not be quoted as results. Run
+22 re-ran run 18's command and every row moved, in both directions, by up to 69 points —
+including the control, which read 76% here and 100% there. And the control's 76% at 233,332
+tokens was read at the time as evidence that a shorter prompt is easier to answer from; it is a
+single median-cost repeat of a configuration that scored 100% on replication, so it does not
+support that. What the series does support is the direction finding 2 states: the record thins
+as the material grows.
+
 ## 5. Findings
 
-### Finding 1 — A model-written record degrades with the bulk it must summarise
+### Finding 1 — The shipped harness default degrades exactly where it is needed
 
-Across the window series, holding the scenario shape fixed and scaling only sizes:
+`context_window` is what `create_harness_agent` installs. It is the worst row on both axes in
+all four current cells, and the gap widens with fill.
 
-| tool result size | facts the record preserved |
-| ---: | ---: |
-| 8,000 | 53 of 53 |
-| 16,000 | 46 of 53 |
-| 25,200 | **18 of 53** |
+| fill | vs none | in$ against the control's | hit% | snap% | facts | acc1 |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| 120K / 0.50 | +27% | $0.2342 / $0.1682 | 88% | 46% | 41/53 | 72% |
+| 120K / 0.70 | +113% | $0.6375 / $0.2758 | 66% | 47% | 23/53 | 43% |
+| 120K / 0.86 | **+141%** | $0.9331 / $0.3543 | **57%** | 47% | 21/53 | 38% |
 
-Monotonic, and far larger than the spread. Two later runs separate the causes: at 8,000-token
-results still carrying eight codes each the record recovers only to 36 of 53, and it reaches
-53 of 53 only when the codes per result also drop to three. **Both the length of a result and
-the number of values buried in it degrade the record**, and the window series alone could not
-tell them apart because it moved them together.
+The mechanism is visible in `snap%`. It holds its snapshot at 45-47% of the window at every
+fill, because its target is a fraction of the input budget rather than a function of how much
+conversation there is. So a fuller conversation means more discarded — and more of the
+surviving prefix rewritten, which is what the falling hit rate measures. At 0.86 it costs two
+and a half times not compacting and answers 38% of what the control answers.
 
-The mechanism is not at fault — the middleware
-forced the call and the forced call produced a record in every run (`REC:1, FORCED:2,
-RECFORCED:1`). What degrades is the *content*: asked to extract every value from more
-material, the model writes a shorter list.
+This is the strongest result in the sweep, and one where the input-only column earns its place:
+the effect is on the prompt side, $0.9331 against $0.3543, not in the replies.
 
-This is the fundamental limit of extraction as a compaction primitive. **What survives is the
+**Two qualifications.** The two lower-fill rows carry `DRIFT:5`, so five probes each were asked
+from a prompt the strategy had edited again after restore, and their `facts` figures overstate
+what the model saw. And this measures the strategy as of our merge-base: upstream
+[#7912](https://github.com/microsoft/agent-framework/pull/7912) rewrote exactly this phase on
+2026-08-31 — giving the tool-eviction step a threshold, removing its destructive oldest-first
+fallback and protecting the first user group. The re-run against upstream main is planned and
+has not been done, so **nothing here describes the framework after that change**.
+
+### Finding 2 — A model-written record degrades with the bulk it must summarise
+
+`tool_summary_anchored` is the strongest recall result this package has produced. In three of
+the four current cells it preserved every planted fact with 100% on both accuracy measures and
+zero spread on either. In each of those three it also scored full marks on the combined
+question, above the control every time.
+
+At 120,000 tokens and 0.86 fill it breaks: 47 of 53 facts, `acc1` 90%, and a seed spread of 52
+points — four seeds at 100% and one at 48%. Its snapshot there is 96,134 tokens, which is where
+this failure arrives at a fixed payload.
+
+The earlier series found the same thing by growing the payload instead — 53/53 at 8,000-token
+results, 46/53 at 16,000, 18/53 at 25,200 — and runs 19 and 20 separated the two causes: both
+the length of a result and the number of values buried in it degrade the record, independently,
+and total tool output is not the driver.
+
+The mechanism is not at fault. The middleware forced the call and the forced call produced a
+record in every run, `FORCED:2, REC:1, RECFORCED:1` on every current row. What degrades is the
+*content*: asked to extract every value from more material, the model writes a shorter list.
+This is the fundamental limit of extraction as a compaction primitive — **what survives is the
 model's judgement, not a policy**, and that judgement gets worse exactly when compaction
 matters most.
 
-### Finding 2 — Proportional retention improves with scale, for the same reason reversed
+It also costs, and the premium is its own output rather than its prompt: 17,628 output tokens
+against the control's 10,417 at 120K/0.70, and 10 to 26% more in total across the four cells.
+It takes extra model calls to do it — 44 against 40 at 60,000, and 50, 62 and 71 against 45, 57
+and 66 at the three 120,000 fills — and those are included in every figure above.
 
-`anchored` keeps a share of the ceiling for each collapsed result, so at a larger window each
-result keeps more of itself: 30% at 60,000 and 44% at 272,000. Its accuracy climbs from 22%
-to 100% as a result.
+### Finding 3 — Proportional retention scales with the window, not with the payload
 
-The arithmetic behind it is worth stating, because it also explains why the framework's
-`ToolResultCompactionStrategy` loses values: head-and-tail retention keeps the first and last
-f/2 of a result, so *n* values spread evenly through it — sitting 1/n apart — survive only
-when f exceeds 2/n. With eight values per result that needs **more than 25% of it retained**.
-A fixed retention, like the framework's 4,096 characters, becomes a rounding error as results
-grow.
+`anchored` allows each collapsed tool result
 
-### Finding 3 — Not compacting still wins on the axis that matters
+```text
+keep_tokens = max_input_tokens × band_share ÷ tool groups in the band
+```
 
-`none` was the verdict at 60,000 and at 272,000. The one strategy that beat it, at 60,000,
-did so by 9% against a 10% spread — which the tool itself refused to certify.
+with `band_share` defaulting to 0.25. That is a share of the *ceiling*, so it grows with the
+window while the payload does not. With the 3,500-token results the current sweep holds fixed,
+the allowance is about 2,900 tokens at 60,000 and about 5,900 at 120,000 — bigger than the
+results themselves. **At 120,000 it therefore plans nothing.** Its snapshot is no smaller than
+the control's at any of the three fills, and `anchored_min_gain` never reports a decline there,
+because its parent proposes nothing to decline.
 
-The reason is unchanged from the earlier work: cached reads are 9.4x cheaper here, the
-discount is strict-prefix, and compaction forfeits it. `none` holds a 94% hit rate at every
-size. The best any compacting strategy managed was 90%.
+This is the qualification the earlier finding needs. The window series showed `anchored`
+climbing from 22% to 100% correct as the window grew, and read that as proportional retention
+improving with scale. But that series scaled tool results with the window, so the results were
+always larger than the allowance and the mechanism was always operating. **The mechanism only
+operates while results exceed the allowance**, and whether they do is a fact about the payload,
+not about the window. The same configuration can be aggressive at 60,000 and idle at 120,000.
 
-**But at 272,000 the picture is more interesting than "don't compact".** The control scored
-**76%** — it fits the window, but the model answers less well from a 233,000-token prompt —
-while `anchored` scored **100%** from a 203,000-token one. Compaction did not just cost less
-information than expected; at that size it produced a *better answer* than not compacting,
-because a shorter prompt is easier to answer from.
+The arithmetic underneath is worth stating separately, because it is general and it also
+explains why the framework's `ToolResultCompactionStrategy` loses values: head-and-tail
+retention keeps the first and last f/2 of a result, so *n* values spread evenly through it —
+sitting 1/n apart — survive only when f exceeds 2/n. With eight values per result that needs
+**more than 25% of it retained**. A fixed retention, like the framework's 4,096 characters,
+becomes a rounding error as results grow.
 
-### Finding 4 — Consistency, not accuracy, is what compaction really costs
+### Finding 4 — A small edit cannot repay the cache it invalidates
 
-Median accuracy for the better strategies is excellent. The spread is not:
+Prompt caching is strict-prefix, so an edit at position K makes the provider re-read everything
+behind K once at the uncached price; the edit then saves the tokens it removed on every turn
+that follows, at the cached price. With `R` the tokens removed, `B` the tokens behind the edit,
+`T` the turns still to come, and `p` and `c` the uncached and cached rates, the edit repays
+itself when `T·R·c > (B − R)(p − c)`, that is:
 
-| | control | best compacting strategy |
+```text
+R > B / (1 + T·c/(p − c))
+```
+
+At these prices, about 40,000 tokens behind the edit and about twenty turns left, that is
+**11,859 tokens against a 52,322-token snapshot — 22.7% of the prompt**, which is where
+`anchored_min_gain`'s 0.23 default comes from. `T` is the term nobody knows at decision time,
+and it divides: ten remaining turns need 35%, forty need 13%.
+
+The measurement that made this concrete: at the 60,000/0.86 cell plain `anchored` removed
+**263 tokens**, 0.5% of the snapshot, dropped its cache hit rate from 92% to 88% — 46,471
+tokens re-read at full price — and cost 11% more than not compacting. That is 177 to 1 against.
+Nothing was wrong with *what* it shortened; the edit was simply too small to be worth making,
+and the strategy had no way to notice, because it never asked.
+
+`anchored_min_gain` asks. In the current 60,000 cell it declined 28 and 50 collapses on the two
+seeds that reported them, and came in at +12% against plain `anchored`'s +17%, with the same 51
+of 53 facts. **Read that gap carefully**: those two rows have seed spreads of 58% and 38%, so
+the five points between them sit far inside the noise, and this cell does not resolve the
+ordering. What it does show
+is that the declines happened, and that they cost nothing in facts. Where the parent is inert —
+every 120,000 cell — the floor is never consulted, and the two rows are indistinguishable from
+each other and from the control.
+
+**The floor is worth having and is not worth much.** It prevents a specific waste. Nothing in
+it makes a compacted run cheaper than an uncompacted one.
+
+### Finding 5 — Not compacting still wins on cost
+
+**No strategy in the current sweep is cheaper than the control with its answers intact.** The
+rows reading below it — `truncation` at -1%, -1% and +0%, `anchored` at -1%,
+`anchored_min_gain` at -2% — sit inside a control spread that runs 9 to 21% within a cell, and
+the tool refused to certify both cells where it named one. The rows that are genuinely cheaper
+paid for it. `truncation` reads 1% under the control at 120,000/0.86 while keeping 23 of 53
+facts; at 60,000/0.86 it costs 2% more and keeps 30 of 53.
+
+The reason is unchanged, and it is not about any particular strategy. Cached reads are 9.4x
+cheaper here, the discount is strict-prefix, and compaction forfeits it. The control holds
+94-97% cache across the four cells. Compacting rows match that only where they are inert —
+`anchored_min_gain` reads 97% at 120,000/0.86, having proposed nothing to do.
+
+Compaction here buys the ability to continue past the window. It does not buy a smaller bill,
+and at the cache discounts this class of model offers it is unlikely to.
+
+### Finding 6 — What compaction costs is reliability across conversations
+
+The mean accuracy of the better strategies is excellent. What moves is which conversation you
+happen to be in. Per-seed `acc1`, one figure per seed:
+
+| | seeds |
+| --- | --- |
+| `none` at 60K/0.86 | 100, 100, 100, 100, 100 |
+| `anchored` at 60K/0.86 | 100, 85, 98, 89, 100 |
+| `tool_summary_anchored` at 120K/0.86 | 48, 100, 100, 100, 100 |
+| `context_window` at 60K/0.86 | 41, 41, 41, 41, 41 |
+
+The split between the two variance sources is the point. Earlier work measured `rep+-` — the
+same snapshot re-asked — at 0 to 2 points, while `seed+-` ran to 30-78 points. Re-asking is
+nearly perfectly repeatable; the variance is almost all in *which seed*, meaning where the
+planted facts fall against a retention boundary. A strategy either clears that boundary on a
+given conversation or it does not, which is why survival counts take a handful of discrete
+values rather than scattering: across six invocations of one earlier configuration,
+`tool_summary_anchored` preserved 53 facts or 39 and nothing between, and `anchored` preserved
+27, 52 or 53.
+
+`context_window`'s flat row above is the same effect with the sign reversed: it discards the
+same fraction every time, so it fails identically every time. Stability is not accuracy.
+
+The practical form of this: **read the seed spread beside the mean.** A strategy with a
+52-point seed spread is not "usually fine"; it is fine on four conversations in five.
+
+### Finding 7 — `acc2` is close to binary, and it is the least trustworthy column
+
+`acc2` asks for all 53 values in one answer. It is the same run scored a second way, not a
+second run, and it behaves nothing like `acc1`.
+
+| cell | control `acc1` | control `acc2` |
 | --- | ---: | ---: |
-| accuracy spread across repeats | 7-17pp | 31-78pp |
-| cost spread | 5-6% | 3-13% |
+| 60K / 0.86 | 100% | 95% |
+| 120K / 0.50 | 97% | 87% |
+| 120K / 0.70 | 97% | **46%** |
+| 120K / 0.86 | 98% | **62%** |
 
-The same configuration produced 13, 41, 48, 52, 59, 72 and 78-point spreads on different
-runs. That is not sampling noise to be averaged away; it is the property. A compacted agent
-answers well *on average* and unpredictably *in particular*, and an application that needs a
-dependable answer should read that as the real cost.
+The per-attempt values cluster at two levels rather than spreading: on the rows that preserved
+everything, almost every attempt reads about 100% or about 21%, with little in between, so a
+cell mean is mostly a count of which side the attempts fell on rather than a graded score.
 
-### Finding 5 — The advertised context window is not the input limit
+And it moves on a byte-identical prompt: on the uncompacted control at 60,000,
+**one attempt in fifteen collapsed from 100% to 21%** from the same restored snapshot that
+produced 100% on the other fourteen. It is asked three times per seed at 60,000 and five times
+per seed at each 120,000 cell, and it still moves that much; the control's `rep2+-` reaches 48
+points at 120K/0.86.
+
+What it largely measures is the model's willingness to enumerate 53 labelled values in one
+reply, which is a different question from whether the values survived compaction. **`acc1` is
+the column to read.** `acc2` is worth keeping for the one thing `acc1` cannot show —
+`tool_summary_anchored` scoring 100% on it in three cells, above the control every time, which
+says a compact grouped record is easier to search than the conversation it replaced — and worth
+distrusting everywhere else.
+
+### Finding 8 — Cost differences under about 20% are not resolvable
+
+The control's own cost spread within a cell is 17%, 21%, 19% and 9%. That is the floor on what
+any cost claim in this sweep can mean, and it is driven by reply length rather than by anything
+compaction does: on one clean five-seed control cell — the sequential 60,000/0.86 records in
+`runs/raw/oldprompt-conc1-*` — the output ran from 4,134 to 11,704 tokens across the five
+seeds, and output is priced 57 times a cache read at these rates.
+
+That is why the tables above carry `in$`, the prompt side of the same money. The instrument's
+own note on the column: on a clean five-seed control the total moved 38% while the input side
+moved 13%. Rank a *mechanism* on `in$`; `cost` is still the number that gets billed, and it is
+what the ranking uses.
+
+The consequence for reading section 4.1 is blunt. `context_window`'s +113% and +141% are
+results. `tool_summary_anchored`'s +10% to +26% premium is a result, and its cause is visible
+in the output column. Everything else in those tables — every row within 20% of the control —
+is unresolved on cost, and the honest statement is that those strategies cost about what not
+compacting costs.
+
+### Finding 9 — The advertised context window is not the input limit
 
 `gpt-5.4-mini` is documented at 400,000 tokens. Measured directly: 270,294 accepted, 275,292
 refused with HTTP 400 `context_length_exceeded`, `param: "input"`. The 400,000 is
@@ -204,74 +522,125 @@ limit, not the advertised window.
 
 ## 6. What to do
 
-**Size your tool results before choosing a strategy, and count the values in them.** Both
-the length of a result and the number of values buried in it decide whether a record can be
-trusted. Below roughly 10,000 tokens per result,
-having the model record the values and dropping the originals is both cheapest and lossless.
-Above that, keep a fixed proportion of each result and do not trust a summary.
+**Do not run the shipped default at a high fill without measuring it.** `context_window` at its
+0.5/0.8 thresholds was the worst row on both axes in every cell here, and the fuller the
+conversation the worse it got: at 0.86 fill, two and a half times the cost of not compacting
+for 38% of the accuracy. If you keep it, know that it compacts to a fixed share of the window
+regardless of how much conversation there is. Upstream #7912 changes this code path, and that
+version has not been measured here.
 
-**If the conversation fits your window comfortably, do not compact** — unless the prompt is
-large enough that the model answers worse from it, which happened here above 230,000 tokens.
+**Size a strategy's dial against the payload you have, not against the window.** A retention
+allowance expressed as a share of the ceiling goes inert once it exceeds your tool results, and
+turns generous exactly where it should be careful. Compare a strategy's `snap%` against the
+control's before believing it is doing anything at all.
 
-**Never let retention be a fixed size.** Make it a share of the window, or it silently becomes
-a rounding error at exactly the scale where it matters.
+**Never let retention be a fixed size either.** A fixed 4,096 characters becomes a rounding
+error at exactly the scale where retention matters, and with *n* values spread through a result
+you need more than 2/n of it to keep them all.
+
+**Do not compact for cost. Compact to continue past the window.** Nothing measured here is both
+cheaper than not compacting and as correct, on any model, provider or API this project has
+tested.
+
+**If you must compact and the answers matter, have the model record the values and drop the
+originals — and check the size of what it is being asked to read.** That was the only mechanism
+here to score above the uncompacted control on the hardest question, and it degrades once one
+call has to read roughly 100,000 tokens of context, or extract eight values from each of
+several large results. It costs extra model calls and materially more output.
 
 **Configure the input limit, not the model card.** And set the request's `max_tokens`
 explicitly: the compaction reservation is arithmetic, and nothing constrains the model to it
 unless the request says so.
 
-**Read the spread, not the median.** A strategy with a 78-point accuracy spread is not
-"usually fine".
+**Read `acc1`, and read the seed spread beside it.** A single accuracy figure for a compacting
+strategy is a statement about one conversation, and the combined-question column is close to
+binary — treat it as an indicator, not a measure.
 
 ## 7. What to try next
 
 **Summarise each tool result on its own, not all of them in one call.** The record thins as
 there is more to record, and the current design asks for one record covering every result in
-the band — so at 272,000 the model is asked to recall values from 151,200 tokens of material
-in a single answer. Summarising one result at a time bounds that work to roughly 8,000 tokens
-per call whatever the window size, which is the regime where the record scored 53 of 53.
+the band. Bounding it per result bounds both quantities it degrades with — the text one call
+must read, and the values it must extract — at the price of more calls. Every measurement in
+finding 2 points at it.
 
 Design notes for whoever builds it:
 
-- **Summarise when a result ages into the band, not when it arrives.** Compressing on
-  ingestion means the full result never reaches the model on any later turn, which is a
-  different product decision from compaction. Ageing keeps the result intact while it is
-  recent and the model is still working with it.
-- **Cost is the obvious trade.** One forced call per result instead of one per conversation,
-  so a six-tool run pays six extra agent turns. Against that, each call is small and reads a
-  cached prefix, and the current single-call design already costs one extra turn.
+- **Summarise when a result ages into the band, not when it arrives.** Compressing on ingestion
+  means the full result never reaches the model on any later turn, which is a different product
+  decision from compaction. Ageing keeps the result intact while it is recent and the model is
+  still working with it.
+- **Cost is the obvious trade.** One forced call per result instead of one per conversation, so
+  a six-tool run pays six extra agent turns. Against that, each call is small and reads a
+  cached prefix, and the current single-call design already costs extra calls — 44 against 40
+  at 60,000, 71 against 66 at 120,000/0.86.
 - **Cache behaviour should be no worse and may be better.** Each record is created once,
   frozen, and covers one group, so mutations still march forward and never revisit. Records
   accumulate rather than being rewritten, which is the property that gave this family its
-  86-90% hit rates.
+  90-94% hit rates.
 - **It gives the fallback something better to do.** With per-result records, a thin or missing
   record loses that result rather than everything the band held.
 
-**Settle whether compaction should keep running while the model is being scored.** It
-currently does: the closing turns go through the same loop as every other turn, so the first
-scope is asked from a fuller context than the last, and the combined question — the hardest --
-is asked from the most compacted context of all. Each closing answer also lists codes, putting
-them back into history, which offsets that in an uncontrolled direction. A
-`--freeze-during-answers` flag and both arms at 272,000 would settle it, and it is a live
-candidate for the 39-78 point accuracy spread that nothing else has explained.
+**Sweep the payload, not just the fill.** `--tool-result-tokens` is fixed at 3,500 in every
+current cell, which is why `anchored` has nothing to do at 120,000 and why this sweep says
+nothing about the shape result the earlier series found. Varying it across runs — at a fixed
+window and fill, against the same strategies — is the one parameter that would make `anchored`
+testable at 120,000 and above, and it would put the record's degradation on a controlled axis
+rather than one confounded with the window. It is also the cheapest missing measurement: the
+payload is the term the fill solver holds fixed, so a payload sweep moves one number per run.
+
+**Run the after arm of upstream #7912.** The current sweep is a clean *before* arm — no
+framework file is modified, so it measures upstream compaction verbatim at our merge-base.
+Re-running it rebased on upstream main would say whether the fix improves the shipped default
+on cost and on recall. It should be reported as "upstream main before and after #7912" rather
+than as an isolated bisect: the rebase advances forty commits, of which #7912 is the
+compaction-relevant one.
 
 ## 8. Limits
 
-**One model, one route, one conversation shape.** The mechanisms generalise; the crossover
-point almost certainly does not.
+**One model, one route, one conversation shape.** The mechanisms generalise; the numbers do
+not. The current cells also ran on a second deployment of the model, on a different
+subscription and SKU from every earlier run. Nothing suggests the deployment matters, and
+nothing here rules it out either.
 
-**Accuracy spreads are wide and did not resolve at five repeats.** Every accuracy figure above
-is a median with a spread beside it, and the spread is often larger than the differences
-between strategies. Cost and prompt-size figures are much tighter.
+**The payload is fixed at 3,500-token results in every current cell.** Result size is the
+variable the earlier series moved and this one does not, so the two answer different questions,
+and section 4.1 does not supersede section 4.2 on shape.
+
+**Only one window has more than one fill.** The sweep is 60,000 at 0.86 and 120,000 at three
+fills. There is no measurement at 272,000 under the current instrument, and the fill axis is
+untested at 60,000.
+
+**Cost differences under about 20% are not resolvable** — see finding 8 — and neither are
+accuracy differences of a few points at five seeds.
+
+**`acc2` is close to binary and unstable** — see finding 7.
+
+**`rep+-` is 0pp by construction** in these cells, because `--probe-repeats 1`. The within-seed
+variance they measure is `rep2+-`, on the combined question only. That trade was deliberate:
+re-asking one snapshot was measured at 0-2 points of spread while seeds ran to 30-78, so seeds
+buy more than repeats do at the same price.
+
+**The output reservation is not the output cap.** Strategies size their input budget as
+`--context-window` minus `--max-output-tokens` (2,048 in these runs), while the value actually
+sent on the request is `--answer-max-tokens` (12,000). So every threshold is a fraction of a
+budget overstated by roughly 10,000 tokens. It does not distort the results here — this model's
+input and output ceilings are independent, and disqualification is checked on the prompt alone
+— but the thresholds are not exactly where the flag values suggest. Fixing it needs a clean
+re-baseline of every cell, so it waits for a model boundary.
+
+**`context_window` at the two lower 120,000 fills carries `DRIFT:5`**, so five of its probes
+per cell were asked from a prompt the strategy had edited again after restore. Those rows
+overstate what reached the model.
 
 **The scoring guidance is inert for the control.** Every row is told how to read a compaction
 record; `none` has no record, so the clause helps only the compacting strategies. It cannot
 create facts, but the asymmetry is real.
 
-**`tool_summary_anchored` costs an extra agent turn**, visible as 32 model calls against 29.
-That is included in every cost figure above.
-
 ---
 
-*Source data — verbatim output and exact invocations — is in [`runs/`](runs/). Full tables and
-the earlier cross-model work are in [`RESULTS.md`](RESULTS.md).*
+*Source data — verbatim output, per-seed records and exact invocations — is in
+[`runs/`](runs/); `cachebench_live --from-jsonl <file>` rebuilds any current table from the
+records beside it. Full tables and the earlier cross-model work are in
+[`RESULTS.md`](RESULTS.md); the strategies written here are documented in
+[`agent_framework_lab_cachebench/compaction/STRATEGIES.md`](agent_framework_lab_cachebench/compaction/STRATEGIES.md).*

@@ -112,16 +112,22 @@ _MAX_SHED_PASSES: Final[int] = 4
 #: tokens removed, ``B`` for the included tokens sitting behind the edit, ``T`` for the turns
 #: still to come, and ``p`` and ``c`` for the uncached and cached prices. On the turn after
 #: the edit the compacted arm pays ``(B - R) * p`` where the uncompacted arm pays ``B * c``,
-#: and on each of the ``T - 1`` turns after that it pays ``R * c`` less. So the edit repays
-#: itself when ``T * R * c > (B - R) * (p - c)``, which is::
+#: and on each of the ``T`` turns after that it pays ``R * c`` less. So the edit repays itself
+#: when ``T * R * c > (B - R) * p - B * c``, which rearranges to::
 #:
-#:     R > B / (1 + T * c / (p - c))
+#:     R > B * (p - c) / (p + T * c)
 #:
-#: At the measured prices -- 0.66 and 0.07 per million, so ``c / (p - c)`` is 0.1186 -- and at
-#: the cell where the anchored row was measured (``B`` about 40,000 tokens behind the edit,
-#: ``T`` about 20 turns left) that is ``R > 11,859`` tokens against a 52,322-token snapshot:
-#: 22.7% of the included prompt, rounded up here so the floor is never *below* the break-even
-#: it is derived from. What the anchored row actually removed at that cell was 263 tokens,
+#: The first term on the right of that inequality is ``(B - R) * p - B * c`` and not
+#: ``(B - R) * (p - c)``: the tokens removed are not re-sent, so they are not re-read at the
+#: cached price either, and writing it the other way drops an ``R * c`` and overstates the
+#: floor by about 3%.
+#:
+#: At the measured prices -- 0.66 and 0.07 per million -- and at the cell where the anchored
+#: row was measured (``B`` about 40,000 tokens behind the edit, ``T`` about 20 turns left) that
+#: is ``R > 11,456`` tokens against a 52,322-token snapshot: 21.9% of the included prompt,
+#: rounded up here so the floor is never *below* the break-even it is derived from.
+#:
+#: What the anchored row actually removed at that cell was 263 tokens,
 #: 0.5%, and it cost 11% more than not compacting at all -- 46,471 tokens re-read at full
 #: price to save 263, which is 177 to 1 against.
 #:
