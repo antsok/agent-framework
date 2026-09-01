@@ -1174,6 +1174,81 @@ Cost: about $3.1, roughly EUR 2.8.
 
 ---
 
+## Runs 26 and 27 — the rebuilt instrument, four cells
+
+The first results from the seed/snapshot/probe design, on `gpt-5.4-mini-2`. Five seeds per
+cell, one probe repeat, five attempts at the combined question, payload fixed at 3,500-token
+tool results with eight codes each. **90 records, no errors, no throttling, no
+disqualifications.** `acc1` is the seven per-scope questions, `acc2` the one combined question,
+`snap%` the share of the tried window the probes were answered from.
+
+| cell | none | truncation | anchored | anchored_min_gain | tool_summary_anchored | context_window |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 60K / 0.86 | — | +2% | +17% | +12% | **+10%** | +58% |
+| 120K / 0.50 | — | -1% | -1% | +3% | +26% | +27% |
+| 120K / 0.70 | — | +0% | +2% | -2% | +20% | **+113%** |
+| 120K / 0.86 | — | -1% | +6% | +3% | +22% | **+141%** |
+
+*Cost against the uncompacted control. Read against control spreads of 9-21%: only the
+`context_window` figures and `tool_summary_anchored`'s premium are outside the noise.*
+
+### The shipped default gets worse the more it is needed
+
+`context_window` is the strategy `create_harness_agent` installs. Its cost against not
+compacting rises with fill, and its cache hit rate falls as it does:
+
+| fill | vs none | hit% | snap% | facts | acc1 |
+| ---: | ---: | ---: | ---: | ---: | ---: |
+| 0.50 | +27% | 88% | 46% | 41/53 | 72% |
+| 0.70 | +113% | 66% | 47% | 23/53 | 43% |
+| 0.86 | **+141%** | **57%** | 47% | 21/53 | 38% |
+
+It compacts to the same 47% of the window at every fill, so the fuller the conversation the
+more it throws away -- and the more of the surviving prefix it rewrites, which is what the hit
+rate is measuring. At 0.86 it costs **two and a half times** not compacting and answers 38% of
+what the control answers. Both axes, worst row, every cell.
+
+### The two anchored rows swap places with the window
+
+`anchored` keeps a share of the *ceiling*, so a bigger window makes it more generous:
+
+| cell | anchored | facts | acc1 | acc2 |
+| --- | ---: | ---: | ---: | ---: |
+| 60K / 0.86 | +17% | 51/53 | 94% | 87% |
+| 120K / 0.70 | +2% | 53/53 | 98% | 68% |
+| 120K / 0.86 | **+6%** | **53/53** | **99%** | **100%** |
+
+At 120K/0.86 it is the best faithful row in the sweep: everything preserved, both accuracy
+measures at or above the control, six percent dearer.
+
+`anchored_min_gain` declines a collapse whose saving cannot repay the cache invalidation. At
+60K it declined every one and came 5% under plain `anchored`; at 120K the two are within a
+point or two of each other and of the control. **The floor is worth having and is not worth
+much** -- it prevents a specific waste rather than making compaction pay.
+
+### The record is reliable until the bulk defeats it
+
+`tool_summary_anchored` was the only row perfect on both accuracy measures in three of four
+cells -- 53/53, 100%, 100%, with zero spread on either measure -- and the only row that ever
+beat the control on `acc2`. It costs 10 to 26% more, and the premium is its own output: 17,628
+tokens against the control's 10,417 at 120K/0.70.
+
+At 120K/0.86 it breaks: 47/53 facts, `acc1` 90%, and a seed spread of 52 points. That is the
+same failure the window series found before -- the record degrades with the material it must
+read -- arriving here at about 96,000 tokens of context.
+
+### What no cell shows
+
+**No strategy is cheaper than not compacting with its answers intact.** Every row that reads
+below the control -- `truncation` at -1%, `anchored_min_gain` at -2% -- is inside a control
+spread of 9 to 21%, and `truncation` pays for its at 0.86 by losing 30 of 53 facts.
+
+Compaction here buys the ability to continue past the window, not a lower bill.
+
+Cost: about $34, roughly EUR 31.
+
+---
+
 ## Models that could not be measured
 
 **`google/gemini-3.7-flash` — excluded.** Its turns fail partway through a conversation
