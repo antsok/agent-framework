@@ -64,6 +64,13 @@ SCHEMA_VERSION: Final[int] = 2
 #: measure rather than what it measured: a cell abandoned after three strategies and resumed
 #: for the other two is one cell, and has to aggregate as one. Includes the prices, because
 #: two runs priced differently produce costs that cannot go in one column.
+#:
+#: ``tool_share`` is here although ``tool_result_tokens`` already carries what it derived, and
+#: so already separates two workloads that differ: two shares reaching one per-result size
+#: would have to build the same conversation. It is kept for the reason ``fill`` is, which is
+#: likewise nearly implied by ``filler_turns`` and ``filler_tokens`` -- the key states the
+#: parameter that was set and not only the number it produced, so a file holding a sweep can
+#: be read back against the sweep's own axes.
 _CELL_KEY_FIELDS: Final[tuple[str, ...]] = (
     "provider",
     "model",
@@ -75,6 +82,7 @@ _CELL_KEY_FIELDS: Final[tuple[str, ...]] = (
     "narration",
     "fact_placement",
     "tool_result_tokens",
+    "tool_share",
     "filler_turns",
     "filler_tokens",
     "tool_turns",
@@ -107,6 +115,12 @@ def _plan_from_dict(data: Mapping[str, Any]) -> FillPlan:
         predicted_tokens=int(data["predicted_tokens"]),
         payload_tokens=int(data["payload_tokens"]),
         tool_payload_tokens=int(data["tool_payload_tokens"]),
+        # The two sizing fields are read leniently where the rest are not, because a plan
+        # written before the payload could be derived has neither and its run is not in doubt:
+        # the size was stated, which is what a share of 0 means, and it is on the cell beside
+        # this plan. Demanding them here would refuse every record already on disk.
+        tool_result_tokens=int(data.get("tool_result_tokens", 0)),
+        tool_share=float(data.get("tool_share", 0.0)),
     )
 
 
@@ -141,6 +155,11 @@ class CellParams:
     narration: str
     fact_placement: str
     tool_result_tokens: int
+    """Size each tool result was built to, whether stated or derived from ``tool_share``.
+
+    What the run did, not what it was asked for, so a table rebuilt from the file describes
+    the workload that was measured however it came to be chosen.
+    """
     filler_turns: int
     filler_tokens: int
     tool_turns: int
@@ -159,6 +178,17 @@ class CellParams:
     Defaulted to 1 for a record written before the combined question had its own count, where
     it was one of the closing questions and so asked ``probe_repeats`` times --
     :meth:`from_dict` fills that in, so an old file reads as the measurement it was.
+    """
+    tool_share: float = 0.0
+    """Share of the fill target the tool results were sized to reach, 0 when the size was stated.
+
+    The request beside its result: ``tool_result_tokens`` above is what this derived. Both are
+    recorded because neither reconstructs the other -- the size cannot say what fraction of the
+    context it was meant to be, and the share cannot be turned back into a size without the
+    window, the fill and the tool-group count.
+
+    Defaulted to 0 for a record written before the payload could be derived, where the size was
+    stated outright and 0 is what that means.
     """
     min_correctness: float = DEFAULT_MIN_CORRECTNESS
     """The correctness bar the verdict applied.
@@ -192,10 +222,15 @@ class CellParams:
     def label(self) -> str:
         """Return a one-line description of the cell, for a file holding more than one."""
         fill = f"fill {self.fill:.0%}" if self.fill > 0 else "fill manual"
+        # The share, when there was one, sits beside the size rather than replacing it: the
+        # size is what the conversation carried and the share is why it was that size, and a
+        # sweep across window sizes needs both to be readable as one axis.
+        payload = f"payload {self.tool_result_tokens:,}x{self.tool_turns}"
+        if self.tool_share > 0:
+            payload += f" at share {self.tool_share:.0%}"
         return (
             f"{self.provider}:{self.model}  agent {self.agent_kind}  "
-            f"window {self.context_window:,}  {fill}  "
-            f"payload {self.tool_result_tokens:,}x{self.tool_turns}  "
+            f"window {self.context_window:,}  {fill}  {payload}  "
             f"probes {self.probe_repeats}  combined {self.combined_repeats}"
         )
 
