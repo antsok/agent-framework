@@ -33,6 +33,10 @@ they are copied, not recomputed.
 | `run-21-freeze-validation.*` | 21 | 120,000 | harness | 53 | 8 min, **mechanism only** |
 | `run-22-freeze-paired-272k-*.txt` | 22 | 272,000 | harness | 53 | 2 h 20 min, two arms |
 | `run-23-bimodality-60k.*` | 23 | 60,000 | harness | 53 | 40 min, six invocations |
+| `run-24-new-instrument-60k.*` | 24 | 60,000 | harness | 53 | 77 min, instrument validation |
+| `run-25-stage1-60k-fill*` | 25 | 60,000 | harness | 53 | old prompt, superseded by 26 |
+| `run-26-60k-fill86.*` | 26 | 60,000 | harness | 53 | 60 min, 5 seeds |
+| `run-27-120k-fill*` | 27 | 120,000 | harness | 53 | 6 h, 3 fills x 5 seeds |
 
 Run 19 raised the call count to sixteen by dropping the codes per result from eight to three,
 so it changed call count, result size and code count together. Run 20 is the honest form: six
@@ -104,3 +108,11 @@ and that `az login` has been run, since the Foundry provider authenticates with
 Costs are not small. Run 7 was about EUR 8 and Run 8 about EUR 14, both at the rates passed
 on the command line; a run that omits `--price-input` will fail rather than guess, because
 only OpenRouter pricing is auto-discoverable.
+
+Runs 26 and 27 are the first under the rebuilt instrument: the conversation is seeded to a
+share of the tried window, snapshotted, and every closing question asked from that snapshot
+rather than appended to it. Their `.jsonl` files are the records themselves -- `cachebench_live
+--from-jsonl <file>` rebuilds the table from them, which is how the `.txt` beside each was
+produced. Anything earlier used the old design and its `all` column, today's `acc2`, is
+inflated: the combined question was asked last, after seven answers had already re-listed the
+codes into the context it read.
