@@ -36,6 +36,9 @@ behaviour change.
 namespace Microsoft owns, and a package published from there would claim an association it
 does not have. The distribution and its import path both have to move out of
 ``agent_framework`` first; only the dependency on it stays.
+
+What each strategy does, why it is shaped that way and where it fails is in
+``STRATEGIES.md`` beside this file. It travels with the package.
 """
 
 from ._anchored import (
