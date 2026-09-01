@@ -463,3 +463,9 @@ The subpackage depends on `agent_framework._compaction`, which is **private API*
 upstream PR [#7912](https://github.com/microsoft/agent-framework/pull/7912) has just rewritten.
 `compaction/__init__.py` says what that means for whoever extracts it, and what has to be
 renamed before anything is published from there.
+
+## The strategies written here
+
+`agent_framework_lab_cachebench/compaction/STRATEGIES.md` explains each one: the
+mechanism, the design constraints behind it, and the short evidence for when it works
+and when it does not. It lives inside the subpackage because it travels with it.
