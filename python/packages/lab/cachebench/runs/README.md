@@ -116,3 +116,12 @@ rather than appended to it. Their `.jsonl` files are the records themselves -- `
 produced. Anything earlier used the old design and its `all` column, today's `acc2`, is
 inflated: the combined question was asked last, after seven answers had already re-listed the
 codes into the context it read.
+
+## Raw records
+
+[`raw/`](raw/) holds the per-seed records from every run made under the rebuilt instrument,
+including the failed ones, with a README of its own saying what each group is evidence for.
+Those files are the measurement: `cachebench_live --from-jsonl` rebuilds any table from them
+through the same aggregation the live run uses, so nothing here has to be taken on trust.
+
+Runs before 24 predate that format and exist only as captured stdout.
