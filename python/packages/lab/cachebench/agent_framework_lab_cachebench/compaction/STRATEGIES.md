@@ -23,10 +23,13 @@ The removed tokens are not re-sent, so they are not re-read at the cached price 
 Writing the first term as `(B − R)(p − c)` rather than `(B − R)p − Bc` drops an `R·c` and
 overstates the floor by about 3%.
 
-At a 40,000-token suffix with twenty turns left, that is about **22% of the prompt**. Removing
-less than that costs more than it saves, however sensible the removal looks. Measured: one
-strategy removed 263 tokens, dropped its cache hit rate from 92% to 88% — 46,471 extra
-full-price tokens — and cost 11% more than not compacting at all.
+The right-hand side is a share of `B` and of nothing else. With twenty turns left it is **29%
+of the tokens behind the edit** — not of the prompt, which it only resembles when the edit
+starts near the front of the conversation. Removing less than that costs more than it saves,
+however sensible the removal looks. Measured: at a 60,000-token window the anchored row held a
+lower prompt-cache hit rate than the uncompacted control on every one of five seeds, 89–93%
+against 91–95%. That gap is the price of editing at all, paid whether or not the edit removed
+anything worth having.
 
 Two consequences run through everything here. **Decide from position, not content**, so a
 decision made on turn 5 is still the same decision on turn 20 and the prefix stabilises after
@@ -38,16 +41,31 @@ so the conversation stays legible and the edit stays local.
 ## `AnchoredCompactionStrategy`
 
 **Mechanism.** Keeps a fixed number of head groups and tail groups verbatim, and shortens the
-tool results in the band between them. Each banded result is trimmed to a share of the
-ceiling:
+tool results in the band between them. Each banded result is trimmed to a share of the ceiling
+set by where in the band it sits, counting from the head:
 
 ```
-keep_tokens = max_input_tokens × band_share ÷ tool groups in the band
+keep_tokens = max_input_tokens × band_share ÷ (band position + 1)
 ```
 
 `band_share` defaults to 0.25. Only if shortening leaves the prompt over the ceiling does it
 remove whole groups, oldest first. Every decision is a function of a message's position, so it
 does not change as the conversation grows.
+
+The divisor used to be the number of tool groups in the band *at that moment*, and a result is
+trimmed once — `_shorten` leaves a result that already carries the marker alone — so retention
+froze at whatever the band happened to be wide on the turn the trim fired. At a 120,000-token
+window that is 29,488 tokens for a result caught alone in the band against 4,914 for one caught
+sixth: a decision that moved with the conversation's current size, which is what this design
+exists to avoid.
+
+Reading the divisor off the result's own position instead costs the band its constant bound: it
+is now `band_share` of the ceiling times the harmonic number of the band's tool groups — 2.4×
+at six groups, 3.6× at twenty — with each further group adding less than the one before. That
+is forced rather than chosen. A budget that never trims what the old rule left alone has to be
+at least `band_share × ceiling ÷ (position + 1)` at every position, and those terms sum without
+limit; the alternative is a bounded band that starts spending cache at windows where everything
+already fits.
 
 The head anchor is load-bearing: it holds the system prompt and the opening requirements, which
 are what give later values their meaning. The tail is what the model is currently working on.
@@ -58,9 +76,9 @@ common case in a real agent trace. In the window series it preserved all 53 plan
 result.
 
 **When it does not.** When results are *smaller* than the allowance, it plans nothing and
-returns without acting. With 3,500-token results at a 120,000-token window the allowance is
-about 5,900 tokens, so it is inert — measured across ten seeds, its snapshots were no smaller
-than the uncompacted control's. It is not performing badly there; it is not performing.
+returns without acting. With 3,500-token results at a 120,000-token window the smallest
+allowance in a six-group band is 4,914 tokens, so it is inert. It is not performing badly
+there; it is not performing.
 
 The allowance scales with the window and not with the payload, so the same configuration can be
 aggressive at 60,000 tokens and idle at 120,000. Size `band_share` against the results you
@@ -77,8 +95,15 @@ default to measure what dropping it costs.
 
 **Mechanism.** `AnchoredCompactionStrategy`, plus a floor. Before mutating anything it prices
 the collapse it is about to perform, and declines if the projected saving is below
-`min_gain_fraction` of the current prompt. The default is **0.23**, the break-even above
-rounded up so the floor is never under its own threshold.
+`min_gain_fraction` of the tokens the collapse puts back on the meter — the included prompt
+from its earliest rewrite to the end, the `B` above. The default is **0.29**, the break-even
+above rounded up so the floor is never under its own threshold.
+
+The base is `B` and not the prompt because everything in front of the earliest rewrite stays
+cached and is never paid for again. Charging the collapse for the prompt overstates its cost by
+`prompt ÷ B`: invisible for a collapse that starts at the head of the band, and enough to
+refuse every incremental collapse of a group that has just aged out of the tail, where the edit
+is near the end and `B` is a fraction of the prompt.
 
 The projection is the plan the collapse then executes, not a mutate-and-roll-back: compaction
 marks exclusions by mutating `additional_properties` in place, and a rollback that misses one
@@ -88,9 +113,18 @@ field is a silent wrong measurement.
 not an optimisation whose saving must beat a cache cost — it is what keeps the conversation
 admissible, and declining it would hand the work to whole-group removal.
 
-**When it works.** Exactly where the parent wastes money: at a 60,000-token window with
-3,500-token results it declined 28 to 50 collapses per seed and came out about 5% cheaper than
-the parent, with the same facts preserved.
+**When it works.** Where the parent wastes money, though the one cell that measured it does not
+say so cleanly. At a 60,000-token window with 3,500-token results it declined 28 to 50
+collapses a seed. Its cost against the parent, seed by seed, was 0.67, **1.40**, 0.86, 0.96,
+0.96: cheaper on four seeds, 40% dearer on the fifth, and the "about 5% cheaper" that the
+totals give is one seed carrying the other four. The control's own cost varies by 18% across
+those same five seeds, so the difference does not clear the run's noise. Recall moved in both
+directions too — on seed 4 the floor kept all 53 planted facts where the parent lost five, and
+on seed 2 it kept 42 where the parent kept 48.
+
+Those rows were produced by a floor measured against the whole prompt rather than against `B`
+(`REVIEW-2026-09-02.md` §2), so they describe a floor that refused a great deal more than the
+break-even asks it to.
 
 **When it does not.** It prevents a specific waste; it does not make compaction pay. Where the
 parent is inert the floor is never consulted at all, and both rows behave identically. Nothing
@@ -138,10 +172,16 @@ overflow while waiting.
   Truncation is detected from the provider's `finish_reason` and counted.
 
 **When it works.** It is the strongest recall result this package has produced. In three cells
-of four it preserved every planted fact with full marks on both accuracy measures and no
-spread across seeds, and it is the only strategy that has ever scored *above* the uncompacted
-control on the hardest question — the one asking for every value at once. A compact grouped
-record is easier to search than the conversation it replaced.
+of four it preserved every planted fact with full marks on both accuracy measures and no spread
+across seeds.
+
+It also read above the uncompacted control on the combined question — the one asking for every
+value at once — and that comparison does not survive scrutiny. The combined question never had
+its counts spelled out the way the scoped ones did, so 226 of 240 control samples land on
+exactly 1.0 or 11/53: the five non-tool facts plus one code per lookup, the model reading *every
+code returned by every deployment lookup* as *the* return code of each. Where the expected
+answer is a grouped list, a grouped record is being copied straight into it, and the measure is
+rewarding the record's format (`REVIEW-2026-09-02.md` §5).
 
 **When it does not.** The record degrades with the bulk it must read and the number of values
 it must pull out. Both matter independently: at 25,200-token results it preserved 18 of 53
@@ -166,6 +206,13 @@ above points at it.
 cell measured, each row reading below the uncompacted control sits inside the control's own
 cost spread, and the rows that are genuinely cheaper are cheaper because they discarded the
 conversation.
+
+Read that as a direction and not as a size. Two instrument defects sit under every cost number
+here (`REVIEW-2026-09-02.md` §1): the control drops byte-identical acknowledgements that the
+annotated rows keep, which makes the control artificially cheap, and `cost` includes twelve
+probe re-reads of a frozen snapshot, which flatters whatever compacted hardest. They push
+opposite ways on different cells, so no single correction rescues the axis, and the headline
+cost comparisons are pending a repaired instrument.
 
 Compaction here buys the ability to continue past the context window. It does not buy a
 smaller bill, and at the cache discounts these models offer it is unlikely to.

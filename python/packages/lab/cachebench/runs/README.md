@@ -92,8 +92,21 @@ strange:
   and its accuracy cannot be read against it.
 - **`flags`** — `ERR` a failed turn, `S<n>` summarizer failures, `<n>/<n>t` turns completed,
   `NO:<opt>` an option the provider rejected and the harness dropped, `FETCH` a row that
-  gathered a different fact set from the control. **An empty flags column is a precondition
-  for reading the row at all.**
+  gathered a different fact set from the control, `MSGS:<±n>` the control ran a conversation
+  n messages away from the strategy rows', `NOSPLIT` the row cannot say what its probing cost.
+  **An empty flags column is a precondition for reading the row at all.**
+
+## The money columns moved
+
+Every `.txt` in this directory was rendered before the cost axis was split, when `in$`, `cost`,
+`+-` and `vs none` all described the whole run — seeding plus twelve probes, each of which
+re-sends the entire snapshot. Re-rendering the same `.jsonl` today produces `seed in$`, `seed$`,
+`probe$`, `run$`, `seed$+-` and `vs none$`, of which only `run$` is comparable with what the
+`.txt` beside it shows: `run$` is the old `cost` unchanged, and the four other money columns
+read `?` because these records counted their calls in one total and the halves cannot be
+recovered from them. **Every one of these cells also carries `MSGS` on its control**, so its
+cost comparisons are withdrawn and it prints no verdict. `REVIEW-2026-09-02-REREAD.md` is the
+cell-by-cell reading.
 
 ## Noise at the end of each log
 

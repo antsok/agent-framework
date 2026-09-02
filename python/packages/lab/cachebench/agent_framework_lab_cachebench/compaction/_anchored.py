@@ -80,11 +80,14 @@ EXCLUDE_REASON: Final[str] = "anchored_compaction"
 #: preserve uniformly distributed information at any budget worth calling compaction.
 DEFAULT_KEEP_TOKENS: Final[int] = 150
 
-#: Fraction of the ceiling the collapsed middle band may occupy, shared between its tool
-#: results. A fixed per-result budget cannot work: measured at a 60,000-token window a
-#: 600-character retention is 0.9% of the result, and at 272,000 it is 0.3%. The strategy
-#: scored 32 of 53 facts in the first case and 11 in the second -- 11 being exactly the five
-#: non-tool facts plus the one code per result that fell inside the surviving head fragment.
+#: Fraction of the ceiling the oldest tool result in the collapsed middle band may occupy.
+#: The ``n``-th result in the band gets an ``n``-th of it; see :meth:`_keep_tokens_for` for
+#: why the divisor is the result's own position rather than the band's width.
+#:
+#: A budget fixed in tokens cannot work: measured at a 60,000-token window a 600-character
+#: retention is 0.9% of the result, and at 272,000 it is 0.3%. The strategy scored 32 of 53
+#: facts in the first case and 11 in the second -- 11 being exactly the five non-tool facts
+#: plus the one code per result that fell inside the surviving head fragment.
 DEFAULT_BAND_SHARE: Final[float] = 0.25
 
 #: Refinement passes when converting a token budget into a character offset. Two is enough:
@@ -104,7 +107,8 @@ MARKER_ID_PREFIX: Final[str] = "anchored_"
 #: termination condition cannot become an infinite loop inside a chat client.
 _MAX_SHED_PASSES: Final[int] = 4
 
-#: Share of the currently included prompt a collapse must remove before it is worth making.
+#: Share of the tokens *behind* a collapse that the collapse must remove before it is worth
+#: making.
 #:
 #: Derived rather than chosen. Prompt caching is strict-prefix, so an edit at position K makes
 #: the provider re-read everything behind K once at the uncached price; the edit then saves
@@ -122,19 +126,24 @@ _MAX_SHED_PASSES: Final[int] = 4
 #: cached price either, and writing it the other way drops an ``R * c`` and overstates the
 #: floor by about 3%.
 #:
-#: At the measured prices -- 0.66 and 0.07 per million -- and at the cell where the anchored
-#: row was measured (``B`` about 40,000 tokens behind the edit, ``T`` about 20 turns left) that
-#: is ``R > 11,456`` tokens against a 52,322-token snapshot: 21.9% of the included prompt,
-#: rounded up here so the floor is never *below* the break-even it is derived from.
+#: The right-hand side is a share of ``B`` and of nothing else. At the measured prices --
+#: 0.66 and 0.07 per million -- with twenty turns left it is 0.286, and this default is that
+#: rounded up to the next percent so the floor is never *below* the break-even it comes from.
 #:
-#: What the anchored row actually removed at that cell was 263 tokens,
-#: 0.5%, and it cost 11% more than not compacting at all -- 46,471 tokens re-read at full
-#: price to save 263, which is 177 to 1 against.
+#: The previous default, 0.23, was the same figure scaled by the ``B``-to-prompt ratio of the
+#: single cell it was fitted to -- ``B`` about 40,000 tokens behind the edit against a
+#: 52,322-token snapshot, so about 0.76 -- and then compared against the whole prompt. The two
+#: forms agree at that one geometry and differ everywhere else by a factor of ``prompt / B``.
+#: A whole-band collapse starting near the head of the band has a large ``B`` and is barely
+#: affected; the incremental collapse of one group that has just aged out of the tail sits
+#: near the end of the prompt, where ``B`` can be a fifth of it, and the prompt-based form
+#: then asks that collapse for five times its own base. That is the shape the floor met most
+#: often -- 28 to 60 refusals a seed across the recorded rows -- and it could not pass.
 #:
 #: ``T`` is the term nobody knows at decision time, and it divides: ten remaining turns need
-#: 35% and forty need 13%. This default is the twenty-turn figure, so a caller who expects
-#: shorter conversations should raise it rather than trust it.
-DEFAULT_MIN_GAIN_FRACTION: Final[float] = 0.23
+#: 43% of ``B`` and forty need 17%. This default is the twenty-turn figure, so a caller who
+#: expects shorter conversations should raise it rather than trust it.
+DEFAULT_MIN_GAIN_FRACTION: Final[float] = 0.29
 
 
 def _is_marker(message: Message) -> bool:
@@ -149,11 +158,16 @@ class _Shortening:
     ``saved_tokens`` is measured on the result text rather than on the serialized message, so
     it omits the few tokens of JSON envelope that the rewrite does not change. The two agree
     to within a token per result, and the text is what the reduction is actually made of.
+
+    ``message_index`` is where the rewrite lands, which a subclass pricing the collapse needs:
+    a strict-prefix cache is spent on everything from the earliest rewrite to the end of the
+    prompt, so that suffix and not the prompt is what a saving has to be weighed against.
     """
 
     content: Content
     text: str
     saved_tokens: int
+    message_index: int
 
 
 class AnchoredCompactionStrategy:
@@ -174,14 +188,16 @@ class AnchoredCompactionStrategy:
             model loses the thread of what it is doing, too large and each new turn shifts a
             large block and re-bills it.
         keep_tokens: Tokens of a collapsed tool result to retain, split between its head and
-            its tail. ``None`` derives it from ``band_share``, which is what makes the
-            retention scale with the window instead of shrinking to nothing as results grow.
-            Counted with the tokenizer rather than converted from characters: a fixed
-            characters-per-token guess was wrong by a factor of two on this workload, which
-            both wasted budget and made the reported retention wrong.
-        band_share: Fraction of ``max_input_tokens`` the whole collapsed band may occupy,
-            divided evenly between the tool results in it. Raising it keeps more of each
-            result and saves less.
+            its tail, the same for every result. ``None`` derives it from ``band_share`` and
+            the result's position, which is what makes the retention scale with the window
+            instead of shrinking to nothing as results grow. Counted with the tokenizer rather
+            than converted from characters: a fixed characters-per-token guess was wrong by a
+            factor of two on this workload, which both wasted budget and made the reported
+            retention wrong.
+        band_share: Fraction of ``max_input_tokens`` the band's oldest tool result may occupy,
+            the ``n``-th getting an ``n``-th of it. Raising it keeps more of each result and
+            saves less. See :meth:`_keep_tokens_for` for why the divisor is the result's own
+            position and not the band's width.
         collapse_assistant_text: Allow assistant narration in the middle band to be dropped
             when tool shedding is not enough. Last resort, because narration is often where
             a tool's values ended up after the model restated them.
@@ -315,12 +331,18 @@ class AnchoredCompactionStrategy:
         Returns:
             One entry per tool result whose text would change, in band order.
         """
-        budget = self._keep_tokens_for(band)
         plan: list[_Shortening] = []
+        position = 0
         for group in band:
             if group.get("kind") != "tool_call":
                 continue
-            for message in messages[group["start_index"] : group["end_index"] + 1]:
+            budget = self._keep_tokens_for(position)
+            # Counted over every tool group in the band, whether or not it still has a result
+            # to shorten, so that a group already shed or already trimmed still occupies its
+            # place and the groups behind it keep the position -- and the budget -- they had.
+            position += 1
+            for index in range(group["start_index"], group["end_index"] + 1):
+                message = messages[index]
                 if message.additional_properties.get(EXCLUDED_KEY, False):
                     continue
                 for content in message.contents:
@@ -331,7 +353,7 @@ class AnchoredCompactionStrategy:
                     if shortened == text:
                         continue
                     saved = self.tokenizer.count_tokens(text) - self.tokenizer.count_tokens(shortened)
-                    plan.append(_Shortening(content=content, text=shortened, saved_tokens=saved))
+                    plan.append(_Shortening(content=content, text=shortened, saved_tokens=saved, message_index=index))
         return plan
 
     @staticmethod
@@ -348,26 +370,54 @@ class AnchoredCompactionStrategy:
             item.content.result = item.text
         return bool(plan)
 
-    def _keep_tokens_for(self, band: list[dict[str, Any]]) -> int:
-        """Return how many characters each collapsed tool result may keep.
+    def _keep_tokens_for(self, band_position: int) -> int:
+        """Return how many tokens one collapsed tool result may keep.
 
-        An explicit ``keep_tokens`` is honoured verbatim. Otherwise the band as a whole gets
-        ``band_share`` of the ceiling and the tool results in it divide that evenly, so the
-        retention grows with the window rather than becoming a rounding error against it.
+        An explicit ``keep_tokens`` is honoured verbatim. Otherwise the band's oldest tool
+        result may keep ``band_share`` of the ceiling and the ``n``-th may keep an ``n``-th of
+        that, so the retention grows with the window rather than becoming a rounding error
+        against it, and each result's share is a number its own position fixes for good.
+
+        Dividing that share by the band's *current* width instead is what this replaces, and
+        it was not a scaling choice but a bug. A result is trimmed once -- :meth:`_shorten`
+        recognises its own marker and leaves a trimmed result alone -- so it froze at whatever
+        width happened to be in force on the turn the trim fired. At one ceiling and one
+        configuration that is 29,488 tokens for a result caught while alone in the band and
+        4,914 for one caught sixth, six times the retention for no reason but arrival order,
+        and it is the mechanism behind a reversal between two measured cells. It also
+        contradicts this module's first design constraint outright: a decision that moves with
+        the band's width is a decision that depends on the conversation's current size.
+
+        The price is that the band is no longer bounded by ``band_share`` alone. It is now
+        bounded by ``band_share`` times the ceiling times the harmonic number of its tool
+        groups -- 2.4x at six groups, 3.6x at twenty -- with each further group contributing
+        less than the one before. That is unavoidable rather than chosen: a budget that never
+        trims what the width-based rule left alone must be at least
+        ``band_share * ceiling / (position + 1)`` for every position, because that is the
+        widest the old rule ever was at that position, and those terms sum without limit. So
+        the alternatives are a bounded band that starts editing where this strategy is
+        currently and correctly idle, or an unbounded one that does not, and the second is
+        worth more: an edit that saves less than the cache it invalidates is a loss, whereas
+        the residual here lands on the shed step that already exists for it.
+
+        Rejected on that reasoning: a geometric split summing to ``band_share`` exactly, which
+        bounds the band but hands every group after the first less than it gets today, so the
+        strategy would begin paying for edits at windows where everything already fits; and a
+        flat per-result budget, which does the same at one end, goes inert at the other, and
+        throws away the retention's scaling with the window -- itself a fix for a measured
+        recall failure, 32 planted facts of 53 against 11.
 
         Args:
-            band: The middle groups, as returned by :meth:`_middle_band`.
+            band_position: This result's place among the band's tool groups, counted from the
+                head, the oldest being zero.
 
         Returns:
-            A token budget per collapsed result, never below a floor that still carries a
+            A token budget for that result, never below a floor that still carries a
             recognisable fragment.
         """
         if self.keep_tokens is not None:
             return self.keep_tokens
-        tool_groups = sum(1 for group in band if group.get("kind") == "tool_call")
-        if tool_groups == 0:
-            return DEFAULT_KEEP_TOKENS
-        share = self.max_input_tokens * self.band_share / tool_groups
+        share = self.max_input_tokens * self.band_share / (band_position + 1)
         return max(int(share), DEFAULT_KEEP_TOKENS)
 
     def _shorten(self, text: str, budget: int) -> str:
@@ -505,13 +555,14 @@ class AnchoredCompactionStrategy:
 class MinimumGainAnchoredCompactionStrategy(AnchoredCompactionStrategy):
     """The anchored strategy, refusing any collapse too small to repay the cache it spends.
 
-    Anchored compaction is cheap per edit but not free, and at one measured cell it was
-    almost entirely cost. At a 60,000-token window, 0.86 fill and 3,500-token tool results,
-    the ``anchored`` row removed **263 tokens** -- 0.5% of a 52,322-token snapshot -- and came
-    out 11% more expensive than not compacting at all. Its prompt-cache hit rate fell from
-    92% to 88%, which is 46,471 tokens re-read at the uncached price. Nothing was wrong with
-    *what* it shortened. The edit was simply too small to be worth making, at 177 to 1
-    against, and the strategy had no way to notice that because it never asked.
+    Anchored compaction is cheap per edit but not free. An edit at position K makes the
+    provider re-read everything behind K once at the uncached price, so a collapse that removes
+    less than the break-even in :data:`DEFAULT_MIN_GAIN_FRACTION` is a loss however sensible
+    the removal looks. At a 60,000-token window with 0.86 fill and 3,500-token tool results the
+    unfloored row held a lower prompt-cache hit rate than the uncompacted control on every one
+    of five seeds -- 89-93% against 91-95% -- which is that re-read arriving on the bill.
+    Nothing was wrong with *what* it shortened. The edits were simply too small to be worth
+    making, and the strategy had no way to notice that because it never asked.
 
     This one asks. Before any result is rewritten it prices the whole collapse against the
     break-even in :data:`DEFAULT_MIN_GAIN_FRACTION`, and when the projected reduction falls
@@ -535,8 +586,9 @@ class MinimumGainAnchoredCompactionStrategy(AnchoredCompactionStrategy):
     last-resort shedding behind it is untouched.
 
     Keyword Args:
-        min_gain_fraction: Share of the currently included prompt a collapse must be
-            projected to remove before it is allowed to happen. Zero disables the floor,
+        min_gain_fraction: Share of the tokens behind the collapse -- the included prompt from
+            its earliest rewrite to the end -- that it must be projected to remove before it
+            is allowed to happen. Zero disables the floor,
             which makes this row identical to ``anchored``. See
             :data:`DEFAULT_MIN_GAIN_FRACTION` for where the default comes from and for the
             one term in it -- the turns remaining -- that no strategy can know.
@@ -593,6 +645,15 @@ class MinimumGainAnchoredCompactionStrategy(AnchoredCompactionStrategy):
     def _collapse_tool_results(self, messages: list[Message], band: list[dict[str, Any]]) -> bool:
         """Collapse the band's tool results, unless doing so would not pay for itself.
 
+        The saving is weighed against the tokens the edit puts back on the meter, which is the
+        included prompt from the earliest rewrite to the end -- the ``B`` of the break-even in
+        :data:`DEFAULT_MIN_GAIN_FRACTION` -- and not the whole prompt. Everything in front of
+        the earliest rewrite stays cached and is not paid for again, so charging the collapse
+        for it overstates its cost by a factor of ``prompt / B``: harmless for a collapse that
+        starts at the head of the band, and enough to refuse every incremental collapse of a
+        group that has just aged out of the tail, where the edit is near the end and ``B`` is
+        a fraction of the prompt.
+
         Relies on the token annotations :meth:`AnchoredCompactionStrategy.__call__` refreshes
         before it calls this, which is the only caller.
 
@@ -606,13 +667,13 @@ class MinimumGainAnchoredCompactionStrategy(AnchoredCompactionStrategy):
         plan = self._plan_shortenings(messages, band)
         if not plan:
             return False
-        included = included_token_count(messages)
         # Over the ceiling the collapse is not being judged on its saving: it is the cheapest
         # way left to make the conversation fit, and refusing it here would hand the work to
         # the shed step, which removes whole groups rather than trimming them.
-        if included > self.max_input_tokens:
+        if included_token_count(messages) > self.max_input_tokens:
             return self._apply_shortenings(plan)
-        if sum(item.saved_tokens for item in plan) < int(included * self.min_gain_fraction):
+        behind = included_token_count(messages[min(item.message_index for item in plan) :])
+        if sum(item.saved_tokens for item in plan) < int(behind * self.min_gain_fraction):
             self._declined += 1
             return False
         return self._apply_shortenings(plan)

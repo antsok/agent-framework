@@ -59,7 +59,14 @@ __all__ = [
 #:
 #: 3 adds the connection-retry counters, and this time the version is what separates a record
 #: whose run could re-send a dropped call from one whose run could not.
-SCHEMA_VERSION: Final[int] = 3
+#:
+#: 4 adds the probe phase's own token counts, which split ``cost`` into the workload and the
+#: instrument. Bumped for the version 2 reason and not the ``combined_repeats`` one: what a
+#: version 3 record spent on probing is not merely absent, it is unknowable from the record,
+#: and reading the absent counts as zero would report every one of those runs as having probed
+#: for free -- which would put the whole of a twelve-probe discount into the seeding half and
+#: make the correction this field exists for read as already applied.
+SCHEMA_VERSION: Final[int] = 4
 
 #: Versions this reader accepts, which is not only the current one.
 #:
@@ -72,7 +79,12 @@ SCHEMA_VERSION: Final[int] = 3
 #:
 #: Refusing version 2 instead would have thrown away the six recorded cells on disk, 180 seeds
 #: of paid-for measurement, to avoid a column of zeroes that are true.
-_READABLE_SCHEMAS: Final[frozenset[int]] = frozenset({2, SCHEMA_VERSION})
+#:
+#: Versions 2 and 3 are readable in the same spirit, and their probe counts come back as
+#: ``None`` rather than as zero. Everything those records measured they still measure; the one
+#: thing they cannot say is how their cost divided between seeding and probing, and ``None`` is
+#: how a reader is told that instead of being handed a number nobody took.
+_READABLE_SCHEMAS: Final[frozenset[int]] = frozenset({2, 3, SCHEMA_VERSION})
 
 #: The parameters that make two records the same cell, and so aggregable into one row.
 #:
@@ -306,11 +318,32 @@ class SeedRecord:
     seed: int
     """1-based index of this seed within its strategy."""
     cost: float
-    """The whole seed: seeding, every probe, and the strategy's own summarizer calls."""
+    """The whole seed: seeding, every probe, and the strategy's own summarizer calls.
+
+    What the run was billed, which is not what a strategy is ranked on: see
+    :attr:`seeding_cost` for the half of it that is the workload.
+    """
     summarizer_cost: float
     input_tokens: int
     cached_tokens: int
     output_tokens: int
+    probe_input_tokens: int | None
+    """Input tokens the probe phase billed, of ``input_tokens``.
+
+    The instrument's share. Every probe re-sends the whole snapshot, so a strategy with a small
+    snapshot is discounted once per probe on a phase no deployed agent has: an agent continues
+    the conversation, it is not interrogated twelve times from a frozen state. Recorded so the
+    ranking can be taken on the other half.
+
+    ``None`` on a record written before version 4, where the phases were never counted apart
+    and no arithmetic over the stored fields can separate them: the per-probe prompts are not
+    on the record, and pricing twelve of them at ``prompt_tokens_final`` is a model of the run
+    rather than the run. Those records rank on their whole cost and say so.
+    """
+    probe_cached_tokens: int | None
+    """How many of those the provider served from cache, or ``None`` before version 4."""
+    probe_output_tokens: int | None
+    """Output tokens the probe phase billed, or ``None`` before version 4."""
     calls: int
     messages_left: int
     messages_peak: int
@@ -404,6 +437,57 @@ class SeedRecord:
         """
         return self.cell.pricing.input_cost(self.input_tokens, self.cached_tokens)
 
+    @property
+    def probe_cost(self) -> float | None:
+        """What the probing cost: the instrument, and the half a deployed agent never pays.
+
+        Returns:
+            The cost, or None when this record was written before the phases were counted
+            apart, where no honest number exists to return.
+        """
+        if self.probe_input_tokens is None or self.probe_cached_tokens is None or self.probe_output_tokens is None:
+            return None
+        pricing = self.cell.pricing
+        return (
+            pricing.input_cost(self.probe_input_tokens, self.probe_cached_tokens)
+            + self.probe_output_tokens * pricing.output_per_million / 1_000_000
+        )
+
+    @property
+    def seeding_cost(self) -> float | None:
+        """What the conversation cost: the workload, and the number a strategy is judged on.
+
+        Taken as the whole seed less the probing rather than summed over the seeding calls, so
+        that the two halves add back to ``cost`` exactly whatever else the run did. Anything
+        that is neither an answered probe nor a seeding turn -- the summarizer's own calls, and
+        a probe that failed before it produced an outcome -- therefore lands here. The
+        summarizer belongs here on its merits: it runs while the conversation is being had, and
+        a deployed agent pays for it.
+
+        Returns:
+            The cost, or None when the phases were never counted apart.
+        """
+        probing = self.probe_cost
+        return None if probing is None else self.cost - probing
+
+    @property
+    def seeding_input_cost(self) -> float | None:
+        """What the conversation's prompt side cost, output and the probes both left out.
+
+        The quiet reading of the workload, for the reason :attr:`input_cost` is the quiet
+        reading of the whole seed: output is priced many times a cache read here, so a reply
+        the model ran long on moves a total further than compaction does.
+
+        Returns:
+            The cost, or None when the phases were never counted apart.
+        """
+        if self.probe_input_tokens is None or self.probe_cached_tokens is None:
+            return None
+        return self.cell.pricing.input_cost(
+            max(self.input_tokens - self.probe_input_tokens, 0),
+            max(self.cached_tokens - self.probe_cached_tokens, 0),
+        )
+
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable mapping of this record."""
         return asdict(self)
@@ -440,6 +524,12 @@ class SeedRecord:
         # quietly inherit the same zeroes for a run that could have re-sent.
         values.setdefault("connection_retries", 0)
         values.setdefault("connection_seconds", 0.0)
+        # None, not zero, and for the opposite reason to the two above. Those record something
+        # the run could not do; these record something the run did and did not count, and every
+        # one of those runs probed twelve times. Zero here would hand a reader the exact
+        # correction this field exists to make, already applied, and wrong.
+        for name in ("probe_input_tokens", "probe_cached_tokens", "probe_output_tokens"):
+            values.setdefault(name, None)
         try:
             return cls(cell=CellParams.from_dict(data["cell"]), **values)
         except (KeyError, TypeError) as error:

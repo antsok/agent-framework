@@ -20,6 +20,7 @@ from agent_framework._compaction import (
     project_included_messages,
 )
 from agent_framework_lab_cachebench.compaction._anchored import (
+    DEFAULT_KEEP_TOKENS,
     DEFAULT_MIN_GAIN_FRACTION,
     REMOVAL_MARKER,
     AnchoredCompactionStrategy,
@@ -47,8 +48,17 @@ def _tool_turn(index: int, payload_chars: int = 8_000) -> list[Message]:
     ]
 
 
-def _conversation(tool_turns: int, payload_chars: int = 8_000) -> list[Message]:
-    """Return a conversation with a stable head and ``tool_turns`` tool groups."""
+def _conversation(
+    tool_turns: int, payload_chars: int = 8_000, *, oversized: dict[int, int] | None = None
+) -> list[Message]:
+    """Return a conversation with a stable head and ``tool_turns`` tool groups.
+
+    Keyword Args:
+        oversized: Payload sizes in characters for individual tool turns, overriding
+            ``payload_chars``. Lets a test put the one result a budget bites on where it wants
+            it, rather than making every result the same size and every edit start at the
+            front of the band.
+    """
     messages = [
         Message(role="system", contents=["You are an assistant."], message_id="sys"),
         Message(role="user", contents=["Requirement: region is EU-WEST-1."], message_id="u0"),
@@ -56,7 +66,7 @@ def _conversation(tool_turns: int, payload_chars: int = 8_000) -> list[Message]:
     ]
     for index in range(tool_turns):
         messages.append(Message(role="user", contents=[f"Look up {index}."], message_id=f"u_{index}"))
-        messages.extend(_tool_turn(index, payload_chars))
+        messages.extend(_tool_turn(index, (oversized or {}).get(index, payload_chars)))
     return messages
 
 
@@ -130,26 +140,49 @@ async def test_decisions_are_frozen_as_the_conversation_grows() -> None:
     the fate of an old group -- as any "compact to 50% when over 80%" rule does -- rewrites
     the start of the prompt and re-bills everything after it. Here the prefix that both turns
     share must come out byte-identical.
-    """
-    strategy = AnchoredCompactionStrategy(max_input_tokens=3_000, tokenizer=TOKENIZER)
 
-    earlier = _conversation(tool_turns=8)
+    Run at a ceiling the strategy is actually configured for, and with results large enough to
+    be cut well clear of ``DEFAULT_KEEP_TOKENS``. An earlier version of this test used a
+    3,000-token ceiling, where every per-result budget clamped to that 150-token floor and
+    both conversations trimmed to the same number whatever rule produced it. It therefore
+    passed against a strategy whose retention moved by a factor of six with the band's width,
+    which is the one thing it exists to forbid.
+    """
+    strategy = AnchoredCompactionStrategy(max_input_tokens=117_952, tokenizer=TOKENIZER)
+
+    earlier = _conversation(tool_turns=8, payload_chars=40_000)
     await strategy(earlier)
     earlier_rendered = _rendered(earlier)
 
     # The same conversation two tool turns later, compacted from scratch as the before-phase
     # always does: exclusion flags do not survive into storage.
-    later = _conversation(tool_turns=10)
+    later = _conversation(tool_turns=10, payload_chars=40_000)
     await strategy(later)
 
-    # Groups 0-3 are in the middle band of both conversations: the band only ever grows from
-    # the tail end, so a group that has entered it never leaves. Each must render identically.
+    assert REMOVAL_MARKER in earlier_rendered, "the fixture has to give the collapse something to freeze"
+    # Shortening alone has to reach the ceiling here, or the comparison below would be pinning
+    # the shed step's holes rather than the retention rule.
+    assert "[compacted: an earlier tool call and its result]" not in earlier_rendered
+
+    # Tool turns 0-6 are in the middle band of both conversations: the band only ever grows
+    # from the tail end, so a group that has entered it never leaves. Each must render
+    # identically. Turn 7 is the tail's at eight turns and the band's at ten, so it is not a
+    # group whose fate was already settled.
     earlier_by_id = {m.message_id: _text_of(m) for m in project_included_messages(earlier)}
     later_by_id = {m.message_id: _text_of(m) for m in project_included_messages(later)}
-    for index in range(4):
+    for index in range(7):
         for message_id in (f"a_call_{index}", f"t_res_{index}", f"a_txt_{index}"):
-            assert earlier_by_id.get(message_id) == later_by_id.get(message_id), message_id
-    assert earlier_rendered  # the earlier conversation was in fact compacted, not empty
+            kept_earlier, kept_later = earlier_by_id.get(message_id), later_by_id.get(message_id)
+            assert kept_earlier is not None and kept_later is not None, message_id
+            assert len(kept_earlier) == len(kept_later), (
+                f"{message_id} kept {len(kept_earlier):,} characters at eight tool turns and "
+                f"{len(kept_later):,} at ten: retention moved with the band's width"
+            )
+            assert kept_earlier == kept_later, message_id
+
+    # And the surviving slices are two orders of magnitude clear of the floor, so no part of
+    # the agreement above comes from both sides clamping to the same constant.
+    assert TOKENIZER.count_tokens(later_by_id["t_res_6"]) > 10 * DEFAULT_KEEP_TOKENS
 
 
 async def test_running_twice_changes_nothing_further() -> None:
@@ -170,8 +203,13 @@ async def test_shortening_alone_is_preferred_to_removing_anything() -> None:
 
     This is the cheap case and it should be the common one: the model still sees that every
     call happened and roughly what each returned, and no message is missing.
+
+    The ceiling has to be roomy for that to be reachable. Retaining a share of the ceiling per
+    band *position* rather than splitting one share across the band's current width keeps more
+    in total -- ``band_share`` times the harmonic number of the band's tool groups rather than
+    ``band_share`` -- so the window in which trimming alone suffices starts higher than it did.
     """
-    strategy = AnchoredCompactionStrategy(max_input_tokens=5_000, tokenizer=TOKENIZER)
+    strategy = AnchoredCompactionStrategy(max_input_tokens=10_000, tokenizer=TOKENIZER)
     messages = _conversation(tool_turns=8)
 
     await strategy(messages)
@@ -261,25 +299,38 @@ async def test_retention_scales_with_the_ceiling() -> None:
     """
     small = AnchoredCompactionStrategy(max_input_tokens=57_952, tokenizer=TOKENIZER)
     large = AnchoredCompactionStrategy(max_input_tokens=269_952, tokenizer=TOKENIZER)
-    band = [
-        {"kind": "tool_call", "group_id": f"g{index}", "start_index": index, "end_index": index} for index in range(6)
-    ]
 
-    assert large._keep_tokens_for(band) > 4 * small._keep_tokens_for(band)
+    assert large._keep_tokens_for(5) > 4 * small._keep_tokens_for(5)
     # And an explicit value still wins, so a caller can pin it for a comparison.
     pinned = AnchoredCompactionStrategy(max_input_tokens=269_952, tokenizer=TOKENIZER, keep_tokens=600)
-    assert pinned._keep_tokens_for(band) == 600
+    assert pinned._keep_tokens_for(5) == 600
 
 
 async def test_a_wider_band_share_keeps_more_of_each_result() -> None:
     """The knob has to move the trade-off, or it is decoration."""
     narrow = AnchoredCompactionStrategy(max_input_tokens=269_952, tokenizer=TOKENIZER, band_share=0.05)
     wide = AnchoredCompactionStrategy(max_input_tokens=269_952, tokenizer=TOKENIZER, band_share=0.5)
-    band = [
-        {"kind": "tool_call", "group_id": f"g{index}", "start_index": index, "end_index": index} for index in range(6)
-    ]
 
-    assert wide._keep_tokens_for(band) > narrow._keep_tokens_for(band)
+    assert wide._keep_tokens_for(5) > narrow._keep_tokens_for(5)
+
+
+async def test_retention_is_fixed_by_position_not_by_the_bands_width() -> None:
+    """A result's allowance has to be a number its own place in the band settles, once.
+
+    The rule this replaced divided one band-wide share by the tool groups in the band *at that
+    moment*, and :meth:`_shorten` refuses to re-trim a result already carrying the marker. A
+    result therefore froze at whatever share was in force on the turn the trim happened to
+    fire: at this ceiling, 29,488 tokens if the trim caught it alone in the band and 4,914 if
+    it caught it sixth -- six times the retention for nothing but arrival order, and a decision
+    that moves with the conversation's current size, which this module's first design
+    constraint forbids outright.
+    """
+    strategy = AnchoredCompactionStrategy(max_input_tokens=117_952, tokenizer=TOKENIZER)
+
+    assert strategy._keep_tokens_for(0) == 29_488
+    assert strategy._keep_tokens_for(5) == 4_914
+    # And never below the floor, however deep into the band the result sits.
+    assert strategy._keep_tokens_for(10_000) == DEFAULT_KEEP_TOKENS
 
 
 def test_band_share_is_validated() -> None:
@@ -296,12 +347,11 @@ def test_band_share_is_validated() -> None:
 async def test_a_collapse_below_the_floor_leaves_the_conversation_untouched() -> None:
     """The measured failure, refused.
 
-    At a 60,000-token window and 0.86 fill the anchored row removed 263 tokens, 0.5% of the
-    snapshot, and cost 11% more than not compacting at all: its hit rate fell four points,
-    which is 46,471 tokens re-read at the uncached price to save 263. The geometry is
-    reproduced here -- a band budget nearly as large as the results it is trimming -- and the
-    only correct action is none at all. Not a smaller edit: none, because the cache is spent
-    on editing at a position rather than on how much was edited there.
+    At a 60,000-token window and 0.86 fill the unfloored row held a lower prompt-cache hit rate
+    than the uncompacted control on every one of five seeds, 89-93% against 91-95%. The
+    geometry is reproduced here -- a band budget nearly as large as the result it is trimming
+    -- and the only correct action is none at all. Not a smaller edit: none, because the cache
+    is spent on editing at a position rather than on how much was edited there.
     """
     strategy = MinimumGainAnchoredCompactionStrategy(max_input_tokens=50_000, tokenizer=TOKENIZER)
     messages = _annotated(tool_turns=8)
@@ -310,6 +360,37 @@ async def test_a_collapse_below_the_floor_leaves_the_conversation_untouched() ->
     assert await strategy(messages) is False
     assert _fingerprint(messages) == before
     assert strategy.declined_collapses == 1
+
+
+async def test_the_floor_is_measured_against_the_tokens_the_edit_re_bills() -> None:
+    """The base is the suffix behind the edit, not the prompt, and the two are not the same.
+
+    A strict-prefix cache is spent on everything from the earliest rewrite to the end; what
+    sits in front of it stays cached and is never paid for again. That suffix is the ``B`` of
+    ``R > B(p - c) / (p + T·c)``. Charging a collapse for the whole prompt instead overstates
+    its cost by ``prompt / B`` -- barely visible for a collapse that begins at the head of the
+    band, and fatal for the case the strategy meets most often, one group that has just aged
+    out of the tail, where the edit is near the end and ``B`` is a fraction of the prompt.
+
+    Here the only result the band's budget bites on is the last one in the band. The saving is
+    over half of what the edit re-bills and comfortably repays it, and under a quarter of the
+    prompt, so the prompt-based test would have refused it.
+    """
+    strategy = MinimumGainAnchoredCompactionStrategy(max_input_tokens=100_000, tokenizer=TOKENIZER)
+    messages = _conversation(tool_turns=8, payload_chars=14_400, oversized={6: 48_000})
+    annotate_message_groups(messages)
+    annotate_token_counts(messages, tokenizer=TOKENIZER)
+
+    plan = strategy._plan_shortenings(messages, strategy._middle_band(messages, group_messages(messages)))
+    saved = sum(item.saved_tokens for item in plan)
+    behind = included_token_count(messages[min(item.message_index for item in plan) :])
+
+    assert len(plan) == 1, "the fixture has to put one edit near the end of the band"
+    assert saved < included_token_count(messages) * DEFAULT_MIN_GAIN_FRACTION
+    assert saved > behind * DEFAULT_MIN_GAIN_FRACTION
+
+    assert await strategy(messages) is True
+    assert strategy.declined_collapses == 0
 
 
 async def test_above_the_floor_it_is_the_anchored_strategy() -> None:
@@ -410,24 +491,29 @@ async def test_every_declined_pass_is_counted() -> None:
 def test_the_default_floor_is_the_break_even_it_claims_to_be() -> None:
     """The default is derived, and this is the derivation.
 
-    ``T * R * c > (B - R) * (p - c)`` rearranges to ``R > B / (1 + T * c / (p - c))``. At the
-    measured prices and the measured cell -- 0.66 and 0.07 per million, about 40,000 tokens
-    sitting behind the edit, about 20 turns left, a 52,322-token snapshot -- that is 11,859
-    tokens, or 22.7% of the included prompt. The constant is that figure rounded up to the
-    next percent, so the floor is never below the break-even it comes from.
+    ``T * R * c > (B - R) * p - B * c`` rearranges to ``R > B * (p - c) / (p + T * c)``, whose
+    right-hand side is a share of the tokens behind the edit and of nothing else. At the
+    measured prices -- 0.66 and 0.07 per million -- with twenty turns left that share is 0.286,
+    and the constant is it rounded up to the next percent, so the floor is never below the
+    break-even it comes from.
+
+    The constant it replaces, 0.23, was this same share multiplied by the ratio of tokens-
+    behind to prompt at the single cell it was fitted to -- about 40,000 against 52,322 -- and
+    then compared against the prompt. Both roads land near 0.22 at that geometry and nowhere
+    else, which is why the base and not the constant was the defect.
 
     Pinned as a test because the number is the whole argument for the row existing: if the
     arithmetic is revised and the constant does not follow it, the strategy declines edits it
     should make or makes edits it should decline, and either way the run measures nothing.
     """
     price_input, price_cached = 0.66, 0.07
-    behind, turns, snapshot = 40_000, 20, 52_322
+    turns = 20
 
-    break_even = behind / (1 + turns * price_cached / (price_input - price_cached))
+    break_even = (price_input - price_cached) / (price_input + turns * price_cached)
 
-    assert break_even == pytest.approx(11_859, abs=1)
-    assert break_even / snapshot == pytest.approx(0.2267, abs=0.0001)
-    assert break_even / snapshot <= DEFAULT_MIN_GAIN_FRACTION < break_even / snapshot + 0.01
+    assert break_even == pytest.approx(0.2864, abs=0.0001)
+    assert break_even <= DEFAULT_MIN_GAIN_FRACTION < break_even + 0.01
+    assert break_even * (40_000 / 52_322) == pytest.approx(0.219, abs=0.001)
 
 
 @pytest.mark.parametrize("fraction", [-0.1, 1.0, 1.5])
