@@ -98,6 +98,7 @@ __all__ = [
     "RETRIEVAL_GUIDANCE",
     "RETRY_JITTER",
     "TERSE_INSTRUCTIONS",
+    "IdentifiedHistoryProvider",
     "LiveOutcome",
     "MeteredClient",
     "ModelCall",
@@ -627,6 +628,32 @@ class LiveOutcome:
         return sum(call.output_tokens for call in self.calls)
 
     @property
+    def probe_input_tokens(self) -> int:
+        """Input tokens the probe phase billed.
+
+        Summed off the probes themselves rather than derived from the last prompt. Every probe
+        carries the same snapshot, but not at the same price: the first one warms a prefix the
+        rest read back, so twelve probes at the final prompt's size is a different number from
+        what the twelve of them were, and the difference is the whole cache discount.
+
+        Whatever a failed probe spent is *not* here, because a probe that never answered
+        produced no :class:`ProbeOutcome`. That spend lands in the seeding half by subtraction,
+        which is the conservative direction: the workload is charged for it rather than the
+        instrument, so no strategy is credited with a saving it did not make.
+        """
+        return sum(call.input_tokens for probe in self.probes for call in probe.calls)
+
+    @property
+    def probe_cached_tokens(self) -> int:
+        """Input tokens of the probe phase that were served from the provider's cache."""
+        return sum(call.cached_tokens for probe in self.probes for call in probe.calls)
+
+    @property
+    def probe_output_tokens(self) -> int:
+        """Output tokens the probe phase billed: the answers, which nothing else reads."""
+        return sum(call.output_tokens for probe in self.probes for call in probe.calls)
+
+    @property
     def messages_left(self) -> int:
         """Messages in a probe's prompt: the snapshot as compaction left it, plus the question.
 
@@ -933,6 +960,72 @@ def _spread_codes(codes: Sequence[str], body: str, *, labelled: bool) -> str:
     return "".join(parts)
 
 
+class IdentifiedHistoryProvider(InMemoryHistoryProvider):
+    """Issue every stored message an id, so the control keeps the conversation it ran.
+
+    ``filter_new_messages`` identifies a message by its ``message_id`` and falls back to
+    ``(role, serialized contents)`` when there is none. Compaction assigns ids to everything it
+    annotates, so a row carrying a strategy is always identified the first way. The control has
+    no strategy and therefore no ids, and is identified the second way -- so its byte-identical
+    replies to filler turns collide and the later ones are dropped from the stored history.
+
+    Measured at 120,000/0.86: the control peaked at 82 messages where every strategy row peaked
+    at 109 on the same turn list, and ``anchored``, which planned nothing at that cell, ended
+    with a snapshot 5.4% larger than the baseline it was supposed to equal. Two rows that both
+    did nothing are not the same conversation, so every ``vs none`` figure taken then is biased
+    in the control's favour.
+
+    Fixed here rather than in the framework because the framework's behaviour is the contract
+    and not the defect: an application whose messages carry ids gets exact identity, and one
+    whose messages do not gets a content hash that cannot tell a repeated turn from a resent
+    one. This makes the lab the first kind of application on every row instead of only on the
+    rows a strategy happened to annotate.
+
+    The ids are issued at the point the history receives a message, which is the last moment
+    before identity is decided and the only one every row passes through. They are never sent
+    to the provider -- :func:`serialize_message` excludes them -- so no prompt, token count or
+    cache prefix moves.
+    """
+
+    def __init__(self) -> None:
+        """Create the provider, with the base class's defaults and a counter of its own.
+
+        No parameters, because the lab wants exactly one configuration of this and taking the
+        base class's six would be an option surface nothing chooses from.
+        """
+        super().__init__()
+        self._issued = 0
+
+    async def save_messages(
+        self,
+        session_id: str | None,
+        messages: Sequence[Message],
+        *,
+        state: dict[str, Any] | None = None,
+        **kwargs: Any,
+    ) -> None:
+        """Stamp anything that arrives without an id, then store it the usual way.
+
+        The counter only ever climbs, and deliberately: a turn re-sent after a restore is a
+        different message from the one the failed attempt produced, and the state it is stored
+        into no longer holds that one. Reusing the id would be the only way to make the two
+        collide again.
+
+        Args:
+            session_id: The session these messages belong to.
+            messages: The messages to persist.
+
+        Keyword Args:
+            state: Provider-scoped session state.
+            kwargs: Passed through.
+        """
+        for message in messages:
+            if not message.message_id:
+                self._issued += 1
+                message.message_id = f"cachebench_{self._issued}"
+        await super().save_messages(session_id, messages, state=state, **kwargs)
+
+
 def build_live_agent(
     runtime: ProviderRuntime,
     *,
@@ -972,6 +1065,10 @@ def build_live_agent(
     if kind not in AGENT_KINDS:
         raise ValueError(f"Unknown agent kind {kind!r}. Available: {', '.join(AGENT_KINDS)}")
 
+    # Built before the branch and handed to both kinds, because the defect it exists to
+    # prevent is not a property of either: whichever agent the cell is measured on, the
+    # control is the row whose replies repeat and so the row that loses them.
+    history = IdentifiedHistoryProvider()
     if kind == "harness":
         # The harness resolves both phases itself from the strategies handed in, so it gets
         # the same object twice. Its optional providers are switched off: each adds tools
@@ -984,6 +1081,7 @@ def build_live_agent(
             tools=list(tools),
             max_context_window_tokens=max_context_window_tokens,
             max_output_tokens=max_output_tokens,
+            history_provider=history,
             disable_compaction=strategy is None,
             before_compaction_strategy=strategy,
             after_compaction_strategy=strategy,
@@ -999,7 +1097,6 @@ def build_live_agent(
             default_options={},
         )
 
-    history = InMemoryHistoryProvider()
     providers: list[Any] = [history]
     if strategy is not None:
         # before_strategy is deliberately None: on a provider it would never run. The

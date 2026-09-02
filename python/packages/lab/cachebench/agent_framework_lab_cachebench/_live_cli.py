@@ -425,12 +425,16 @@ def _resolve_pricing(args: argparse.Namespace, provider: str, model: str) -> Mod
 
 
 def _cost(outcome: LiveOutcome, pricing: ModelPricing) -> float:
-    """Return what one live run cost, seeding and probes together.
+    """Return what one live run was billed, seeding and probes together.
 
-    One number, not two. The seeding spend and what each probe added are the same money spent
-    answering the same question, and a table that reports them apart invites reading the cheap
-    half: a strategy that seeds cheaply and then needs an enormous prompt to answer anything is
-    not a cheap strategy.
+    What the invoice says, and not what a strategy is ranked on. This used to be one number on
+    the argument that reporting the halves apart invites reading the cheap one -- which held
+    while the closing questions were ordinary turns, since a strategy that seeds cheaply and
+    then needs an enormous prompt to answer is not cheap. It stopped holding when the questions
+    became probes: each is asked from a restored snapshot, so the snapshot is re-sent once per
+    probe, and a strategy that compacts hard collects that discount twelve times over on a
+    phase no deployed agent has. :attr:`SeedRecord.seeding_cost` is the half that is the
+    workload, and the ranking is taken there.
 
     Summarization additionally bills calls the agent never sees; those are added here so that
     the strategy which spends money to preserve information is not scored as though preserving
@@ -530,6 +534,9 @@ def _seed_record(
         input_tokens=outcome.input_tokens,
         cached_tokens=outcome.cached_tokens,
         output_tokens=outcome.output_tokens,
+        probe_input_tokens=outcome.probe_input_tokens,
+        probe_cached_tokens=outcome.probe_cached_tokens,
+        probe_output_tokens=outcome.probe_output_tokens,
         calls=len(outcome.calls),
         messages_left=outcome.messages_left,
         messages_peak=outcome.messages_peak,
@@ -618,6 +625,26 @@ def _spread(costs: Sequence[float]) -> float:
     return (max(costs) - min(costs)) / median if len(costs) > 1 and median > 0 else 0.0
 
 
+def _measured(values: Sequence[float | None]) -> list[float] | None:
+    """Return the readings when every seed took one, and None when any seed did not.
+
+    All or nothing on purpose. A row is a mean over its seeds, and a mean over whichever of
+    them happened to record a quantity is a mean over a different row than the one the table
+    names -- silently, since nothing about the printed figure says how many seeds are behind
+    it. A cell merged from a run before the probe split and a run after it therefore reads as
+    unsplit, which is what it is.
+
+    Args:
+        values: One reading per seed, or None from a seed that did not take it.
+
+    Returns:
+        The readings, or None.
+    """
+    if any(value is None for value in values):
+        return None
+    return [value for value in values if value is not None]
+
+
 @dataclass(frozen=True, slots=True)
 class CellStats:
     """One strategy's cell, aggregated over its seeds and their probe repeats.
@@ -637,6 +664,7 @@ class CellStats:
     that is not here is a way for the two to disagree.
     """
     cost: float
+    """What this cell was billed: the ``run$`` column, seeding and probing together."""
     cost_spread: float
     input_cost: float
     """What the prompt side of this cell cost, output excluded.
@@ -644,6 +672,24 @@ class CellStats:
     The same money as ``cost`` minus its output and summarizer halves, and the one worth
     ranking a mechanism on: output is priced 57 times a cache read here, so a reply the model
     happened to run long on moves the total further than compaction does.
+    """
+    seeding_cost: float | None
+    """What the conversation cost, with the probe phase taken out: the ``seed$`` column.
+
+    The workload, and what the ranking is on. None when any seed of this row predates the
+    split, because a row is a mean over its seeds and a mean over the ones that happened to
+    record it would be a different row from the one the table names.
+    """
+    probe_cost: float | None
+    """What the probing cost: the ``probe$`` column, and the instrument's own price."""
+    seeding_input_cost: float | None
+    """The prompt side of ``seeding_cost``: the ``seed in$`` column."""
+    seeding_cost_spread: float | None
+    """Spread between the cheapest and dearest seed on ``seeding_cost``.
+
+    Its own figure rather than ``cost_spread`` read across, because the probe phase is the
+    steadier half -- the same snapshot, the same twelve questions -- so a spread taken on the
+    total understates how much the part being ranked actually moved.
     """
     summarizer_cost: float
     input_tokens: float
@@ -721,12 +767,19 @@ def _aggregate(strategy: str, records: Sequence[SeedRecord]) -> CellStats:
     ignored = [float(value) for record in records for value in record.ignored_samples]
     combined_samples = tuple(record.combined_samples for record in records)
     combined = [value for seed in combined_samples for value in seed]
+    seeding = _measured([record.seeding_cost for record in records])
+    probing = _measured([record.probe_cost for record in records])
+    seeding_input = _measured([record.seeding_input_cost for record in records])
     return CellStats(
         strategy=strategy,
         records=tuple(records),
         cost=fmean(record.cost for record in records),
         cost_spread=_spread([record.cost for record in records]),
         input_cost=fmean(record.input_cost for record in records),
+        seeding_cost=None if seeding is None else fmean(seeding),
+        probe_cost=None if probing is None else fmean(probing),
+        seeding_input_cost=None if seeding_input is None else fmean(seeding_input),
+        seeding_cost_spread=None if seeding is None else _spread(seeding),
         summarizer_cost=fmean(record.summarizer_cost for record in records),
         input_tokens=fmean(record.input_tokens for record in records),
         cached_tokens=fmean(record.cached_tokens for record in records),
@@ -758,8 +811,43 @@ def _aggregate(strategy: str, records: Sequence[SeedRecord]) -> CellStats:
     )
 
 
-def _excluded_cells(cells: Sequence[CellStats]) -> tuple[set[str], set[str]]:
-    """Return the cells that did not finish, and the cells that overran the tried limit.
+def _control_message_gap(cells: Sequence[CellStats], control: str = "none") -> int | None:
+    """Return how far the control's conversation sits from the one every strategy row ran.
+
+    Every row of a cell is driven from the same user-side turn list, and compaction only ever
+    adds messages to the stored history -- it excludes and rewrites in place rather than
+    deleting, and what it adds is its own: a summary, or the call that fetches a record back.
+    So the leanest strategy row is the turn list at its own size, and the control, which adds
+    nothing, has to equal it. It cannot legitimately come in under it.
+
+    When it does, the control ran a shorter conversation than everything it is the baseline
+    for, and every ``vs none`` in the cell is a comparison between two different workloads.
+    Measured at 120,000/0.86 before :class:`IdentifiedHistoryProvider`: the control peaked at
+    82 messages where every strategy row peaked at 109, and ``anchored``, inert at that cell,
+    finished with a snapshot 5.4% larger than the baseline it should have matched.
+
+    Compared against the *minimum* rather than every row, because a strategy is free to sit
+    above the turn list and two of them do. The reading assumes the cell measured at least one
+    strategy that adds nothing of its own, which every default strategy list does.
+
+    Args:
+        cells: Every aggregated cell.
+        control: Name of the uncompacted baseline.
+
+    Returns:
+        The control's peak message count less the leanest strategy row's, or None when the two
+        agree or when the cell holds no control or no strategy row to check it against.
+    """
+    baseline = next((cell for cell in cells if cell.strategy == control), None)
+    others = [cell for cell in cells if cell.strategy != control]
+    if baseline is None or not others:
+        return None
+    gap = round(baseline.messages_peak) - round(min(cell.messages_peak for cell in others))
+    return gap or None
+
+
+def _excluded_cells(cells: Sequence[CellStats], control: str = "none") -> tuple[set[str], set[str], set[str]]:
+    """Return the cells that did not finish, overran the tried limit, or ran another conversation.
 
     Disqualified rather than starred. A row whose prompt exceeded the limit it stands in for
     is not a slightly worse row: it is a row a model of that size would have refused. Ranking
@@ -769,20 +857,63 @@ def _excluded_cells(cells: Sequence[CellStats]) -> tuple[set[str], set[str]]:
     A run that stopped early is excluded for the opposite reason: it spent almost nothing and
     answered almost nothing, so it ranks as "100% cheaper" for having died.
 
+    The third exclusion is the same objection aimed at the baseline itself. When
+    :func:`_control_message_gap` fires, the control is not the conversation the strategies ran,
+    so it is excluded -- and since every ranking in this table is relative to it, excluding it
+    is what stops the cell being ranked at all. The alternative, excluding the strategy rows
+    instead, would put the flag on every row but the one that is wrong.
+
     Args:
         cells: Every aggregated cell.
+        control: Name of the uncompacted baseline.
 
     Returns:
-        The names that did not finish, and the names that were disqualified.
+        The names that did not finish, the names that were disqualified, and the name of the
+        control when its conversation diverged from the strategy rows'.
     """
     incomplete = {
         cell.strategy for cell in cells if any(record.turns_completed < record.turns_total for record in cell.records)
     }
     oversized = {cell.strategy for cell in cells if cell.disqualified > 0}
-    return incomplete, oversized
+    diverged = {control} if _control_message_gap(cells, control) is not None else set[str]()
+    return incomplete, oversized, diverged
 
 
-def _to_joint(stats: CellStats) -> JointOutcome:
+def _split_measured(cells: Sequence[CellStats]) -> bool:
+    """Return whether this cell can say what its probing cost, and so be ranked on its workload.
+
+    A property of the cell and not of a row. Rows ranked on two different halves of the money
+    would be ordered on two different questions, and nothing in the printed column would say
+    which row was which, so one seed anywhere in the cell that predates the split takes the
+    whole cell back to its billed total.
+
+    Args:
+        cells: Every row of one cell.
+
+    Returns:
+        True when every row counted its probe phase apart from its seeding.
+    """
+    return bool(cells) and all(cell.seeding_cost is not None for cell in cells)
+
+
+def _ranked_cost(stats: CellStats, *, split: bool) -> float:
+    """Return the cost this row is ordered, compared and recommended on.
+
+    Args:
+        stats: The row.
+
+    Keyword Args:
+        split: What :func:`_split_measured` said about the cell this row belongs to.
+
+    Returns:
+        The seeding cost -- the workload -- when the cell measured it, and the billed total
+        when it did not, which is the older and dirtier reading and is labelled as such
+        wherever it appears.
+    """
+    return stats.cost if not split or stats.seeding_cost is None else stats.seeding_cost
+
+
+def _to_joint(stats: CellStats, *, split: bool = True) -> JointOutcome:
     """Convert an aggregated cell into the shape the joint verdict already understands.
 
     The verdict ranks on ``correctness``, which here is the mean over every sample of every
@@ -790,10 +921,24 @@ def _to_joint(stats: CellStats) -> JointOutcome:
     :class:`CellStats`, and ``JointOutcome`` consults its score only when there are no samples
     to rank on -- which cannot happen here, since scoring yields at least one reading even for
     a seed that never answered. The field exists for the replay paths, which read a cell once.
+
+    ``cost`` is the workload rather than the invoice, so ``recommend`` and its saving fraction
+    describe the money a deployed agent would move. The verdict is a general function of
+    whatever cost it is handed; deciding which cost that is belongs here, beside the table that
+    has to say the same thing.
+
+    Args:
+        stats: The row.
+
+    Keyword Args:
+        split: What :func:`_split_measured` said about the cell this row belongs to.
+
+    Returns:
+        The row in the verdict's own shape.
     """
     return JointOutcome(
         strategy=stats.strategy,
-        cost=stats.cost,
+        cost=_ranked_cost(stats, split=split),
         input_tokens=round(stats.input_tokens),
         cached_tokens=round(stats.cached_tokens),
         messages_left=round(stats.messages_left),
@@ -913,6 +1058,69 @@ def _fill_note(stats: dict[str, CellStats], plan: FillPlan | None, control: str)
     return lines
 
 
+def _divergence_note(message_gap: int | None, control: str) -> list[str]:
+    """Return the lines saying the control did not run the strategies' conversation.
+
+    Its own block rather than a flag alone, because what it invalidates is not one row. Every
+    cost figure in the cell is relative to this baseline, so a baseline carrying a different
+    number of messages makes all of them comparisons between two workloads -- and a reader
+    scanning the ``vs none$`` column would find question marks with nothing saying why.
+
+    Args:
+        message_gap: What :func:`_control_message_gap` found, or None when it found nothing.
+        control: Name of the uncompacted baseline.
+
+    Returns:
+        Zero lines when the conversations matched, otherwise the finding and what it costs.
+    """
+    if message_gap is None:
+        return []
+    direction = "fewer" if message_gap < 0 else "more"
+    return [
+        "",
+        f"CONTROL DIVERGED: {control!r} carried {abs(message_gap)} {direction} messages at its peak than the",
+        "leanest strategy row, on the same user-side turn list. Compaction only ever adds to the",
+        "stored history, so those two counts have to match; they do not, which means the baseline",
+        "and the rows measured against it are two different conversations. Every cost comparison in",
+        "this cell is withdrawn and the control is out of the ranking. This is not correctable after",
+        "the fact -- the conversation the control ran is the one on the record -- so the cell has to",
+        "be re-run to be read on cost.",
+    ]
+
+
+def _split_note(cells: Sequence[CellStats], split: bool) -> list[str]:
+    """Return the lines saying which money the cost columns describe.
+
+    Stated once per cell rather than left to the legend, because two tables printed by one
+    version of this code can be ranked on two different quantities, and nothing inside the
+    columns says which. A reader placing an old cell beside a new one has to be told.
+
+    Args:
+        cells: The rows, in the order they appear in the table.
+        split: What :func:`_split_measured` said about them.
+
+    Returns:
+        Two or more lines, always: a table that says nothing here is the ambiguity this exists
+        to remove.
+    """
+    if split:
+        return [
+            "",
+            "Cost: seed$ is the conversation and probe$ is the instrument, priced apart. The ranking,",
+            "the verdict and vs none$ are all on seed$, because every probe re-sends the whole snapshot",
+            "and a strategy that compacted hard would otherwise collect that discount once per probe.",
+        ]
+    missing = ", ".join(sorted(cell.strategy for cell in cells if cell.seeding_cost is None))
+    return [
+        "",
+        f"NO PHASE SPLIT ({missing}): these records counted seeding and probing in one total, so seed$",
+        "and probe$ cannot be recovered from them -- the per-probe prompts are not on the record, and",
+        "pricing twelve probes at the final prompt's size would be a model of the run rather than the",
+        "run. The ranking above is therefore on run$, which includes twelve re-reads of the snapshot",
+        "that no deployed agent pays for and which favour whichever strategy compacted hardest.",
+    ]
+
+
 def _throttle_note(cells: Sequence[CellStats]) -> list[str]:
     """Return the lines reporting what throttling cost this cell in time.
 
@@ -1000,12 +1208,17 @@ def _stability_note(verdict: JointVerdict, spread: dict[str, float], repeats: in
     return []
 
 
-def _flags(stats: CellStats, control: CellStats | None) -> list[str]:
+def _flags(stats: CellStats, control: CellStats | None, *, message_gap: int | None = None) -> list[str]:
     """Return the short tokens the flags column carries for one row.
 
     Args:
         stats: The row.
         control: The uncompacted baseline, or None when the file being read does not hold it.
+
+    Keyword Args:
+        message_gap: What :func:`_control_message_gap` found for this cell, when it found
+            anything. Carried in rather than derived here because it is a fact about the cell
+            and this function sees one row of it.
     """
     flags: list[str] = []
     # A row that gathered a different set of facts than the control is not comparable to
@@ -1013,6 +1226,16 @@ def _flags(stats: CellStats, control: CellStats | None) -> list[str]:
     # token volume for cost. Measured at 25% more input for runs that fetched every tool.
     if control is not None and round(stats.nofetch) != round(control.nofetch):
         flags.append("FETCH")
+    # The same objection, one level up: this row *is* the control, and the conversation it ran
+    # is not the one the strategies ran. Sits on the control rather than on the rows that
+    # differ from it, because the rows that differ from it are all of them.
+    if message_gap is not None and control is not None and stats.strategy == control.strategy:
+        flags.append(f"MSGS:{message_gap:+d}")
+    # A row that cannot say what its probing cost cannot be ranked on its workload, so its
+    # money columns are the invoice: seeding, twelve re-reads of the snapshot, and no way to
+    # tell which is which.
+    if stats.seeding_cost is None:
+        flags.append("NOSPLIT")
     dropped = {option for record in stats.records for option in record.dropped_options}
     if dropped:
         flags.append("NO:" + ",".join(sorted(option[:4] for option in dropped)))
@@ -1048,7 +1271,30 @@ def _sample_groups(samples: Sequence[Sequence[float]]) -> str:
     return "  ".join("[" + " ".join(f"{value:.0%}" for value in seed) + "]" for seed in samples if seed)
 
 
-def _row(stats: CellStats, control: CellStats | None, excluded: bool, limit: int) -> str:
+def _money(value: float | None) -> str:
+    """Return a cost, or ``?`` when the records behind the row never measured it.
+
+    A question mark rather than a dash, and never a number: the dash in this table means "not
+    applicable to this row", which the control's own ``vs none`` is, and a run that did not
+    count something is a different statement from a run to which it does not apply.
+
+    Args:
+        value: The cost, or None when it was not measured.
+
+    Returns:
+        The rendered cell.
+    """
+    return "?" if value is None else "$" + format(value, ".4f")
+
+
+def _row(
+    stats: CellStats,
+    control: CellStats | None,
+    excluded: bool,
+    limit: int,
+    *,
+    message_gap: int | None = None,
+) -> str:
     """Render one strategy's line of the table.
 
     Args:
@@ -1058,17 +1304,26 @@ def _row(stats: CellStats, control: CellStats | None, excluded: bool, limit: int
         limit: The tried context window, which ``snap%`` is a share of
             against whichever row happened to be first.
         excluded: Whether this row is out of the ranking.
+
+    Keyword Args:
+        message_gap: What :func:`_control_message_gap` found for this cell, when it found
+            anything. Suppresses the cost comparison, which is the column it invalidates.
     """
-    if control is None or stats.strategy == control.strategy or control.cost <= 0:
-        cost_delta = "-"
+    ranked, control_ranked = stats.seeding_cost, None if control is None else control.seeding_cost
+    if control is None or stats.strategy == control.strategy or message_gap is not None:
+        cost_delta = "-" if message_gap is None else "?"
+    elif ranked is None or control_ranked is None:
+        # One of the two rows cannot say what its probing cost, so the only comparison
+        # available is between two invoices, and that is the comparison being withdrawn.
+        cost_delta = "?"
     else:
-        cost_delta = f"{stats.cost / control.cost - 1:+.0%}"
+        cost_delta = "-" if control_ranked <= 0 else f"{ranked / control_ranked - 1:+.0%}"
     if control is None or stats.strategy == control.strategy or control.correctness <= 0:
         relative = "-"
     else:
         relative = f"{stats.correctness / control.correctness:.0%}"
     hit = "n/a" if stats.hit_rate is None else f"{stats.hit_rate:.0%}"
-    flags = _flags(stats, control)
+    flags = _flags(stats, control, message_gap=message_gap)
     # ``DQ`` is the dq column crossing zero and nothing else. It used to be "excluded from the
     # ranking", which is a wider set: a row that failed a turn is excluded too, and the last
     # sweep printed rows flagged DQ beside a dq of 0% because every one of them had died on a
@@ -1090,10 +1345,10 @@ def _row(stats: CellStats, control: CellStats | None, excluded: bool, limit: int
         f"{f'{stats.prompt_tokens_final:,.0f}/{stats.prompt_tokens_peak:,.0f}':>16}"
         f"{snap:>7}"
         f"{stats.calls:>7.0f}{stats.input_tokens:>12,.0f}{hit:>6}"
-        f"{stats.output_tokens:>10,.0f}{'$' + format(stats.input_cost, '.4f'):>9}"
-        f"{'$' + format(stats.cost, '.4f'):>10}"
-        f"{stats.cost_spread:>6.0%}"
-        f"{('-' if not summ else '$' + format(summ, '.4f')):>8}{cost_delta:>9}"
+        f"{stats.output_tokens:>10,.0f}{_money(stats.seeding_input_cost):>10}"
+        f"{_money(stats.seeding_cost):>9}{_money(stats.probe_cost):>9}{_money(stats.cost):>9}"
+        f"{('?' if stats.seeding_cost_spread is None else format(stats.seeding_cost_spread, '.0%')):>8}"
+        f"{('-' if not summ else '$' + format(summ, '.4f')):>8}{cost_delta:>10}"
         f"{f'{stats.facts_left:.0f}/{stats.facts_total}':>9}{lost:>6.0f}"
         f"{stats.nofetch:>8.0f}{stats.ignored:>8.0f}"
         f"{stats.correctness:>8.0%}{'*' if control is not None and stats.strategy == control.strategy else ' '}"
@@ -1120,20 +1375,37 @@ _LEGEND: Final[tuple[str, ...]] = (
     "out       = output tokens billed across the whole run. Its own column because a total",
     "            driven by how much the model wrote is a different finding from one driven",
     "            by how much context it was sent, and one number cannot show which",
-    "in$       = what those input tokens cost, uncached and cached together, with output and",
-    "            the summarizer left out. The low-variance view of what compaction changes:",
-    "            on a clean five-seed control the total moved 38% while the input side moved",
-    "            13%, because output is priced 57x a cache read and the model's verbosity",
-    "            swamps the axis compaction acts on. Read this to see what a mechanism did;",
-    "            cost is still the number that gets billed, and the ranking is on cost",
-    "cost      = the whole run: seeding, plus what every probe added, summed. Not split into",
-    "            a seed and a probe column, because half of it is not a price anyone pays",
-    "+-        = spread between the cheapest and dearest seed. A gap smaller than this is not",
-    "            a result. 0% with one seed means stability is unknown, not that it is stable",
-    "summ$     = what this strategy's own summarization calls cost, of that total",
-    "vs none   = against the uncompacted control: the first is cost, the second acc1, which",
-    "            is also what the ranking and the verdict are judged on. Read them together",
-    "            or not at all -- cheaper and less correct is not a saving",
+    "seed in$  = the prompt side of seed$: uncached and cached together, with output, the",
+    "            summarizer and the probes all left out. The low-variance view of what",
+    "            compaction changes: on a clean five-seed control the total moved 38% while",
+    "            the input side moved 13%, because output is priced 57x a cache read and the",
+    "            model's verbosity swamps the axis compaction acts on",
+    "seed$     = what the conversation cost: seeding, plus the strategy's own summarizer",
+    "            calls, and nothing else. The workload, and what the ranking, the verdict and",
+    "            vs none$ are all taken on. This is the money a deployed agent moves",
+    "probe$    = what the probing cost: the instrument. Every probe is asked from the restored",
+    "            snapshot, so each one re-sends the whole snapshot, and a strategy that",
+    "            compacted hard collects that discount once per probe -- twelve times over on",
+    "            a phase no deployed agent has, since an agent continues the conversation",
+    "            rather than being interrogated from a frozen state. Folded into the ranking",
+    "            it turned one cell's -14.1% into -3.5% and flipped the sign on two others",
+    "run$      = seed$ + probe$: what the run was actually billed. Here because it is the",
+    "            number every earlier write-up quotes, not because it ranks anything",
+    "seed$+-   = spread between the cheapest and dearest seed, on seed$. A gap smaller than",
+    "            this is not a result. 0% with one seed means stability is unknown, not that",
+    "            it is stable. Taken on seed$ rather than run$ because probing is the steadier",
+    "            half -- one snapshot, the same questions -- so a spread on the total",
+    "            understates how far the ranked half moved",
+    "summ$     = what this strategy's own summarization calls cost, of seed$",
+    "vs none$  = seed$ against the uncompacted control's seed$: what compaction moved on the",
+    "            workload. '?' means the comparison is unavailable -- either a row could not",
+    "            separate its probing from its seeding (NOSPLIT), or the control did not run",
+    "            the strategies' conversation (MSGS) and there is nothing to compare against",
+    "'?'       = in any money column, the records behind this row never measured that",
+    "            quantity. Records written before schema 4 counted their calls in one total,",
+    "            and no arithmetic over what they stored can separate the phases -- pricing",
+    "            twelve probes at the final prompt's size is a model of the run, not the run.",
+    "            Those rows carry NOSPLIT, show run$ alone, and are ranked on it",
     "facts     = planted facts surviving compaction into the snapshot: recall's ceiling.",
     "            Scored against the snapshot, which is exactly the context every probe was",
     "            answered from. Scored against a closing prompt instead, this was circular:",
@@ -1166,6 +1438,9 @@ _LEGEND: Final[tuple[str, ...]] = (
     "rep2+-    = the same within-seed spread for acc2, over its own attempts. Read it beside",
     "            rep+-: at --probe-repeats 1 that column is 0pp by construction and this one",
     "            is the only within-seed variance the cell measures",
+    "vs none   = acc1 against the uncompacted control's acc1, which is also what the ranking",
+    "            and the verdict are judged on. Read it together with vs none$ on the left or",
+    "            not at all -- cheaper and less correct is not a saving",
     "dq        = share of this cell's seeds that sent a prompt larger than the tried limit.",
     "            The limit is simulated, so it is enforced here or not at all. A cell that",
     "            disqualifies at all is excluded from the ranking rather than starred: a row",
@@ -1196,7 +1471,14 @@ _LEGEND: Final[tuple[str, ...]] = (
     "            FALLBACK is measuring that other strategy, not the one named. NO:<opt> the",
     "            provider rejected that option so it was dropped; a run that dropped",
     "            tool_choice chose its own tool calls and is not comparable with one that did",
-    "            not. FETCH this row gathered a different set of facts than the control",
+    "            not. FETCH this row gathered a different set of facts than the control.",
+    "            MSGS:<+-n> this row is the control and its conversation was n messages away",
+    "            from the leanest strategy row's on the same turn list. Compaction only adds",
+    "            to the stored history, so the control has to match that row and cannot come",
+    "            in under it; when it does, every vs none$ in the cell compares two different",
+    "            workloads, and the control is excluded so that none of them is ranked.",
+    "            NOSPLIT this row cannot say what its probing cost, so its money columns are",
+    "            the invoice rather than the workload",
 )
 
 
@@ -1208,8 +1490,9 @@ def _table_order(
     Cost ascending used to be the whole order, and on its own it ranks the strategy that threw
     the conversation away above the one that kept it: the cheapest row of a cell is reliably
     the one that destroyed the most. So the rows that still answer come first and the rest
-    follow, each group cheapest first on *total* cost -- the input-only column is the quieter
-    reading of the same money, but it is not what anyone is charged.
+    follow, each group cheapest first on the workload -- ``seed$``, not the invoice, because
+    the probe phase discounts a small snapshot once per probe and would order the rows on how
+    hard they were interrogated.
 
     The bar is the verdict's own eligibility test applied to the verdict's own numbers, so the
     split and the recommendation underneath it cannot disagree about which rows are usable.
@@ -1223,21 +1506,24 @@ def _table_order(
     Returns:
         The ordered rows, and how many leading rows cleared the bar.
     """
+    split = _split_measured(cells)
     # Without a control there is nothing to be accurate *relative to*, so every row stays in
     # one group and the order is cost alone, as it was before there were two groups.
-    base = None if control is None else _to_joint(control)
+    base = None if control is None else _to_joint(control, split=split)
     cleared = {
         cell.strategy
         for cell in cells
-        if base is None or relative_correctness(_to_joint(cell), base) >= min_correctness
+        if base is None or relative_correctness(_to_joint(cell, split=split), base) >= min_correctness
     }
     # The strategy name settles a tie in cost, so that a file read back in a different order
     # from the one the run wrote it in cannot order two rows differently from the live table.
-    ordered = sorted(cells, key=lambda cell: (cell.strategy not in cleared, cell.cost, cell.strategy))
+    ordered = sorted(
+        cells, key=lambda cell: (cell.strategy not in cleared, _ranked_cost(cell, split=split), cell.strategy)
+    )
     return ordered, len(cleared)
 
 
-def _ranking_note(cleared: int, total: int, control: CellStats | None, min_correctness: float) -> str:
+def _ranking_note(cleared: int, total: int, control: CellStats | None, min_correctness: float, *, split: bool) -> str:
     """Return the line that says what the table's order means.
 
     Printed whether or not the split line appears below it: a cell where every row clears the
@@ -1250,17 +1536,23 @@ def _ranking_note(cleared: int, total: int, control: CellStats | None, min_corre
         control: The uncompacted baseline, or None when the records do not hold it.
         min_correctness: The bar those rows were judged against.
 
+    Keyword Args:
+        split: What :func:`_split_measured` said about this cell. Named in the line rather
+            than left to the legend, because the two orders are different rankings and a
+            reader comparing this table with another has to know which one they have.
+
     Returns:
         One line.
     """
+    basis = "seed$" if split else "run$, probes and all"
     if control is None:
         return (
-            "Ranking: total cost ascending. These records hold no uncompacted control, so no row "
+            f"Ranking: {basis} ascending. These records hold no uncompacted control, so no row "
             "can be judged accurate enough to rank above another."
         )
     return (
         f"Ranking: {cleared} of {total} rows kept at least {min_correctness:.0%} of the control's "
-        "acc1 and are ranked first, cheapest total cost first; the rest follow below the line."
+        f"acc1 and are ranked first, cheapest {basis} first; the rest follow below the line."
     )
 
 
@@ -1298,11 +1590,14 @@ def _render(
     """
     baseline = next((cell for cell in cells if cell.strategy == control), None)
     ordered, cleared = _table_order(cells, baseline, min_correctness)
+    split = _split_measured(cells)
+    message_gap = _control_message_gap(cells, control)
     cell_params = cells[0].records[0].cell
     pricing = cell_params.pricing
     header = (
         f"{'strategy':<28}{'msgs':>9}{'tok left/peak':>16}{'snap%':>7}{'calls':>7}{'in':>12}{'hit%':>6}"
-        f"{'out':>10}{'in$':>9}{'cost':>10}{'+-':>6}{'summ$':>8}{'vs none':>9}"
+        f"{'out':>10}{'seed in$':>10}{'seed$':>9}{'probe$':>9}{'run$':>9}{'seed$+-':>8}"
+        f"{'summ$':>8}{'vs none$':>10}"
         f"{'facts':>9}{'lost':>6}{'nofetch':>8}{'ignored':>8}{'acc1':>9}{'seed+-':>8}{'rep+-':>7}"
         f"{'acc2':>6}{'rep2+-':>8}{'vs none':>9}{'dq':>5}{'flags':>10}"
     )
@@ -1316,7 +1611,7 @@ def _render(
             f"Pricing: ${pricing.input_per_million:.2f}/M in, "
             f"${pricing.cached_read_per_million:.3f}/M cached, ${pricing.output_per_million:.2f}/M out"
         ),
-        _ranking_note(cleared, len(ordered), baseline, min_correctness),
+        _ranking_note(cleared, len(ordered), baseline, min_correctness, split=split),
         "",
         header,
         "-" * len(header),
@@ -1324,7 +1619,9 @@ def _render(
     for index, cell in enumerate(ordered):
         if index == cleared:
             lines.append(f" below {min_correctness:.0%} of the control's acc1 ".center(len(header), "-"))
-        lines.append(_row(cell, baseline, cell.strategy in excluded, cell_params.context_window))
+        lines.append(
+            _row(cell, baseline, cell.strategy in excluded, cell_params.context_window, message_gap=message_gap)
+        )
     lines += ["", *_LEGEND, "", "per-sample acc1, one group per seed:"]
     for cell in ordered:
         lines.append(f"  {cell.strategy:<28}{_sample_groups(cell.samples)}")
@@ -1335,14 +1632,21 @@ def _render(
     for cell in ordered:
         lines.append(f"  {cell.strategy:<28}{_sample_groups(cell.combined_samples)}")
     lines += _fill_note({cell.strategy: cell for cell in ordered}, cell_params.plan, control)
+    lines += _divergence_note(message_gap, control)
+    lines += _split_note(ordered, split)
     lines += _throttle_note(ordered)
     lines += _reconnect_note(ordered)
     if verdict is None:
+        reason = (
+            f"the {control!r} row ran a different conversation from the strategies"
+            if message_gap is not None
+            else f"these records hold no admissible {control!r} row"
+        )
         lines += [
             "",
             (
-                f"NO VERDICT: these records hold no admissible {control!r} row, and every ranking "
-                "here is relative to one. The columns above still describe what was measured."
+                f"NO VERDICT: {reason}, and every ranking here is relative to one. The columns "
+                "above still describe what was measured."
             ),
         ]
     else:
@@ -1352,7 +1656,12 @@ def _render(
             verdict.rationale,
             *_stability_note(
                 verdict,
-                {cell.strategy: cell.cost_spread for cell in ordered},
+                # The spread of the money the verdict was taken on, so the margin and the noise
+                # it is judged against are two readings of one column.
+                {
+                    cell.strategy: (cell.cost_spread if cell.seeding_cost_spread is None else cell.seeding_cost_spread)
+                    for cell in ordered
+                },
                 # Seeds actually present, not the --repeats that was asked for. One cell is
                 # often several single-seed invocations merged, and reading the request would
                 # have this announce "single seed" over five of them.
@@ -1451,12 +1760,13 @@ def _progress(record: SeedRecord) -> str:
     return "  ".join(parts)
 
 
-def _exclusion_notes(incomplete: set[str], oversized: set[str], limit: int) -> list[str]:
+def _exclusion_notes(incomplete: set[str], oversized: set[str], diverged: set[str], limit: int) -> list[str]:
     """Return the lines naming what was dropped from the ranking, and why.
 
     Args:
         incomplete: Strategies that did not finish their turns.
         oversized: Strategies that overran the tried limit.
+        diverged: The control, when it did not run the strategies' conversation.
         limit: The context limit the cell stands in for.
 
     Returns:
@@ -1470,6 +1780,12 @@ def _exclusion_notes(incomplete: set[str], oversized: set[str], limit: int) -> l
             "",
             f"Excluded from the verdict ({len(oversized)} exceeded the {limit:,}-token "
             "limit this run stands in for): " + ", ".join(sorted(oversized)),
+        ]
+    if diverged:
+        lines += [
+            "",
+            "Excluded from the verdict (the control ran a different conversation from the rows it "
+            "is the baseline for): " + ", ".join(sorted(diverged)),
         ]
     return lines
 
@@ -1557,13 +1873,14 @@ def _render_from_records(args: argparse.Namespace) -> int:
     print(f"{len(records)} seed records from {path}, in {len(groups)} cell(s).")
     for cell_params, cell_records in groups:
         cells = _cells_from_records(cell_records)
-        incomplete, oversized = _excluded_cells(cells)
-        excluded = incomplete | oversized
+        incomplete, oversized, diverged = _excluded_cells(cells)
+        excluded = incomplete | oversized | diverged
         for line in _coverage(cell_params, cell_records):
             print(line)
-        for line in _exclusion_notes(incomplete, oversized, cell_params.context_window):
+        for line in _exclusion_notes(incomplete, oversized, diverged, cell_params.context_window):
             print(line)
-        ranked = [_to_joint(cell) for cell in cells if cell.strategy not in excluded]
+        split = _split_measured(cells)
+        ranked = [_to_joint(cell, split=split) for cell in cells if cell.strategy not in excluded]
         # The bar the run set, unless this invocation names one: a rebuilt verdict that
         # silently applied a different threshold would rank rows the original never ranked,
         # while every column above it stayed identical.
@@ -1835,7 +2152,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
     # A run that stopped early spent almost nothing and answered almost nothing. Ranking it
     # produces "100% cheaper" for a strategy that simply died, and counts it as clearing the
     # correctness bar because a near-zero control makes every ratio look enormous.
-    incomplete, oversized = _excluded_cells(cells)
+    incomplete, oversized, diverged = _excluded_cells(cells)
     if all(any(record.error for record in cell.records) for cell in cells):
         first = next(record.error for cell in cells for record in cell.records if record.error)
         raise SystemExit(
@@ -1846,12 +2163,24 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
     if not any(cell.cost > 0 for cell in cells):
         raise SystemExit("No strategy reported any billed tokens, so there is nothing to compare.")
 
-    excluded = incomplete | oversized
-    for line in _exclusion_notes(incomplete, oversized, args.context_window):
+    excluded = incomplete | oversized | diverged
+    for line in _exclusion_notes(incomplete, oversized, diverged, args.context_window):
         print(line)
-    ranked = [_to_joint(cell) for cell in cells if cell.strategy not in excluded]
+    split = _split_measured(cells)
+    ranked = [_to_joint(cell, split=split) for cell in cells if cell.strategy not in excluded]
 
-    if not any(outcome.strategy == "none" for outcome in ranked):
+    verdict: JointVerdict | None = None
+    if diverged:
+        # Printed rather than raised, unlike the two reasons below. Those are cells that could
+        # not be measured; this one was measured and cannot be ranked, and the table still
+        # carries every column the divergence does not touch -- which is most of them, and all
+        # of them paid for.
+        print()
+        print(
+            "The uncompacted control ran a different conversation from the rows it is the baseline "
+            "for, so this cell has no ranking. See CONTROL DIVERGED below."
+        )
+    elif not any(outcome.strategy == "none" for outcome in ranked):
         reason = "exceeded the tried limit" if "none" in oversized else "did not finish"
         raise SystemExit(
             f"The uncompacted control {reason}, so there is no admissible baseline at "
@@ -1859,10 +2188,11 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
             "the finding for this cell: lower --fill, or raise --context-window to a size the "
             "conversation fits in."
         )
-    try:
-        verdict = recommend(ranked, min_correctness=min_correctness)
-    except ValueError as error:
-        raise SystemExit(f"Cannot summarize: {error}") from error
+    else:
+        try:
+            verdict = recommend(ranked, min_correctness=min_correctness)
+        except ValueError as error:
+            raise SystemExit(f"Cannot summarize: {error}") from error
     if tool_strategies_inert:
         affected = ", ".join(cell.strategy for cell in cells if "tool" in cell.strategy) or "the tool strategies"
         print()

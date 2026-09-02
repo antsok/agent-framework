@@ -41,6 +41,7 @@ from agent_framework import (
 from agent_framework_lab_cachebench import (
     AGENT_KINDS,
     FillPlan,
+    IdentifiedHistoryProvider,
     LiveOutcome,
     MeteredClient,
     ModelCall,
@@ -81,6 +82,7 @@ from agent_framework_lab_cachebench._live_cli import (
     CellStats,
     _accuracy_note,
     _aggregate,
+    _control_message_gap,
     _cost,
     _coverage,
     _excluded_cells,
@@ -591,6 +593,95 @@ def test_plain_agent_installs_no_provider_for_the_control() -> None:
 
     assert agent.compaction_strategy is None
     assert not [p for p in agent.context_providers if isinstance(p, CompactionProvider)]
+
+
+class RepeatingStub(StubChatClient):
+    """A stub that answers every call with the same words, the way a model answers filler.
+
+    ``StubChatClient`` stamps each reply with the call index precisely so that no two of them
+    can collide, which is the one thing a test about message identity has to switch off. The
+    live runs it stands in for did collide: the model's acknowledgements of filler turns were
+    byte-identical, which is what the content hash could not tell apart.
+    """
+
+    def _stamp(self, index: int, messages: Sequence[Message]) -> str:
+        """Return nothing, so every reply this stub gives is identical to every other."""
+        return ""
+
+
+@pytest.mark.parametrize("kind", list(AGENT_KINDS))
+def test_every_agent_kind_issues_its_messages_an_id(kind: str) -> None:
+    """Identity has to be the same on both kinds, since either can be the cell under test.
+
+    The harness builds its own history provider when none is handed to it, so the fix reaching
+    only the plain agent would leave every ``--agent harness`` cell -- which is every cell on
+    disk -- carrying the defect while the tests said otherwise.
+    """
+    agent = build_live_agent(
+        ProviderRuntime(client=StubChatClient(), model="stub"),
+        kind=kind,
+        strategy=None,
+        tokenizer=TOKENIZER,
+        tools=[],
+        recorder=UsageRecorder(),
+        max_context_window_tokens=8_000,
+        max_output_tokens=512,
+    )
+
+    providers = [p for p in agent.context_providers if isinstance(p, InMemoryHistoryProvider)]
+    assert providers, f"the {kind} agent stores its history somewhere else"
+    assert all(isinstance(provider, IdentifiedHistoryProvider) for provider in providers)
+
+
+@pytest.mark.parametrize("strategy", ["truncation", "context_window"])
+async def test_the_control_carries_the_same_conversation_as_a_strategy_row(strategy: str) -> None:
+    """Two rows driven from one turn list must reach the same number of messages.
+
+    The control has no strategy, so nothing annotates its messages and nothing gave them ids;
+    identity then fell back to ``(role, serialized contents)``, and the model's byte-identical
+    replies to filler turns collided and were dropped from the stored history. A strategy row
+    was never affected, because compaction stamps everything it touches.
+
+    So the control was measured on a shorter conversation than every row it was the baseline
+    for. Recorded at 120,000/0.86: 82 messages against 109, with ``anchored`` -- which planned
+    nothing at that cell -- ending 5.4% larger than the baseline it was supposed to equal.
+    Every ``vs none`` taken then is a comparison between two workloads.
+    """
+    scenario = build_live_scenario(salt="identity", filler_turns=3, filler_tokens=50, tool_turns=6)
+    peaks: dict[str, int] = {}
+    for name in ("none", strategy):
+        outcome = await run_live(
+            ProviderRuntime(client=RepeatingStub(usage=UsageDetails(input_token_count=100)), model="stub"),
+            strategy_name=name,
+            options=_options(),
+            scenario=scenario,
+            probe_repeats=1,
+        )
+        assert outcome.error is None
+        peaks[name] = outcome.messages_peak
+
+    assert peaks["none"] == peaks[strategy], "the control lost messages the strategy row kept"
+
+
+async def test_the_ids_never_reach_the_provider() -> None:
+    """The fix has to move no prompt, or it is a second change riding on the first.
+
+    ``serialize_message`` excludes ``message_id`` by construction, so an id changes no prompt
+    text, no token count and no cache prefix. Asserted on the recorded prompts rather than
+    argued from the serializer, because the recorded prompts are what every cost column reads.
+    """
+    scenario = build_live_scenario(salt="identity", filler_turns=3, filler_tokens=50, tool_turns=6)
+    outcome = await run_live(
+        ProviderRuntime(client=RepeatingStub(usage=UsageDetails(input_token_count=100)), model="stub"),
+        strategy_name="none",
+        options=_options(),
+        scenario=scenario,
+        probe_repeats=1,
+    )
+
+    assert outcome.error is None
+    assert "cachebench_" not in outcome.snapshot_prompt
+    assert not [call for call in outcome.calls if "cachebench_" in call.prompt_text]
 
 
 def test_unknown_agent_kind_is_rejected() -> None:
@@ -2360,8 +2451,8 @@ async def test_a_disqualified_cell_is_excluded_from_the_ranking() -> None:
         outcome, scenario = await _probed(StubChatClient(usage=UsageDetails(input_token_count=usage)), repeats=1)
         cells.append(_aggregate(name, [_record(outcome, scenario, strategy=name)]))
 
-    incomplete, oversized = _excluded_cells(cells)
-    ranked = [cell.strategy for cell in cells if cell.strategy not in incomplete | oversized]
+    incomplete, oversized, diverged = _excluded_cells(cells)
+    ranked = [cell.strategy for cell in cells if cell.strategy not in incomplete | oversized | diverged]
 
     assert cells[0].disqualified == 0.0
     assert cells[1].disqualified == 1.0
@@ -2388,7 +2479,7 @@ async def test_the_dq_flag_says_what_the_dq_column_says() -> None:
     assert "DQ" in _row(oversized, None, True, 60_000)
     # Both are out of the ranking, and for different reasons: the notes under the table name
     # each of them, so the flag only has to say which kind this row is.
-    assert _excluded_cells([unfinished, oversized]) == ({"none"}, {"none"})
+    assert _excluded_cells([unfinished, oversized]) == ({"none"}, {"none"}, set())
 
 
 async def test_a_throttled_row_says_so_in_the_table() -> None:
@@ -2586,7 +2677,63 @@ async def test_the_input_cost_column_prices_the_prompt_side_and_nothing_else() -
     cell = _aggregate("none", [record])
 
     assert cell.input_cost == pytest.approx(expected)
-    assert f"${expected:.4f}" in _render(None, [cell], set(), show_answers=False)
+    # What the table prints is the seeding half of it, because that is the half the ranking is
+    # on: the whole-run figure carries twelve re-reads of the snapshot that nobody deploys.
+    assert cell.seeding_input_cost is not None
+    assert cell.seeding_input_cost < cell.input_cost
+    assert f"${cell.seeding_input_cost:.4f}" in _render(None, [cell], set(), show_answers=False)
+
+
+async def test_the_two_phases_add_back_to_what_the_run_was_billed() -> None:
+    """Splitting the money must not create or lose any of it.
+
+    Taken as the whole seed less the probing rather than summed over the seeding calls, so the
+    two halves reconcile whatever else the run did. Anything that is neither an answered probe
+    nor a seeding turn -- the summarizer, a probe that failed before it produced an outcome --
+    lands in the workload, which is the direction that cannot flatter a strategy.
+    """
+    outcome, scenario = await _probed(
+        StubChatClient(
+            usage=UsageDetails(input_token_count=1_000, output_token_count=20, cache_read_input_token_count=300)
+        ),
+        repeats=2,
+    )
+    record = _record(outcome, scenario)
+
+    assert record.probe_cost is not None
+    assert record.seeding_cost is not None
+    assert record.probe_cost > 0, "a run that probed for nothing is not measuring the probes"
+    assert record.seeding_cost + record.probe_cost == pytest.approx(record.cost)
+    assert record.seeding_input_cost is not None
+    assert 0 < record.seeding_input_cost < record.input_cost, "the prompt side has to split the same way"
+    # Measured off the probes rather than modelled from the last prompt, which is what makes
+    # this exact: every probe carries the same snapshot but not at the same hit rate.
+    assert record.probe_input_tokens == sum(call.input_tokens for probe in outcome.probes for call in probe.calls)
+    assert record.probe_output_tokens == sum(call.output_tokens for probe in outcome.probes for call in probe.calls)
+    assert 0 < (record.probe_input_tokens or 0) < record.input_tokens
+    assert SeedRecord.from_dict(record.to_dict()).seeding_cost == pytest.approx(record.seeding_cost)
+
+
+async def test_a_record_written_before_the_phase_split_says_so_rather_than_guessing() -> None:
+    """The ten recorded cells counted their calls in one total, and nothing recovers the halves.
+
+    The per-probe prompts are not on those records; twelve probes priced at
+    ``prompt_tokens_final`` is a model of the run, not the run. Zero would be worse than a
+    guess -- it would hand a reader the correction already applied, and wrong, since every one
+    of those runs probed twelve times.
+    """
+    outcome, scenario = await _probed(StubChatClient(usage=UsageDetails(input_token_count=1_000)), repeats=1)
+    written = _record(outcome, scenario).to_dict()
+    written["schema"] = 3
+    for name in ("probe_input_tokens", "probe_cached_tokens", "probe_output_tokens"):
+        del written[name]
+
+    old = SeedRecord.from_dict(written)
+
+    assert old.probe_input_tokens is None
+    assert (old.probe_cost, old.seeding_cost, old.seeding_input_cost) == (None, None, None)
+    assert old.cost > 0, "everything the record did measure still reads"
+    assert _aggregate("none", [old]).seeding_cost is None
 
 
 async def test_a_cheap_lossy_row_ranks_below_a_dearer_faithful_one() -> None:
@@ -2615,6 +2762,152 @@ async def test_a_cheap_lossy_row_ranks_below_a_dearer_faithful_one() -> None:
     assert [line.startswith("-") for line in _body(table)] == [False, False, True, False]
     assert "Ranking: 2 of 3 rows kept at least 90%" in table
     assert "below 90% of the control's acc1" in table
+
+
+def _turn_list_cells(record: SeedRecord, control_peak: int) -> list[CellStats]:
+    """Return one cell's rows, differing only in how many messages each reached.
+
+    Args:
+        record: The record to shape every row from.
+        control_peak: Peak message count to give the control.
+
+    Returns:
+        The control, a strategy that adds nothing of its own, and one that adds a record and
+        the call that fetches it -- which is a legitimate reason to sit above the turn list
+        and so the reason the guard reads the leanest row rather than every row.
+    """
+    peaks = {"none": control_peak, "truncation": 109, "tool_summary_anchored": 121}
+    return [_aggregate(name, [replace(record, strategy=name, messages_peak=peak)]) for name, peak in peaks.items()]
+
+
+async def test_a_control_that_ran_another_conversation_is_flagged_and_out_of_the_ranking() -> None:
+    """A baseline carrying fewer messages than its rows is a broken measurement, not a cheap row.
+
+    Compaction excludes and rewrites in place; it never deletes from the stored history, and
+    what it adds is its own. So the leanest strategy row is the turn list at its own size and
+    the control, which adds nothing, has to equal it. Recorded at 120,000/0.86 it did not: 82
+    against 109, which makes every cost figure in that cell a comparison between two different
+    conversations. Ranked silently, that reads as compaction being expensive.
+    """
+    outcome, scenario = await _probed(StubChatClient(usage=UsageDetails(input_token_count=1_000)), repeats=1)
+    cells = _turn_list_cells(_record(outcome, scenario), control_peak=82)
+
+    assert _control_message_gap(cells) == -27
+    assert _excluded_cells(cells) == (set(), set(), {"none"})
+
+    table = _render(None, cells, {"none"}, show_answers=False)
+    control_row = next(line for line in _body(table) if line.startswith("none"))
+
+    assert "MSGS:-27" in control_row
+    assert "EXCL" in control_row
+    assert "CONTROL DIVERGED" in table
+    assert "NO VERDICT: the 'none' row ran a different conversation" in table
+    # The one column the divergence invalidates, withdrawn rather than printed as a number.
+    # These rows measured their phases, so every other money column is a figure and the single
+    # question mark on the line is the comparison that has been taken away.
+    assert next(line for line in _body(table) if line.startswith("truncation")).count("?") == 1
+
+
+async def test_a_control_that_matches_its_rows_is_left_alone() -> None:
+    """The guard has to be quiet on a sound cell, or it says nothing when it fires.
+
+    The row above the turn list is the point: a strategy that fetches a record back adds a
+    call and its result, so equality with *every* row would flag the sound case forever.
+    """
+    outcome, scenario = await _probed(StubChatClient(usage=UsageDetails(input_token_count=1_000)), repeats=1)
+    cells = _turn_list_cells(_record(outcome, scenario), control_peak=109)
+
+    assert _control_message_gap(cells) is None
+    assert _excluded_cells(cells) == (set(), set(), set())
+
+    table = _render(None, cells, set(), show_answers=False)
+
+    assert not [line for line in _body(table) if "MSGS" in line]
+    assert "CONTROL DIVERGED" not in table
+    assert "?" not in next(line for line in _body(table) if line.startswith("truncation"))
+
+
+def _phase_cell(record: SeedRecord, *, strategy: str, cost: float, probe_input: int | None) -> CellStats:
+    """Return a one-seed row whose invoice and whose workload can be set against each other.
+
+    Args:
+        record: The record to shape.
+
+    Keyword Args:
+        strategy: Name the row under.
+        cost: What the whole run was billed.
+        probe_input: Input tokens the probe phase billed, or None for a record written before
+            the phases were counted apart.
+
+    Returns:
+        The aggregated row.
+    """
+    return _aggregate(
+        strategy,
+        [
+            replace(
+                record,
+                strategy=strategy,
+                cost=cost,
+                probe_input_tokens=probe_input,
+                probe_cached_tokens=None if probe_input is None else 0,
+                probe_output_tokens=None if probe_input is None else 0,
+            )
+        ],
+    )
+
+
+async def test_the_ranking_is_on_the_workload_and_not_on_the_invoice() -> None:
+    """A row dearer on the whole run but cheaper on the conversation must rank first.
+
+    Every probe is asked from the restored snapshot, so each one re-sends the snapshot whole,
+    and a strategy with a small snapshot collects that discount once per probe -- on a phase no
+    deployed agent has, since an agent continues the conversation instead of being interrogated
+    twelve times from a frozen state. Ranked on the invoice, the measurement pays a strategy
+    for being cheap to measure. Stripping the probes turned one recorded cell's -14.1% into
+    -3.5% and reversed the sign on two of three.
+    """
+    outcome, scenario = await _probed(
+        StubChatClient(usage=UsageDetails(input_token_count=1_000, output_token_count=20)), repeats=1
+    )
+    record = _record(outcome, scenario)
+    # 1.00 - 0.50 of probing against 1.10 - 0.80: the second is the dearer run and the
+    # cheaper conversation, which is the only pair of numbers that can tell the two apart.
+    invoice = _phase_cell(record, strategy="cheap_to_measure", cost=1.00, probe_input=500_000)
+    workload = _phase_cell(record, strategy="cheap_to_run", cost=1.10, probe_input=800_000)
+    cells = [invoice, workload]
+
+    assert invoice.cost < workload.cost
+    assert workload.seeding_cost is not None and invoice.seeding_cost is not None
+    assert workload.seeding_cost < invoice.seeding_cost
+    assert _order(_render(None, cells, set(), show_answers=False)) == ["cheap_to_run", "cheap_to_measure"]
+
+
+async def test_a_cell_that_cannot_split_its_phases_ranks_on_the_invoice_and_says_so() -> None:
+    """The correction cannot be applied to a record that never counted its probing.
+
+    The per-probe prompts are not on those records, and pricing twelve probes at the final
+    prompt's size is a model of the run rather than the run. So the ranking falls back to what
+    the run was billed -- the older and dirtier order, which is exactly the one the split
+    exists to replace -- and every money column that would have described the workload reads
+    '?' instead of quietly describing something else.
+    """
+    outcome, scenario = await _probed(
+        StubChatClient(usage=UsageDetails(input_token_count=1_000, output_token_count=20)), repeats=1
+    )
+    record = _record(outcome, scenario)
+    invoice = _phase_cell(record, strategy="cheap_to_measure", cost=1.00, probe_input=None)
+    workload = _phase_cell(record, strategy="cheap_to_run", cost=1.10, probe_input=None)
+    cells = [invoice, workload]
+
+    table = _render(None, cells, set(), show_answers=False)
+
+    assert invoice.seeding_cost is None and invoice.probe_cost is None
+    assert _order(table) == ["cheap_to_measure", "cheap_to_run"], "the invoice order, since nothing else is known"
+    assert "Ranking: run$, probes and all ascending" in table
+    assert "NO PHASE SPLIT" in table
+    assert all("NOSPLIT" in line for line in _body(table))
+    assert all(line.count("?") >= 4 for line in _body(table)), "a money column read as a number it never measured"
 
 
 async def test_the_split_holds_when_every_row_clears_and_when_none_does() -> None:
@@ -2755,6 +3048,9 @@ def test_the_two_accuracy_measures_are_named_acc1_and_acc2() -> None:
         input_tokens=1_000,
         cached_tokens=300,
         output_tokens=20,
+        probe_input_tokens=400,
+        probe_cached_tokens=120,
+        probe_output_tokens=8,
         calls=4,
         messages_left=6,
         messages_peak=12,
@@ -2950,6 +3246,9 @@ def _control_cell(seeded: int) -> dict[str, CellStats]:
         input_tokens=1_000,
         cached_tokens=300,
         output_tokens=20,
+        probe_input_tokens=400,
+        probe_cached_tokens=120,
+        probe_output_tokens=8,
         calls=4,
         messages_left=6,
         messages_peak=12,
@@ -3626,7 +3925,7 @@ async def test_each_finished_seed_prints_a_line_of_its_own(
     await run_live_comparison(build_parser().parse_args(_live_argv()))
     printed = capsys.readouterr().out
 
-    lines = [line for line in printed.splitlines() if " seed " in line and "acc1 " in line]
+    lines = [line for line in printed.splitlines() if re.search(r" seed \d+/\d+ ", line)]
     assert len(lines) == 4, "one line per strategy-seed"
     assert "none seed 1/2" in lines[0]
     for line in lines:
@@ -3645,6 +3944,9 @@ def test_a_progress_line_shows_what_a_watcher_needs() -> None:
         input_tokens=1_000,
         cached_tokens=300,
         output_tokens=20,
+        probe_input_tokens=400,
+        probe_cached_tokens=120,
+        probe_output_tokens=8,
         calls=4,
         messages_left=6,
         messages_peak=12,

@@ -209,9 +209,11 @@ def _build_anchored_min_gain(options: StrategyOptions) -> CompactionStrategy:
 
     Pairs with ``anchored`` to measure one setting: whether declining collapses too small to
     repay the prompt cache they invalidate is worth the information they would have removed.
-    At the 60,000-token cell the unfloored row removed 263 tokens and cost 11% more than the
-    uncompacted control, so the pair is a direct test of whether a strategy is better off
-    doing nothing than doing a little. See :mod:`.compaction._anchored`.
+    What the pair has actually shown so far is that the floor's effect reverses between cells
+    -- the floored row kept fewer facts than its parent at one tool share and more at another --
+    which the review of 2 September traced to retention being path-dependent rather than to the
+    floor. Both defects are fixed; the pair has not been re-measured since. See
+    :mod:`.compaction._anchored`.
     """
     return MinimumGainAnchoredCompactionStrategy(
         max_input_tokens=options.input_budget_tokens,
