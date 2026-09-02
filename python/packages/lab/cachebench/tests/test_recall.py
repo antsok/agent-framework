@@ -14,7 +14,7 @@ from agent_framework_lab_cachebench import (
     score_answer,
 )
 from agent_framework_lab_cachebench._metrics import serialize_message
-from agent_framework_lab_cachebench._recall import score_scoped
+from agent_framework_lab_cachebench._recall import combined_question, score_scoped
 
 TOKENIZER = CharacterEstimatorTokenizer()
 
@@ -304,3 +304,31 @@ def test_the_combined_question_is_not_double_counted() -> None:
 
     assert scenario.answer_scopes[-1] == "*"
     assert not any(outcome.recalled for outcome in scoped)
+
+
+def test_the_combined_question_states_how_many_codes_it_wants() -> None:
+    """Ask for "every code returned by every lookup" and a model answers a different question.
+
+    Measured across 240 control samples under the old wording: 226 were either every value or
+    exactly eleven -- five non-tool facts plus *one* code per lookup. The model reads it as
+    *the* return code of each lookup, answers that correctly, and is scored as having recalled
+    21%. `acc2` was measuring the phrasing. The per-scope questions state their counts for this
+    reason; this one did not.
+    """
+    lookups = {"early": ("a",) * 8, "mid": ("b",) * 8, "late": ("c",) * 8, "aside": ()}
+
+    question = combined_question(lookups)
+
+    assert "all 24 codes" in question, "the total is what stops 'every code' being read as one each"
+    assert "3 deployment lookups" in question
+    assert "8 from each" in question
+    # A code-free filler lookup is not something the model can be asked to recall.
+    assert "4 deployment" not in question
+
+
+def test_the_combined_question_omits_the_per_lookup_count_when_it_varies() -> None:
+    """Stating "8 from each" when they differ would be a false instruction, not a helpful one."""
+    question = combined_question({"early": ("a",) * 8, "mid": ("b",) * 3})
+
+    assert "all 11 codes" in question
+    assert "from each" not in question

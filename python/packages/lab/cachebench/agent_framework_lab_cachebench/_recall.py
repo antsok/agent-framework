@@ -62,21 +62,43 @@ _FIRST_QUESTION: Final[str] = (
     "reference, and which pipeline we settled on. List them plainly, one per line, no "
     "preamble. If any of them appears nowhere in this conversation, say so for that one."
 )
-_COMBINED_QUESTION: Final[str] = (
-    "Final question. Combine everything now into one list: every requirement code, the "
-    "change-of-direction reference, which pipeline we settled on, and every code returned by "
-    "every deployment lookup. Group them under the tool or requirement they came from. Take "
-    "as long as you need and work through the conversation systematically. If any value "
-    "appears nowhere in this conversation, say so for that one rather than inventing it."
-)
-"""One closing question asking for all of it at once.
 
-Deliberately harder than the per-scope questions, and reported separately from them. Values
-are scattered through a long conversation, so answering needs the model to work through it
-rather than answer from what is nearby -- and a compaction record, if there is one, is where
-they have been gathered. A model that scores well per scope and badly here is telling us
-something the per-scope figure hides.
-"""
+
+def combined_question(lookups: Mapping[str, tuple[str, ...]]) -> str:
+    """Return the closing question that asks for every planted value at once.
+
+    Deliberately harder than the per-scope questions, and reported separately from them.
+    Values are scattered through a long conversation, so answering needs the model to work
+    through it rather than answer from what is nearby -- and a compaction record, if there is
+    one, is where they have been gathered.
+
+    **It states its counts**, exactly as the per-scope questions do. The earlier wording asked
+    for "every code returned by every deployment lookup", which a model reads as *the* return
+    code of each lookup: across 240 recorded control samples, 226 were either every value or
+    exactly eleven -- five non-tool facts plus one code per lookup. That is a model answering a
+    different question correctly, scored as a recall failure, and it made `acc2` a measure of
+    the phrasing rather than of what compaction preserved. The per-scope questions were fixed
+    this way for the same reason; this one was missed.
+
+    Args:
+        lookups: Codes per scope, including any code-free filler scopes, which are ignored.
+
+    Returns:
+        The question text.
+    """
+    bearing = {name: codes for name, codes in lookups.items() if codes}
+    total = sum(len(codes) for codes in bearing.values())
+    sizes = {len(codes) for codes in bearing.values()}
+    each = f", {sizes.pop()} from each" if len(sizes) == 1 else ""
+    return (
+        f"Final question. Combine everything now into one list: every requirement code, the "
+        f"change-of-direction reference, which pipeline we settled on, and all {total} codes "
+        f"returned by the {len(bearing)} deployment lookups{each}. Group them under the tool "
+        "or requirement they came from. Take as long as you need and work through the "
+        "conversation systematically. If any value appears nowhere in this conversation, say "
+        "so for that one rather than inventing it."
+    )
+
 
 _SWEEPING_QUESTION: Final[str] = (
     "Write the final report summary now. It must contain, verbatim: every requireme"
@@ -605,7 +627,7 @@ def build_recall_scenario(
         # failure here cannot drag down the per-scope figure, and vice versa.
         turns.append(
             TranscriptTurn(
-                request=(Message(role="user", contents=[_COMBINED_QUESTION]),),
+                request=(Message(role="user", contents=[combined_question(lookups)]),),
                 reply=(),
             )
         )
