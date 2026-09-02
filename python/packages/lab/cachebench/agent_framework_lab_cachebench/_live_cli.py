@@ -549,6 +549,8 @@ def _seed_record(
         context_drift=outcome.context_drift,
         rate_limit_retries=outcome.rate_limit_retries,
         throttled_seconds=outcome.throttled_seconds,
+        connection_retries=outcome.connection_retries,
+        connection_seconds=outcome.connection_seconds,
         turns_completed=outcome.turns_completed,
         turns_total=outcome.turns_total,
         probe_repeats=outcome.probe_repeats,
@@ -680,6 +682,10 @@ class CellStats:
     Summed over its seeds rather than averaged: this is time the cell took, and a sweep
     reading its logs back wants the total it paid, not a per-seed rate.
     """
+    connection_retries: int
+    """Calls this cell re-sent because the request never came back with an answer."""
+    connection_seconds: float
+    """Seconds this cell spent waiting for the provider to answer again, summed over its seeds."""
     samples: tuple[tuple[float, ...], ...]
     """Per-sample ``acc1``: one tuple per seed, one value per probe repeat."""
     combined_samples: tuple[tuple[float, ...], ...]
@@ -745,6 +751,8 @@ def _aggregate(strategy: str, records: Sequence[SeedRecord]) -> CellStats:
         disqualified=fmean(1.0 if record.disqualified else 0.0 for record in records),
         rate_limit_retries=sum(record.rate_limit_retries for record in records),
         throttled_seconds=sum(record.throttled_seconds for record in records),
+        connection_retries=sum(record.connection_retries for record in records),
+        connection_seconds=sum(record.connection_seconds for record in records),
         samples=samples,
         combined_samples=combined_samples,
     )
@@ -934,6 +942,40 @@ def _throttle_note(cells: Sequence[CellStats]) -> list[str]:
     ]
 
 
+def _reconnect_note(cells: Sequence[CellStats]) -> list[str]:
+    """Return the lines reporting what connection failures cost this cell in time.
+
+    Its own note rather than a line in the throttling one, because the reading is different.
+    Throttling is the account being at its limit and says something about how the sweep was
+    scheduled; a dropped connection says nothing about the measurement at all, only that the
+    run survived something that used to end it -- a cell of 30 seeds came back every row
+    ``ERR`` with no turns completed, and three cells of an earlier sweep went the same way.
+
+    The waits are seconds rather than minutes, so unlike a throttled row this one is unlikely
+    to have lost its cached prefix. Unlikely is not the same as measured, which is why the
+    count is on the row and the seconds are here.
+
+    Args:
+        cells: The rows, in the order they appear in the table.
+
+    Returns:
+        Zero lines when nothing was re-sent, otherwise a heading and one line per row.
+    """
+    reconnected = [cell for cell in cells if cell.connection_retries]
+    if not reconnected:
+        return []
+    return [
+        "",
+        "Reconnected: these calls never came back with an answer and were re-sent from the",
+        "state the turn began in. Each one survived a seed that would otherwise have ended at",
+        "the turn it happened on, taking every turn already paid for with it.",
+        *(
+            f"  {cell.strategy:<28}{cell.connection_retries} retries, {cell.connection_seconds:,.0f}s waiting"
+            for cell in reconnected
+        ),
+    ]
+
+
 def _stability_note(verdict: JointVerdict, spread: dict[str, float], repeats: int) -> list[str]:
     """Return a warning when the recommendation's margin is inside the measured noise.
 
@@ -981,6 +1023,8 @@ def _flags(stats: CellStats, control: CellStats | None) -> list[str]:
         flags.append(f"DRIFT:{drift}")
     if stats.rate_limit_retries:
         flags.append(f"THROTTLED:{stats.rate_limit_retries}")
+    if stats.connection_retries:
+        flags.append(f"RECONNECTED:{stats.connection_retries}")
     failures = sum(record.summarizer_failures for record in stats.records)
     if failures:
         flags.append(f"S{failures}")
@@ -1133,8 +1177,14 @@ _LEGEND: Final[tuple[str, ...]] = (
     "            THROTTLED:<n> calls re-sent after the provider refused them for rate",
     "            reasons; the seconds spent waiting are printed below the table, and they",
     "            matter because a cached prefix that expired during a wait is a miss the hit%",
-    "            column charges to compaction. DRIFT:<n> probes whose prompt was not the",
-    "            snapshot verbatim, because the strategy acted again on the restored state.",
+    "            column charges to compaction. RECONNECTED:<n> calls re-sent because the",
+    "            request never came back with an answer -- the connection dropped, or the",
+    "            provider answered 5xx. Counted apart from THROTTLED because the waits are",
+    "            seconds rather than a quota window, so this row's cached prefix is very",
+    "            likely intact; without the retry it would not be a row at all, but a seed",
+    "            that ended at the turn it happened on. DRIFT:<n> probes whose prompt was",
+    "            not the snapshot verbatim, because the strategy acted again on the",
+    "            restored state.",
     "            Those probes saw slightly less than survival was scored against, so a row",
     "            carrying this overstates what reached the model. S<n> summarizer failures,",
     "            <n>/<n>t turns",
@@ -1286,6 +1336,7 @@ def _render(
         lines.append(f"  {cell.strategy:<28}{_sample_groups(cell.combined_samples)}")
     lines += _fill_note({cell.strategy: cell for cell in ordered}, cell_params.plan, control)
     lines += _throttle_note(ordered)
+    lines += _reconnect_note(ordered)
     if verdict is None:
         lines += [
             "",
@@ -1393,6 +1444,8 @@ def _progress(record: SeedRecord) -> str:
         parts.append(f"DRIFT:{record.context_drift}")
     if record.rate_limit_retries:
         parts.append(f"THROTTLED:{record.rate_limit_retries} ({record.throttled_seconds:,.0f}s)")
+    if record.connection_retries:
+        parts.append(f"RECONNECTED:{record.connection_retries} ({record.connection_seconds:,.0f}s)")
     if record.error:
         parts.append(record.error)
     return "  ".join(parts)

@@ -38,7 +38,12 @@ from agent_framework_lab_cachebench import (
     write_records_jsonl,
     write_summary_csv,
 )
-from agent_framework_lab_cachebench._runner import is_rate_limited, retry_after_seconds, unsupported_option
+from agent_framework_lab_cachebench._runner import (
+    is_connection_error,
+    is_rate_limited,
+    retry_after_seconds,
+    unsupported_option,
+)
 from agent_framework_lab_cachebench._strategies import STRATEGIES_NEEDING_SUMMARIZER, StrategyOptions
 from agent_framework_lab_cachebench._types import TurnRecord
 
@@ -525,6 +530,97 @@ def test_a_retry_after_that_is_not_a_count_leaves_the_schedule_to_decide() -> No
     """
     assert retry_after_seconds(_Throttled({"Retry-After": "Wed, 21 Oct 2026 07:28:00 GMT"})) is None
     assert retry_after_seconds(_Throttled()) is None
+
+
+def _dropped() -> Exception:
+    """Return a lost connection shaped the way one arrives: a wrapper over a transport error.
+
+    ``APIConnectionError`` carries no status and says only "Connection error.", and the
+    framework wraps that in turn, so what is caught is two removes from the object that knows
+    the socket failed. The wrapper here says nothing at all, which is the point: only the cause
+    can classify it.
+    """
+    wrapped = Exception("<class 'FoundryChatClient'> service failed to complete the prompt")
+    wrapped.__cause__ = ConnectionResetError(104, "the peer went away")
+    return wrapped
+
+
+def test_a_lost_connection_is_found_through_the_wrapper_that_hides_it() -> None:
+    """The class that knows the socket failed is never the class that is caught.
+
+    Providers wrap differently, so a test on the exception's own type would work for exactly
+    one of them, and a test on its name would break the first time a provider renamed one.
+    Walking the chain to the transport error is what does not depend on either.
+    """
+    assert is_connection_error(_dropped())
+    assert not is_rate_limited(_dropped())
+
+
+def test_a_wrapper_with_nothing_under_it_is_not_a_lost_connection() -> None:
+    """The cause is doing the work, and this is what says so.
+
+    The wrapper above is deliberately silent, so the same wrapper with nothing beneath it must
+    classify the other way. Without this, a detection that had quietly degraded into matching
+    the wrapper's own wording would still pass every test above.
+    """
+    assert not is_connection_error(Exception("<class 'FoundryChatClient'> service failed to complete the prompt"))
+
+
+def test_a_lost_connection_is_found_in_the_text_when_the_wrapper_kept_no_object() -> None:
+    """A wrapper that rendered its cause to a string still has to be classifiable.
+
+    ``APIConnectionError``'s own message is the whole of what survives that rendering, and it
+    is "Connection error."
+    """
+    assert is_connection_error(Exception("Connection error."))
+    assert is_connection_error(Exception("httpcore.RemoteProtocolError: server disconnected without response"))
+
+
+@pytest.mark.parametrize("status", [408, 500, 502, 503, 504])
+def test_a_provider_that_failed_to_serve_is_worth_re_sending(status: int) -> None:
+    """A 5xx is the provider saying it failed, not that the request was wrong.
+
+    From here that is the same event as the connection dropping: nothing came back that
+    answers the question, and the same request may well be answered next time. It is the
+    weaker half of this classification -- a deterministic 500 will be re-sent four times before
+    failing -- which is why the attempt budget is small and the waits are seconds.
+    """
+    refused = Exception(f"Error code: {status}")
+    refused.status_code = status  # type: ignore[attr-defined]
+
+    assert is_connection_error(refused)
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        Exception("Error code: 400 - supports at most 272000 tokens, got 274293"),
+        Exception("Error code: 401 - Access denied due to invalid subscription key"),
+        Exception("Unsupported parameter: 'timeout' is not supported with this model."),
+    ],
+    ids=["context_length", "auth", "an_option_that_happens_to_be_called_timeout"],
+)
+def test_a_refusal_the_provider_decided_on_is_not_a_lost_connection(error: Exception) -> None:
+    """Re-sending a refusal spends the whole prompt again for the same answer.
+
+    The last case is why every text marker is a phrase and not a word. A provider rejecting an
+    option *called* ``timeout`` would match a bare "timeout", and the drop-and-retry path that
+    refusal belongs to would never see it -- the same shape as reading the "429" inside a token
+    count as a status.
+    """
+    assert not is_connection_error(error)
+
+
+def test_a_rate_limit_and_a_lost_connection_are_not_each_other() -> None:
+    """Two retries, two counters, and no call that lands in both.
+
+    A 429 is a status the provider answered with, so it is a decision and not a failure to
+    arrive; the transient statuses are enumerated so that it cannot be read as one by accident.
+    Without this the same refusal could be charged to both counters and the table would say a
+    seed had been throttled and reconnected for one event.
+    """
+    assert is_rate_limited(_Throttled()) and not is_connection_error(_Throttled())
+    assert is_connection_error(_dropped()) and not is_rate_limited(_dropped())
 
 
 # region provider selectors

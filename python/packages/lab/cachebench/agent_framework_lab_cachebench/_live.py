@@ -63,7 +63,7 @@ from ._recall import (
     score_answer,
     score_scoped,
 )
-from ._runner import is_rate_limited, retry_after_seconds, unsupported_option
+from ._runner import is_connection_error, is_rate_limited, retry_after_seconds, unsupported_option
 from ._strategies import StrategyOptions, build_strategy
 from ._transcripts import TRUE_CHARS_PER_TOKEN, sized_text
 from .compaction import (
@@ -83,16 +83,20 @@ if TYPE_CHECKING:
 __all__ = [
     "AGENT_KINDS",
     "COMPACTION_GUIDANCE",
+    "CONNECTION_ATTEMPTS",
+    "CONNECTION_BASE_DELAY",
+    "CONNECTION_MAX_DELAY",
+    "CONNECTION_MAX_WAIT",
     "DEFAULT_COMBINED_REPEATS",
     "DEFAULT_PROBE_REPEATS",
     "DEFAULT_TOOL_RESULT_TOKENS",
     "NEUTRAL_INSTRUCTIONS",
     "RATE_LIMIT_ATTEMPTS",
     "RATE_LIMIT_BASE_DELAY",
-    "RATE_LIMIT_JITTER",
     "RATE_LIMIT_MAX_DELAY",
     "RATE_LIMIT_MAX_WAIT",
     "RETRIEVAL_GUIDANCE",
+    "RETRY_JITTER",
     "TERSE_INSTRUCTIONS",
     "LiveOutcome",
     "MeteredClient",
@@ -189,15 +193,56 @@ RATE_LIMIT_MAX_DELAY: Final[float] = 60.0
 #: a run that spent its wall clock here says so instead of looking merely slow.
 RATE_LIMIT_MAX_WAIT: Final[float] = 300.0
 
+#: Attempts one call makes against a dropped connection before the turn is failed.
+#:
+#: Five, and they are the operative bound: the schedule below spends about 15 seconds over the
+#: four re-sends, well inside the wait budget, so what ends a turn is running out of attempts
+#: rather than running out of clock. A cell of 30 seed records was lost outright to
+#: ``APIConnectionError`` with every row ``ERR`` and no turns completed, and three cells of an
+#: earlier sweep went the same way, so the first fifteen seconds of a network blip are the
+#: whole point of this.
+#:
+#: Cheaper to spend than the throttling attempts above: a request the transport never delivered
+#: is a request the provider never billed. That is an argument for retrying promptly, not for
+#: retrying forever -- a 5xx counts as transient here too, and one of those may well have been
+#: billed for the work it failed at.
+CONNECTION_ATTEMPTS: Final[int] = 5
+
+#: First backoff in seconds, doubled per attempt: 1, 2, 4, 8.
+#:
+#: Half the rate limit's, because the two are asking different questions. A 429 waits for a
+#: quota window to refill, which happens on a fixed period and cannot be hurried; a dropped
+#: socket has no such structure, and the honest question -- is the path back -- can be asked
+#: as soon as a reconnect could plausibly have succeeded, which is under a second.
+CONNECTION_BASE_DELAY: Final[float] = 1.0
+
+#: Ceiling on any single wait, in seconds, including one the provider asked for.
+#:
+#: Twenty rather than the rate limit's sixty, for the same reason the base is smaller: sixty
+#: is the length of the quota window, and there is no equivalent unit here to wait out. A path
+#: still down after twenty seconds is an outage rather than a blip, and the remaining attempts
+#: should establish that quickly instead of parking the sweep on it.
+CONNECTION_MAX_DELAY: Final[float] = 20.0
+
+#: Ceiling on the total one turn may spend waiting out connection failures, in seconds.
+#:
+#: A minute, against the rate limit's five. Five minutes is several quota windows; a minute is
+#: already four reconnection attempts, and anything that survives it is not transient. The
+#: budget binds only when the provider names its own waits -- a 503 answering ``Retry-After``
+#: at the 20-second cap three times over exhausts it before the attempts run out.
+CONNECTION_MAX_WAIT: Final[float] = 60.0
+
 #: Share of each computed wait that is randomised away, so waits land between 75% and 100%.
 #:
 #: The quota is per deployment, not per process, and it is shared with whatever else is
 #: running against the same account. A fixed schedule makes two throttled clients re-collide
-#: on every attempt; this is enough to break that without making the schedule unreadable.
+#: on every attempt; this is enough to break that without making the schedule unreadable. The
+#: connection schedule is jittered by the same fraction and for the same reason: a gateway
+#: coming back up is met by everything that was talking to it when it went down.
 #: Not applied to a delay the provider asked for, which is an instruction rather than a guess.
-RATE_LIMIT_JITTER: Final[float] = 0.25
+RETRY_JITTER: Final[float] = 0.25
 
-#: Source of the jitter above. Not a security control; see ``_throttle_delay``.
+#: Source of the jitter above. Not a security control; see ``_retry_delay``.
 _JITTER_SOURCE: Final[random.SystemRandom] = random.SystemRandom()
 
 TERSE_INSTRUCTIONS: Final[str] = (
@@ -537,6 +582,23 @@ class LiveOutcome:
     The count alone does not say whether the run was inconvenienced or shaped by throttling:
     six retries of two seconds and six of a minute are different runs. This is the one that
     is comparable with the run's wall clock.
+    """
+    connection_retries: int = 0
+    """Calls re-sent because the request never came back with an answer.
+
+    Counted apart from the throttled ones because the two say different things about the run,
+    and folding them together would give every row the worse reading of whichever it met. A
+    throttled call waited out a quota window, which is a minute wide and long enough for the
+    prompt cache to expire underneath it, so a throttled row's hit rate is suspect. A
+    reconnected one waited seconds and re-sent the same prefix, so its cache is very likely
+    intact and its numbers are the numbers.
+    """
+    connection_seconds: float = 0.0
+    """Seconds this run spent waiting for the provider to answer again.
+
+    Beside the count for the reason the throttled seconds are: four re-sends over eight seconds
+    and four over a minute are different runs, and only this one is comparable with the wall
+    clock a sweep was measured against.
     """
     seed_prompt_tokens: int = 0
     """Billed size of the last prompt the seeding phase sent.
@@ -1052,25 +1114,74 @@ def restore_state(
         recall_middleware.forget_pending()
 
 
-def _throttle_delay(attempt: int, requested: float | None) -> float:
-    """Return how long to wait before re-sending a call the provider refused for rate reasons.
+def _retry_delay(attempt: int, requested: float | None, *, base: float, maximum: float) -> float:
+    """Return how long to wait before re-sending a call that did not come back with an answer.
+
+    One schedule shape for both failures, parametrised rather than duplicated: they differ in
+    their numbers -- how long a wait is worth taking, and how many -- and not in how a wait is
+    computed. Two copies of this would be two places for a cap to be applied to the jitter
+    rather than to the delay.
 
     Args:
-        attempt: 0-based index of the attempt that was refused.
+        attempt: 0-based index of the attempt that failed.
         requested: Seconds the provider asked for, if it named any.
 
+    Keyword Args:
+        base: The first backoff, doubled per attempt.
+        maximum: Ceiling on this wait, applied to a requested delay as well as a computed one.
+
     Returns:
-        Seconds to wait, never more than :data:`RATE_LIMIT_MAX_DELAY`.
+        Seconds to wait, never more than ``maximum``.
     """
     if requested is not None:
         # Taken as given, only capped. The provider knows when its window refills and we do
         # not, so jittering an instruction downwards just spends an attempt early.
-        return min(requested, RATE_LIMIT_MAX_DELAY)
-    delay = min(RATE_LIMIT_BASE_DELAY * 2**attempt, RATE_LIMIT_MAX_DELAY)
+        return min(requested, maximum)
+    delay = min(base * 2**attempt, maximum)
     # SystemRandom only because both linters reject the ordinary generator on sight, and a
     # backoff wait is worth neither an argument nor a pair of suppression comments.
     jitter = _JITTER_SOURCE.random()
-    return delay * (1.0 - RATE_LIMIT_JITTER * jitter)
+    return delay * (1.0 - RETRY_JITTER * jitter)
+
+
+@dataclass(slots=True)
+class _RetryBudget:
+    """What one kind of failure may spend on one turn, and what it has spent so far.
+
+    One of these per failure kind, so that neither draws on the other's allowance. A turn that
+    waits out two rate limits and then loses its connection should survive both: the events are
+    independent, and a shared counter would make the second failure's chances depend on how
+    unlucky the turn had already been with the first.
+
+    Fresh per turn, and per option-drop attempt within it, since a re-send with a different
+    option set is a different request.
+    """
+
+    attempts: int
+    base_delay: float
+    max_delay: float
+    max_wait: float
+    retries: int = 0
+    """Re-sends charged to this budget, which is also the 0-based index of the next attempt."""
+    seconds: float = 0.0
+
+    def take(self, requested: float | None) -> float | None:
+        """Return the next wait and charge it to this budget, or None when it has run out.
+
+        Args:
+            requested: Seconds the provider asked for, if it named any.
+
+        Returns:
+            Seconds to wait before re-sending, or None when the attempts or the wait budget are
+            spent and the turn should fail.
+        """
+        remaining = self.max_wait - self.seconds
+        if self.retries + 1 >= self.attempts or remaining <= 0:
+            return None
+        delay = min(_retry_delay(self.retries, requested, base=self.base_delay, maximum=self.max_delay), remaining)
+        self.retries += 1
+        self.seconds += delay
+        return delay
 
 
 def _repeats_for_scope(scope: str, *, probe_repeats: int, combined_repeats: int) -> int:
@@ -1210,8 +1321,9 @@ async def run_live(
             tool call loses its arguments rather than shortening them -- and the middleware
             cannot send an instruction message, so the description is the only channel left.
             ``None`` states no target.
-        sleep: How the backoff between throttled attempts is taken. Injectable only so that
-            a test can prove the retry is bounded without spending the bound in wall clock.
+        sleep: How the backoff between re-sent attempts is taken, throttled and disconnected
+            alike. Injectable only so that a test can prove the retries are bounded, and prove
+            it against the schedule itself, without spending the bound in wall clock.
 
     Returns:
         The outcome. A turn that fails sets ``error`` and stops the run rather than raising,
@@ -1290,9 +1402,17 @@ async def run_live(
     dropped: list[str] = []
     retries = 0
     throttled = 0.0
+    reconnects = 0
+    reconnected_seconds = 0.0
 
     async def _attempt(text: str, turn_options: dict[str, Any], before: Mapping[str, Any]) -> Any:
-        """Send one turn, waiting out provider throttling for as long as the bounds allow.
+        """Send one turn, waiting out throttling and dropped connections while the bounds allow.
+
+        Two failures, one loop, separate budgets. They are alike in what they need -- a wait, a
+        restore, and a bounded number of goes -- and unlike in everything else: a quota window
+        refills on a fixed period and a network path does not, so the schedules differ, and the
+        counters differ because a throttled run and a reconnected one are not the same
+        measurement. Anything the provider actually answered is re-raised on the first try.
 
         Args:
             text: The user turn.
@@ -1303,29 +1423,57 @@ async def run_live(
             The agent response.
 
         Raises:
-            Exception: Whatever the provider raised, once it is not throttling or the
-                attempt and wait budgets are spent. Failing here is deliberate: the caller
-                fails the turn and abandons the seed, which is the honest outcome for a limit
-                that did not lift. Continuing with a short conversation would report a cheap,
-                forgetful strategy that was never run.
+            Exception: Whatever the provider raised, once it is neither throttling nor a
+                connection failure, or the matching attempt and wait budgets are spent. Failing
+                here is deliberate: the caller fails the turn and abandons the seed, which is
+                the honest outcome for a limit that did not lift or a provider that stayed
+                unreachable. Continuing with a short conversation would report a cheap,
+                forgetful strategy that was never run, and a retry that hid an outage would
+                report the sweep as merely slow.
         """
-        nonlocal retries, throttled
-        waited = 0.0
-        attempt = 0
-        while True:
-            try:
-                return await agent.run(text, session=session, options=turn_options)
-            except Exception as exc:
-                remaining = RATE_LIMIT_MAX_WAIT - waited
-                if attempt + 1 >= RATE_LIMIT_ATTEMPTS or remaining <= 0 or not is_rate_limited(exc):
-                    raise
-                delay = min(_throttle_delay(attempt, retry_after_seconds(exc)), remaining)
-                await sleep(delay)
-                restore_state(session, before, recall_middleware)
-                waited += delay
-                attempt += 1
-                retries += 1
-                throttled += delay
+        nonlocal retries, throttled, reconnects, reconnected_seconds
+        rate_limit_budget = _RetryBudget(
+            attempts=RATE_LIMIT_ATTEMPTS,
+            base_delay=RATE_LIMIT_BASE_DELAY,
+            max_delay=RATE_LIMIT_MAX_DELAY,
+            max_wait=RATE_LIMIT_MAX_WAIT,
+        )
+        connection_budget = _RetryBudget(
+            attempts=CONNECTION_ATTEMPTS,
+            base_delay=CONNECTION_BASE_DELAY,
+            max_delay=CONNECTION_MAX_DELAY,
+            max_wait=CONNECTION_MAX_WAIT,
+        )
+        try:
+            while True:
+                try:
+                    return await agent.run(text, session=session, options=turn_options)
+                except Exception as exc:
+                    # Throttling first. The two predicates disagree about a 429 by
+                    # construction -- a status the provider answered with is a decision, and
+                    # only 408 and the 5xx read as transient -- but the order says which
+                    # reading wins if some gateway ever wraps one failure in the other.
+                    if is_rate_limited(exc):
+                        budget = rate_limit_budget
+                    elif is_connection_error(exc):
+                        budget = connection_budget
+                    else:
+                        raise
+                    # ``Retry-After`` is read on both paths: a 503 is entitled to name one,
+                    # and it is a better answer than any schedule invented here.
+                    delay = budget.take(retry_after_seconds(exc))
+                    if delay is None:
+                        raise
+                    await sleep(delay)
+                    restore_state(session, before, recall_middleware)
+        finally:
+            # In a ``finally`` because the turn's spend is the turn's spend either way: a seed
+            # that failed after four re-sends has to report them, and that is exactly the row
+            # someone will be reading the counters on.
+            retries += rate_limit_budget.retries
+            throttled += rate_limit_budget.seconds
+            reconnects += connection_budget.retries
+            reconnected_seconds += connection_budget.seconds
 
     async def _send(text: str, *, turn_index: int, label: str) -> Any:
         """Send one turn, dropping an option the provider rejects and retrying once.
@@ -1349,16 +1497,17 @@ async def run_live(
         # measured on two of five models, one rejecting temperature and one rejecting any
         # pinned tool choice.
         #
-        # Throttling is retried inside each of these attempts rather than beside them, so the
-        # two compose: an option rejected on the third attempt after two 429s still drops the
-        # option and goes round again, with a fresh wait budget for the new option set. The
-        # sweep this was built for lost 100 seeds and EUR 4.17 because a rate limit fell
-        # through a loop that only knew how to drop an option it was never given.
+        # Throttling and lost connections are retried inside each of these attempts rather than
+        # beside them, so they compose: an option rejected on the third attempt after two 429s
+        # still drops the option and goes round again, with fresh wait budgets for the new
+        # option set. The sweep this was built for lost 100 seeds and EUR 4.17 because a rate
+        # limit fell through a loop that only knew how to drop an option it was never given,
+        # and a later cell lost all 30 of its seed records the same way to a connection drop.
         #
-        # Both loops restore, because both re-send. An option is named on the call that
-        # carries it, and after a tool result that is the second call of the turn -- so this
-        # one reaches a half-finished turn exactly as the rate limit does, and a run that
-        # restored only the throttled path would still send a dangling call down the other.
+        # Every loop restores, because every one of them re-sends. An option is named on the
+        # call that carries it, and after a tool result that is the second call of the turn --
+        # so this one reaches a half-finished turn exactly as the rate limit does, and a run
+        # that restored only the throttled path would still send a dangling call down the other.
         for _ in range(2):
             # Per-turn options carry the runtime's own options too: this replaces the
             # per-call option set rather than adding to it.
@@ -1468,6 +1617,8 @@ async def run_live(
         context_drift=drift,
         rate_limit_retries=retries,
         throttled_seconds=throttled,
+        connection_retries=reconnects,
+        connection_seconds=reconnected_seconds,
         seed_prompt_tokens=seed_prompt_tokens,
         summarizer_failures=summarizer.failures if summarizer else 0,
         strategy_notes=_strategy_notes(strategy) + _strategy_notes(recall_middleware),

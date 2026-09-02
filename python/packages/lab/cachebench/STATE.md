@@ -203,6 +203,41 @@ tokens**: `deepcopy` returns the immutable strings as themselves, so the copy re
 message objects around the payloads rather than the payloads, against a call that spends tens of
 seconds sending them.
 
+**Then a cell was lost to the network, and the retry covers that too now.** A cell of 30 seed
+records came back every row `ERR` with no turns completed, lost whole to `APIConnectionError`,
+and three cells of an earlier sweep went the same way. The retry covered HTTP 429 only, and a
+request that never arrived is not a refusal, so the turn failed and the seed was abandoned.
+`_attempt` now also waits out a **transient failure**: a dropped connection with its timeout
+subclasses, and the statuses that say the provider failed to serve a request it received --
+408, 500, 502, 503, 504. Anything the provider *decided* is re-raised on the first attempt: a
+400, an auth failure, a context-length rejection. Re-sending a 230,000-token prompt against a
+wall is the failure the `429`-substring bug already caused once, so the transient statuses are
+enumerated rather than written as `>= 500`, and every text marker is a phrase -- a bare
+"timeout" would match a provider rejecting an option *called* `timeout`, which belongs to the
+option-drop path. Detection walks the exception chain the way `is_rate_limited` does: a status
+first, then `isinstance` against `ConnectionError`, `TimeoutError` and `socket.gaierror`, then
+the phrases, for a wrapper that rendered its cause and kept no object. `is_connection_error`,
+in `_runner.py` beside the other two.
+
+**Its own schedule**, because a network drop has no window to refill: 5 attempts, 1s base
+doubling, 20s per wait and 60s per turn, against throttling's 6/2s/60s/300s. Both are
+`_RetryBudget` objects and there is one of each per turn, so a turn that reconnects twice can
+still wait out a quota window afterwards and starts that wait at the rate limit's own base.
+`Retry-After` is honoured on both paths -- a 503 may name one -- and capped by the path's own
+ceiling. The same snapshot and restore run before every re-send, so a connection lost between a
+function call and its result cannot re-send a dangling call. Exhausting the budget still fails
+the turn: the point is surviving a blip, not hiding an outage.
+
+**Counted apart from throttling**, because the two readings differ: a throttled row waited out
+a minute-wide quota window and may have lost its cached prefix, a reconnected one waited seconds
+and re-sent the same prefix, so one flag for both would put that caveat on every row that merely
+survived a blip. `LiveOutcome.connection_retries` and `connection_seconds`, the same two on
+`SeedRecord` and `CellStats`, a `RECONNECTED:<n>` flag and a `Reconnected:` block under the
+table. **Records are `schema` 3 as a result, and version 2 is still read**: a version 2 record
+was written by code that could not re-send, so its zeroes are a measurement and not a gap, and
+the six recorded cells -- 180 seeds -- read unchanged. Version 1 is still refused, its accuracy
+columns being answers to a question the rebuild replaced.
+
 **The flags column said `DQ` for two different things.** It read "excluded from the ranking",
 which covers both a row that oversent and a row that never finished, while the `dq` column
 means only the first — which is why the last table showed rows flagged `DQ` beside a `dq` of
@@ -438,13 +473,14 @@ Each of these produced a plausible wrong number first.
   it. **A push would not be a fast-forward.** Pushing needs its own go-ahead, and it needs a
   decision about the rewrite first.
 - `dev/` is untracked Git-LFS junk. **Never stage it.**
-- 301 tests pass against the rebased framework; ruff, pyright and bandit are clean. Everything
-  described in §3, §3b, §5 and §5a is committed — the measurement rebuild, the per-seed results
+- 361 tests pass against the rebased framework; ruff, pyright and bandit are clean. Everything
+  described in §3, §5 and §5a is committed — the measurement rebuild, the per-seed results
   file, the rate-limit retry and its snapshot-and-restore fix, the `acc1`/`acc2` split and the
   `compaction/` subpackage with the rewritten recall prompt and its two bounds.
-- The working tree is clean apart from `dev/` **and the runs 28/29 write-ups**: `RESULTS.md`
-  landed with the run, and the updates to this file, `REPORT-GPT-5-4-MINI.md` and
-  `runs/README.md` are uncommitted.
+- The working tree is clean apart from `dev/`, **the runs 28/29 write-ups** and **the
+  connection retry**: `RESULTS.md` landed with the run, and the updates to this file,
+  `REPORT-GPT-5-4-MINI.md` and `runs/README.md` are uncommitted, as is the transient-failure
+  retry of §3b — `_runner.py`, `_live.py`, `_records.py`, `_live_cli.py` and their tests.
 - `REPORT.md` and `ARTICLE.md` still describe only the six-model cross-provider work and
   predate everything from run 7 onward. They do not mention the 272,000 input limit, the
   crossover, or either new strategy.
