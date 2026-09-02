@@ -458,11 +458,21 @@ Each of these produced a plausible wrong number first.
 - **`--tool-turns` is silently capped** by `--filler-turns`: extra tool groups are placed
   inside filler sections, so 16 requested with the default 6 filler turns yields 9. `plan_fill`
   now sizes the filler above that floor, and a test pins it.
-- **The history provider drops byte-identical messages.** `filter_new_messages` hashes them,
-  so a stub that answered the same words on every turn built a history a third the size it
-  appeared to be, and the offline sizing test read 16,565 tokens where it should have read
-  19,881. The stub numbers its replies now. Nothing about the live runs was affected -- a real
-  model never repeats itself exactly -- but any future offline fixture must.
+- **The history provider drops byte-identical messages, and this corrupts the control.**
+  `filter_new_messages` falls back to `(role, serialized contents)` for identity when a message
+  carries no `message_id`. A row running a strategy gets annotated and always has ids; the
+  **control** does not, so its short acknowledgements to filler turns collide and are dropped.
+  Measured at 120,000/0.86: the control peaks at 82 messages where every strategy row peaks at
+  109, and `anchored` -- which plans nothing at that cell -- ends with a snapshot **5.4% larger**
+  than the control's. Two rows that both did nothing are not the same conversation.
+
+  **This entry previously read "Nothing about the live runs was affected -- a real model never
+  repeats itself exactly." That was wrong**, and it is why the defect survived four sweeps: the
+  `msgs` column showed it in every rendered table. Every `vs none` figure taken before the fix is
+  biased in the control's favour. See [`REVIEW-2026-09-02.md`](REVIEW-2026-09-02.md) §1a.
+
+  It also broke the offline sizing test, which read 16,565 tokens where it should have read
+  19,881; the stub numbers its replies now, and any future fixture must.
 
 ## 7. Repository state
 
