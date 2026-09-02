@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+import socket
 import time
 from collections.abc import Callable, Iterable, Iterator, Mapping, Sequence
 from dataclasses import dataclass
@@ -38,6 +39,7 @@ __all__ = [
     "CallOutcome",
     "ProviderCaller",
     "TurnCaller",
+    "is_connection_error",
     "is_rate_limited",
     "retry_after_seconds",
     "run_cell",
@@ -53,6 +55,45 @@ _RATE_LIMIT_MARKERS: Final[tuple[str, ...]] = ("rate limit", "rate_limit", "too 
 # contains it -- and a deterministic 400 retried as if it were throttling wastes the attempt
 # budget and delays the honest failure by minutes.
 _STATUS_429: Final[re.Pattern[str]] = re.compile(r"(?<!\d)429(?!\d)")
+
+# Statuses that say the provider failed to serve a request it received, rather than refusing
+# the request itself. Enumerated rather than written as ">= 500": 501 and 505 are statements
+# about what the endpoint supports and will say the same thing next time. Everything outside
+# this set and 429 is a decision about the content, and re-sending one spends the whole prompt
+# again -- 50,000 to 230,000 tokens here -- against an answer that cannot change.
+_TRANSIENT_STATUSES: Final[frozenset[int]] = frozenset({408, 500, 502, 503, 504})
+
+# What the transport raises when the request never got an answer back. Base classes, not
+# names: ``ConnectionError`` already covers reset, refused, aborted and broken pipe, and
+# ``TimeoutError`` is what both ``asyncio`` and the socket layer raise for a read that never
+# completed. ``OSError`` itself is deliberately not here -- a tool that raised
+# ``FileNotFoundError`` would then be re-sent four times as though the network had blinked.
+_CONNECTION_TYPES: Final[tuple[type[BaseException], ...]] = (ConnectionError, TimeoutError, socket.gaierror)
+
+# The fallback for a wrapper that rendered its cause to a string and dropped the object it came
+# from, which is how ``APIConnectionError`` usually reaches us: its own message is "Connection
+# error." and nothing structural survives the rendering.
+#
+# Every marker is a phrase rather than a word. A bare "timeout" would match a provider refusing
+# a request option *called* timeout, and that refusal would then be retried four times before
+# the option-drop loop it belongs to ever saw it -- the same shape as the "429" substring bug.
+_CONNECTION_MARKERS: Final[tuple[str, ...]] = (
+    "connection error",
+    "connection reset",
+    "connection aborted",
+    "connection refused",
+    "connection closed",
+    "server disconnected",
+    "remote protocol error",
+    "request timed out",
+    "read timed out",
+    "read timeout",
+    "connect timeout",
+    "temporarily unavailable",
+    "service unavailable",
+    "bad gateway",
+    "broken pipe",
+)
 
 # Reasoning models reject sampling parameters outright. The wording differs by provider,
 # and some gateways silently strip the field instead of failing, so the same model can 400
@@ -138,6 +179,41 @@ def is_rate_limited(error: BaseException) -> bool:
         return True
     text = " ".join(f"{type(exc).__name__} {exc}" for exc in _error_chain(error)).lower()
     return bool(_STATUS_429.search(text)) or any(marker in text for marker in _RATE_LIMIT_MARKERS)
+
+
+def is_connection_error(error: BaseException) -> bool:
+    """Return whether a call failed to get an answer through, rather than being answered.
+
+    A dropped connection and a rate limit are both worth re-sending, and nothing else is. The
+    distinction this makes is not "was it a network error" but "did the provider decide
+    anything": a 400 for a prompt over the limit, a 401 for a key and a context-length rejection
+    are all answers, and re-sending one spends the whole prompt again against a wall. So a
+    status that reached us settles the question on its own, and only the absence of one gets as
+    far as the transport signals below.
+
+    Structure before wording, in three layers, because a provider error arrives wrapped:
+
+    1. A status anywhere in the chain. 408 and the 5xx in :data:`_TRANSIENT_STATUSES` are the
+       provider saying it failed to serve a request it received -- which, from here, is the
+       same event as the connection dropping -- and any other status is a decision.
+    2. An exception type from :data:`_CONNECTION_TYPES` anywhere in the chain. Matched by
+       ``isinstance`` rather than by class name, since every provider wraps differently and a
+       name test would work for exactly one of them.
+    3. The phrases in :data:`_CONNECTION_MARKERS`, for a wrapper that kept only the text.
+
+    Args:
+        error: The exception a call raised.
+
+    Returns:
+        True when re-sending the same request may get a different answer.
+    """
+    statuses = {code for exc in _error_chain(error) if (code := _status_code(exc)) is not None}
+    if statuses:
+        return not statuses.isdisjoint(_TRANSIENT_STATUSES)
+    if any(isinstance(exc, _CONNECTION_TYPES) for exc in _error_chain(error)):
+        return True
+    text = " ".join(f"{type(exc).__name__} {exc}" for exc in _error_chain(error)).lower()
+    return any(marker in text for marker in _CONNECTION_MARKERS)
 
 
 def _header(headers: Any, name: str) -> str | None:

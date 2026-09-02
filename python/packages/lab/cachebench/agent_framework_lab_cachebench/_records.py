@@ -56,7 +56,23 @@ __all__ = [
 #: of the closing questions then, so it was asked exactly ``probe_repeats`` times, and
 #: :meth:`CellParams.from_dict` fills that in. There is no "not measured" to confuse with a
 #: measurement, and the samples on the record say the same thing by their count.
-SCHEMA_VERSION: Final[int] = 2
+#:
+#: 3 adds the connection-retry counters, and this time the version is what separates a record
+#: whose run could re-send a dropped call from one whose run could not.
+SCHEMA_VERSION: Final[int] = 3
+
+#: Versions this reader accepts, which is not only the current one.
+#:
+#: Version 2 is readable because its two absent counters are a measurement rather than a gap: a
+#: version 2 record was written by code that failed the turn on a connection error instead of
+#: re-sending it, so zero re-sends is what happened, and :meth:`SeedRecord.from_dict` fills it
+#: in as such. That is the opposite of the version 1 case, which is still refused -- those
+#: records predate the seed/snapshot/probe rebuild and scored ``survived`` against a different
+#: prompt, so their accuracy columns are answers to another question.
+#:
+#: Refusing version 2 instead would have thrown away the six recorded cells on disk, 180 seeds
+#: of paid-for measurement, to avoid a column of zeroes that are true.
+_READABLE_SCHEMAS: Final[frozenset[int]] = frozenset({2, SCHEMA_VERSION})
 
 #: The parameters that make two records the same cell, and so aggregable into one row.
 #:
@@ -337,6 +353,17 @@ class SeedRecord:
     limit was met; this says how much of the seed's wall clock went into meeting it, which is
     what makes a cache hit rate comparable with a cell that never waited at all.
     """
+    connection_retries: int
+    """Calls this seed re-sent because the request never came back with an answer.
+
+    Its own field rather than added to the throttled count, because the reader's next question
+    differs. A throttled seed waited out a quota window, which is wide enough that the prompt
+    cache may have gone with it; a reconnected seed waited seconds and re-sent the same prefix.
+    Summed into one column, every reconnected row would carry a caveat that belongs to the
+    other failure.
+    """
+    connection_seconds: float
+    """Seconds this seed spent waiting for the provider to answer again."""
     turns_completed: int
     turns_total: int
     probe_repeats: int
@@ -396,15 +423,23 @@ class SeedRecord:
                 fields this one requires.
         """
         version = data.get("schema")
-        if version != SCHEMA_VERSION:
+        if version not in _READABLE_SCHEMAS:
+            readable = ", ".join(str(number) for number in sorted(_READABLE_SCHEMAS))
             raise ValueError(
-                f"schema {version!r}, but this reader understands {SCHEMA_VERSION}. Records from "
+                f"schema {version!r}, but this reader understands {readable}. Records from "
                 "another version describe a different measurement and must not be averaged with these."
             )
         known = {field.name for field in fields(cls)} - {"cell"}
         values = {key: value for key, value in data.items() if key in known}
         for name in _TUPLE_FIELDS:
             values[name] = tuple(values.get(name) or ())
+        # A version 2 record ran under code that had no connection retry at all: a dropped call
+        # failed its turn on the spot. So nothing was re-sent and nothing was waited, and zero
+        # is what that run did rather than a number this reader could not find. Left as a
+        # required field with no default, so the live path cannot forget to record it and
+        # quietly inherit the same zeroes for a run that could have re-sent.
+        values.setdefault("connection_retries", 0)
+        values.setdefault("connection_seconds", 0.0)
         try:
             return cls(cell=CellParams.from_dict(data["cell"]), **values)
         except (KeyError, TypeError) as error:

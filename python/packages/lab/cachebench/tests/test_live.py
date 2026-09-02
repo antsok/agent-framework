@@ -61,6 +61,10 @@ from agent_framework_lab_cachebench import (
 )
 from agent_framework_lab_cachebench._advisor import ModelPricing
 from agent_framework_lab_cachebench._live import (
+    CONNECTION_ATTEMPTS,
+    CONNECTION_BASE_DELAY,
+    CONNECTION_MAX_DELAY,
+    CONNECTION_MAX_WAIT,
     DEFAULT_COMBINED_REPEATS,
     RATE_LIMIT_ATTEMPTS,
     RATE_LIMIT_BASE_DELAY,
@@ -1189,6 +1193,41 @@ class _Throttled(Exception):
         self.response = SimpleNamespace(headers={"Retry-After": retry_after} if retry_after else {})
 
 
+class _Disconnected(Exception):
+    """A dropped connection shaped the way one actually reaches this code.
+
+    Deliberately unhelpful on its own. ``APIConnectionError`` carries no status, and its own
+    message is the bare "Connection error.", so the only thing in it that says what happened is
+    the transport exception it was raised *from* -- which is why the detection walks the chain.
+    The message here names nothing a marker could match, so a test using this fails if the
+    detection ever quietly degrades into reading text or class names.
+    """
+
+    def __init__(self, cause: BaseException | None = None) -> None:
+        """Create the failure.
+
+        Args:
+            cause: What the transport raised, defaulting to a reset socket.
+        """
+        super().__init__("upstream request failed")
+        self.__cause__ = cause or ConnectionResetError(104, "the peer went away")
+
+
+class _Refused(Exception):
+    """A refusal the provider decided on, carrying its status the way an SDK error does."""
+
+    def __init__(self, status: int | None, message: str) -> None:
+        """Create the refusal.
+
+        Args:
+            status: The HTTP status, or None for a provider that only rendered its message.
+            message: What the provider said.
+        """
+        super().__init__(message)
+        if status is not None:
+            self.status_code = status
+
+
 class ThrottlingStub(StubChatClient):
     """A stub that refuses its first calls with a 429 and then answers normally."""
 
@@ -1209,6 +1248,44 @@ class ThrottlingStub(StubChatClient):
             self.refused += 1
             raise _Throttled(self.retry_after)
         return super()._inner_get_response(messages=messages, stream=stream, options=options, **kwargs)
+
+
+class DisconnectingStub(StubChatClient):
+    """A stub whose first calls never come back with an answer, and which then answers."""
+
+    def __init__(self, *, drops: int, **kwargs: Any) -> None:
+        """Create the stub.
+
+        Keyword Args:
+            drops: How many calls to lose before answering.
+        """
+        super().__init__(**kwargs)
+        self.drops = drops
+        self.dropped = 0
+
+    def _inner_get_response(self, *, messages: Any, stream: Any, options: Any, **kwargs: Any) -> Any:
+        if self.dropped < self.drops:
+            self.dropped += 1
+            raise _Disconnected
+        return super()._inner_get_response(messages=messages, stream=stream, options=options, **kwargs)
+
+
+class RefusingStub(StubChatClient):
+    """A stub that answers every call with the same refusal, as a wall does."""
+
+    def __init__(self, *, status: int | None, message: str, **kwargs: Any) -> None:
+        """Create the stub.
+
+        Keyword Args:
+            status: The HTTP status to carry, or None to carry only the message.
+            message: What the provider says.
+        """
+        super().__init__(**kwargs)
+        self.status = status
+        self.message = message
+
+    def _inner_get_response(self, *, messages: Any, stream: Any, options: Any, **kwargs: Any) -> Any:
+        raise _Refused(self.status, self.message)
 
 
 class _Waits:
@@ -1420,11 +1497,21 @@ class _ToolLoopStub(StubChatClient):
     the provider's own 400, so a retry that re-sends one fails loudly rather than passing.
     """
 
-    def __init__(self, *, throttle_once: bool = False, reject_option: str | None = None, **kwargs: Any) -> None:
+    def __init__(
+        self,
+        *,
+        throttle_once: bool = False,
+        disconnect_once: bool = False,
+        reject_option: str | None = None,
+        **kwargs: Any,
+    ) -> None:
         """Create the stub.
 
         Keyword Args:
             throttle_once: Refuse the first call that carries a tool result with a 429.
+            disconnect_once: Lose the first call that carries a tool result, so the connection
+                fails in the same place -- between a function call and its result -- where a
+                429 produced the provider 400 this restore exists for.
             reject_option: Name of a request option to refuse, and refuse only on a call
                 carrying a tool result -- so the option-drop retry meets a half-finished turn
                 exactly as the rate limit does.
@@ -1432,8 +1519,10 @@ class _ToolLoopStub(StubChatClient):
         super().__init__(obey_tool_choice=True, **kwargs)
         self.requests: list[tuple[Message, ...]] = []
         self.throttle_once = throttle_once
+        self.disconnect_once = disconnect_once
         self.reject_option = reject_option
         self.throttled = 0
+        self.disconnected = 0
         self.rejected = 0
 
     def _inner_get_response(
@@ -1456,6 +1545,9 @@ class _ToolLoopStub(StubChatClient):
         if after_tool_result and self.throttle_once and not self.throttled:
             self.throttled += 1
             raise _Throttled
+        if after_tool_result and self.disconnect_once and not self.disconnected:
+            self.disconnected += 1
+            raise _Disconnected
         if after_tool_result and self.reject_option is not None and self.reject_option in options:
             self.rejected += 1
             raise RuntimeError(f"Unsupported parameter: '{self.reject_option}' is not supported with this model.")
@@ -1587,6 +1679,226 @@ async def test_a_throttled_probe_is_also_re_sent_from_the_snapshot() -> None:
     assert outcome.error is None
     assert outcome.turns_completed == outcome.turns_total
     assert [request for request in client.requests if _dangling_calls(request)] == []
+
+
+async def test_a_dropped_connection_is_waited_out_and_re_sent() -> None:
+    """A network blip must cost a wait, not the seed.
+
+    A cell of 30 seed records came back every row ``ERR`` with no turns completed, lost whole
+    to ``APIConnectionError``; three cells of an earlier sweep went the same way. The retry
+    covered HTTP 429 only, so a request that never arrived failed its turn and abandoned the
+    seed, taking every turn already paid for with it.
+    """
+    waits = _Waits()
+    scenario = build_live_scenario(salt="drop", filler_turns=3, filler_tokens=50, tool_turns=6)
+
+    outcome = await run_live(
+        ProviderRuntime(client=DisconnectingStub(drops=2), model="stub"),
+        strategy_name="none",
+        options=_options(),
+        scenario=scenario,
+        sleep=waits,
+    )
+
+    assert outcome.error is None
+    assert outcome.turns_completed == outcome.turns_total
+    assert outcome.connection_retries == 2
+    assert outcome.connection_seconds == pytest.approx(sum(waits.delays))
+    assert outcome.rate_limit_retries == 0, "a dropped connection was counted as throttling"
+    assert outcome.throttled_seconds == 0.0
+    # Its own schedule, and a faster one: a quota window refills on a fixed period and cannot
+    # be hurried, while the only question a reconnect asks is whether the path is back.
+    assert len(waits.delays) == 2
+    assert 0 < waits.delays[0] <= CONNECTION_BASE_DELAY < RATE_LIMIT_BASE_DELAY
+    assert waits.delays[0] < waits.delays[1] <= CONNECTION_BASE_DELAY * 2
+
+
+async def test_a_connection_that_stays_down_fails_the_turn_rather_than_looping() -> None:
+    """Retries are for surviving a blip, not for hiding an outage.
+
+    A provider that has gone away has to end the seed, and end it in seconds: this is the same
+    bargain the rate-limit retry makes, struck at a shorter horizon because there is no window
+    to wait out. The bound has to be provable without waiting for it, which is what the
+    injected sleep is for -- a delay capped wrongly is visible in the schedule and invisible in
+    an elapsed time.
+    """
+    waits = _Waits()
+    scenario = build_live_scenario(salt="outage", filler_turns=3, filler_tokens=50, tool_turns=6)
+
+    outcome = await run_live(
+        ProviderRuntime(client=DisconnectingStub(drops=1_000), model="stub"),
+        strategy_name="none",
+        options=_options(),
+        scenario=scenario,
+        sleep=waits,
+    )
+
+    assert outcome.error is not None
+    assert outcome.turns_completed == 0
+    assert outcome.connection_retries == len(waits.delays) == CONNECTION_ATTEMPTS - 1
+    assert max(waits.delays) <= CONNECTION_MAX_DELAY
+    assert sum(waits.delays) <= CONNECTION_MAX_WAIT
+    # And the schedule really would have waited, so it is the injected sleep keeping this test
+    # instant rather than the bounds being trivially small.
+    assert sum(waits.delays) > CONNECTION_BASE_DELAY
+
+
+@pytest.mark.parametrize(
+    ("status", "message"),
+    [
+        (400, "Error code: 400 - supports at most 272000 tokens, got 274293"),
+        (401, "Error code: 401 - Access denied due to invalid subscription key"),
+        (403, "Error code: 403 - {'error': {'code': 'PermissionDenied'}}"),
+        (None, "Error code: 400 - {'error': {'message': 'Invalid value for tool_choice'}}"),
+    ],
+    ids=["context_length", "auth", "forbidden", "no_status_at_all"],
+)
+async def test_a_failure_the_provider_decided_on_is_not_re_sent(status: int | None, message: str) -> None:
+    """A refusal is an answer, and re-sending a large prompt against one buys nothing.
+
+    This is the failure the ``429``-as-substring bug already caused once: a prompt-too-large
+    error names the size it refused, and 274,293 contains those digits, so a wall was retried
+    as though it were a spike and cost six attempts and minutes of waiting before failing
+    exactly as it would have failed at once. Widening the retry is the same opportunity again,
+    against prompts of 50,000 to 230,000 tokens.
+    """
+    waits = _Waits()
+    scenario = build_live_scenario(salt="wall", filler_turns=3, filler_tokens=50, tool_turns=6)
+
+    outcome = await run_live(
+        ProviderRuntime(client=RefusingStub(status=status, message=message), model="stub"),
+        strategy_name="none",
+        options=_options(),
+        scenario=scenario,
+        sleep=waits,
+    )
+
+    assert outcome.error is not None
+    assert waits.delays == []
+    assert outcome.connection_retries == 0
+    assert outcome.rate_limit_retries == 0
+
+
+async def test_a_turn_disconnected_inside_the_tool_loop_is_re_sent_from_where_it_started() -> None:
+    """The re-send has to put the conversation back, whatever it was that failed.
+
+    A connection lost between a function call and its result leaves exactly what a 429 there
+    leaves: history is persisted per model call, so the assistant's call is already durable and
+    the result still in flight is not, and re-sending against that state is refused outright
+    with "No tool output found for function call". That was measured at 7 occurrences in one
+    cell, on the uncompacted control as well as the compacting rows, and it destroyed the seeds
+    the retry existed to save. The new path reuses the same snapshot and restore, and this is
+    what says so: the stub answers any request carrying a dangling call with the provider's own
+    400, and the finished history has to be the one a clean run would have left.
+    """
+    waits = _Waits()
+    scenario = build_live_scenario(salt="dropmidloop", filler_turns=3, filler_tokens=50, tool_turns=6)
+    client = _ToolLoopStub(disconnect_once=True)
+
+    async def _seed(stub: _ToolLoopStub) -> LiveOutcome:
+        return await run_live(
+            ProviderRuntime(client=stub, model="stub"),
+            strategy_name="none",
+            options=_options(),
+            scenario=scenario,
+            sleep=waits,
+        )
+
+    outcome = await _seed(client)
+    clean = await _seed(_ToolLoopStub())
+
+    assert client.disconnected == 1, "the stub never reached the call it was written to drop"
+    assert outcome.error is None
+    assert outcome.turns_completed == outcome.turns_total
+    assert outcome.connection_retries == 1
+    assert clean.connection_retries == 0
+    assert [request for request in client.requests if _dangling_calls(request)] == []
+    assert clean.snapshot_prompt, "the control seeded nothing, so matching it proves nothing"
+    assert outcome.snapshot_prompt == clean.snapshot_prompt
+
+
+async def test_a_lost_connection_and_a_rate_limit_keep_their_own_budgets() -> None:
+    """One turn may meet both, and neither may spend the other's allowance.
+
+    They are independent events with different schedules, so a turn that reconnected twice
+    should still be able to wait out a quota window afterwards -- and it should wait out the
+    *first* window with the first wait of the rate-limit schedule, not with wherever the
+    reconnections had left a shared counter.
+    """
+    waits = _Waits()
+
+    class Unlucky(StubChatClient):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.dropped = 0
+            self.refused = 0
+
+        def _inner_get_response(self, *, messages: Any, stream: Any, options: Any, **kwargs: Any) -> Any:
+            if self.dropped < 2:
+                self.dropped += 1
+                raise _Disconnected
+            if self.refused < 2:
+                self.refused += 1
+                raise _Throttled
+            return super()._inner_get_response(messages=messages, stream=stream, options=options, **kwargs)
+
+    scenario = build_live_scenario(salt="bothkinds", filler_turns=3, filler_tokens=50, tool_turns=6)
+    outcome = await run_live(
+        ProviderRuntime(client=Unlucky(), model="stub"),
+        strategy_name="none",
+        options=_options(),
+        scenario=scenario,
+        sleep=waits,
+    )
+
+    assert outcome.error is None
+    assert outcome.turns_completed == outcome.turns_total
+    assert outcome.connection_retries == 2
+    assert outcome.rate_limit_retries == 2
+    assert len(waits.delays) == 4
+    # The third wait is the first throttled one. Shared counters would have made it the fourth
+    # step of a single schedule -- four seconds and upwards -- rather than the base again.
+    assert waits.delays[2] <= RATE_LIMIT_BASE_DELAY
+    assert outcome.connection_seconds == pytest.approx(sum(waits.delays[:2]))
+    assert outcome.throttled_seconds == pytest.approx(sum(waits.delays[2:]))
+
+
+async def test_a_lost_connection_composes_with_dropping_an_option() -> None:
+    """The two retries are nested, so a turn that meets both still gets both.
+
+    Written flat, whichever loop was outermost would swallow the other. That is not
+    hypothetical: the rate-limit retry was placed beside the option drop first, and a 429 fell
+    straight through a handler that only knew what to do with an option the provider had named.
+    """
+    waits = _Waits()
+
+    class Awkward(StubChatClient):
+        def __init__(self, **kwargs: Any) -> None:
+            super().__init__(**kwargs)
+            self.dropped = 0
+
+        def _inner_get_response(self, *, messages: Any, stream: Any, options: Any, **kwargs: Any) -> Any:
+            if not self.dropped:
+                self.dropped += 1
+                raise _Disconnected
+            if "temperature" in options:
+                raise RuntimeError("Unsupported parameter: 'temperature' is not supported with this model.")
+            return super()._inner_get_response(messages=messages, stream=stream, options=options, **kwargs)
+
+    scenario = build_live_scenario(salt="dropopt", filler_turns=3, filler_tokens=50, tool_turns=6)
+    outcome = await run_live(
+        ProviderRuntime(client=Awkward(), model="stub", options={"temperature": 0.0}),
+        strategy_name="none",
+        options=_options(),
+        scenario=scenario,
+        sleep=waits,
+    )
+
+    assert outcome.error is None
+    assert outcome.turns_completed == outcome.turns_total
+    assert outcome.dropped_options == ("temperature",)
+    assert outcome.connection_retries == 1
+    assert len(waits.delays) == 1
 
 
 async def test_every_probe_answer_reaches_the_score() -> None:
@@ -2108,6 +2420,39 @@ async def test_a_throttled_row_says_so_in_the_table() -> None:
     assert "Throttled:" in table, "the seconds are the point, and the flag cannot carry them"
 
 
+async def test_a_reconnected_row_says_so_separately_from_a_throttled_one() -> None:
+    """The two retries are different events and must not read as one.
+
+    A throttled row waited out a quota window, which is wide enough that its cached prefix may
+    have gone with it, so its hit% carries a caveat. A reconnected row waited seconds and
+    re-sent the same prefix. One flag for both would put that caveat on every row that merely
+    survived a blip, and would hide which of the two a sweep is actually losing time to.
+    """
+    waits = _Waits()
+    scenario = build_live_scenario(salt="flagdrop", filler_turns=3, filler_tokens=50, tool_turns=6)
+    outcome = await run_live(
+        ProviderRuntime(client=DisconnectingStub(drops=2, usage=UsageDetails(input_token_count=1_000)), model="stub"),
+        strategy_name="none",
+        options=_options(),
+        scenario=scenario,
+        probe_repeats=1,
+        sleep=waits,
+    )
+    cell = _aggregate("none", [_record(outcome, scenario)])
+
+    assert cell.connection_retries == 2
+    assert cell.connection_seconds == pytest.approx(sum(waits.delays))
+    assert cell.rate_limit_retries == 0
+    assert "RECONNECTED:2" in _flags(cell, None)
+    assert not any(flag.startswith("THROTTLED") for flag in _flags(cell, None))
+
+    table = _render(None, [cell], set(), show_answers=False)
+
+    assert "RECONNECTED:2" in table
+    assert "Reconnected:" in table, "the seconds are the point, and the flag cannot carry them"
+    assert "Throttled:" not in table
+
+
 async def test_a_declined_collapse_reaches_the_flags_column() -> None:
     """A row that never fired and a row that fired to no effect must not read the same.
 
@@ -2427,6 +2772,8 @@ def test_the_two_accuracy_measures_are_named_acc1_and_acc2() -> None:
         context_drift=0,
         rate_limit_retries=0,
         throttled_seconds=0.0,
+        connection_retries=0,
+        connection_seconds=0.0,
         turns_completed=10,
         turns_total=10,
         probe_repeats=2,
@@ -2620,6 +2967,8 @@ def _control_cell(seeded: int) -> dict[str, CellStats]:
         context_drift=0,
         rate_limit_retries=0,
         throttled_seconds=0.0,
+        connection_retries=0,
+        connection_seconds=0.0,
         turns_completed=10,
         turns_total=10,
         probe_repeats=1,
@@ -3313,6 +3662,8 @@ def test_a_progress_line_shows_what_a_watcher_needs() -> None:
         context_drift=1,
         rate_limit_retries=4,
         throttled_seconds=37.5,
+        connection_retries=2,
+        connection_seconds=6.0,
         turns_completed=10,
         turns_total=10,
         probe_repeats=2,
@@ -3333,20 +3684,64 @@ def test_a_progress_line_shows_what_a_watcher_needs() -> None:
     assert "DQ" in line
     assert "DRIFT:1" in line
     assert "THROTTLED:4 (38s)" in line
+    assert "RECONNECTED:2 (6s)" in line
 
 
-def test_records_from_another_schema_are_refused() -> None:
+@pytest.mark.parametrize("version", [1, SCHEMA_VERSION + 1], ids=["before_the_rebuild", "from_the_future"])
+def test_records_from_another_schema_are_refused(version: int) -> None:
     """A reader must be able to tell an old record from a new one.
 
     The measurement itself has been rebuilt once. Before the seed/snapshot/probe design,
     ``survived`` was scored against a prompt the closing answers had written, and the same
     strategy read 53/53 on one run and 18/53 on another. Averaging records from either side of
-    that into one row would be a mean over two different questions.
+    that into one row would be a mean over two different questions, which is why version 1 is
+    still refused although version 2 is not.
     """
-    payload = {"schema": SCHEMA_VERSION + 1, "cell": _cell_params().to_dict(), "strategy": "none"}
+    payload = {"schema": version, "cell": _cell_params().to_dict(), "strategy": "none"}
 
     with pytest.raises(ValueError, match="schema"):
         SeedRecord.from_dict(payload)
+
+
+async def test_a_record_written_before_the_connection_counters_still_reads() -> None:
+    """The six cells on disk are version 2, and they are 180 seeds of paid-for measurement.
+
+    Their absent counters are not a gap: the code that wrote them failed the turn on a dropped
+    connection instead of re-sending it, so no call was re-sent and none was waited on, and
+    zero is what that run did. That is the opposite of the version 1 case above, where the
+    numbers on the record are answers to a question this reader no longer asks.
+    """
+    outcome, scenario = await _probed(
+        StubChatClient(usage=UsageDetails(input_token_count=1_000, output_token_count=20)), repeats=1
+    )
+    written = _record(outcome, scenario).to_dict()
+    written["schema"] = 2
+    del written["connection_retries"]
+    del written["connection_seconds"]
+
+    old = SeedRecord.from_dict(written)
+
+    assert (old.connection_retries, old.connection_seconds) == (0, 0.0)
+    cell = _aggregate("none", [old])
+    assert cell.connection_retries == 0
+    assert "RECONNECTED" not in " ".join(_flags(cell, None)), "a run that never reconnected was flagged as having"
+    assert "Reconnected:" not in _render(None, [cell], set(), show_answers=False)
+
+
+def test_the_recorded_cells_on_disk_still_read() -> None:
+    """The files this package's results are written up from have to survive a schema change.
+
+    Not a fixture: these are the actual records behind ``RESULTS.md`` and the report, and the
+    reader refuses a line rather than skipping it, so a change that makes them unreadable makes
+    every recorded cell unrecoverable at once.
+    """
+    recorded = sorted((Path(__file__).parents[1] / "runs").glob("*.jsonl"))
+    assert recorded, "no recorded cells were found, so this passed without reading anything"
+
+    for path in recorded:
+        records = read_seed_records(path)
+        assert records, f"{path.name} read as empty"
+        assert all(record.correctness_samples for record in records), f"{path.name} lost its samples"
 
 
 def test_the_solved_sizing_survives_the_file() -> None:
