@@ -3,23 +3,19 @@
 Cell: foundry:gpt-5.4-mini-2  agent harness  window 120,000  fill 70%  payload 3,500x6  probes 1  combined 5
   seeds present: anchored 5/1, anchored_min_gain 5/1, context_window 5/1, none 5/1, tool_summary_anchored 5/1, truncation 5/1
 
-Excluded from the verdict (6 did not finish): anchored, anchored_min_gain, context_window, none, tool_summary_anchored, truncation
-
-Excluded from the verdict (the control ran a different conversation from the rows it is the baseline for): none
-
 Model: gpt-5.4-mini-2   agent: harness   probe repeats: 1 (acc1), 5 (acc2)
 Pricing: $0.66/M in, $0.070/M cached, $3.96/M out
-Ranking: 3 of 6 rows kept at least 90% of the control's acc1 and are ranked first, cheapest seed$ first; the rest follow below the line.
+Ranking: 4 of 6 rows kept at least 90% of the control's acc1 and are ranked first, cheapest seed$ first; the rest follow below the line.
 
 strategy                         msgs   tok left/peak  snap%  calls          in  hit%       out  seed in$    seed$   probe$     run$ seed$+-   summ$  vs none$    facts  lost nofetch ignored     acc1  seed+-  rep+-  acc2  rep2+-  vs none   dq     flags
 -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-none                            73/73   69,371/69,371    58%     46   2,366,728   96%     9,511   $0.1648  $0.1899  $0.0731  $0.2630    108%       -         ?    42/53     1      10       1     79%*    98pp    0pp  100%     0pp        -   0%EXCL,MSGS:+18,ERR,RECONNECTED:4,0/47t
-tool_summary_anchored           66/82   59,850/59,850    50%     50   2,360,955   94%    14,753   $0.1974  $0.2451  $0.0637  $0.3088    112%       -         ?    42/53     1      10       0     80%     98pp    0pp   82%     8pp     102%   0%EXCL,ERR,RECONNECTED:7,FORCED:2,REC:1,RECFORCED:1,0/47t
-context_window                  71/74   65,027/65,027    54%     46   2,282,930   91%     9,783   $0.2250  $0.2526  $0.0683  $0.3209    104%       -         ?    38/53     6      10       0     71%     98pp    0pp   83%    14pp      91%   0%EXCL,ERR,THROTTLED:1,RECONNECTED:4,0/47t
+anchored                        91/91   87,447/87,447    73%     57   2,970,458   96%    12,999   $0.1971  $0.2314  $0.0934  $0.3248     12%       -       -1%    53/53     0       0       1     99%      6pp    0pp   99%     0pp     102%   0%         -
+none                            91/91   86,082/86,082    71%     57   2,937,314   96%    11,127   $0.2056  $0.2345  $0.0908  $0.3253     21%       -         -    53/53     0       0       1     97%*     7pp    0pp  100%     0pp        -   0%         -
+anchored_min_gain               91/91   86,915/86,915    72%     57   2,955,817   96%    11,837   $0.2086  $0.2408  $0.0909  $0.3316     17%       -       +3%    53/53     0       0       3     95%     13pp    0pp  100%     0pp      98%   0%         -
+tool_summary_anchored          83/101   73,711/73,906    61%     62   2,896,416   94%    17,401   $0.2419  $0.2972  $0.0789  $0.3762     21%       -      +27%    53/53     0       0       0    100%      0pp    0pp   86%     6pp     103%   0%FORCED:2,REC:1,RECFORCED:1
 ------------------------------------------------------------------------------------------------------------- below 90% of the control's acc1 -------------------------------------------------------------------------------------------------------------
-anchored_min_gain               55/55   51,753/51,753    43%     34   1,760,303   95%     6,686   $0.1293  $0.1470  $0.0541  $0.2012    117%       -         ?    32/53     2      19       3     56%     93pp    0pp  100%     0pp      71%   0%EXCL,FETCH,ERR,RECONNECTED:8,0/47t
-anchored                        67/67   63,898/63,898    53%     41   1,964,219   96%     8,894   $0.1397  $0.1637  $0.0564  $0.2201    113%       -         ?    39/53     3      11       8     60%     98pp    0pp   98%     0pp      76%   0%EXCL,FETCH,ERR,RECONNECTED:8,27/47t
-truncation                      66/73   64,426/69,496    53%     46   2,302,087   94%    11,173   $0.1792  $0.2124  $0.0686  $0.2809    120%       -         ?    42/53     1      10      11     60%     93pp    0pp   85%    32pp      76%   0%EXCL,ERR,RECONNECTED:4,0/47t
+truncation                      84/91   82,380/87,450    68%     57   2,914,245   95%    14,064   $0.2101  $0.2520  $0.0863  $0.3382     31%       -       +7%    53/53     0       0      11     79%     59pp    0pp   84%    42pp      81%   0%         -
+context_window                  89/93   81,595/81,595    68%     57   2,859,507   91%    12,307   $0.2789  $0.3146  $0.0845  $0.3992     16%       -      +34%    46/53     7       0       1     86%     28pp    0pp   80%    20pp      88%   0%         -
 
 msgs      = messages in a probe's prompt, out of the most any call carried. Every probe
             is asked from the same restored snapshot, so this no longer drifts downwards
@@ -143,49 +139,28 @@ flags     = DQ the dq column above is not zero, so this row sent a prompt a mode
             the invoice rather than the workload
 
 per-sample acc1, one group per seed:
-  none                        [100%]  [93%]  [100%]  [2%]  [100%]
-  tool_summary_anchored       [100%]  [100%]  [2%]  [100%]  [100%]
-  context_window              [78%]  [78%]  [100%]  [2%]  [100%]
-  anchored_min_gain           [94%]  [94%]  [2%]  [2%]  [87%]
-  anchored                    [100%]  [94%]  [2%]  [2%]  [100%]
-  truncation                  [69%]  [41%]  [94%]  [2%]  [93%]
+  anchored                    [100%]  [94%]  [100%]  [100%]  [100%]
+  none                        [100%]  [93%]  [100%]  [94%]  [100%]
+  anchored_min_gain           [94%]  [94%]  [100%]  [100%]  [87%]
+  tool_summary_anchored       [100%]  [100%]  [100%]  [100%]  [100%]
+  truncation                  [69%]  [41%]  [100%]  [93%]  [93%]
+  context_window              [78%]  [78%]  [72%]  [100%]  [100%]
 
 per-sample acc2, one group per seed:
-  none                        [100% 100% 100% 100% 100%]  [100% 100% 100% 100% 100%]  [100% 100% 100% 100% 100%]  [100% 100% 100% 100% 100%]
-  tool_summary_anchored       [100% 100% 100% 100% 100%]  [9% 40% 9% 40% 40%]  [100% 100% 100% 100% 100%]  [100% 100% 100% 100% 100%]
-  context_window              [21% 77% 77% 32% 74%]  [77% 77% 77% 77% 77%]  [100% 100% 100% 100% 100%]  [100% 100% 100% 100% 100%]
-  anchored_min_gain           [100% 100% 100% 100% 100%]  [100% 100% 100% 100% 100%]  [100% 100% 100% 100% 100%]
-  anchored                    [100% 100% 100% 100% 100%]  [94% 94% 94% 94% 94%]  [100% 100% 100% 100% 100%]
-  truncation                  [100% 100% 100% 32% 100%]  [40% 40% 40% 100% 40%]  [100% 100% 100% 100% 100%]  [100% 100% 100% 100% 100%]
+  anchored                    [100% 100% 100% 100% 100%]  [94% 94% 94% 94% 94%]  [100% 100% 100% 100% 100%]  [100% 100% 100% 100% 100%]  [100% 100% 100% 100% 100%]
+  none                        [100% 100% 100% 100% 100%]  [100% 100% 100% 100% 100%]  [100% 100% 100% 100% 100%]  [100% 100% 100% 100% 100%]  [100% 100% 100% 100% 100%]
+  anchored_min_gain           [100% 100% 100% 100% 100%]  [100% 100% 100% 100% 100%]  [100% 100% 100% 100% 100%]  [100% 100% 100% 100% 100%]  [100% 100% 100% 100% 100%]
+  tool_summary_anchored       [100% 100% 100% 100% 100%]  [9% 40% 9% 40% 40%]  [100% 100% 100% 100% 100%]  [100% 100% 100% 100% 100%]  [100% 100% 100% 100% 100%]
+  truncation                  [100% 100% 100% 32% 100%]  [40% 40% 40% 100% 40%]  [100% 100% 100% 100% 100%]  [100% 100% 100% 100% 21%]  [100% 100% 100% 100% 100%]
+  context_window              [21% 77% 77% 32% 74%]  [77% 77% 77% 77% 77%]  [77% 77% 32% 77% 77%]  [100% 100% 100% 100% 100%]  [100% 100% 100% 100% 100%]
 
-Fill: 69,066 tokens seeded against a target of 84,000 (70% of 120,000), -17.8%. Payload 24,497 tokens, of which 21,967 is tool results.
-FILL OFF TARGET: -17.8% is outside the 5% tolerance, so this cell is not the fill fraction it is labelled with and does not sit on the same axis as the others. The replies are the one term the sizing cannot compute; adjust --filler-tokens or re-solve against a measured reply size.
-
-CONTROL DIVERGED: 'none' carried 18 more messages at its peak than the
-leanest strategy row, on the same user-side turn list. Compaction only ever adds to the
-stored history, so those two counts have to match; they do not, which means the baseline
-and the rows measured against it are two different conversations. Every cost comparison in
-this cell is withdrawn and the control is out of the ranking. This is not correctable after
-the fact -- the conversation the control ran is the one on the record -- so the cell has to
-be re-run to be read on cost.
+Fill: 85,724 tokens seeded against a target of 84,000 (70% of 120,000), +2.1%. Payload 24,497 tokens, of which 21,967 is tool results.
 
 Cost: seed$ is the conversation and probe$ is the instrument, priced apart. The ranking,
 the verdict and vs none$ are all on seed$, because every probe re-sends the whole snapshot
 and a strategy that compacted hard would otherwise collect that discount once per probe.
 
-Throttled: the provider refused these calls for rate reasons and they were re-sent
-after a wait. The measurement is unchanged; the wall clock is not, and neither is the
-cache hit rate if a prefix expired while a call was waiting.
-  context_window              1 retries, 2s waiting
+VERDICT: anchored
+'anchored' is 1% cheaper than not compacting while answering at 102% of the control. 3 of 5 strategies cleared the correctness bar.
 
-Reconnected: these calls never came back with an answer and were re-sent from the
-state the turn began in. Each one survived a seed that would otherwise have ended at
-the turn it happened on, taking every turn already paid for with it.
-  none                        4 retries, 14s waiting
-  tool_summary_anchored       7 retries, 18s waiting
-  context_window              4 retries, 12s waiting
-  anchored_min_gain           8 retries, 27s waiting
-  anchored                    8 retries, 26s waiting
-  truncation                  4 retries, 12s waiting
-
-NO VERDICT: the 'none' row ran a different conversation from the strategies, and every ranking here is relative to one. The columns above still describe what was measured.
+NOT SUPPORTED: repeats of one strategy varied by 21%, wider than the 1% gap this recommendation rests on. Treat the cost ranking as unresolved.
