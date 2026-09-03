@@ -81,8 +81,23 @@ allowance in a six-group band is 4,914 tokens, so it is inert. It is not perform
 there; it is not performing.
 
 The allowance scales with the window and not with the payload, so the same configuration can be
-aggressive at 60,000 tokens and idle at 120,000. Size `band_share` against the results you
-actually have.
+aggressive at 60,000 tokens and idle at 120,000. `band_share` is now a constructor argument and
+a `--band-share` flag, which it was not when that sentence was first written.
+
+**But tuning it does not rescue a small payload, and this was checked rather than assumed.** At
+a 117,952-token ceiling with six 3,500-token results in a 103,200-token prompt, lowering the
+share does make the strategy act -- and every setting still falls short of the break-even the
+edit has to clear:
+
+| `band_share` | oldest keeps | newest keeps | removed | clears ~29,900? |
+| ---: | ---: | ---: | ---: | --- |
+| 0.25 (default) | 3,500 | 3,500 | 0 | never fires |
+| 0.05 | 3,500 | 982 | 8,952 | no |
+| 0.01 | 1,179 | 196 | 18,114 | no |
+
+At 0.01 it sheds 94% of every result and still cannot pay. The whole tool payload is 21,000
+tokens against a break-even near 30,000, so **this is the regime, not the setting**: idleness is
+the correct behaviour on a payload this small, and the dial only lets you buy a loss.
 
 **Variant: `collapse_assistant_text=False`.** Forbids shedding assistant prose in the
 last-resort step. Exists because when the model narrates tool values into its replies, that

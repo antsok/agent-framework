@@ -48,6 +48,7 @@ from agent_framework import (
 )
 
 from .compaction import (
+    DEFAULT_BAND_SHARE,
     AnchoredCompactionStrategy,
     MinimumGainAnchoredCompactionStrategy,
     ToolResultAnchoredSummarizationCompactionStrategy,
@@ -88,6 +89,7 @@ class StrategyOptions:
     keep_last_tool_call_groups: int = 4
     keep_head_groups: int = 3
     keep_tail_groups: int = 4
+    band_share: float = DEFAULT_BAND_SHARE
     token_budget_fraction: float = 0.5
     summarizer: SupportsChatGetResponse[Any] | None = None
 
@@ -184,6 +186,7 @@ def _build_anchored(options: StrategyOptions) -> CompactionStrategy:
         tokenizer=options.tokenizer,
         keep_head_groups=options.keep_head_groups,
         keep_tail_groups=options.keep_tail_groups,
+        band_share=options.band_share,
     )
 
 
@@ -200,6 +203,7 @@ def _build_anchored_no_assistant(options: StrategyOptions) -> CompactionStrategy
         tokenizer=options.tokenizer,
         keep_head_groups=options.keep_head_groups,
         keep_tail_groups=options.keep_tail_groups,
+        band_share=options.band_share,
         collapse_assistant_text=False,
     )
 
@@ -220,6 +224,7 @@ def _build_anchored_min_gain(options: StrategyOptions) -> CompactionStrategy:
         tokenizer=options.tokenizer,
         keep_head_groups=options.keep_head_groups,
         keep_tail_groups=options.keep_tail_groups,
+        band_share=options.band_share,
     )
 
 

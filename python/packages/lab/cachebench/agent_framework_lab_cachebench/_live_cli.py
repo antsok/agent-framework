@@ -36,7 +36,7 @@ from ._records import CellParams, SeedRecord, append_seed_record, group_by_cell,
 from ._strategies import StrategyOptions, build_strategy, needs_summarizer, strategy_names
 from ._summary import DEFAULT_MIN_CORRECTNESS, JointOutcome, JointVerdict, recommend, relative_correctness
 from ._tokenizers import TOKENIZER_NAMES, build_tokenizer
-from .compaction import DEFAULT_RECORD_MAX_TOKENS, DEFAULT_RECORD_TARGET_TOKENS
+from .compaction import DEFAULT_BAND_SHARE, DEFAULT_RECORD_MAX_TOKENS, DEFAULT_RECORD_TARGET_TOKENS
 
 if TYPE_CHECKING:
     from agent_framework._clients import SupportsChatGetResponse
@@ -323,6 +323,21 @@ def build_parser() -> argparse.ArgumentParser:
             "because one appended there would be persisted into the user's own conversation. "
             "Keep it comfortably under --record-max-tokens, so overshooting the target is not "
             "the same event as being cut. 0 to state no target."
+        ),
+    )
+    parser.add_argument(
+        "--band-share",
+        type=float,
+        default=DEFAULT_BAND_SHARE,
+        help=(
+            "Share of the input budget the anchored family's oldest banded tool result may "
+            "keep, the n-th keeping an n-th of that. Unreachable before this flag existed, "
+            "which hid that the default leaves a small payload untouched: at a 117,952-token "
+            "ceiling the oldest result may keep 29,488 tokens, so 3,500-token results are "
+            "never trimmed. Lowering it makes the strategy act, but measured against the "
+            "break-even it still cannot pay on such a payload -- even at 0.01, shedding 94%% "
+            "of every result, the 18,114 tokens removed fall short of the ~29,900 the edit "
+            "re-bills. Default %(default)s."
         ),
     )
     parser.add_argument(
@@ -2117,6 +2132,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
                 max_output_tokens=args.max_output_tokens,
                 token_budget_fraction=args.budget_fraction,
                 keep_last_tool_call_groups=args.keep_last_tool_groups,
+                band_share=args.band_share,
                 # A recording proxy, not a client: see MeteredClient for why it is cast.
                 summarizer=cast("SupportsChatGetResponse[Any] | None", summarizer),
             )
