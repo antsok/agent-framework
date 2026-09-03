@@ -343,6 +343,72 @@ input and output the instrument would report an overflowing run as clean.
 having two. Whichever way round, it needs a clean re-baseline of every cell, which is why it
 waits for a model boundary.
 
+## 3e. Everything before run 32 is withdrawn on cost — read this first
+
+An adversarial review on 2026-09-02 found two instrument defects sitting under every `vs none`
+figure the project had produced. Both are fixed; the full account is in
+[`REVIEW-2026-09-02.md`](REVIEW-2026-09-02.md). In short:
+
+- **The control ran a different conversation from every strategy row.** Message identity falls
+  back to a content hash when there is no `message_id`; compaction annotates and so always has
+  ids, the control did not, so its repeated acknowledgements were dropped. At 120,000/0.86 the
+  control peaked at 82 messages against every strategy's 109. `IdentifiedHistoryProvider` fixes
+  it, a `MSGS` flag catches any recurrence, and a diverged control now refuses to be ranked.
+- **`cost` summed the workload with twelve probe re-reads of the snapshot**, so a strategy that
+  compacted hard was discounted twelve times over by the measurement. Cost is now `seed$`
+  (workload) plus `probe$` (instrument), and **the ranking is on `seed$`**.
+
+Two strategy defects went with them: the min-gain floor compared its saving against the whole
+prompt where the derivation defines `B` as the tokens behind the edit (default moved 0.23 to
+0.29), and anchored retention divided by the band's width *at the moment of trimming*, so what
+a result kept depended on which turn the trim fired. The freeze test could not have caught
+either — at its 3,000-token ceiling every allowance clamped to the same floor.
+
+And the combined question was measuring its own wording: 226 of 240 control samples were either
+every value or exactly eleven, because "every code returned by every deployment lookup" reads as
+*the* return code of each. It states its counts now, and `acc2` moved from 58% to 100% on the
+control.
+
+## 3f. Runs 32 and 33 — the matrix on the repaired instrument
+
+Nine cells, five seeds each, 300 records, $84.69 plus $4.12 to repair one cell. Cost against
+not compacting, on the workload axis:
+
+| cell | tool_summary | anchored | min_gain | truncation | context_window | control spread |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| fixed 60K / 0.86 | +47% | +10% | +1% | +15% | +29% | 17% |
+| fixed 120K / 0.50 | +25% | -3% | +5% | +5% | +40% | 14% |
+| fixed 120K / 0.70 | +27% | -1% | +3% | +7% | +34% | 21% |
+| fixed 100K / 0.86 | +13% | -7% | +7% | +17% | +17% | 11% |
+| fixed 120K / 0.86 | +9% | +3% | +4% | -2% | +11% | 21% |
+| share 0.60, 120K / 0.86 | +8% | -1% | -1% | +10% | +30% | 16% |
+| share 0.80, 120K / 0.50 | +12% | -2% | -2% | -2% | +17% | 31% |
+| share 0.80, 120K / 0.70 | +11% | +3% | +6% | -2% | +32% | 3% |
+| share 0.80, 120K / 0.86 | **-3%** | -2% | +1% | +7% | +25% | 7% |
+
+**No resolvable saving anywhere** — every negative sits inside its control's spread.
+`context_window` is dearer in all nine, +11% to +40%, after #7912, and worst or near-worst on
+recall throughout. `tool_summary_anchored` reaches parity only at the highest fill and highest
+tool share, where it answers from 45% of the window against the control's 88% with all 53 facts:
+**headroom, not savings.** The anchored family is free and mostly idle.
+
+Withdrawn by this run: "compaction pays when tool output dominates" (that -14% was the combined
+column inflated by cheap probes). Surviving: "compaction never buys a smaller bill", now on
+sound evidence, and the #7912 result.
+
+## 3g. `anchored`'s idleness is the regime, not the configuration
+
+`band_share` was unreachable — a constructor argument the registry never passed. It is now
+`--band-share`. Tuning it makes the strategy act and never makes it pay: at a 117,952-token
+ceiling with 3,500-token results, 0.05 removes 8,952 tokens and 0.01 sheds 94% of every result
+to remove 18,114, against a break-even near 29,900. The whole tool payload is 21,000 tokens in a
+103,200-token prompt. Idleness is correct behaviour there; the dial only buys a loss. Pinned by
+a test that says so.
+
+Note the retention gradient runs **oldest-keeps-most**, which is forced rather than chosen:
+position is counted from the head so it never moves as the conversation grows, and counting from
+the tail would re-decide every group on every turn — the path dependence just removed.
+
 ## 4. The two-variable crossover — stated in the report now, and one point of it withdrawn
 
 **Done:** `REPORT-GPT-5-4-MINI.md` used to index the crossover on tool result size alone, and
