@@ -1302,6 +1302,81 @@ Cost: about $24 for the two cells, roughly EUR 22.
 
 ---
 
+## Runs 32 and 33 — the whole matrix, on a repaired instrument
+
+Everything before this is withdrawn on cost. An adversarial review found two defects that sat
+under every `vs none` figure in the project — the control silently ran a shorter conversation
+than every strategy row, and `cost` summed the workload with twelve probe re-reads that scale
+with whatever compaction had just removed. See [`REVIEW-2026-09-02.md`](REVIEW-2026-09-02.md).
+
+Both are fixed, along with two strategy defects and the combined question's wording. These nine
+cells are the first measurement where the control runs the conversation the strategies run, and
+where **cost is split into the workload (`seed$`) and the instrument (`probe$`), with the
+ranking on the workload.** 300 records, five seeds a cell, $84.69.
+
+### Cost against not compacting, on the workload axis
+
+| cell | tool_summary | anchored | min_gain | truncation | context_window | control spread |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| fixed 60K / 0.86 | +47% | +10% | +1% | +15% | +29% | 17% |
+| fixed 120K / 0.50 | +25% | -3% | +5% | +5% | +40% | 14% |
+| fixed 120K / 0.70 | +29% | -3% | +3% | +12% | +33% | 7% |
+| fixed 100K / 0.86 | +13% | -7% | +7% | +17% | +17% | 11% |
+| fixed 120K / 0.86 | +9% | +3% | +4% | -2% | +11% | 21% |
+| share 0.60, 120K / 0.86 | +8% | -1% | -1% | +10% | +30% | 16% |
+| share 0.80, 120K / 0.50 | +12% | -2% | -2% | -2% | +17% | 31% |
+| share 0.80, 120K / 0.70 | +11% | +3% | +6% | -2% | +32% | 3% |
+| share 0.80, 120K / 0.86 | **-3%** | -2% | +1% | +7% | +25% | 7% |
+
+**Not one resolvable saving anywhere.** Every negative figure sits inside its own control's
+spread. Read the last column before any other.
+
+### The shipped default is dearer in all nine cells
+
+`context_window` runs **+11% to +40%** against not compacting, in every cell, on the workload
+axis, **after #7912**. The fix halved its old penalty and it is still the most expensive row in
+seven of nine cells. It is also worst or near-worst on recall throughout: 25 to 50 of 53 facts.
+
+That is the clearest result the project has, and it is the one a reader should act on.
+
+### The record reaches parity, once, at the most favourable cell
+
+`tool_summary_anchored` costs **+8% to +47%** in eight cells and reads **-3%** in the ninth —
+highest fill, highest tool share — against a 7% control spread, so parity rather than a saving.
+Its cost falls monotonically as fill and tool share rise, which is a real gradient, and it never
+resolvably crosses zero.
+
+**The earlier claim that it pays when tool output dominates is withdrawn.** That -14% was a
+combined-column figure inflated by twelve cheap probes.
+
+What it does buy is headroom. At share 0.80 and 0.86 fill it answered from **45% of the window
+where the control needed 88%**, with all 53 facts and full marks on both accuracy measures. Same
+work, half the context, the same price.
+
+### The anchored family is the free option, mostly by doing little
+
+`anchored` is within ±7% everywhere and `anchored_min_gain` within ±7% too. Neither costs
+anything; neither saves anything. The repaired floor now behaves as designed — at 60K it
+declines every collapse (`NOGAIN:54`), matches the control on cost and keeps all 53 facts, where
+the unfloored parent acts and loses one for +10%.
+
+### The combined question now measures recall
+
+Stating its counts moved the control's `acc2` at 60K/0.86 from 58% to **100%**, and `acc2` now
+tracks `acc1` instead of contradicting it. The old bimodality -- 226 of 240 samples at either
+every value or exactly eleven -- was the model reading "every code returned by every lookup" as
+*the* return code of each, answering that correctly, and being scored as a recall failure.
+
+### What is still not measured
+
+The `fixed 120K / 0.70` cell lost 8 of 30 records to a connection outage longer than the retry
+budget; its two damaged seeds need re-running. Nothing structural, and the retry behaved as
+designed -- it survives blips, not outages.
+
+Cost: $84.69, roughly EUR 78.
+
+---
+
 ## Models that could not be measured
 
 **`google/gemini-3.7-flash` — excluded.** Its turns fail partway through a conversation
