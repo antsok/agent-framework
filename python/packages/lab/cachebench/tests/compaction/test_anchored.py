@@ -521,3 +521,24 @@ def test_an_unusable_floor_is_rejected(fraction: float) -> None:
     """A floor of a whole prompt can never be met, so the strategy would silently never act."""
     with pytest.raises(ValueError, match="min_gain_fraction"):
         MinimumGainAnchoredCompactionStrategy(max_input_tokens=1_000, tokenizer=TOKENIZER, min_gain_fraction=fraction)
+
+
+def test_no_band_share_makes_a_small_payload_worth_trimming() -> None:
+    """Tuning the dial cannot rescue a payload the break-even is larger than.
+
+    The default leaves 3,500-token results untouched at a 117,952-token ceiling, because the
+    oldest banded result may keep 29,488. That looks like a mis-configuration, and the flag now
+    exists to test it -- but the arithmetic says it is the regime, not the setting: the whole
+    tool payload is 21,000 tokens in a 103,200-token prompt, and the edit re-bills roughly
+    30,000. Even shedding 94% of every result falls short.
+    """
+    ceiling, result, groups, prompt = 117_952, 3_500, 6, 103_200
+    break_even = 0.29 * prompt * 0.84  # the suffix behind an edit early in the band
+
+    for share in (0.25, 0.10, 0.05, 0.03, 0.01):
+        keeps = [min(int(ceiling * share / (position + 1)), result) for position in range(groups)]
+        removed = sum(result - keep for keep in keeps)
+        assert removed < break_even, (
+            f"band_share {share} removed {removed:,}, which would clear {break_even:,.0f} -- "
+            "if this ever fails the regime claim needs re-deriving, not the test relaxing"
+        )

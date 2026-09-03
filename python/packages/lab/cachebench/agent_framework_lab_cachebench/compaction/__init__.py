@@ -42,6 +42,7 @@ What each strategy does, why it is shaped that way and where it fails is in
 """
 
 from ._anchored import (
+    DEFAULT_BAND_SHARE,
     DEFAULT_KEEP_TOKENS,
     DEFAULT_MIN_GAIN_FRACTION,
     MARKER_ID_PREFIX,
@@ -62,6 +63,7 @@ from ._toolsummary import (
 )
 
 __all__ = [
+    "DEFAULT_BAND_SHARE",
     "DEFAULT_KEEP_TOKENS",
     "DEFAULT_MIN_GAIN_FRACTION",
     "DEFAULT_RECORD_MAX_TOKENS",
