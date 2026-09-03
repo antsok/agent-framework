@@ -1320,7 +1320,7 @@ ranking on the workload.** 300 records, five seeds a cell, $84.69.
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | fixed 60K / 0.86 | +47% | +10% | +1% | +15% | +29% | 17% |
 | fixed 120K / 0.50 | +25% | -3% | +5% | +5% | +40% | 14% |
-| fixed 120K / 0.70 | +29% | -3% | +3% | +12% | +33% | 7% |
+| fixed 120K / 0.70 | +27% | -1% | +3% | +7% | +34% | 21% |
 | fixed 100K / 0.86 | +13% | -7% | +7% | +17% | +17% | 11% |
 | fixed 120K / 0.86 | +9% | +3% | +4% | -2% | +11% | 21% |
 | share 0.60, 120K / 0.86 | +8% | -1% | -1% | +10% | +30% | 16% |
@@ -1367,11 +1367,17 @@ tracks `acc1` instead of contradicting it. The old bimodality -- 226 of 240 samp
 every value or exactly eleven -- was the model reading "every code returned by every lookup" as
 *the* return code of each, answering that correctly, and being scored as a recall failure.
 
-### What is still not measured
+### The one damaged cell, repaired
 
-The `fixed 120K / 0.70` cell lost 8 of 30 records to a connection outage longer than the retry
-budget; its two damaged seeds need re-running. Nothing structural, and the retry behaved as
-designed -- it survives blips, not outages.
+`fixed 120K / 0.70` lost 8 of 30 records to a connection outage longer than the retry budget.
+Its two seeds were re-run at the same offsets, so the scenario salt rebuilt the conversations
+that had failed rather than fresh ones, and the cell is now five clean seeds like every other.
+The retry behaved as designed throughout: it survives blips, not outages.
+
+Re-reading it moved nothing that matters -- `anchored` -1% rather than -3%, `truncation` +7%
+rather than +12% -- but the control's own spread went from 7% to **21%**, which is the more
+useful correction: the three surviving seeds had understated the noise, and on five seeds
+nothing in that cell is resolvable at all.
 
 Cost: $84.69, roughly EUR 78.
 
