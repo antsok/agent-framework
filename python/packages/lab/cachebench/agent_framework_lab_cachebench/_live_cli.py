@@ -14,7 +14,7 @@ from statistics import fmean
 from typing import TYPE_CHECKING, Any, Final, cast
 
 from ._advisor import ModelPricing, fetch_openrouter_pricing
-from ._fill import FillPlan, plan_fill
+from ._fill import ASSUMED_REPLY_TOKENS, FillPlan, plan_fill
 from ._live import (
     AGENT_KINDS,
     DEFAULT_COMBINED_REPEATS,
@@ -323,6 +323,19 @@ def build_parser() -> argparse.ArgumentParser:
             "because one appended there would be persisted into the user's own conversation. "
             "Keep it comfortably under --record-max-tokens, so overshooting the target is not "
             "the same event as being cut. 0 to state no target."
+        ),
+    )
+    parser.add_argument(
+        "--assumed-reply-tokens",
+        type=int,
+        default=ASSUMED_REPLY_TOKENS,
+        help=(
+            "How large the model's own replies are assumed to be when sizing the conversation "
+            "to --fill. It is the one term the solver cannot compute, and it is per model: the "
+            "default is gpt-5.4-mini's, and gpt-5.6-luna writes about 602 tokens a reply, which "
+            "over ninety turns overshot a 200,000-token cell by 24%% and disqualified its own "
+            "control. Measure it from a one-seed probe -- output tokens over turns -- before "
+            "sizing a matrix on a model this has not been run against. Default %(default)s."
         ),
     )
     parser.add_argument(
@@ -1731,6 +1744,7 @@ def _plan_or_exit(args: argparse.Namespace, tokenizer: Any) -> FillPlan | None:
             tool_share=args.tool_share,
             narration=args.narration,
             fact_placement=args.fact_placement,
+            reply_tokens=args.assumed_reply_tokens,
             retrieval_guidance=not args.no_retrieval_guidance,
             subset_questions=not args.sweeping_question,
             filler_turn_tokens=args.filler_tokens,
