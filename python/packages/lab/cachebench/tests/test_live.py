@@ -12,6 +12,7 @@ between those layers, and a hand-rolled mock that skipped them would answer none
 from __future__ import annotations
 
 import contextlib
+import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import replace
@@ -76,7 +77,10 @@ from agent_framework_lab_cachebench._live import (
     _turn_text,
     make_scope_tools,
     probe_count,
+    recall_record_text,
     resolve_instructions,
+    serialize_history,
+    snapshot_state,
 )
 from agent_framework_lab_cachebench._live_cli import (
     CellStats,
@@ -85,6 +89,7 @@ from agent_framework_lab_cachebench._live_cli import (
     _control_message_gap,
     _cost,
     _coverage,
+    _dump_record,
     _excluded_cells,
     _fill_note,
     _flags,
@@ -113,6 +118,7 @@ from agent_framework_lab_cachebench.compaction import (
     DEFAULT_RECORD_MAX_TOKENS,
     DEFAULT_RECORD_TARGET_TOKENS,
     RECALL_TOOL_NAME,
+    RECORD_MARKER,
     ToolResultAnchoredSummarizationCompactionStrategy,
     ToolResultRecallMiddleware,
     make_recall_tool,
@@ -764,6 +770,8 @@ def test_every_argument_the_runner_reads_is_defined() -> None:
         "no_temperature",
         "tokenizer",
         "show_answers",
+        "dump_record",
+        "max_groups_before_record",
         "dry_run",
         "fill",
         "tool_share",
@@ -3075,6 +3083,8 @@ def test_the_two_accuracy_measures_are_named_acc1_and_acc2() -> None:
         probe_repeats=2,
         summarizer_calls=0,
         summarizer_failures=0,
+        groups_kept_uncovered=0,
+        fallbacks_after_record=0,
         strategy_notes=(),
         dropped_options=(),
         answer="",
@@ -3273,6 +3283,8 @@ def _control_cell(seeded: int) -> dict[str, CellStats]:
         probe_repeats=1,
         summarizer_calls=0,
         summarizer_failures=0,
+        groups_kept_uncovered=0,
+        fallbacks_after_record=0,
         strategy_notes=(),
         dropped_options=(),
         answer="",
@@ -3550,6 +3562,378 @@ async def test_a_run_that_was_not_cut_short_says_nothing() -> None:
     assert not [note for note in _strategy_notes(middleware) if note.startswith("TRUNCATED")]
 
 
+def _tool_conversation(tool_turns: int, *, covered: int) -> list[Message]:
+    """Return a conversation whose recall record names only the first ``covered`` tools.
+
+    The live benchmark's own shape: one no-argument tool per scope, named ``lookup_<n>``, so a
+    turn can pin exactly which fact it gathers. It has to be that shape here because the
+    strategy checks a record against the *names* of the tools it claims to cover, and a
+    fixture calling a single tool repeatedly would exercise only the degenerate case.
+
+    Args:
+        tool_turns: How many lookup turns to generate.
+
+    Keyword Args:
+        covered: How many of them the record names. Fewer than ``tool_turns`` is the measured
+            shape of a model that named some tools and stopped.
+
+    Returns:
+        The messages, the record last.
+    """
+    messages = [
+        Message(role="system", contents=["You are an assistant."], message_id="sys"),
+        Message(role="user", contents=["Requirement: region is EU-WEST-1."], message_id="u0"),
+        Message(role="assistant", contents=["Understood."], message_id="a0"),
+    ]
+    for index in range(tool_turns):
+        call_id = f"call_{index}"
+        messages += [
+            Message(role="user", contents=[f"Look up {index}."], message_id=f"u_{index}"),
+            Message(
+                role="assistant",
+                contents=[{"type": "function_call", "call_id": call_id, "name": f"lookup_{index}", "arguments": "{}"}],
+                message_id=f"a_call_{index}",
+            ),
+            Message(
+                role="tool",
+                contents=[{"type": "function_result", "call_id": call_id, "result": f"CODE-{index} " + "x" * 8_000}],
+                message_id=f"t_res_{index}",
+            ),
+        ]
+    values = " ".join(f"lookup_{index}: CODE-{index}." for index in range(covered))
+    return [
+        *messages,
+        Message(
+            role="assistant",
+            contents=[{"type": "function_call", "call_id": "rec", "name": RECALL_TOOL_NAME, "arguments": "{}"}],
+            message_id="rec_call",
+        ),
+        Message(
+            role="tool",
+            contents=[{"type": "function_result", "call_id": "rec", "result": f"{RECORD_MARKER} {values}"}],
+            message_id="rec_res",
+        ),
+    ]
+
+
+async def test_groups_a_record_never_named_reach_the_seed_record_and_the_flags_column() -> None:
+    """What the coverage check held back has to be visible, or the row reads as a clean run.
+
+    The strategy now refuses to delete a tool group the record does not mention, which turns a
+    silent loss into a cost: the row carries tokens a complete record would have replaced. That
+    cost is indistinguishable from the design simply not saving much, and the two call for
+    opposite responses -- one says fix the record, the other says the strategy does not pay. So
+    the count has to travel from the strategy through the outcome and the seed record to the
+    column a reader actually looks at, which is four handoffs and four places to lose it.
+    """
+    strategy = ToolResultAnchoredSummarizationCompactionStrategy(max_input_tokens=16_000, tokenizer=TOKENIZER)
+
+    assert await strategy(_tool_conversation(6, covered=2)) is True
+    assert strategy.groups_kept_uncovered == 4
+
+    notes = _strategy_notes(strategy)
+    assert "UNCOVERED:4" in notes
+
+    outcome, scenario = await _probed(StubChatClient(usage=UsageDetails(input_token_count=1_000)), repeats=1)
+    record = _record(
+        replace(outcome, strategy_notes=notes, groups_kept_uncovered=strategy.groups_kept_uncovered),
+        scenario,
+        strategy="tool_summary_anchored",
+    )
+
+    assert record.groups_kept_uncovered == 4, "the count must survive scoring, not only the flag string"
+    cell = _aggregate("tool_summary_anchored", [record])
+
+    assert "UNCOVERED:4" in _flags(cell, None)
+    assert "UNCOVERED:4" in _render(None, [cell], set(), show_answers=False)
+
+
+async def test_a_record_that_named_every_tool_adds_no_flag_at_all() -> None:
+    """A silent check is the point of it, so a complete record must leave the column clean.
+
+    gpt-5.4-mini writes records naming every tool they cover, and on those the check costs
+    nothing. A flag that appeared anyway would put a warning on every row of every model that
+    complied, which is how a flags column stops being read.
+    """
+    strategy = ToolResultAnchoredSummarizationCompactionStrategy(max_input_tokens=22_000, tokenizer=TOKENIZER)
+
+    assert await strategy(_tool_conversation(8, covered=8)) is True
+    assert strategy.groups_kept_uncovered == 0
+    assert not [note for note in _strategy_notes(strategy) if note.startswith("UNCOVERED")]
+
+    outcome, scenario = await _probed(StubChatClient(usage=UsageDetails(input_token_count=1_000)), repeats=1)
+    record = _record(outcome, scenario, strategy="tool_summary_anchored")
+    cell = _aggregate("tool_summary_anchored", [record])
+
+    assert record.groups_kept_uncovered == 0
+    assert not [flag for flag in _flags(cell, None) if flag.startswith("UNCOVERED")]
+
+
+async def test_a_fallback_taken_behind_a_record_reaches_the_seed_record_and_the_flags_column() -> None:
+    """A row measuring the fallback strategy has to say so, and this half of it never did.
+
+    ``FALLBACK`` is the flag whose legend says the row is measuring another strategy, and only
+    the give-up path ever set it. The path taken here is the other one: a record arrives, the
+    strategy anchors on it, drops what it covers, finds the prompt still over the ceiling and
+    hands the rest to the fallback -- which sheds the very groups the coverage check had just
+    declined to delete. The row then loses facts by shortening rather than by deletion, and
+    reported no fallback of any kind: measured, a seed flagged UNCOVERED:4 lost the control's
+    facts while sitting three messages shorter and 16,617 tokens lighter.
+
+    So the count has to travel from the strategy through the outcome and the seed record to
+    the column a reader looks at, which is the same four handoffs UNCOVERED makes and the same
+    four places to lose it.
+    """
+    strategy = ToolResultAnchoredSummarizationCompactionStrategy(
+        max_input_tokens=500, tokenizer=TOKENIZER, trigger_fraction=0.1, fallback_fraction=0.9
+    )
+
+    assert await strategy(_tool_conversation(6, covered=2)) is True
+    assert strategy.fallbacks_after_record == 1
+    assert strategy.fallbacks_used == 0, "the give-up path is a different event and must stay at zero"
+
+    notes = _strategy_notes(strategy)
+    assert "RECFALLBACK:1" in notes
+    assert "FALLBACK:1" not in notes, "the two counts must not be readable as one another"
+
+    outcome, scenario = await _probed(StubChatClient(usage=UsageDetails(input_token_count=1_000)), repeats=1)
+    record = _record(
+        replace(outcome, strategy_notes=notes, fallbacks_after_record=strategy.fallbacks_after_record),
+        scenario,
+        strategy="tool_summary_anchored",
+    )
+
+    assert record.fallbacks_after_record == 1, "the count must survive scoring, not only the flag string"
+    cell = _aggregate("tool_summary_anchored", [record])
+
+    assert "RECFALLBACK:1" in _flags(cell, None)
+    assert "RECFALLBACK:1" in _render(None, [cell], set(), show_answers=False)
+
+
+async def test_a_record_that_freed_enough_leaves_the_fallback_flag_off() -> None:
+    """The flag has to be silent on the runs where the design worked, or it stops being read.
+
+    A record that covers its groups and frees the room they took is this strategy doing exactly
+    what it is for, and a row like that measures nothing but itself. A flag appearing there
+    would put a warning on the good case, which is how a flags column comes to be skipped.
+    """
+    strategy = ToolResultAnchoredSummarizationCompactionStrategy(max_input_tokens=22_000, tokenizer=TOKENIZER)
+
+    assert await strategy(_tool_conversation(8, covered=8)) is True
+    assert strategy.fallbacks_after_record == 0
+    assert not [note for note in _strategy_notes(strategy) if note.startswith("RECFALLBACK")]
+
+    outcome, scenario = await _probed(StubChatClient(usage=UsageDetails(input_token_count=1_000)), repeats=1)
+    record = _record(outcome, scenario, strategy="tool_summary_anchored")
+    cell = _aggregate("tool_summary_anchored", [record])
+
+    assert record.fallbacks_after_record == 0, "a control run took no record and no fallback behind one"
+    assert not [flag for flag in _flags(cell, None) if flag.startswith("RECFALLBACK")]
+
+
+async def test_the_uncovered_count_survives_the_results_file_and_an_older_record_reads_as_zero(
+    tmp_path: Path,
+) -> None:
+    """The file is where a cell's numbers live, and the schema is what dates them.
+
+    A count that reached the live table but not the file would go missing on exactly the runs
+    it matters for: a cell is hours long, and the table people read months later is rebuilt
+    from these lines. The older-record half pins the other direction -- a record written before
+    the coverage check existed ran under a strategy that dropped every group in front of the
+    record regardless, so no group was ever kept for want of coverage and zero is a measurement
+    rather than a gap. Refusing those records would throw away every cell already on disk.
+    """
+    outcome, scenario = await _probed(StubChatClient(usage=UsageDetails(input_token_count=1_000)), repeats=1)
+    record = _record(replace(outcome, groups_kept_uncovered=4), scenario, strategy="tool_summary_anchored")
+    path = tmp_path / "results.jsonl"
+    append_seed_record(path, record)
+
+    (read_back,) = read_seed_records(path)
+
+    assert read_back.groups_kept_uncovered == 4
+    assert read_back.schema == SCHEMA_VERSION
+
+    older = {key: value for key, value in record.to_dict().items() if key != "groups_kept_uncovered"}
+    older["schema"] = SCHEMA_VERSION - 1
+
+    assert SeedRecord.from_dict(older).groups_kept_uncovered == 0
+
+
+async def test_the_post_record_fallback_count_survives_the_file_and_an_older_record_reads_as_unknown(
+    tmp_path: Path,
+) -> None:
+    """This count reads back as None where the one beside it reads back as zero, deliberately.
+
+    Both are new fields on the same schema, and their absences mean opposite things. No run
+    before the coverage check could keep an uncovered group, so zero groups is what those runs
+    did. Every run since this strategy existed *could* fall back behind a record that had not
+    freed enough, and none of them counted it when they did -- so a zero here would tell a
+    reader that every recorded row stayed the strategy it is named for, which is precisely the
+    claim nobody was in a position to make. None is how the record says nobody took the number.
+    """
+    outcome, scenario = await _probed(StubChatClient(usage=UsageDetails(input_token_count=1_000)), repeats=1)
+    record = _record(replace(outcome, fallbacks_after_record=2), scenario, strategy="tool_summary_anchored")
+    path = tmp_path / "results.jsonl"
+    append_seed_record(path, record)
+
+    (read_back,) = read_seed_records(path)
+
+    assert read_back.fallbacks_after_record == 2
+    assert read_back.schema == SCHEMA_VERSION
+
+    older = {key: value for key, value in record.to_dict().items() if key != "fallbacks_after_record"}
+    older["schema"] = SCHEMA_VERSION - 1
+
+    assert SeedRecord.from_dict(older).fallbacks_after_record is None, "an uncounted fallback is not a fallback of zero"
+
+
+class _RecordingStub(StubChatClient):
+    """A model that answers its first call with a recall record and plain text after that.
+
+    The base stub answers every call with empty arguments, which is right for the no-argument
+    lookup tools and wrong for the recall tool: ``values`` is required, so an empty call is a
+    failed invocation rather than a record, and nothing would ever reach the stored history to
+    be read back out of it.
+    """
+
+    def __init__(self, values: str, **kwargs: Any) -> None:
+        """Create the stub.
+
+        Args:
+            values: What this model writes into the record.
+
+        Keyword Args:
+            kwargs: Passed to the base stub.
+        """
+        super().__init__(**kwargs)
+        self.values = values
+        self.recorded = False
+
+    def _inner_get_response(
+        self,
+        *,
+        messages: Sequence[Message],
+        stream: bool,
+        options: Mapping[str, Any],
+        **kwargs: Any,
+    ) -> Any:
+        if self.recorded:
+            return super()._inner_get_response(messages=messages, stream=stream, options=options, **kwargs)
+        self.recorded = True
+        self.seen.append(len(messages))
+        self.options_seen.append(dict(options))
+
+        async def _go() -> ChatResponse[Any]:
+            return ChatResponse(
+                messages=Message(
+                    role="assistant",
+                    contents=[
+                        Content.from_function_call(
+                            call_id="call_record",
+                            name=RECALL_TOOL_NAME,
+                            arguments=json.dumps({"values": self.values}),
+                        )
+                    ],
+                ),
+                usage_details=self.usage,
+            )
+
+        return _go()
+
+
+def _recorded_agent(client: StubChatClient) -> Agent[Any]:
+    """Return the harness's own agent with the recall tool registered and no strategy.
+
+    The tool is ungated, so it records whatever it is asked to. What is under test is reading
+    a record back out of a finished conversation, not the arming that decides when one is
+    written, and a gate here would only add a way for the fixture to produce nothing.
+    """
+    return build_live_agent(
+        cast(Any, SimpleNamespace(client=client, model="stub", options={})),
+        kind="plain",
+        strategy=None,
+        tokenizer=TOKENIZER,
+        tools=[make_recall_tool()],
+        recorder=UsageRecorder(),
+        max_context_window_tokens=10_000,
+        max_output_tokens=100,
+    )
+
+
+async def test_the_record_dump_writes_the_text_the_model_actually_wrote(tmp_path: Path) -> None:
+    """Every count about a record describes it without quoting it, and the record is the question.
+
+    The counters say how many records were found, forced, truncated, and how many groups were
+    left uncovered. None of them can say whether a record that named every tool also kept the
+    values under those names -- the failure a check by name cannot see, and the one this exists
+    to expose. So the dump carries the record verbatim, out of the conversation the probes were
+    answered from, into a file named for the strategy and seed that produced it.
+    """
+    client = _RecordingStub("lookup_early: CODE-AAA1. lookup_late: CODE-ZZZ9.")
+    agent = _recorded_agent(client)
+    session = agent.create_session()
+    await agent.run("record what you have", session=session)
+
+    text = recall_record_text(agent, snapshot_state(session))
+
+    assert RECORD_MARKER in text
+    assert "CODE-AAA1" in text, "the values are the whole point of reading it"
+    assert "CODE-ZZZ9" in text
+
+    path = _dump_record(tmp_path / "records", "tool_summary_anchored", 2, text)
+
+    assert path is not None
+    assert path.name == "tool_summary_anchored-seed2.txt", "a file nobody can attribute is not a diagnostic"
+    assert path.read_text(encoding="utf-8") == text
+
+
+async def test_a_seed_that_took_no_record_leaves_no_file_behind(tmp_path: Path) -> None:
+    """An empty file and a record the model wrote as nothing would look identical.
+
+    Four of the five strategies in a cell never take a record at all, so a dump writing one
+    file per seed regardless would bury the two or three worth reading under a dozen empty
+    ones -- each of which reads as a model that was asked and answered nothing.
+    """
+    outcome, _ = await _probed(StubChatClient(usage=UsageDetails(input_token_count=1_000)), repeats=1)
+    directory = tmp_path / "records"
+
+    assert outcome.record_text == "", "the control takes no record, so run_live must report none"
+    assert _dump_record(directory, "none", 1, outcome.record_text) is None
+    assert not directory.exists(), "asking for a dump must not litter the disk with empty directories"
+
+
+async def test_reading_the_record_back_changes_nothing_about_the_run(tmp_path: Path) -> None:
+    """The dump is diagnostic, so it must be unable to move a single number in the table.
+
+    Two ways it could: by being computed while the conversation is being had, where it would be
+    state threaded through the object under measurement, or by mutating what it reads. It is
+    neither -- it reads the finished history and returns a string -- and this pins that, because
+    the flag exists to answer a question about a paid-for run and would be worthless if turning
+    it on changed the run. The parser half pins the other guarantee: off unless asked for, and
+    asking for it creates nothing until there is something to write.
+    """
+    client = _RecordingStub("lookup_early: CODE-AAA1.")
+    agent = _recorded_agent(client)
+    session = agent.create_session()
+    await agent.run("record what you have", session=session)
+    before = serialize_history(agent, session.state)
+    calls = len(client.seen)
+
+    first = recall_record_text(agent, session.state)
+    second = recall_record_text(agent, session.state)
+
+    assert first == second != ""
+    assert serialize_history(agent, session.state) == before, "reading the record rewrote the conversation"
+    assert len(client.seen) == calls, "reading the record sent something to the provider"
+
+    default = build_parser().parse_args(["openrouter:some/model"])
+    asked = build_parser().parse_args(["openrouter:some/model", "--dump-record", str(tmp_path / "records")])
+
+    assert default.dump_record is None, "the dump must be opt-in"
+    assert asked.dump_record == str(tmp_path / "records")
+    assert not (tmp_path / "records").exists(), "parsing must not create the directory"
+
+
 async def test_a_pinned_tool_choice_does_not_survive_the_follow_up_call() -> None:
     """A turn's pinned tool_choice applies to the first call, not to the whole turn.
 
@@ -3713,6 +4097,48 @@ async def test_the_record_bounds_reach_the_run(
 
     assert seen
     assert set(seen) == {expected}
+
+
+@pytest.mark.parametrize(
+    ("argv", "expected"),
+    [
+        pytest.param([], None, id="off-by-default"),
+        pytest.param(["--max-groups-before-record", "0"], None, id="zero-is-off"),
+        pytest.param(["--max-groups-before-record", "3"], 3, id="set"),
+    ],
+)
+async def test_the_group_bound_reaches_the_middleware_that_enforces_it(
+    monkeypatch: pytest.MonkeyPatch, argv: list[str], expected: int | None
+) -> None:
+    """The bound was implemented and unit-tested, and nothing constructed it with a value.
+
+    A parameter no caller sets has never run, whatever its own tests say, so the wiring is the
+    thing worth pinning: the flag has to arrive at the one object that acts on it. Zero means
+    off, the same convention --record-max-tokens and --fill already use, and off has to be the
+    default -- forcing a record every few groups spends an agent turn each time and is a trade
+    a run opts into rather than one it discovers.
+
+    Asserted on the middleware's own construction rather than on the run's kwargs, because the
+    kwarg was never in doubt: what this covers is the one strategy that builds a middleware at
+    all, and the four that must not.
+    """
+    _stub_provider(monkeypatch)
+    seen: list[int | None] = []
+
+    class _Capturing(ToolResultRecallMiddleware):
+        """The real middleware, noting what it was built with on the way past."""
+
+        def __init__(self, **kwargs: Any) -> None:
+            seen.append(kwargs["max_groups_before_record"])
+            super().__init__(**kwargs)
+
+    monkeypatch.setattr("agent_framework_lab_cachebench._live.ToolResultRecallMiddleware", _Capturing)
+
+    await run_live_comparison(
+        build_parser().parse_args(_live_argv("--strategies", "none,tool_summary_anchored", "--repeats", "1", *argv))
+    )
+
+    assert seen == [expected], "one middleware, for the one strategy that takes a record"
 
 
 async def test_the_combined_count_reaches_the_record_and_the_cell_it_identifies(
@@ -3971,6 +4397,8 @@ def test_a_progress_line_shows_what_a_watcher_needs() -> None:
         probe_repeats=2,
         summarizer_calls=0,
         summarizer_failures=0,
+        groups_kept_uncovered=0,
+        fallbacks_after_record=0,
         strategy_notes=(),
         dropped_options=(),
         answer="",

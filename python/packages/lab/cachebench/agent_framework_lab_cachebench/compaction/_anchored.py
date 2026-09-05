@@ -32,6 +32,18 @@ resort. It never touches user turns.
 it removes. This one does not preserve every fact and does not claim to; it preserves the
 head, guarantees a ceiling that token-blind strategies cannot, and pays as little cache as
 the mechanism allows.
+
+**One class of message is off limits, and it is not one this module can recognise on its own.**
+A message carrying :data:`~._preserve.PRESERVED_KEY` is a message some other strategy has
+already made the sole surviving copy of something it deleted -- the record written by
+``_toolsummary`` is the case this was built for, and shortening it there discarded thirty-two
+identifiers while the run reported nothing. Every path here that removes content therefore
+consults :func:`~._preserve.is_preserved` first: shortening in place, shedding whole tool
+groups, and shedding assistant narration. A preserved message is not excluded, so it still
+counts against the ceiling in full; it simply may not be made smaller. When the only thing
+left to remove is preserved, this strategy stops over its ceiling rather than looping, on the
+same reasoning as an anchor larger than the ceiling: an honest overflow the caller can see
+beats a silent loss it cannot.
 """
 
 from __future__ import annotations
@@ -51,6 +63,8 @@ from agent_framework._compaction import (
     included_token_count,
     set_excluded,
 )
+
+from ._preserve import any_preserved, is_preserved
 
 if TYPE_CHECKING:
     from agent_framework import TokenizerProtocol
@@ -238,8 +252,18 @@ class AnchoredCompactionStrategy:
     async def __call__(self, messages: list[Message]) -> bool:
         """Compact in place and report whether anything changed.
 
+        The shed loop below terminates on "nothing moved" rather than on "the ceiling is met",
+        and that is what makes preservation safe. A preserved group is skipped but still
+        counted, so a conversation can be over the ceiling with every remaining candidate
+        protected; the pass then sheds nothing, breaks, and returns having left the prompt too
+        large. That is deliberate and is the same behaviour as an anchor bigger than the
+        ceiling: the caller sees a prompt it must deal with, instead of a strategy quietly
+        eating the one message another strategy has made irreplaceable, or spinning against a
+        band it is no longer allowed to touch.
+
         Returns:
-            True if any message was excluded or replaced.
+            True if any message was excluded or replaced. False does not imply the prompt now
+            fits -- check ``included_token_count`` for that.
         """
         if not messages:
             return False
@@ -344,6 +368,13 @@ class AnchoredCompactionStrategy:
             for index in range(group["start_index"], group["end_index"] + 1):
                 message = messages[index]
                 if message.additional_properties.get(EXCLUDED_KEY, False):
+                    continue
+                # Removal path one of three. A preserved result is the only surviving copy of
+                # material another strategy has already deleted, so the tokens this rewrite
+                # would save are not a saving at all: they are the deletion's receipt. Skipped
+                # *after* the position counter above has advanced, so the groups behind it keep
+                # the budget they had and the retention rule stays a function of position only.
+                if is_preserved(message):
                     continue
                 for content in message.contents:
                     if content.type != "function_result":
@@ -509,6 +540,14 @@ class AnchoredCompactionStrategy:
             # leaving a silent hole instead of a stated one, and undoing the only signal the
             # model has that something was removed.
             if all(_is_marker(message) for message in members):
+                continue
+            # Removal paths two and three: this method is called once for tool groups and once
+            # for assistant narration, and both arrive here. One preserved member protects the
+            # whole group, because dropping a tool call while keeping its result -- or the
+            # reverse -- is a malformed conversation on most providers, so there is no partial
+            # shed available. A group skipped here still counts toward the ceiling, which is
+            # why the caller's loop can end over budget; see :meth:`__call__`.
+            if any_preserved(members):
                 continue
             for message in members:
                 set_excluded(message, excluded=True, reason=EXCLUDE_REASON)

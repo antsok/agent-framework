@@ -69,9 +69,11 @@ from ._transcripts import TRUE_CHARS_PER_TOKEN, sized_text
 from .compaction import (
     DEFAULT_RECORD_MAX_TOKENS,
     DEFAULT_RECORD_TARGET_TOKENS,
+    RECORD_MARKER,
     RecallGate,
     ToolResultAnchoredSummarizationCompactionStrategy,
     ToolResultRecallMiddleware,
+    find_record_index,
     make_recall_tool,
 )
 
@@ -109,6 +111,7 @@ __all__ = [
     "make_lookup_tool",
     "make_scope_tools",
     "probe_count",
+    "recall_record_text",
     "resolve_instructions",
     "restore_state",
     "run_live",
@@ -542,6 +545,40 @@ class LiveOutcome:
     #: column. A strategy that can silently degrade into a different one has to say so:
     #: this package has twice read a row that scored well for having done nothing.
     strategy_notes: tuple[str, ...] = ()
+    groups_kept_uncovered: int = 0
+    """Tool groups the recall record never mentioned, so the strategy declined to drop them.
+
+    The same number ``strategy_notes`` carries as a flag, kept here as an integer as well
+    because a flag is read and a column is measured. Non-zero says a row's cost is the price
+    of a partial record rather than of the design working, and a mean over seeds cannot be
+    taken on a string. Zero on every strategy that keeps no such count, which is all of them
+    but ``tool_summary_anchored``.
+    """
+    fallbacks_after_record: int = 0
+    """Compaction passes where a record existed and the strategy fell back regardless.
+
+    Reported apart from the ``FALLBACK`` count for the reason that count is reported at all:
+    a strategy that degrades into another one produces a number belonging to neither, and
+    this is the half of that degradation nobody could see. The pre-record fallback means the
+    model never wrote a record; this means it wrote one that did not free enough, and the
+    fallback then shortened the tool results still in the prompt -- the very groups a partial
+    record left behind. Non-zero says part of this row measures the fallback strategy.
+
+    Zero on every strategy that keeps no such count, which is all of them but
+    ``tool_summary_anchored``.
+    """
+    record_text: str = ""
+    """The recall record the run produced, exactly as the model wrote it.
+
+    Read back out of the finished conversation rather than captured while it was made, so
+    nothing about the prompts, the token accounting or the cost depends on whether anyone
+    wants to look at it. Empty when the run took no record, which is every strategy but
+    ``tool_summary_anchored`` and any run of that one where the model never complied.
+
+    Here because the counter above says only *how many* groups a record failed to cover, and
+    the question that follows is always what the record actually said. Nothing reads this by
+    default: ``--dump-record`` writes it out for a human, and everything else ignores it.
+    """
     #: Every probe, in the order they were asked: each question in turn, each asked as many
     #: times as its own scope calls for.
     probes: tuple[ProbeOutcome, ...] = ()
@@ -758,10 +795,12 @@ def _strategy_notes(strategy: Any) -> tuple[str, ...]:
     for attribute, label in (
         ("records_found", "REC"),
         ("fallbacks_used", "FALLBACK"),
+        ("fallbacks_after_record", "RECFALLBACK"),
         ("forced_calls", "FORCED"),
         ("records_forced", "RECFORCED"),
         ("records_volunteered", "RECVOLUNTEERED"),
         ("records_truncated", "TRUNCATED"),
+        ("groups_kept_uncovered", "UNCOVERED"),
         ("declined_collapses", "NOGAIN"),
     ):
         value = getattr(strategy, attribute, None)
@@ -1129,10 +1168,8 @@ def _turn_text(messages: Sequence[Message]) -> str:
     )
 
 
-def serialize_history(agent: Agent[Any], state: Mapping[str, Any]) -> str:
-    """Return the conversation a session state holds, as compaction left it.
-
-    Two things here are easy to get wrong and both were.
+def _stored_messages(agent: Agent[Any], state: Mapping[str, Any]) -> list[Message]:
+    """Return every message a session state holds, exclusions included.
 
     The history is not at a fixed key. A ``HistoryProvider`` is handed
     ``state[provider.source_id]`` and stores its messages under ``"messages"`` inside that,
@@ -1140,9 +1177,27 @@ def serialize_history(agent: Agent[Any], state: Mapping[str, Any]) -> str:
     builds. Reading a hard-coded key therefore reports an empty conversation for one of the
     two agent kinds, which reads as a strategy that deleted everything.
 
-    The stored list is also not the prompt. ``InMemoryHistoryProvider`` keeps excluded
-    messages in state so that a strategy can still reconsider them, so serializing it without
-    projecting reports that every strategy preserved every fact.
+    Args:
+        agent: The agent whose providers say where the history lives.
+        state: Session state, live or snapshotted.
+
+    Returns:
+        The stored list, copied so that a caller cannot append to the session's own.
+    """
+    for provider in agent.context_providers:
+        if isinstance(provider, HistoryProvider):
+            stored: Mapping[str, Any] = state.get(provider.source_id) or {}
+            return list(stored.get("messages", []))
+    return []
+
+
+def serialize_history(agent: Agent[Any], state: Mapping[str, Any]) -> str:
+    """Return the conversation a session state holds, as compaction left it.
+
+    The stored list is not the prompt. ``InMemoryHistoryProvider`` keeps excluded messages in
+    state so that a strategy can still reconsider them, so serializing it without projecting
+    reports that every strategy preserved every fact. That was measured, and it is why the
+    projection here is not optional.
 
     Args:
         agent: The agent whose providers say where the history lives.
@@ -1152,12 +1207,47 @@ def serialize_history(agent: Agent[Any], state: Mapping[str, Any]) -> str:
         The included messages, serialized the same way a recorded prompt is, so the two can
         be compared directly.
     """
-    for provider in agent.context_providers:
-        if isinstance(provider, HistoryProvider):
-            stored: Mapping[str, Any] = state.get(provider.source_id) or {}
-            messages: list[Message] = list(stored.get("messages", []))
-            return chr(10).join(serialize_message(message) for message in project_included_messages(messages))
-    return ""
+    messages = _stored_messages(agent, state)
+    return chr(10).join(serialize_message(message) for message in project_included_messages(messages))
+
+
+def recall_record_text(agent: Agent[Any], state: Mapping[str, Any]) -> str:
+    """Return the newest recall record a session's history holds, as the model wrote it.
+
+    A diagnostic, and only a diagnostic. It reads the finished conversation and writes
+    nothing back, so whether anyone calls it makes no difference to the prompts that were
+    sent, the tokens they were billed at, or what the run cost. That property is the whole
+    reason it reads the history afterwards instead of the strategy capturing the text while
+    it works: a capture is state threaded through the object under measurement, and this
+    package has already had one measurement moved by an instrument it installed.
+
+    Read off the *stored* messages rather than the projected ones. A record is never excluded
+    by the strategy that anchors on it, but nothing here should depend on that: a projection
+    would make "the model wrote no record" and "compaction removed the record" the same empty
+    string, and those are opposite findings.
+
+    Args:
+        agent: The agent whose providers say where the history lives.
+        state: Session state, live or snapshotted.
+
+    Returns:
+        The record, or an empty string when the conversation holds none. Several results
+        batched into one message are joined, which is what a provider that batches them
+        produces; only results carrying :data:`RECORD_MARKER` are read, so an ordinary tool
+        result sitting beside the record is not mistaken for part of it.
+    """
+    messages = _stored_messages(agent, state)
+    index = find_record_index(messages)
+    if index is None:
+        return ""
+    parts: list[str] = []
+    for content in messages[index].contents:
+        if content.type != "function_result":
+            continue
+        result = content.result if isinstance(content.result, str) else str(content.result)
+        if RECORD_MARKER in result:
+            parts.append(result)
+    return chr(10).join(parts)
 
 
 def snapshot_state(session: AgentSession) -> dict[str, Any]:
@@ -1339,6 +1429,7 @@ async def run_live(
     combined_repeats: int = DEFAULT_COMBINED_REPEATS,
     record_max_tokens: int | None = DEFAULT_RECORD_MAX_TOKENS,
     record_target_tokens: int | None = DEFAULT_RECORD_TARGET_TOKENS,
+    max_groups_before_record: int | None = None,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> LiveOutcome:
     """Seed a conversation against a real agent, snapshot it, then probe the snapshot.
@@ -1418,6 +1509,13 @@ async def run_live(
             tool call loses its arguments rather than shortening them -- and the middleware
             cannot send an instruction message, so the description is the only channel left.
             ``None`` states no target.
+        max_groups_before_record: How many tool-call groups one record may be asked to cover
+            before the middleware forces another, used only by ``tool_summary_anchored``.
+            ``None`` asks for a single record however much there is to record, which is what
+            the run did before the bound existed. One ask covering everything is an ask a
+            model may only partly answer, and the strategy now keeps whatever a record does
+            not name, so an unbounded ask degrades into compacting almost nothing; this is
+            what buys the compaction back.
         sleep: How the backoff between re-sent attempts is taken, throttled and disconnected
             alike. Injectable only so that a test can prove the retries are bounded, and prove
             it against the schedule itself, without spending the bound in wall clock.
@@ -1458,17 +1556,22 @@ async def run_live(
     # strategies something new to call, which is a difference between rows that has nothing
     # to do with compaction.
     recall_middleware: ToolResultRecallMiddleware | None = None
-    if isinstance(strategy, ToolResultAnchoredSummarizationCompactionStrategy):
+    # Kept as a narrowed reference rather than re-tested at the end of the run. The counters
+    # this outcome reports are read off the strategy object once the conversation is over, and
+    # a second isinstance down there is a second place to keep in step with this one.
+    recording = strategy if isinstance(strategy, ToolResultAnchoredSummarizationCompactionStrategy) else None
+    if recording is not None:
         gate = RecallGate()
         # Registered like any other tool, because the harness must know it to run it, and
         # inert until the middleware arms it, because it cannot be hidden from the model.
         scope_tools = [*scope_tools, make_recall_tool(gate, target_tokens=record_target_tokens)]
         recall_middleware = ToolResultRecallMiddleware(
-            max_input_tokens=strategy.max_input_tokens,
+            max_input_tokens=recording.max_input_tokens,
             tokenizer=options.tokenizer,
             arm=gate.arm,
-            trigger_fraction=strategy.trigger_fraction,
+            trigger_fraction=recording.trigger_fraction,
             record_max_tokens=record_max_tokens,
+            max_groups_before_record=max_groups_before_record,
         )
 
     agent = build_live_agent(
@@ -1719,6 +1822,11 @@ async def run_live(
         seed_prompt_tokens=seed_prompt_tokens,
         summarizer_failures=summarizer.failures if summarizer else 0,
         strategy_notes=_strategy_notes(strategy) + _strategy_notes(recall_middleware),
+        groups_kept_uncovered=recording.groups_kept_uncovered if recording is not None else 0,
+        fallbacks_after_record=recording.fallbacks_after_record if recording is not None else 0,
+        # Taken from the snapshot rather than from the live session, so it is the record the
+        # probes were answered from and not one a probe's own compaction pass moved.
+        record_text=recall_record_text(agent, snapshot),
         summarizer_input_tokens=summarizer.input_tokens if summarizer else 0,
         summarizer_output_tokens=summarizer.output_tokens if summarizer else 0,
         error=error,

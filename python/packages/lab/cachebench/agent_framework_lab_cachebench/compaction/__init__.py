@@ -22,6 +22,10 @@ What is here:
   three names to work: :func:`make_recall_tool` is the tool the model calls,
   :class:`RecallGate` keeps that tool inert until it is asked for, and
   :class:`ToolResultRecallMiddleware` is what asks.
+- :func:`set_preserved` and :func:`is_preserved` carry one annotation between the two: a
+  message no strategy may shorten, drop or shed. It exists because the record is a tool
+  result, the anchored strategy trims tool results, and for a while it trimmed the record --
+  destroying the only surviving copy of everything the other strategy had just deleted.
 
 **This depends on ``agent_framework._compaction``, which is private API.** Grouping, token
 annotation and the exclusion flags all come from there; nothing public exposes them. That
@@ -50,7 +54,15 @@ from ._anchored import (
     AnchoredCompactionStrategy,
     MinimumGainAnchoredCompactionStrategy,
 )
+from ._preserve import (
+    PRESERVE_REASON_KEY,
+    PRESERVED_KEY,
+    any_preserved,
+    is_preserved,
+    set_preserved,
+)
 from ._toolsummary import (
+    DEFAULT_COVERAGE_SHARE,
     DEFAULT_RECORD_MAX_TOKENS,
     DEFAULT_RECORD_TARGET_TOKENS,
     RECALL_TOOL_NAME,
@@ -64,11 +76,14 @@ from ._toolsummary import (
 
 __all__ = [
     "DEFAULT_BAND_SHARE",
+    "DEFAULT_COVERAGE_SHARE",
     "DEFAULT_KEEP_TOKENS",
     "DEFAULT_MIN_GAIN_FRACTION",
     "DEFAULT_RECORD_MAX_TOKENS",
     "DEFAULT_RECORD_TARGET_TOKENS",
     "MARKER_ID_PREFIX",
+    "PRESERVED_KEY",
+    "PRESERVE_REASON_KEY",
     "RECALL_TOOL_NAME",
     "RECORD_MARKER",
     "REMOVAL_MARKER",
@@ -77,6 +92,9 @@ __all__ = [
     "RecallGate",
     "ToolResultAnchoredSummarizationCompactionStrategy",
     "ToolResultRecallMiddleware",
+    "any_preserved",
     "find_record_index",
+    "is_preserved",
     "make_recall_tool",
+    "set_preserved",
 ]
