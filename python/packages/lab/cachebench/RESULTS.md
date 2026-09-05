@@ -1383,6 +1383,63 @@ Cost: $84.69, roughly EUR 78.
 
 ---
 
+## Runs 34 and 35 — the same matrix on a second model
+
+`gpt-5.6-luna`, same deployment, same repaired instrument, nine cells at 60,000, 120,000 and
+200,000 tokens. 390 records, five seeds a cell, no errors, $48.77. Both models carry the same
+**10x cache discount**, which is what the break-even says should govern the outcome.
+
+| cell | tool_summary | anchored | min_gain | truncation | context_window | control spread |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| fixed 60K / 0.86 | +56% | +83% | +55% | +31% | +29% | 22% |
+| fixed 120K / 0.50 | +37% | -7% | -6% | -2% | +27% | 29% |
+| fixed 120K / 0.70 | +27% | +6% | +16% | +7% | +34% | 35% |
+| fixed 120K / 0.86 | +47% | +51% | +52% | +10% | +0% | 20% |
+| fixed 200K / 0.86 | +39% | +67% | +101% | +11% | +4% | 35% |
+| share 0.60, 120K / 0.86 | +11% | +23% | +51% | +5% | +39% | 26% |
+| share 0.80, 60K / 0.86 | +6% | +31% | +18% | +14% | +17% | 12% |
+| share 0.80, 120K / 0.86 | +9% | -2% | +5% | +13% | +20% | 6% |
+| share 0.80, 200K / 0.86 | **-8%** | +3% | +4% | +1% | +22% | 12% |
+
+### What transfers between the models
+
+**Nothing is resolvably cheaper than not compacting.** Eighteen cells now, across two models
+and four window sizes. Every negative figure sits inside its control's spread, on both.
+
+**The cache penalty is the mechanism, on both.** Whenever a strategy edits the prefix its hit
+rate falls -- to 75-91% on luna against controls at 94-98% -- and the cost follows.
+
+**`context_window` is dearest or near-dearest almost everywhere**, +17% to +39% on luna in seven
+of nine cells. The two exceptions are instructive rather than reassuring: at 120,000/0.86 and
+200,000/0.86 it reads +0% and +4% *because it discards so much that it stops paying for what it
+kept* -- 20 of 53 facts in both, `acc1` 40%.
+
+### What does not transfer, and it is the useful half
+
+**Which strategy is least bad is model-specific.** At the cell where `gpt-5.4-mini` gave its one
+parity result -- share 0.80, 120,000, 0.86 fill -- the two models disagree completely:
+
+| | `gpt-5.4-mini` | `gpt-5.6-luna` |
+| --- | ---: | ---: |
+| `tool_summary_anchored` vs none | **-3%** | +9% |
+| facts kept | **53/53** | 40/53 |
+| `acc1` | **100%** | 76% |
+
+The record is only as good as the model writing it, and luna writes a much worse one: 21 of 53
+facts at the fixed payload where 5.4-mini kept all 53. So the break-even predicts the
+**direction** on both models at the same discount, and predicts **nothing** about which strategy
+to choose. Any recommendation naming a strategy has to be measured on the model being deployed.
+
+### Luna is a noisier subject
+
+Control spreads run 6-35% against 5.4-mini's 3-31%, and single strategies reach 101% and 141%.
+Five seeds resolve less here, and no luna cost figure under roughly 40% should be read as
+meaning anything.
+
+Cost: $48.77, roughly EUR 45.
+
+---
+
 ## Models that could not be measured
 
 **`google/gemini-3.7-flash` — excluded.** Its turns fail partway through a conversation
