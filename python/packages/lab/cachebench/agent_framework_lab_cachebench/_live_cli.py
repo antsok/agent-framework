@@ -33,10 +33,24 @@ from ._live import (
 from ._providers import build_provider, parse_provider_selector, provider_names
 from ._recall import COMBINED_SCOPE, RecallScenario, RecallScore
 from ._records import CellParams, SeedRecord, append_seed_record, group_by_cell, read_seed_records
-from ._strategies import StrategyOptions, build_strategy, needs_summarizer, strategy_names
+from ._strategies import (
+    STRATEGIES_NEEDING_SUMMARIZER,
+    StrategyOptions,
+    build_strategy,
+    needs_summarizer,
+    strategy_names,
+)
 from ._summary import DEFAULT_MIN_CORRECTNESS, JointOutcome, JointVerdict, recommend, relative_correctness
 from ._tokenizers import TOKENIZER_NAMES, build_tokenizer
-from .compaction import DEFAULT_BAND_SHARE, DEFAULT_RECORD_MAX_TOKENS, DEFAULT_RECORD_TARGET_TOKENS
+from .compaction import (
+    DEFAULT_BAND_SHARE,
+    DEFAULT_COVERAGE_SHARE,
+    DEFAULT_FALLBACK_FRACTION,
+    DEFAULT_MIN_GAIN_FRACTION,
+    DEFAULT_RECORD_MAX_TOKENS,
+    DEFAULT_RECORD_TARGET_TOKENS,
+    DEFAULT_TRIGGER_FRACTION,
+)
 
 if TYPE_CHECKING:
     from agent_framework._clients import SupportsChatGetResponse
@@ -339,7 +353,73 @@ def build_parser() -> argparse.ArgumentParser:
             "tool_summary_anchored now keeps every group its record does not name, so an "
             "unbounded ask degrades into compacting almost nothing: this is what buys the "
             "compaction back. Each record costs an agent turn, so a small number is not free. "
-            "0 for one record per run, which is what the run did before this existed."
+            "0 to leave the bound off, which is what the run did before this existed."
+        ),
+    )
+    parser.add_argument(
+        "--no-record-repeats",
+        action="store_true",
+        help=(
+            "Ask for one recall record per conversation and no more, whatever else accumulates. "
+            "Every run up to and including 39 was single-record, because the size trigger was "
+            "gated on there being no record yet, so a row meant to be compared against those "
+            "has to set this. Left off, the trigger asks again once the agent has done tool "
+            "work no existing record accounts for -- which is the condition that keeps it from "
+            "asking on every remaining call, since the size that fired it does not go away when "
+            "a record arrives. Each further record costs an agent turn and is preserved for the "
+            "rest of the run, so RECORDS:<n> in the flags column is the price of leaving this "
+            "off. --max-groups-before-record is unaffected: setting a group bound is asking for "
+            "repeats outright, and it keeps forcing them either way."
+        ),
+    )
+    parser.add_argument(
+        "--trigger-fraction",
+        type=float,
+        default=DEFAULT_TRIGGER_FRACTION,
+        help=(
+            "Share of the input budget at which tool_summary_anchored asks for its record, on "
+            "both halves at once: the strategy waits at this line and the middleware reads the "
+            "strategy's own value, so the ask and the wait cannot be set apart. It is a bet "
+            "that enough conversation remains to repay the compaction, and it was 0.6 until it "
+            "was measured as one taken far too early -- 0.6 of the budget is 58%% of a "
+            "60,000-token window at the default output reservation, which spends an agent turn "
+            "and breaks the cached prefix in a conversation that may end before it ever needed "
+            "compacting. Waiting costs nothing until the ceiling is in reach. Must be below "
+            "--fallback-fraction. Default %(default)s."
+        ),
+    )
+    parser.add_argument(
+        "--fallback-fraction",
+        type=float,
+        default=DEFAULT_FALLBACK_FRACTION,
+        help=(
+            "Share of the input budget at which tool_summary_anchored stops waiting for a "
+            "record and compacts without one. The gap above --trigger-fraction is what the "
+            "record has to arrive in, and it is a whole turn wide by construction: the "
+            "middleware can only read the history on the way out of a call and can only pin "
+            "the next one, so the conversation grows by a turn between the ask and the answer. "
+            "At a 0.8 trigger the old 0.9 left one turn's room, and one turn carrying a large "
+            "tool result crossed it -- compacting without a record while the record was still "
+            "in flight, which is the single outcome this strategy exists to avoid. It cannot "
+            "go to 1.0 either: past this line the fallback still has to fit the conversation "
+            "under the ceiling. Must exceed --trigger-fraction. Default %(default)s."
+        ),
+    )
+    parser.add_argument(
+        "--coverage-share",
+        type=float,
+        default=DEFAULT_COVERAGE_SHARE,
+        help=(
+            "Share of a group's distinctive values the recall record must quote before "
+            "tool_summary_anchored will delete that group. The default is a threshold rather "
+            "than a derivation, and the right value depends on how many values a workload's "
+            "results carry: at the eight per result these runs use, 0.8 tolerates exactly one "
+            "unrecognisable value, while at two values per group the share can only be 0, 0.5 "
+            "or 1 and inheriting this is meaningless. 1.0 is as brittle as the tool-name rule "
+            "it replaced -- one value the model reformatted keeps a whole group, which cost a "
+            "complete-record model its compaction, 20%% down to 5-6%%. 0 restores the older "
+            "behaviour, where any group holding a distinctive value at all counted as covered, "
+            "so the two can be run side by side. Default %(default)s."
         ),
     )
     parser.add_argument(
@@ -368,6 +448,79 @@ def build_parser() -> argparse.ArgumentParser:
             "break-even it still cannot pay on such a payload -- even at 0.01, shedding 94%% "
             "of every result, the 18,114 tokens removed fall short of the ~29,900 the edit "
             "re-bills. Default %(default)s."
+        ),
+    )
+    parser.add_argument(
+        "--keep-tokens",
+        type=int,
+        default=0,
+        help=(
+            "Fix the anchored family's retention at this many tokens per collapsed tool "
+            "result, split between its head and its tail, instead of deriving it from "
+            "--band-share and the result's position. A fixed budget is what this did "
+            "originally and it cannot work across window sizes: 600 characters is 0.9%% of a "
+            "result at a 60,000-token window and 0.3%% at 272,000, and the strategy scored 32 "
+            "of 53 facts in the first case and 11 in the second -- the 11 being the five "
+            "non-tool facts plus the one code per result that happened to fall inside the "
+            "surviving head. It is exposed to make that comparison runnable again, not because "
+            "it is a good setting. 0 derives it, which is the default."
+        ),
+    )
+    parser.add_argument(
+        "--min-gain-fraction",
+        type=float,
+        default=DEFAULT_MIN_GAIN_FRACTION,
+        help=(
+            "Share of the tokens *behind* a collapse that anchored_min_gain must remove before "
+            "it will make the collapse. The one setting that distinguishes that row from "
+            "anchored, and unreachable until this flag existed, so the pair could only ever be "
+            "compared at one value of the thing being tested. Derived rather than chosen: a "
+            "strict-prefix cache makes an edit re-bill everything behind it once at the "
+            "uncached price and save the removed tokens on every later turn at the cached one, "
+            "which repays when R > B*(p-c)/(p+T*c). The default is that at the measured prices "
+            "with twenty turns remaining. T is the term nobody knows at decision time and it "
+            "divides -- ten remaining turns need 43%% of B and forty need 17%% -- so a caller "
+            "expecting shorter conversations should raise this rather than trust it. Default "
+            "%(default)s."
+        ),
+    )
+    parser.add_argument(
+        "--keep-head-groups",
+        type=int,
+        default=3,
+        help=(
+            "Message groups at the start of the conversation the anchored family and "
+            "tool_summary_anchored never touch. These carry the task, its requirements and the "
+            "corrections to them, which every deleting strategy measured here throws away "
+            "first and which are the cheapest facts in a conversation to keep: truncation left "
+            "29 of 53 planted facts in the prompt and the model used none of them, because the "
+            "codes survived while the turns saying which deployment each belonged to did not. "
+            "Lower it to measure what that labelling is worth. Default %(default)s."
+        ),
+    )
+    parser.add_argument(
+        "--keep-tail-groups",
+        type=int,
+        default=4,
+        help=(
+            "Recent groups the anchored family keeps verbatim: the working set. Too small and "
+            "the model loses the thread of what it is doing; too large and every new turn "
+            "shifts a large block out of the tail and re-bills it, which is cache spent for "
+            "nothing. Reaches tool_summary_anchored's fallback as well, since that is an "
+            "anchored strategy. Default %(default)s."
+        ),
+    )
+    parser.add_argument(
+        "--keep-last-groups",
+        type=int,
+        default=6,
+        help=(
+            "Message groups sliding_window keeps, and the target count summarization compacts "
+            "to. Unreachable before this flag existed, which fixed the worst-performing row in "
+            "the table at one setting: sliding_window drops the oldest group every turn, so it "
+            "changes the *start* of the prompt each time and measured a 1-9%% cache hit rate, "
+            "the worst of anything tested. How much of that is the mechanism and how much is "
+            "this number is not answerable without being able to move it. Default %(default)s."
         ),
     )
     parser.add_argument(
@@ -625,6 +778,7 @@ def _seed_record(
         summarizer_failures=outcome.summarizer_failures,
         groups_kept_uncovered=outcome.groups_kept_uncovered,
         fallbacks_after_record=outcome.fallbacks_after_record,
+        records_in_conversation=outcome.records_in_conversation,
         strategy_notes=outcome.strategy_notes,
         dropped_options=outcome.dropped_options,
         answer=outcome.answer,
@@ -1557,7 +1711,18 @@ _LEGEND: Final[tuple[str, ...]] = (
     "            Those probes saw slightly less than survival was scored against, so a row",
     "            carrying this overstates what reached the model. S<n> summarizer failures,",
     "            <n>/<n>t turns",
-    "            completed, REC:<n> records the strategy found, FORCED:<n> times it asked for",
+    "            completed, REC:<n> whether the model ever wrote a record at all -- it",
+    "            saturates at 1 and answers compliance, not quantity. RECORDS:<n> how many",
+    "            records the conversation ended up carrying, which is a different question",
+    "            and became one when the size trigger was allowed to ask more than once.",
+    "            Every record is preserved: it may be neither shortened nor dropped, by this",
+    "            strategy or by the fallback behind it, and nothing merges them -- an older",
+    "            record is the sole account of the groups behind it, so a merge would rewrite",
+    "            the evidence rather than the bulk. So each one raises a floor under the",
+    "            prompt that no later pass can lower, and a row above 1 here is a row whose",
+    "            money columns are partly that floor rather than the workload. Runs up to",
+    "            39 were single-record by construction and carry no such number;",
+    "            --no-record-repeats reproduces them. FORCED:<n> times it asked for",
     "            one, TRUNCATED:<n> forced calls the provider cut at --record-max-tokens, so",
     "            that record may cover only part of what it was asked to preserve and the",
     "            missing part is scored as compaction damage. UNCOVERED:<n> tool-call groups",
@@ -1842,6 +2007,80 @@ def _plan_or_exit(args: argparse.Namespace, tokenizer: Any) -> FillPlan | None:
         raise SystemExit(str(error)) from error
 
 
+def _strategy_options(args: argparse.Namespace, tokenizer: Any, summarizer: Any = None) -> StrategyOptions:
+    """Return the parameters every strategy in this run is built from.
+
+    One function rather than a literal at each call site, because there are three of them --
+    the pre-flight below, the dry run's plan, and the per-seed build -- and a flag threaded
+    into two of the three produces a run that validates one configuration, describes a second
+    and measures a third. The dry run did exactly that: it built every strategy from bare
+    defaults and printed "every strategy builds cleanly" about a configuration the run was not
+    going to use.
+
+    Args:
+        args: Parsed command line arguments.
+        tokenizer: The run's token counter.
+        summarizer: Metered client for the strategies that need one, per seed.
+
+    Returns:
+        The options.
+    """
+    return StrategyOptions(
+        tokenizer=tokenizer,
+        max_context_window_tokens=args.context_window,
+        max_output_tokens=args.max_output_tokens,
+        keep_last_groups=args.keep_last_groups,
+        keep_last_tool_call_groups=args.keep_last_tool_groups,
+        keep_head_groups=args.keep_head_groups,
+        keep_tail_groups=args.keep_tail_groups,
+        # 0 is the absence of a bound, the same convention --record-max-tokens and --fill use:
+        # no fixed retention, so the anchored family derives one from --band-share instead.
+        keep_tokens=args.keep_tokens or None,
+        band_share=args.band_share,
+        min_gain_fraction=args.min_gain_fraction,
+        trigger_fraction=args.trigger_fraction,
+        fallback_fraction=args.fallback_fraction,
+        coverage_share=args.coverage_share,
+        token_budget_fraction=args.budget_fraction,
+        summarizer=summarizer,
+    )
+
+
+def _build_or_exit(strategies: Sequence[str], options: StrategyOptions) -> None:
+    """Build every selected strategy once, before the run spends anything.
+
+    This is where the numeric flags are range-checked, and it is deliberately not a second
+    copy of the checks. Each strategy validates its own bounds in its own constructor --
+    ``compaction/`` ships without this package, so the constraint has to live there -- and a
+    duplicate here would give a sweep two places to disagree about what is legal. What this
+    adds is *when*: without it a bad ``--band-share`` surfaced on the first seed, after the
+    provider was built, the pricing fetched and the first call paid for, and a bad one under
+    ``--dry-run`` surfaced not at all, because the dry run built from defaults rather than
+    from the flags it was printing a plan for.
+
+    Strategies needing a summarizer are skipped when there is none. Their own missing-client
+    error is raised separately and says what to do about it; reaching it here would report a
+    missing ``--summarizer-provider`` as a bad configuration value.
+
+    Args:
+        strategies: The selected strategy names.
+        options: What they will be built from.
+
+    Raises:
+        SystemExit: If any strategy rejects the configuration.
+    """
+    for name in strategies:
+        if name in STRATEGIES_NEEDING_SUMMARIZER and options.summarizer is None:
+            continue
+        try:
+            build_strategy(name, options)
+        except ValueError as error:
+            raise SystemExit(
+                f"{name} rejects this configuration: {error} Each parameter named there is the "
+                "flag of the same name, with underscores written as dashes."
+            ) from error
+
+
 def _progress(record: SeedRecord) -> str:
     """Return the line printed the moment a seed lands.
 
@@ -2062,6 +2301,9 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
     tool_strategies_inert = planted_groups <= retained
     if needs_summarizer(strategies) and args.summarizer_provider is None and not args.dry_run:
         raise SystemExit("Summarization strategies require --summarizer-provider.")
+    # Before the provider, the pricing and the first paid call, because a range error in a
+    # strategy parameter is a typo and should cost nothing to find.
+    _build_or_exit(strategies, _strategy_options(args, tokenizer))
 
     if args.dry_run:
         scenario = build_live_scenario(
@@ -2120,8 +2362,8 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
                 f"~{per_run:,} per strategy-seed (~{seeding:,} seeding, ~{probing:,} probing). "
                 "Cache reads take most of this off; probing is the half the repeat counts scale."
             )
-        for name in strategies:
-            build_strategy(name, StrategyOptions(tokenizer, args.context_window, args.max_output_tokens))
+        # Already built, from the flags this run would use rather than from defaults, by the
+        # pre-flight above.
         print("every strategy builds cleanly")
         return 0
 
@@ -2233,13 +2475,9 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
                 narration=args.narration,
                 subset_questions=not args.sweeping_question,
             )
-            options = StrategyOptions(
-                tokenizer=tokenizer,
-                max_context_window_tokens=args.context_window,
-                max_output_tokens=args.max_output_tokens,
-                token_budget_fraction=args.budget_fraction,
-                keep_last_tool_call_groups=args.keep_last_tool_groups,
-                band_share=args.band_share,
+            options = _strategy_options(
+                args,
+                tokenizer,
                 # A recording proxy, not a client: see MeteredClient for why it is cast.
                 summarizer=cast("SupportsChatGetResponse[Any] | None", summarizer),
             )
@@ -2261,9 +2499,10 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
                 # --fill 0, which hands sizing back to the manual flags.
                 record_max_tokens=args.record_max_tokens or None,
                 record_target_tokens=args.record_target_tokens or None,
-                # Same convention again: 0 is the absence of a bound, so one record is asked
-                # for and no more, which is what the run did before the group bound existed.
+                # Same convention again: 0 switches the group bound off and leaves the size
+                # trigger as the only thing that asks.
                 max_groups_before_record=args.max_groups_before_record or None,
+                repeat_records=not args.no_record_repeats,
             )
             # Scored, written and reported here rather than when the cell ends. A seed that
             # has been paid for is durable the moment it exists, and the line that follows is

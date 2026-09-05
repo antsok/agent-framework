@@ -567,6 +567,18 @@ class LiveOutcome:
     Zero on every strategy that keeps no such count, which is all of them but
     ``tool_summary_anchored``.
     """
+    records_in_conversation: int = 0
+    """Records the conversation ended up carrying, at the most the strategy saw it hold.
+
+    One is the design working. Several is the design working repeatedly, and the price of that
+    is a floor under the prompt: every record is preserved, so it can be neither shortened nor
+    dropped, and nothing merges them. Reported as a number beside the ``RECORDS`` flag for the
+    reason ``groups_kept_uncovered`` is -- a flag says a row is affected, a number can be meaned
+    over the seeds of a cell and asked how far the floor rose.
+
+    Zero on every strategy that keeps no such count, which is all of them but
+    ``tool_summary_anchored``.
+    """
     record_text: str = ""
     """The recall record the run produced, exactly as the model wrote it.
 
@@ -794,6 +806,7 @@ def _strategy_notes(strategy: Any) -> tuple[str, ...]:
     notes: list[str] = []
     for attribute, label in (
         ("records_found", "REC"),
+        ("records_in_conversation", "RECORDS"),
         ("fallbacks_used", "FALLBACK"),
         ("fallbacks_after_record", "RECFALLBACK"),
         ("forced_calls", "FORCED"),
@@ -1430,6 +1443,7 @@ async def run_live(
     record_max_tokens: int | None = DEFAULT_RECORD_MAX_TOKENS,
     record_target_tokens: int | None = DEFAULT_RECORD_TARGET_TOKENS,
     max_groups_before_record: int | None = None,
+    repeat_records: bool = True,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> LiveOutcome:
     """Seed a conversation against a real agent, snapshot it, then probe the snapshot.
@@ -1511,11 +1525,16 @@ async def run_live(
             ``None`` states no target.
         max_groups_before_record: How many tool-call groups one record may be asked to cover
             before the middleware forces another, used only by ``tool_summary_anchored``.
-            ``None`` asks for a single record however much there is to record, which is what
-            the run did before the bound existed. One ask covering everything is an ask a
-            model may only partly answer, and the strategy now keeps whatever a record does
-            not name, so an unbounded ask degrades into compacting almost nothing; this is
-            what buys the compaction back.
+            ``None`` leaves the bound off, so the size trigger is the only thing that asks.
+            One ask covering everything is an ask a model may only partly answer, and the
+            strategy keeps whatever a record does not name, so an unbounded ask degrades into
+            compacting almost nothing; this is what buys the compaction back.
+        repeat_records: Let the size trigger ask for a further record once the agent has done
+            tool work no existing record accounts for, used only by ``tool_summary_anchored``.
+            On by default. Off, one record is asked for and no more, which is what every run
+            up to and including 39 did -- so a row meant to be compared against those has to
+            set it. It governs the size trigger alone; ``max_groups_before_record`` is a caller
+            asking for repeats outright and keeps forcing them either way.
         sleep: How the backoff between re-sent attempts is taken, throttled and disconnected
             alike. Injectable only so that a test can prove the retries are bounded, and prove
             it against the schedule itself, without spending the bound in wall clock.
@@ -1572,6 +1591,7 @@ async def run_live(
             trigger_fraction=recording.trigger_fraction,
             record_max_tokens=record_max_tokens,
             max_groups_before_record=max_groups_before_record,
+            repeat_records=repeat_records,
         )
 
     agent = build_live_agent(
@@ -1824,6 +1844,7 @@ async def run_live(
         strategy_notes=_strategy_notes(strategy) + _strategy_notes(recall_middleware),
         groups_kept_uncovered=recording.groups_kept_uncovered if recording is not None else 0,
         fallbacks_after_record=recording.fallbacks_after_record if recording is not None else 0,
+        records_in_conversation=recording.records_in_conversation if recording is not None else 0,
         # Taken from the snapshot rather than from the live session, so it is the record the
         # probes were answered from and not one a probe's own compaction pass moved.
         record_text=recall_record_text(agent, snapshot),

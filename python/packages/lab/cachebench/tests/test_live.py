@@ -36,6 +36,7 @@ from agent_framework import (
     Message,
     SlidingWindowStrategy,
     TokenBudgetComposedStrategy,
+    ToolResultCompactionStrategy,
     TruncationStrategy,
     UsageDetails,
 )
@@ -86,6 +87,7 @@ from agent_framework_lab_cachebench._live_cli import (
     CellStats,
     _accuracy_note,
     _aggregate,
+    _build_or_exit,
     _control_message_gap,
     _cost,
     _coverage,
@@ -100,6 +102,7 @@ from agent_framework_lab_cachebench._live_cli import (
     _seed_record,
     _seed_spread,
     _spread,
+    _strategy_options,
     _summarizer_cost,
     _to_joint,
     build_parser,
@@ -119,6 +122,8 @@ from agent_framework_lab_cachebench.compaction import (
     DEFAULT_RECORD_TARGET_TOKENS,
     RECALL_TOOL_NAME,
     RECORD_MARKER,
+    AnchoredCompactionStrategy,
+    MinimumGainAnchoredCompactionStrategy,
     ToolResultAnchoredSummarizationCompactionStrategy,
     ToolResultRecallMiddleware,
     make_recall_tool,
@@ -763,6 +768,17 @@ def test_every_argument_the_runner_reads_is_defined() -> None:
         "max_output_tokens",
         "answer_max_tokens",
         "budget_fraction",
+        "band_share",
+        "keep_tokens",
+        "min_gain_fraction",
+        "keep_head_groups",
+        "keep_tail_groups",
+        "keep_last_groups",
+        "keep_last_tool_groups",
+        "trigger_fraction",
+        "fallback_fraction",
+        "coverage_share",
+        "no_record_repeats",
         "min_correctness",
         "summarizer_provider",
         "no_force_tool_calls",
@@ -959,6 +975,164 @@ def test_context_window_matches_the_framework_tool_retention_default() -> None:
     assert isinstance(built, ContextWindowCompactionStrategy)
     assert built.tool_eviction_threshold == ContextWindowCompactionStrategy.DEFAULT_TOOL_EVICTION_THRESHOLD
     assert built.truncation_threshold == ContextWindowCompactionStrategy.DEFAULT_TRUNCATION_THRESHOLD
+
+
+#: Every strategy knob the command line can set, at a value nothing else in the package uses,
+#: so a builder that silently took a constructor default fails the assertion rather than
+#: matching it by coincidence.
+_TUNED_ARGV = (
+    "--keep-head-groups",
+    "5",
+    "--keep-tail-groups",
+    "7",
+    "--keep-last-groups",
+    "9",
+    "--keep-last-tool-groups",
+    "2",
+    "--keep-tokens",
+    "321",
+    "--band-share",
+    "0.11",
+    "--min-gain-fraction",
+    "0.13",
+    "--trigger-fraction",
+    "0.17",
+    "--fallback-fraction",
+    "0.19",
+    "--coverage-share",
+    "0.23",
+    "--budget-fraction",
+    "0.29",
+)
+
+
+def _tuned_options() -> StrategyOptions:
+    """Return the options a command line setting every knob produces."""
+    return _strategy_options(build_parser().parse_args(["azure", *_TUNED_ARGV]), TOKENIZER)
+
+
+def test_every_tuning_flag_reaches_the_strategy_that_consumes_it() -> None:
+    """A flag that parses and then goes nowhere is worse than no flag at all.
+
+    It is worse because the run reports the value: the cell parameters, the dry-run plan and
+    the archived log all quote what was typed, so a sweep across a knob nothing reads produces
+    a table of identical rows labelled with different settings, and the conclusion drawn is
+    that the knob does not matter. Five of these were unreachable at once --
+    ``min_gain_fraction`` is the whole of what separates ``anchored_min_gain`` from
+    ``anchored``, and the pair had only ever been compared at one value of it.
+    """
+    options = _tuned_options()
+
+    anchored = build_strategy("anchored", options)
+    assert isinstance(anchored, AnchoredCompactionStrategy)
+    assert (anchored.keep_head_groups, anchored.keep_tail_groups) == (5, 7)
+    assert (anchored.keep_tokens, anchored.band_share) == (321, 0.11)
+
+    min_gain = build_strategy("anchored_min_gain", options)
+    assert isinstance(min_gain, MinimumGainAnchoredCompactionStrategy)
+    assert min_gain.min_gain_fraction == 0.13
+
+    summary = build_strategy("tool_summary_anchored", options)
+    assert isinstance(summary, ToolResultAnchoredSummarizationCompactionStrategy)
+    assert (summary.trigger_fraction, summary.fallback_fraction) == (0.17, 0.19)
+    assert (summary.coverage_share, summary.keep_head_groups, summary.keep_tail_groups) == (0.23, 5, 7)
+
+    window = build_strategy("sliding_window", options)
+    assert isinstance(window, SlidingWindowStrategy)
+    assert window.keep_last_groups == 9
+
+    tools = build_strategy("tool_result", options)
+    assert isinstance(tools, ToolResultCompactionStrategy)
+    assert tools.keep_last_tool_call_groups == 2
+
+    composed = build_strategy("token_budget_fallback", options)
+    assert isinstance(composed, TokenBudgetComposedStrategy)
+    assert composed.token_budget == options.composed_budget_tokens
+
+
+def test_the_anchored_knobs_reach_the_fallback_hiding_inside_the_record_strategy() -> None:
+    """``tool_summary_anchored`` falls back to an anchored strategy, and it is a strategy row too.
+
+    Left to its own default, that inner strategy took ``AnchoredCompactionStrategy``'s
+    constructor defaults for ``band_share`` and ``keep_tokens`` -- so a sweep across either
+    moved every anchored row except the one nested inside this one, on a path this strategy
+    takes often enough that ``RECFALLBACK`` has its own flag and its own column.
+    """
+    summary = build_strategy("tool_summary_anchored", _tuned_options())
+
+    assert isinstance(summary, ToolResultAnchoredSummarizationCompactionStrategy)
+    fallback = summary.fallback
+    assert isinstance(fallback, AnchoredCompactionStrategy)
+    assert (fallback.band_share, fallback.keep_tokens) == (0.11, 321)
+    assert (fallback.keep_head_groups, fallback.keep_tail_groups) == (5, 7)
+
+
+def test_a_retention_of_zero_means_derive_it_rather_than_keep_nothing() -> None:
+    """``--keep-tokens 0`` is the absence of a fixed budget, the convention every other 0 uses.
+
+    Read literally it would mean a retention of nothing, which is a different strategy: the
+    anchored family would shorten every banded result to its marker. ``--fill 0``,
+    ``--record-max-tokens 0`` and ``--max-groups-before-record 0`` all already mean "no bound
+    of my own", and one flag reading its zero the other way is the kind of difference nobody
+    checks before spending a cell on it.
+    """
+    default = _strategy_options(build_parser().parse_args(["azure"]), TOKENIZER)
+    explicit = _strategy_options(build_parser().parse_args(["azure", "--keep-tokens", "0"]), TOKENIZER)
+
+    assert default.keep_tokens is None
+    assert explicit.keep_tokens is None
+
+
+@pytest.mark.parametrize(
+    ("argv", "match"),
+    [
+        pytest.param(["--band-share", "1.5"], "band_share", id="band-share"),
+        pytest.param(["--keep-head-groups", "-1"], "keep_head_groups", id="keep-head-groups"),
+        pytest.param(["--min-gain-fraction", "1.0"], "min_gain_fraction", id="min-gain-fraction"),
+        pytest.param(["--trigger-fraction", "0"], "trigger_fraction", id="trigger-fraction"),
+        pytest.param(["--fallback-fraction", "1.5"], "fallback_fraction", id="fallback-fraction"),
+        pytest.param(["--coverage-share", "1.5"], "coverage_share", id="coverage-share"),
+        pytest.param(
+            ["--trigger-fraction", "0.9", "--fallback-fraction", "0.9"], "fallback_fraction", id="thresholds-equal"
+        ),
+        pytest.param(
+            ["--trigger-fraction", "0.9", "--fallback-fraction", "0.8"], "fallback_fraction", id="thresholds-inverted"
+        ),
+    ],
+)
+def test_a_value_outside_a_strategys_range_is_refused_before_anything_is_spent(argv: list[str], match: str) -> None:
+    """A bad number has to fail at the command line, not on the first call of a paid cell.
+
+    The ranges themselves are checked in ``compaction/``, which is where they belong -- those
+    classes ship without this package -- so this is about *when*, not about a second copy of
+    the rule. Before the pre-flight existed a bad ``--band-share`` surfaced on the first seed,
+    after the provider was built and the pricing fetched, and under ``--dry-run`` it surfaced
+    not at all: the dry run built every strategy from bare defaults and then printed "every
+    strategy builds cleanly" about a configuration it was not going to use.
+    """
+    strategies = ["anchored", "anchored_min_gain", "tool_summary_anchored"]
+    options = _strategy_options(build_parser().parse_args(["azure", *argv]), TOKENIZER)
+
+    with pytest.raises(SystemExit) as error:
+        _build_or_exit(strategies, options)
+
+    assert match in str(error.value)
+
+
+async def test_the_dry_run_checks_the_configuration_it_is_printing_a_plan_for(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """ "Every strategy builds cleanly" has to be about this run's flags, not about defaults."""
+    argv = ("--strategies", "none,anchored")
+
+    with pytest.raises(SystemExit) as error:
+        await run_live_comparison(build_parser().parse_args(_dry_argv(*argv, "--band-share", "1.5")))
+
+    assert "band_share" in str(error.value)
+
+    await run_live_comparison(build_parser().parse_args(_dry_argv(*argv, "--band-share", "0.1")))
+
+    assert "every strategy builds cleanly" in capsys.readouterr().out
 
 
 # endregion
@@ -3085,6 +3259,7 @@ def test_the_two_accuracy_measures_are_named_acc1_and_acc2() -> None:
         summarizer_failures=0,
         groups_kept_uncovered=0,
         fallbacks_after_record=0,
+        records_in_conversation=0,
         strategy_notes=(),
         dropped_options=(),
         answer="",
@@ -3285,6 +3460,7 @@ def _control_cell(seeded: int) -> dict[str, CellStats]:
         summarizer_failures=0,
         groups_kept_uncovered=0,
         fallbacks_after_record=0,
+        records_in_conversation=0,
         strategy_notes=(),
         dropped_options=(),
         answer="",
@@ -3562,6 +3738,14 @@ async def test_a_run_that_was_not_cut_short_says_nothing() -> None:
     assert not [note for note in _strategy_notes(middleware) if note.startswith("TRUNCATED")]
 
 
+#: A ceiling that leaves the eight-turn fixture between the strategy's two thresholds, so it
+#: acts on the record rather than sitting below the trigger or giving up above the fallback.
+#: The conversation is about 17,000 tokens, which is 90% of this. It was 22,000 while the
+#: thresholds were 0.6 and 0.9; at 0.8 that puts the fixture *below* the trigger, and every
+#: test built on it would have asserted against a strategy that did nothing.
+_RECORD_CEILING = 19_000
+
+
 def _tool_conversation(tool_turns: int, *, covered: int) -> list[Message]:
     """Return a conversation whose recall record names only the first ``covered`` tools.
 
@@ -3655,7 +3839,7 @@ async def test_a_record_that_named_every_tool_adds_no_flag_at_all() -> None:
     nothing. A flag that appeared anyway would put a warning on every row of every model that
     complied, which is how a flags column stops being read.
     """
-    strategy = ToolResultAnchoredSummarizationCompactionStrategy(max_input_tokens=22_000, tokenizer=TOKENIZER)
+    strategy = ToolResultAnchoredSummarizationCompactionStrategy(max_input_tokens=_RECORD_CEILING, tokenizer=TOKENIZER)
 
     assert await strategy(_tool_conversation(8, covered=8)) is True
     assert strategy.groups_kept_uncovered == 0
@@ -3717,7 +3901,7 @@ async def test_a_record_that_freed_enough_leaves_the_fallback_flag_off() -> None
     what it is for, and a row like that measures nothing but itself. A flag appearing there
     would put a warning on the good case, which is how a flags column comes to be skipped.
     """
-    strategy = ToolResultAnchoredSummarizationCompactionStrategy(max_input_tokens=22_000, tokenizer=TOKENIZER)
+    strategy = ToolResultAnchoredSummarizationCompactionStrategy(max_input_tokens=_RECORD_CEILING, tokenizer=TOKENIZER)
 
     assert await strategy(_tool_conversation(8, covered=8)) is True
     assert strategy.fallbacks_after_record == 0
@@ -3785,6 +3969,101 @@ async def test_the_post_record_fallback_count_survives_the_file_and_an_older_rec
     older["schema"] = SCHEMA_VERSION - 1
 
     assert SeedRecord.from_dict(older).fallbacks_after_record is None, "an uncounted fallback is not a fallback of zero"
+
+
+#: A ceiling that leaves the two-record fixture between the strategy's thresholds, chosen the
+#: same way ``_RECORD_CEILING`` is: four tool turns and two records come to about 8,800 tokens,
+#: which is 88% of this.
+_TWO_RECORD_CEILING = 10_000
+
+
+def _two_record_conversation() -> list[Message]:
+    """Return a conversation carrying two records, which is what repeats produce.
+
+    Both records cover every tool group, so the strategy has no shortfall to report and the
+    only thing left for it to say about this conversation is how many records it is carrying.
+
+    Returns:
+        The messages, the newer record last.
+    """
+    covered = " ".join(f"lookup_{index}: CODE-{index}." for index in range(4))
+    return [
+        *_tool_conversation(4, covered=4),
+        Message(
+            role="assistant",
+            contents=[{"type": "function_call", "call_id": "rec2", "name": RECALL_TOOL_NAME, "arguments": "{}"}],
+            message_id="rec2_call",
+        ),
+        Message(
+            role="tool",
+            contents=[{"type": "function_result", "call_id": "rec2", "result": f"{RECORD_MARKER} {covered}"}],
+            message_id="rec2_res",
+        ),
+    ]
+
+
+async def test_the_record_count_reaches_the_seed_record_and_the_flags_column(tmp_path: Path) -> None:
+    """A conversation accumulating records has to say so, in the one place a reader looks.
+
+    Records are preserved: unshrinkable, undroppable, counted against the ceiling in full, and
+    nothing merges them. So a run that takes three of them carries a floor under its prompt
+    that no later pass can lower -- and every other column reads as though compaction were
+    still working, because the message count keeps rising and each pass still reports having
+    acted. Letting the size trigger ask more than once is what made this possible, so the
+    count has to travel the same four handoffs ``groups_kept_uncovered`` does: strategy,
+    outcome, seed record, column.
+    """
+    strategy = ToolResultAnchoredSummarizationCompactionStrategy(
+        max_input_tokens=_TWO_RECORD_CEILING, tokenizer=TOKENIZER
+    )
+
+    await strategy(_two_record_conversation())
+
+    assert strategy.records_in_conversation == 2
+    notes = _strategy_notes(strategy)
+    assert "RECORDS:2" in notes
+    assert "REC:1" in notes, "compliance and quantity are different questions and both are shown"
+
+    outcome, scenario = await _probed(StubChatClient(usage=UsageDetails(input_token_count=1_000)), repeats=1)
+    record = _record(
+        replace(outcome, strategy_notes=notes, records_in_conversation=strategy.records_in_conversation),
+        scenario,
+        strategy="tool_summary_anchored",
+    )
+
+    assert record.records_in_conversation == 2, "the count must survive scoring, not only the flag string"
+    cell = _aggregate("tool_summary_anchored", [record])
+
+    assert "RECORDS:2" in _flags(cell, None)
+    assert "RECORDS:2" in _render(None, [cell], set(), show_answers=False)
+
+    path = tmp_path / "results.jsonl"
+    append_seed_record(path, record)
+    (read_back,) = read_seed_records(path)
+
+    assert read_back.records_in_conversation == 2
+    assert read_back.schema == SCHEMA_VERSION
+
+
+async def test_a_record_written_before_repeats_existed_reports_no_count_rather_than_one() -> None:
+    """The absence is "nobody took this number", which is not the same as "there was one".
+
+    A run before schema 6 could take at most one record, so the temptation is to read the field
+    back as 1. But whether it took that one depended on whether the model ever complied, and
+    the rows flagged ``FALLBACK`` are precisely the ones where it did not -- so a 1 would credit
+    them with a record they never got, and a 0 would deny one to every row that did. Which of
+    the two happened is on those records only as a flag, and inferring a count from a flag
+    string is not a count anybody took.
+    """
+    outcome, scenario = await _probed(StubChatClient(usage=UsageDetails(input_token_count=1_000)), repeats=1)
+    record = _record(replace(outcome, records_in_conversation=2), scenario, strategy="tool_summary_anchored")
+
+    assert record.records_in_conversation == 2
+
+    older = {key: value for key, value in record.to_dict().items() if key != "records_in_conversation"}
+    older["schema"] = SCHEMA_VERSION - 1
+
+    assert SeedRecord.from_dict(older).records_in_conversation is None, "a count nobody took is not a count of one"
 
 
 class _RecordingStub(StubChatClient):
@@ -4027,6 +4306,35 @@ def _stub_provider(monkeypatch: pytest.MonkeyPatch) -> None:
 def _table(printed: str) -> str:
     """Return just the rendered table from a run's output, dropping the progress before it."""
     return printed[printed.index("Model:") :]
+
+
+async def test_the_record_repeat_setting_reaches_the_run_that_installs_the_middleware(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A reproducibility flag that stops at the parser is worse than not having one.
+
+    The whole value of ``--no-record-repeats`` is that a cell can be put back on the axis runs
+    26-39 were measured on. A flag that parsed, appeared in the archived command line, and then
+    never reached the middleware would produce a cell labelled single-record that was not one,
+    and the comparison it exists for would be made against the wrong thing with nothing saying
+    so.
+    """
+    _stub_provider(monkeypatch)
+    live = run_live
+    seen: list[bool] = []
+
+    async def capture(*args: Any, **kwargs: Any) -> LiveOutcome:
+        seen.append(kwargs["repeat_records"])
+        return await live(*args, **kwargs)
+
+    monkeypatch.setattr("agent_framework_lab_cachebench._live_cli.run_live", capture)
+
+    await run_live_comparison(build_parser().parse_args(_live_argv()))
+    default = list(seen)
+    await run_live_comparison(build_parser().parse_args(_live_argv("--no-record-repeats")))
+
+    assert default and all(default), "repeats are on unless the run asks otherwise"
+    assert not any(seen[len(default) :]), "and off for every strategy-seed of a run that does"
 
 
 async def test_every_finished_seed_is_on_disk_before_the_cell_is(
@@ -4399,6 +4707,7 @@ def test_a_progress_line_shows_what_a_watcher_needs() -> None:
         summarizer_failures=0,
         groups_kept_uncovered=0,
         fallbacks_after_record=0,
+        records_in_conversation=0,
         strategy_notes=(),
         dropped_options=(),
         answer="",

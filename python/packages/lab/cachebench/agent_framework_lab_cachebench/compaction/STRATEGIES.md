@@ -158,6 +158,13 @@ in it makes a compacted run cheaper than an uncompacted one.
 `declined_collapses` counts the refusals, so a run that never fired and a run that fired to no
 effect can be told apart.
 
+`min_gain_fraction` is the whole of what separates this row from its parent, and until the
+`--min-gain-fraction` flag existed the lab's builder took the constructor default — so every
+comparison between the pair had been made at one value of the variable under test. `T`, the
+turns still to come, is the term nobody knows at decision time and it divides: ten remaining
+turns need 43% of `B` and forty need 17%, so a workload with shorter conversations than the
+twenty this default assumes should raise it rather than inherit it.
+
 ---
 
 ## `ToolResultAnchoredSummarizationCompactionStrategy`
@@ -176,6 +183,38 @@ one that spends model calls to do so.
 2. The strategy waits for the resulting tool result to appear, then drops the tool groups in
    front of it **that the record demonstrably carries**. That last clause is the coverage
    check below, and `groups_kept_uncovered` counts what it refused to delete.
+
+**The two thresholds are one decision.** `trigger_fraction` defaults to **0.8** and
+`fallback_fraction` to **0.95**, and the constructor refuses a fallback at or below the trigger.
+0.6 was measured firing at 58% of a 60,000-token window: an agent turn and a broken cached prefix
+spent early in a conversation that may never have needed compacting, when the break-even only
+favours compaction with a long remaining horizon. Raising the trigger forced the give-up line up
+with it, because the record arrives one call late by construction — `process` can only read the
+history on the way *out* of a call and can only pin the *next* one — so a 0.9 line left a single
+turn's growth of room, and one turn carrying a large tool result crossed it. The strategy would
+then compact without a record while the record it asked for was still in flight, which is the one
+outcome this design exists to avoid. It cannot go to 1.0 either: past that line the fallback still
+has to fit the conversation under the ceiling.
+
+**Several records, and what that costs.** The size trigger asks more than once, and it cannot do
+that on size alone: the size that fired it does not go away when a record arrives, because the
+record is *added* to the conversation and then preserved. A trigger reading size would therefore
+pin every remaining call in the run — which is why it used to be gated on there being no record
+at all, and it is the regression to watch for. What re-arms it is new material: at least one
+non-recall tool-call group after the newest record. `_record_due` is the one place that rule is
+written down.
+
+Repeats are needed because a record covers what existed when it was written and nothing after it.
+Without them, every group gathered later is uncoverable for the rest of the run, so it sits in the
+prompt to the end and the row reports `UNCOVERED` for work no record was ever asked to account
+for. The price is accumulation: every record is preserved — unshrinkable, undroppable, counted
+against the ceiling in full — and nothing merges them, because an older record is the sole account
+of the groups behind *it* and a merge rewrites the evidence rather than the bulk. So each record
+raises a floor under the prompt that no later pass can lower, and `records_in_conversation` is what
+says so. It is a different question from `records_found`, which saturates at 1 and answers only
+whether the model ever complied. `repeat_records=False` restores the single-record behaviour every
+run up to and including 39 had; it governs the size trigger alone, since setting
+`max_groups_before_record` is asking for repeats outright.
 
 **Coverage is measured in values, not in tool names.** The check that went in first asked
 whether the record contained the group's function name, reading `RECALL_VALUES_DESCRIPTION`'s

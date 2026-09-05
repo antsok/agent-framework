@@ -49,6 +49,10 @@ from agent_framework import (
 
 from .compaction import (
     DEFAULT_BAND_SHARE,
+    DEFAULT_COVERAGE_SHARE,
+    DEFAULT_FALLBACK_FRACTION,
+    DEFAULT_MIN_GAIN_FRACTION,
+    DEFAULT_TRIGGER_FRACTION,
     AnchoredCompactionStrategy,
     MinimumGainAnchoredCompactionStrategy,
     ToolResultAnchoredSummarizationCompactionStrategy,
@@ -80,7 +84,20 @@ _MIN_AUTO_WINDOW_TOKENS: Final[int] = 4_096
 
 @dataclass(frozen=True, slots=True)
 class StrategyOptions:
-    """Parameters shared by every strategy builder."""
+    """Parameters shared by every strategy builder.
+
+    Every field here is a knob the CLI can set, and that is the point of the type: a builder
+    reading a constructor default instead of a field makes that parameter unreachable from a
+    sweep, which is how ``min_gain_fraction`` and the two record thresholds came to be
+    unsettable while the rows that depend on them were being compared.
+
+    The ranges are not validated here. Each strategy validates its own, in ``compaction/``,
+    which is where the constraint belongs -- those classes ship without this package -- and
+    duplicating the checks would give a sweep two places to disagree about what is legal. What
+    this package owes instead is that every selected strategy is *built* before a run spends
+    anything, so a bad value fails at the command line rather than on the first paid call; see
+    ``_live_cli._build_or_exit``.
+    """
 
     tokenizer: TokenizerProtocol
     max_context_window_tokens: int
@@ -89,7 +106,40 @@ class StrategyOptions:
     keep_last_tool_call_groups: int = 4
     keep_head_groups: int = 3
     keep_tail_groups: int = 4
+    keep_tokens: int | None = None
+    """Tokens of a collapsed tool result the anchored family retains, head and tail together.
+
+    ``None`` derives it from ``band_share`` and the result's position in the band, which is
+    what makes retention scale with the window instead of shrinking to nothing as results grow.
+    A number fixes it, which is the older behaviour and is worth being able to reproduce: the
+    two answer different questions about the same row.
+    """
     band_share: float = DEFAULT_BAND_SHARE
+    min_gain_fraction: float = DEFAULT_MIN_GAIN_FRACTION
+    """Break-even floor under every collapse ``anchored_min_gain`` would make.
+
+    The one setting that row exists to measure, and it was unreachable: the builder took the
+    constructor's default, so the pair ``anchored``/``anchored_min_gain`` could only ever be
+    compared at one value of the thing that separates them.
+    """
+    trigger_fraction: float = DEFAULT_TRIGGER_FRACTION
+    """Share of the input budget at which ``tool_summary_anchored`` asks for its record.
+
+    Reaches both halves of that strategy from here: the run hands it to the strategy, and the
+    middleware takes the strategy's own value rather than a second copy, so the ask and the
+    wait cannot be configured apart.
+    """
+    fallback_fraction: float = DEFAULT_FALLBACK_FRACTION
+    """Share at which ``tool_summary_anchored`` stops waiting and compacts without a record.
+
+    Must exceed ``trigger_fraction``; the strategy raises ``ValueError`` when it does not.
+    """
+    coverage_share: float = DEFAULT_COVERAGE_SHARE
+    """Share of a group's distinctive values a record must quote before the group may be cut.
+
+    The dial on the coverage check, whose default is a threshold rather than a derivation and
+    whose right value depends on how many values a workload's results carry.
+    """
     token_budget_fraction: float = 0.5
     summarizer: SupportsChatGetResponse[Any] | None = None
 
@@ -186,6 +236,7 @@ def _build_anchored(options: StrategyOptions) -> CompactionStrategy:
         tokenizer=options.tokenizer,
         keep_head_groups=options.keep_head_groups,
         keep_tail_groups=options.keep_tail_groups,
+        keep_tokens=options.keep_tokens,
         band_share=options.band_share,
     )
 
@@ -203,6 +254,7 @@ def _build_anchored_no_assistant(options: StrategyOptions) -> CompactionStrategy
         tokenizer=options.tokenizer,
         keep_head_groups=options.keep_head_groups,
         keep_tail_groups=options.keep_tail_groups,
+        keep_tokens=options.keep_tokens,
         band_share=options.band_share,
         collapse_assistant_text=False,
     )
@@ -224,7 +276,9 @@ def _build_anchored_min_gain(options: StrategyOptions) -> CompactionStrategy:
         tokenizer=options.tokenizer,
         keep_head_groups=options.keep_head_groups,
         keep_tail_groups=options.keep_tail_groups,
+        keep_tokens=options.keep_tokens,
         band_share=options.band_share,
+        min_gain_fraction=options.min_gain_fraction,
     )
 
 
@@ -234,11 +288,22 @@ def _build_tool_summary_anchored(options: StrategyOptions) -> CompactionStrategy
     Needs no summarizer client of its own: the recording is done by the agent's own model
     through a tool call the provider issues. That is also why a run using it cannot pin
     ``tool_choice`` -- the model has to be free to choose the recall tool.
+
+    The fallback is built here rather than left to the strategy's own default. The default is
+    the same object with the same head and tail, but it takes the anchored strategy's *own*
+    defaults for ``band_share`` and ``keep_tokens``, so a sweep moving either of those moved
+    every anchored row except the one hiding inside this one -- and this row falls back often
+    enough that the difference is measured rather than theoretical.
     """
     return ToolResultAnchoredSummarizationCompactionStrategy(
         max_input_tokens=options.input_budget_tokens,
         tokenizer=options.tokenizer,
         keep_head_groups=options.keep_head_groups,
+        keep_tail_groups=options.keep_tail_groups,
+        trigger_fraction=options.trigger_fraction,
+        fallback_fraction=options.fallback_fraction,
+        coverage_share=options.coverage_share,
+        fallback=_build_anchored(options),
     )
 
 
