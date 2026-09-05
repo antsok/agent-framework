@@ -1430,6 +1430,48 @@ facts at the fixed payload where 5.4-mini kept all 53. So the break-even predict
 **direction** on both models at the same discount, and predicts **nothing** about which strategy
 to choose. Any recommendation naming a strategy has to be measured on the model being deployed.
 
+### `tool_summary_anchored` on luna is measuring a cut record, not the strategy
+
+The row that led the 5.4-mini matrix collapses on luna -- 21 of 53 facts where mini kept 53 --
+and the cause is in the flags, not the strategy. **`TRUNCATED` appears on 36 of luna's 45
+records and on none of mini's 45.** It is not inferred from the record's length: the middleware
+counts the provider's own `finish_reason == "length"` on the forced call.
+
+The correlation is total:
+
+| | records | facts kept |
+| --- | ---: | --- |
+| no `TRUNCATED` | 9 | **53/53 in all nine** |
+| `TRUNCATED` | 36 | 21 x26, 53 x6, 13 x3, 46 x1 |
+
+And every fact count in the set is exactly `5 + 8k` -- the five non-tool facts plus a whole
+number of eight-code lookups. The record is not degraded, it is **cut on a lookup boundary**:
+26 records covered two lookups of six before the cap stopped them, three covered one.
+
+**Both runs passed the same `--record-max-tokens 4000 --record-target-tokens 2000`.** The cap
+was chosen at twice the target on the reasoning in `_toolsummary.py`'s own docstring -- that it
+"bounds the bill without ever being the thing that stops the writing". On 5.4-mini that held
+exactly. On luna it does not: the model was already measured writing about **four times** what
+mini writes per reply, which is why this run carries `--assumed-reply-tokens 602`, and the
+record overruns 4,000 the same way. Cut at 4,000 having covered a third of the lookups, luna's
+record wants roughly 12,000 tokens.
+
+**The truncation is not benign.** The strategy deletes the tool results the record was meant to
+replace whether or not the record arrived whole, so everything past the cut is scored as
+compaction damage -- and the row also pays output price, 6x input, for tokens it then discards.
+So luna's `tool_summary_anchored` cost figures are not the strategy's either, in either
+direction: the -8% at 200K/share 0.80 is partly content the cut removed.
+
+**The one clean cell says the same thing from the other side.** Share 0.80 at 60,000 is the
+shortest conversation in the matrix at 37 messages, it is the only cell with zero truncations,
+and it is the only luna cell where the strategy kept 53/53 in all five seeds -- at +6%, inside
+the control's 17% spread.
+
+This is a real limit on the strategy and not only a mis-set flag. A record that must enumerate
+everything grows with the material, so on a verbose model the two outcomes available are a cut
+record that loses facts or a complete record too large to save anything. Which of those luna
+gives at a raised cap is unmeasured.
+
 ### The luna cells are less full than their labels, and the instrument said so
 
 Seven of the nine cells tripped `FILL OFF TARGET`. The seeded conversation landed **-3.1% to
