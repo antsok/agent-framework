@@ -326,6 +326,23 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--max-groups-before-record",
+        type=int,
+        default=0,
+        help=(
+            "Force a fresh recall record every N tool-call groups, alongside the size trigger "
+            "that asks for the first one. One record asked to cover a whole conversation is a "
+            "record a model may only partly write: gpt-5.6-luna named two of six tool groups, "
+            "and raising --record-max-tokens, raising --record-target-tokens and rewriting the "
+            "tool's own guidance each left that unchanged. What is left is to ask for less per "
+            "record, which is what this bounds. It is worth having because "
+            "tool_summary_anchored now keeps every group its record does not name, so an "
+            "unbounded ask degrades into compacting almost nothing: this is what buys the "
+            "compaction back. Each record costs an agent turn, so a small number is not free. "
+            "0 for one record per run, which is what the run did before this existed."
+        ),
+    )
+    parser.add_argument(
         "--assumed-reply-tokens",
         type=int,
         default=ASSUMED_REPLY_TOKENS,
@@ -423,6 +440,21 @@ def build_parser() -> argparse.ArgumentParser:
             "anything. Handles a file whose cells are incomplete, and states which strategies "
             "and how many seeds each cell holds, so a partial result cannot be read as a "
             "finished one."
+        ),
+    )
+    parser.add_argument(
+        "--dump-record",
+        default=None,
+        help=(
+            "Write the full text of every recall record the run produces into this directory, "
+            "one file per strategy and seed. Diagnostic only, and observation only: the record "
+            "is read back out of the finished conversation after it is over, so nothing is "
+            "added to any prompt, no extra call is made, and the tokens, the cache hits and the "
+            "cost of the run are byte for byte what they would have been without it. Off by "
+            "default and inert when off. Only tool_summary_anchored writes a record at all, and "
+            "a seed whose model never wrote one produces no file rather than an empty one. Use "
+            "it to read what the model actually preserved, which is the question an UNCOVERED "
+            "flag raises and no count can answer."
         ),
     )
     parser.add_argument("--dry-run", action="store_true", help="Print the plan and its rough size, call nothing.")
@@ -591,11 +623,45 @@ def _seed_record(
         probe_repeats=outcome.probe_repeats,
         summarizer_calls=outcome.summarizer_calls,
         summarizer_failures=outcome.summarizer_failures,
+        groups_kept_uncovered=outcome.groups_kept_uncovered,
+        fallbacks_after_record=outcome.fallbacks_after_record,
         strategy_notes=outcome.strategy_notes,
         dropped_options=outcome.dropped_options,
         answer=outcome.answer,
         error=outcome.error,
     )
+
+
+def _dump_record(directory: Path, strategy: str, seed: int, text: str) -> Path | None:
+    """Write one seed's recall record to its own file, for a human to read.
+
+    The only thing in this module that exists for a reader rather than for a table. Every
+    count the run reports about the record -- how many were found, how many were forced, how
+    many tool groups they failed to cover -- describes the record without quoting it, and the
+    question those counts raise is what the model actually wrote down. That is not a number,
+    so it goes in a file.
+
+    Writes nothing when there is no record, rather than an empty file. An empty file and a
+    record the model wrote as an empty string would be indistinguishable, and the first is the
+    ordinary case: every strategy but ``tool_summary_anchored`` takes no record at all.
+
+    Args:
+        directory: Where to write, created if it does not exist. One run's worth: the name
+            below identifies a seed within a run, so a second cell pointed at the same
+            directory overwrites the first cell's files rather than sitting beside them.
+        strategy: The row this seed belongs to.
+        seed: 1-based index of the seed within its strategy.
+        text: The record, as the model wrote it.
+
+    Returns:
+        The file written, or None when the seed produced no record.
+    """
+    if not text:
+        return None
+    directory.mkdir(parents=True, exist_ok=True)
+    path = directory / f"{strategy}-seed{seed}.txt"
+    path.write_text(text, encoding="utf-8")
+    return path
 
 
 def _seed_spread(samples: Sequence[Sequence[float]]) -> float:
@@ -1494,9 +1560,32 @@ _LEGEND: Final[tuple[str, ...]] = (
     "            completed, REC:<n> records the strategy found, FORCED:<n> times it asked for",
     "            one, TRUNCATED:<n> forced calls the provider cut at --record-max-tokens, so",
     "            that record may cover only part of what it was asked to preserve and the",
-    "            missing part is scored as compaction damage. FALLBACK:<n> times it gave up",
+    "            missing part is scored as compaction damage. UNCOVERED:<n> tool-call groups",
+    "            the record never named, which the strategy therefore refused to delete. This",
+    "            is the coverage check holding the row back, and it is a cost rather than a",
+    "            loss: those groups are still in the prompt, so the row paid for tokens a",
+    "            complete record would have replaced and lost nothing. Read it as how far the",
+    "            model fell short of what the recall tool asked for -- the record is required",
+    "            to group its content by the tool that produced it, so a tool it never names",
+    "            is a tool it did not account for. Before the check existed those groups were",
+    "            deleted anyway and the facts in them arrived in acc1 as compaction damage,",
+    "            with nothing in any column saying where they went. A row with UNCOVERED is",
+    "            not measuring this strategy working; it is measuring it declining to guess.",
+    "            FALLBACK:<n> times it gave up",
     "            and compacted another way. A row with",
-    "            FALLBACK is measuring that other strategy, not the one named. NO:<opt> the",
+    "            FALLBACK is measuring that other strategy, not the one named.",
+    "            RECFALLBACK:<n> passes where a record did exist, was anchored on, and the",
+    "            row still fell back: what the record freed left the prompt over the ceiling.",
+    "            Counted apart from FALLBACK because the two say different things about the",
+    "            model -- FALLBACK is a model that never wrote a record, this is a model that",
+    "            wrote one that did not go far enough -- but read them the same way, because",
+    "            a non-zero value here means part of what this row measured is the fallback",
+    "            strategy and not the one named. It is the quieter of the two: the fallback",
+    "            shortens tool results in place, so the row keeps its message count and loses",
+    "            its values, and beside UNCOVERED it is shortening exactly the groups the",
+    "            coverage check had just declined to delete. Uncounted until a seed reporting",
+    "            UNCOVERED:4 was measured losing the control's facts three messages shorter",
+    "            and 16,617 tokens lighter, with no flag anywhere saying so. NO:<opt> the",
     "            provider rejected that option so it was dropped; a run that dropped",
     "            tool_choice chose its own tool calls and is not comparable with one that did",
     "            not. FETCH this row gathered a different set of facts than the control.",
@@ -2117,6 +2206,10 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
         plan=plan,
     )
     results_path = Path(args.results_jsonl) if args.results_jsonl is not None else None
+    # None unless asked for, and read once here so the seed loop below has nothing to decide.
+    # Dumping observes the finished conversation and changes none of it; the flag only decides
+    # whether anyone looks.
+    dump_path = Path(args.dump_record) if args.dump_record is not None else None
 
     cells: list[CellStats] = []
     for name in strategies:
@@ -2168,6 +2261,9 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
                 # --fill 0, which hands sizing back to the manual flags.
                 record_max_tokens=args.record_max_tokens or None,
                 record_target_tokens=args.record_target_tokens or None,
+                # Same convention again: 0 is the absence of a bound, so one record is asked
+                # for and no more, which is what the run did before the group bound existed.
+                max_groups_before_record=args.max_groups_before_record or None,
             )
             # Scored, written and reported here rather than when the cell ends. A seed that
             # has been paid for is durable the moment it exists, and the line that follows is
@@ -2175,6 +2271,8 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
             record = _seed_record(outcome, scenario, pricing, cell_params, repeat)
             if results_path is not None:
                 append_seed_record(results_path, record)
+            if dump_path is not None:
+                _dump_record(dump_path, name, repeat, outcome.record_text)
             seeds.append(record)
             print(_progress(record), flush=True)
         cells.append(_aggregate(name, seeds))

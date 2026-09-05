@@ -70,6 +70,16 @@ already fits.
 The head anchor is load-bearing: it holds the system prompt and the opening requirements, which
 are what give later values their meaning. The tail is what the model is currently working on.
 
+**It also honours one annotation it cannot produce itself.** A message another strategy has
+marked *preserved* (`compaction/_preserve.py`) is skipped by all three of this strategy's
+removal paths: the in-place shortening, the tool-group shed and the narration shed. Preserved
+is not the same as excluded — the message is still sent and still counted in full — so a
+conversation can end a pass over its ceiling with everything removable already gone. That is
+the intended outcome: the shed loop stops on "nothing moved" rather than "the ceiling is met",
+so it neither loops against a band it may not touch nor reports success on a prompt the
+provider will reject. Only the record-then-drop strategy below sets the mark today, and it had
+to, because this strategy was measured shredding that record.
+
 **When it works.** When tool results are larger than the per-group allowance, which is the
 common case in a real agent trace. In the window series it preserved all 53 planted facts at a
 272,000-token window, where the allowance is generous enough to keep a useful slice of each
@@ -158,15 +168,60 @@ one that spends model calls to do so.
 **Mechanism, in two phases.**
 
 1. `ToolResultRecallMiddleware` watches the conversation size. Past `trigger_fraction` of the
-   ceiling it pins the next request to a single tool, `recall_earlier_tool_results`, whose
-   description asks the model to write down everything from earlier tool results that later
-   work could depend on. The tool echoes that text straight back.
-2. The strategy waits for the resulting tool result to appear, then drops every tool group in
-   front of it. The record is what those groups were reduced to.
+   ceiling — or once `max_groups_before_record` tool groups have piled up since the last
+   record, whichever fires first — it pins the next request to a single tool,
+   `recall_earlier_tool_results`, whose description asks the model to write down everything
+   from earlier tool results that later work could depend on. The tool echoes that text
+   straight back.
+2. The strategy waits for the resulting tool result to appear, then drops the tool groups in
+   front of it **that the record demonstrably carries**. That last clause is the coverage
+   check below, and `groups_kept_uncovered` counts what it refused to delete.
 
-If the record never arrives — the model may simply not call it — a `fallback_fraction`
-threshold hands over to `AnchoredCompactionStrategy` rather than letting the conversation
-overflow while waiting.
+**Coverage is measured in values, not in tool names.** The check that went in first asked
+whether the record contained the group's function name, reading `RECALL_VALUES_DESCRIPTION`'s
+"grouped by the tool that produced it" as the contract. Models do not write function names.
+Luna's record says *"extra0 deployment lookup returned codes: AB-123456, …"* — every identifier
+present, `lookup_extra0` nowhere — and gpt-5.4-mini, whose records carry every value from every
+group, was scored `UNCOVERED:4` by the same rule while its compaction fell from a 20% reduction
+to 5–6% for nothing. A check that penalises the model which complied is a net negative, and
+that one was.
+
+The rule is now the clause the description actually leads with, *"Quote verbatim any value that
+cannot be reconstructed or guessed"*. For each candidate group the strategy extracts the
+distinctive tokens of its tool **results** — whitespace-delimited, punctuation stripped from
+both ends, at least four characters, at least one digit — and calls the group covered when the
+record quotes at least `coverage_share` of them, case-insensitively. The default is **0.8**:
+1.0 is as brittle as the name rule, since one value the model reformatted keeps a whole group,
+and much below 0.5 licenses deleting six of eight values because two were quoted.
+
+Two deliberate gaps in that rule, both stated rather than discovered later. It cannot see a
+value with no digit in it, so a group whose results yield **no** distinctive tokens falls back
+to the old tool-name test — not to "covered", which would let an empty record delete a tool's
+prose findings, and not to "uncovered", which would make every prose-only tool permanently
+undroppable. And it over-collects ordinary numbers, which makes coverage harder to claim and
+keeps more; that is the direction everything here errs in.
+
+**Two fallback paths, and both are counted.** Either way the row is partly measuring
+`AnchoredCompactionStrategy` rather than this design, which is why neither is silent.
+
+- **No record ever arrived.** The model may simply not call the tool. Past `fallback_fraction`
+  the strategy stops waiting and hands the whole conversation over rather than letting it
+  overflow. `fallbacks_used`.
+- **A record arrived and did not free enough.** The groups after the record are untouched by
+  design and can exceed the ceiling alone, and since the coverage check went in so can the
+  groups the record failed to carry. The fallback then runs behind the record and shortens
+  whatever is left. `fallbacks_after_record` — which for a while was counted nowhere, so a seed
+  reporting `UNCOVERED:4` lost the same facts as the control, three messages shorter and 16,617
+  tokens lighter, and carried no flag at all.
+
+**The record is protected from the fallback, and had to be.** The fallback shortens and sheds
+tool results; the record *is* a tool result, and nothing in `_anchored.py` had ever heard of
+one. It trimmed the record like any other bulk — the 16,617 tokens above are that trim, not a
+deletion — which destroys the sole surviving copy of everything phase 2 had just deleted on the
+record's authority. The strategy now marks every record it observes, older records included,
+through `compaction/_preserve.py`, and the anchored strategy skips preserved messages in each
+of its three removal paths. The mark is re-applied on every pass, because compaction runs
+against a freshly loaded conversation and the previous pass's annotations are not in it.
 
 **Four design constraints, each of which cost a wrong measurement to learn.**
 

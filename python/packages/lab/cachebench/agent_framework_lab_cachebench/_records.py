@@ -66,7 +66,24 @@ __all__ = [
 #: and reading the absent counts as zero would report every one of those runs as having probed
 #: for free -- which would put the whole of a twelve-probe discount into the seeding half and
 #: make the correction this field exists for read as already applied.
-SCHEMA_VERSION: Final[int] = 4
+#:
+#: 5 adds ``groups_kept_uncovered``, and the version is what separates a run whose strategy
+#: could decline to drop an unrecorded tool group from one whose strategy could not. Before
+#: it, ``tool_summary_anchored`` dropped every tool group in front of the record on the
+#: assumption that the record had replaced them, so no group was ever kept for want of
+#: coverage and zero is what those runs did. That is the version 3 case exactly, not the
+#: version 4 one: the number is knowable and it is zero, rather than unknowable and reported
+#: as zero. The bump is there so a reader can tell which of the two zeroes a row is showing.
+#:
+#: 5 also adds ``fallbacks_after_record``, and deliberately without a further bump. There is no
+#: version 5 record for a 6 to date it against: the bump above is unreleased, and every recorded
+#: cell on disk is version 2, 3 or 4. What separates the two fields is not the version but what
+#: their absence means, and the values say that themselves -- ``groups_kept_uncovered`` reads
+#: back as 0, which is what those runs did, and ``fallbacks_after_record`` reads back as
+#: ``None``, because those runs *could* fall back behind a record and counted nothing when they
+#: did. That is the version 4 case: not absent but unknowable, and a 0 would tell a reader that
+#: every older row stayed the strategy it is named for.
+SCHEMA_VERSION: Final[int] = 5
 
 #: Versions this reader accepts, which is not only the current one.
 #:
@@ -84,7 +101,15 @@ SCHEMA_VERSION: Final[int] = 4
 #: ``None`` rather than as zero. Everything those records measured they still measure; the one
 #: thing they cannot say is how their cost divided between seeding and probing, and ``None`` is
 #: how a reader is told that instead of being handed a number nobody took.
-_READABLE_SCHEMAS: Final[frozenset[int]] = frozenset({2, 3, SCHEMA_VERSION})
+#:
+#: Version 4 joins them on the version 2 argument rather than the version 3 one: what its runs
+#: did about uncovered tool groups is not in doubt, because their code had no way to keep one.
+#:
+#: What none of the three can say is how often a fallback ran *behind* a record, so
+#: ``fallbacks_after_record`` comes back as ``None`` for all of them, on the probe-count
+#: argument rather than the retry one: that path existed in every one of those runs and
+#: incremented nothing when it was taken.
+_READABLE_SCHEMAS: Final[frozenset[int]] = frozenset({2, 3, 4, SCHEMA_VERSION})
 
 #: The parameters that make two records the same cell, and so aggregable into one row.
 #:
@@ -402,6 +427,37 @@ class SeedRecord:
     probe_repeats: int
     summarizer_calls: int
     summarizer_failures: int
+    groups_kept_uncovered: int
+    """Tool groups the recall record never mentioned, so the strategy kept them instead of dropping them.
+
+    The cost of a partial record, in the one unit that says how partial it was. A row carrying
+    this spent tokens it should not have had to spend and lost nothing, which is the trade
+    ``tool_summary_anchored`` makes on purpose; the alternative it declined was deleting tool
+    results nothing had preserved and reporting that as compaction damage in the accuracy
+    columns, where no reader could trace it back.
+
+    Stored as a number beside the ``UNCOVERED:<n>`` flag on ``strategy_notes`` because the two
+    are read for different things. The flag says a row is affected; this can be meaned across
+    the seeds of a cell, which is what answers how much the coverage check is holding back.
+
+    Zero for every strategy that keeps no such count, and zero on a record written before
+    schema 5 -- see :data:`SCHEMA_VERSION` for why that zero is a measurement rather than a gap.
+    """
+    fallbacks_after_record: int | None
+    """Compaction passes where a record existed and the strategy fell back anyway.
+
+    The other way ``tool_summary_anchored`` stops being itself, and the quieter one: the
+    fallback shortens the tool results a partial record left in the prompt, so the row keeps
+    its messages and loses its values. ``strategy_notes`` carries it as the ``RECFALLBACK:<n>``
+    flag; the number is here so a cell can be meaned on it and asked how often a record failed
+    to free enough, rather than only whether one ever did.
+
+    ``None`` on a record written before the counter existed, which is every readable schema
+    below 5. Not zero: that path ran in those runs and incremented nothing, so the count is
+    unknowable rather than known to be nought -- the probe-token case, not the retry-counter
+    one. Zero from a live run means what it says, including on the four strategies that take no
+    record at all.
+    """
     strategy_notes: tuple[str, ...]
     dropped_options: tuple[str, ...]
     answer: str
@@ -530,6 +586,19 @@ class SeedRecord:
         # correction this field exists to make, already applied, and wrong.
         for name in ("probe_input_tokens", "probe_cached_tokens", "probe_output_tokens"):
             values.setdefault(name, None)
+        # Zero, and for the connection-retry reason rather than the probe-token one. A record
+        # written before schema 5 ran under a strategy that dropped every tool group in front
+        # of the record without checking what the record covered, so no group was kept for want
+        # of coverage: zero groups is what that run did, not a number this reader could not
+        # find. Required with no default on the class for the same reason as the retry
+        # counters, so a live run cannot silently inherit the same zero.
+        values.setdefault("groups_kept_uncovered", 0)
+        # None, and for the probe-token reason rather than the one directly above. Every run
+        # since this strategy existed could fall back behind a record that had not freed
+        # enough; none of them counted it, so what an older record did on that path cannot be
+        # recovered from the record. Zero would say the row stayed the strategy it is named
+        # for, which is the exact claim the counter was added because nobody could make.
+        values.setdefault("fallbacks_after_record", None)
         try:
             return cls(cell=CellParams.from_dict(data["cell"]), **values)
         except (KeyError, TypeError) as error:

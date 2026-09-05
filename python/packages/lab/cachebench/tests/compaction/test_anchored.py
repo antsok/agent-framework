@@ -26,6 +26,7 @@ from agent_framework_lab_cachebench.compaction._anchored import (
     AnchoredCompactionStrategy,
     MinimumGainAnchoredCompactionStrategy,
 )
+from agent_framework_lab_cachebench.compaction._preserve import set_preserved
 
 TOKENIZER = CharacterEstimatorTokenizer()
 
@@ -542,3 +543,99 @@ def test_no_band_share_makes_a_small_payload_worth_trimming() -> None:
             f"band_share {share} removed {removed:,}, which would clear {break_even:,.0f} -- "
             "if this ever fails the regime claim needs re-deriving, not the test relaxing"
         )
+
+
+# region preservation
+
+
+def _preserve(messages: list[Message], *message_ids: str) -> None:
+    """Mark the named messages as protected from removal."""
+    by_id = {message.message_id: message for message in messages}
+    for message_id in message_ids:
+        set_preserved(by_id[message_id], preserved=True, reason="test")
+
+
+async def test_shortening_in_place_skips_a_preserved_result() -> None:
+    """Removal path one: the trim that rewrites a tool result where it stands.
+
+    This is the path that produced the measured failure. The record written by the
+    record-then-drop strategy is a tool result like any other, so the collapse shortened it,
+    and a record holding four lookups' worth of identifiers arrived at the answering prompt
+    holding two -- 16,617 tokens gone while only three messages left, which no message-counting
+    diagnostic could see. ``keep_tokens`` is pinned and the ceiling chosen so that shortening
+    alone reaches it, which isolates this path from the shed steps below.
+    """
+    strategy = AnchoredCompactionStrategy(max_input_tokens=8_000, tokenizer=TOKENIZER, keep_tokens=200)
+    messages = _conversation(tool_turns=8)
+    _preserve(messages, "t_res_3")
+
+    await strategy(messages)
+    rendered = _rendered(messages)
+
+    assert REMOVAL_MARKER in rendered, "the fixture has to give the collapse something to trim"
+    assert "[compacted: an earlier tool call and its result]" not in rendered, "no shedding, so this is the trim path"
+    assert "R3 " + "x" * 8_000 in rendered, "the preserved result is intact to its last character"
+    assert "R2 " + "x" * 8_000 not in rendered, "and its unprotected neighbour was trimmed, so the trim did run"
+
+
+async def test_shedding_tool_groups_skips_a_preserved_group() -> None:
+    """Removal path two: the last-resort step that excludes a whole tool group.
+
+    One preserved member protects the pair, because a tool call sent without its result is a
+    malformed conversation on most providers -- there is no half-shed to fall back on. The
+    ceiling here is far below what the anchors alone need, so the shed step runs as hard as it
+    is ever going to.
+    """
+    strategy = AnchoredCompactionStrategy(max_input_tokens=120, tokenizer=TOKENIZER)
+    messages = _conversation(tool_turns=8)
+    _preserve(messages, "a_call_3", "t_res_3")
+
+    await strategy(messages)
+    rendered = _rendered(messages)
+
+    assert "[compacted: an earlier tool call and its result]" in rendered, "everything else was shed"
+    assert "R3 " + "x" * 8_000 in rendered, "the preserved group survived the shed whole"
+    assert "R2 " not in rendered, "and its unprotected neighbour did not"
+
+
+async def test_shedding_assistant_narration_skips_a_preserved_reply() -> None:
+    """Removal path three: the step that drops assistant prose once tool shedding is not enough.
+
+    Narration is often where a tool's values ended up after the model restated them, so it is
+    exactly the kind of message another strategy may have to declare irreplaceable. Tested
+    separately from the tool path because it is a second call into the same method with a
+    different group kind, and a guard added to one call site and not the other would pass every
+    test above.
+    """
+    strategy = AnchoredCompactionStrategy(max_input_tokens=120, tokenizer=TOKENIZER)
+    messages = _conversation(tool_turns=8)
+    _preserve(messages, "a_txt_3")
+
+    await strategy(messages)
+    rendered = _rendered(messages)
+
+    assert "[compacted: an earlier assistant reply]" in rendered, "the narration shed ran"
+    assert "I looked up 3." in rendered, "and stepped over the preserved reply"
+    assert "I looked up 2." not in rendered, "which it would not have done for an ordinary one"
+
+
+async def test_a_band_of_nothing_but_preserved_messages_stops_over_the_ceiling() -> None:
+    """Protecting a message must be able to fail loudly, and must never become a loop.
+
+    A preserved message is not excluded: it is still sent and still counted, so a conversation
+    can sit over its ceiling with every remaining candidate protected. The two wrong answers
+    are spinning -- re-examining a band nothing may be taken from -- and quietly reporting
+    success while handing the provider a prompt it will reject. The right one is to change
+    nothing and leave the overflow where the caller can see it, which is what the anchors
+    bigger than the ceiling already do.
+    """
+    strategy = AnchoredCompactionStrategy(max_input_tokens=120, tokenizer=TOKENIZER)
+    messages = _annotated(tool_turns=8)
+    for group in strategy._middle_band(messages, group_messages(messages)):
+        for message in messages[group["start_index"] : group["end_index"] + 1]:
+            set_preserved(message, preserved=True, reason="test")
+    before = _fingerprint(messages)
+
+    assert await strategy(messages) is False
+    assert _fingerprint(messages) == before, "a pass that may remove nothing must remove nothing"
+    assert included_token_count(messages) > 120, "and must say so by leaving the prompt over the ceiling"

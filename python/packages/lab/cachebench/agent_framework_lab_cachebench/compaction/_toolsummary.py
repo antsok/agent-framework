@@ -25,7 +25,8 @@ both live here beside the middleware that arms them.
    reaches the caller's stored history.
 2. The model makes the call, the agent executes it, and the result is persisted through the
    ordinary path. On a later pass this strategy finds that real tool result in the loaded
-   history and drops every tool group in front of it.
+   history and drops the tool groups in front of it whose contents the record demonstrably
+   carries -- see the coverage note below, and ``_drop_before`` for how that is decided.
 
 Sending no message matters for more than tokens. A message appended here carries no history
 provider's source tag, so the per-service-call persistence would treat it as new input and
@@ -60,11 +61,50 @@ only channel that reaches the model before it writes, since the middleware sends
 :data:`DEFAULT_RECORD_MAX_TOKENS` is set on the forced call alone and is roughly twice the
 target, so it bounds the bill without ever being the thing that stops the writing. When it is
 the thing that stops it, ``ToolResultRecallMiddleware.records_truncated`` says so.
+
+**What the record covers is checked, not assumed.** Phase 2 used to drop every tool group in
+front of the record because the record was supposed to have replaced them. Measured, that is
+model-dependent: gpt-5.4-mini writes records naming every tool group, gpt-5.6-luna writes one
+covering two of six, and the other four were deleted with nothing preserving them and nothing
+reporting it. Raising the cap, raising the stated target and rewriting the prompt were each
+measured and each changed nothing, so the strategy now drops only the groups the record
+demonstrably carries, and ``groups_kept_uncovered`` counts the rest. That turns the failure
+direction around: a partial record now costs tokens it should not have cost, instead of
+losing facts nobody can trace. ``ToolResultRecallMiddleware``'s ``max_groups_before_record``
+is the other half, bounding how much any one record is asked to cover so partial coverage
+stops being the normal case.
+
+**Coverage is measured in values, not in tool names, because models do not write tool names.**
+The first version of the check asked whether the record contained the group's function name,
+on the reading that :data:`RECALL_VALUES_DESCRIPTION` asks for the results "grouped by the
+tool that produced it". Models do not comply with that clause the way the check assumed.
+Luna's record says *"extra0 deployment lookup returned codes: ..."* and never writes
+``lookup_extra0`` anywhere; gpt-5.4-mini, whose records carry every value from every group,
+scored ``UNCOVERED:4`` on the same rule, and its compaction fell from a 20% reduction to 5-6%
+for no benefit whatsoever. A check that penalises the model that complied is not a check. The
+rule is now the first thing that description actually asks for -- "Quote verbatim any value
+that cannot be reconstructed or guessed" -- so a group is covered when the record quotes
+enough of the distinctive values its results contain. :data:`DEFAULT_COVERAGE_SHARE` is how
+much of them, and :func:`_distinctive_tokens` states the rule that finds them and what it
+cannot see.
+
+**The record is protected from the fallback, and had to be.** When a record does not free
+enough, whatever remains goes to ``fallback``, which defaults to
+:class:`~._anchored.AnchoredCompactionStrategy` -- and that strategy shortens and sheds tool
+results, of which the record is one. Nothing in it recognised a record, so the record was
+trimmed like any other bulk: a live seed's record of four lookups reached the answering prompt
+carrying two, 16,617 tokens gone with only three messages removed. Every deletion phase 2
+performs is licensed by the record, so trimming the record afterwards destroys the sole
+surviving copy of what was already deleted. Both halves therefore agree through
+:mod:`._preserve`: this strategy marks every record it observes, and the anchored strategy
+skips preserved messages in each of its three removal paths.
 """
 
 from __future__ import annotations
 
+import string
 from collections.abc import Awaitable, Callable, Sequence
+from math import ceil
 from typing import TYPE_CHECKING, Any, Final
 
 from agent_framework import ChatContext, ChatMiddleware, ChatResponse, Message
@@ -78,11 +118,13 @@ from agent_framework._compaction import (
 )
 
 from ._anchored import AnchoredCompactionStrategy
+from ._preserve import any_preserved, set_preserved
 
 if TYPE_CHECKING:
     from agent_framework import CompactionStrategy, TokenizerProtocol
 
 __all__ = [
+    "DEFAULT_COVERAGE_SHARE",
     "DEFAULT_RECORD_MAX_TOKENS",
     "DEFAULT_RECORD_TARGET_TOKENS",
     "RECALL_TOOL_NAME",
@@ -121,6 +163,38 @@ RECORD_MARKER: Final[str] = "[recorded by compaction]"
 #: accordingly: this is roughly twice :data:`DEFAULT_RECORD_TARGET_TOKENS`, so a model that
 #: overshoots its stated target still finishes inside the cap.
 DEFAULT_RECORD_MAX_TOKENS: Final[int] = 4_000
+
+#: Reason recorded on the record's messages when this strategy protects them, so a caller
+#: reading a conversation back can tell which strategy claimed them.
+PRESERVE_REASON: Final[str] = "tool_summary_record"
+
+#: Share of a group's distinctive values the record must quote before the group may be dropped.
+#:
+#: The number has to sit between two failures. At 1.0 the check is as brittle as the tool-name
+#: rule it replaces: one value the model rendered differently -- a number regrouped, a
+#: timestamp normalised, an identifier wrapped in quotes the strip below does not remove --
+#: keeps a whole group whose content is demonstrably present, and the measured cost of that
+#: mistake was compaction falling from 20% to 5-6% on a model whose records were complete. Far
+#: below 0.5 the check stops being one: a record that quoted two values from a group of eight
+#: would license deleting the other six, which is the silent loss the whole coverage check
+#: exists to prevent.
+#:
+#: 0.8 is the loosest setting that still refuses a record which dropped a quarter of a group,
+#: and at the eight values per result these runs were measured on it tolerates exactly one
+#: value in eight being unrecognisable. It is a threshold rather than a derivation, and it is a
+#: constructor keyword because the right value depends on how many values a workload's results
+#: carry: at two values per group the share can only be 0, 0.5 or 1, so a workload like that
+#: should set it deliberately rather than inherit this.
+DEFAULT_COVERAGE_SHARE: Final[float] = 0.8
+
+#: Shortest token :func:`_distinctive_tokens` will treat as a value worth quoting.
+#:
+#: Three characters and under is where ordinary prose with a digit in it lives -- "3rd", "v2",
+#: "10%", "1)" -- and none of that is a value a later question could depend on. Four is also
+#: the point below which substring matching starts producing accidental hits: "a12" occurs
+#: inside any longer identifier containing it, so a short token would count itself covered by
+#: an unrelated mention.
+_MIN_DISTINCTIVE_LENGTH: Final[int] = 4
 
 #: Record length stated in the tool's own description, which is the only channel that makes
 #: the model aim for a size.
@@ -198,6 +272,187 @@ def find_record_index(messages: Sequence[Message]) -> int | None:
             if RECORD_MARKER in result:
                 newest = index
     return newest
+
+
+def _record_text(message: Message) -> str:
+    """Return the record text carried by a recall tool result message.
+
+    Only results bearing :data:`RECORD_MARKER` are read. A provider may batch several tool
+    results into one message, and text from an unrelated result sitting beside the record would
+    then count towards coverage without anyone having written it as a record -- which is
+    precisely the mistake the coverage check exists to stop.
+
+    Args:
+        message: The message at the anchor index.
+
+    Returns:
+        The record, or an empty string when the message carries none.
+    """
+    parts: list[str] = []
+    for content in message.contents:
+        if content.type != "function_result":
+            continue
+        result = content.result if isinstance(content.result, str) else str(content.result)
+        if RECORD_MARKER in result:
+            parts.append(result)
+    return "\n".join(parts)
+
+
+def _called_function_names(messages: Sequence[Message], group: dict[str, Any]) -> set[str]:
+    """Return the distinct function names called inside one group's span.
+
+    Args:
+        messages: The conversation the span indexes into.
+        group: One span from :func:`group_messages`.
+
+    Returns:
+        The names, empty when the span holds only results whose declaration sits elsewhere.
+    """
+    return {
+        content.name
+        for message in messages[group["start_index"] : group["end_index"] + 1]
+        for content in message.contents
+        if content.type == "function_call" and content.name
+    }
+
+
+def _group_result_text(messages: Sequence[Message], group: dict[str, Any]) -> str:
+    """Return everything the tools in one group returned, concatenated.
+
+    Only ``function_result`` contents are read. The call's arguments are excluded on purpose:
+    the model wrote those, so they are reconstructable from the conversation and quoting them
+    back proves nothing about whether the *result* survived.
+
+    Args:
+        messages: The conversation the span indexes into.
+        group: One span from :func:`group_messages`.
+
+    Returns:
+        The results' text, empty when the span returned nothing.
+    """
+    parts: list[str] = []
+    for message in messages[group["start_index"] : group["end_index"] + 1]:
+        for content in message.contents:
+            if content.type == "function_result":
+                parts.append(content.result if isinstance(content.result, str) else str(content.result))
+    return "\n".join(parts)
+
+
+def _distinctive_tokens(text: str) -> set[str]:
+    """Return the tokens in ``text`` that look like values nothing could reconstruct.
+
+    **The rule.** Split on whitespace; strip punctuation from both ends of each token; keep
+    what is left when it is at least :data:`_MIN_DISTINCTIVE_LENGTH` characters long and
+    contains at least one digit. Results are lowercased, because the comparison against the
+    record is case-insensitive.
+
+    It is deliberately generic and deliberately crude. The temptation is to match this
+    benchmark's hex identifiers, and a rule fitted to those would be worthless on the next
+    workload -- the same mistake the tool's own description already had to be rewritten out of
+    (see :data:`RECALL_VALUES_DESCRIPTION`). A digit is the one signal shared by nearly
+    everything :data:`RECALL_VALUES_DESCRIPTION` lists as unreconstructable: identifiers,
+    codes, numbers, versions, timestamps, and most paths and URLs that matter.
+
+    **What it cannot see, stated rather than discovered later.**
+
+    - *Alphabetic values.* A name, a status word, a region, a UUID that happens to have no
+      digits: none of these are found, so a group whose results hold only those yields nothing
+      and falls through to the tool-name test instead. That is the whole reason the fallback in
+      :meth:`ToolResultAnchoredSummarizationCompactionStrategy._drop_before` exists.
+    - *Ordinary numbers.* Line numbers, counts, prices and dates are collected as though they
+      were identifiers. That over-collects, which makes coverage harder to claim and keeps more
+      -- the direction this package errs in everywhere.
+    - *Its own leftovers.* A result already shortened by the anchored fallback carries that
+      strategy's marker, whose character count is a digit-bearing token no record will ever
+      quote. It costs the group one token's worth of coverage, in the keeping direction again.
+    - *Substrings.* A value is "quoted" when it appears anywhere in the record, so a record
+      mentioning ``AB-1234567`` also satisfies a group whose value was ``AB-123456``. Bounded
+      by the length floor, and biased toward finding coverage; the alternative, tokenising the
+      record too, would miss every value the model wrapped in punctuation it chose itself.
+
+    Args:
+        text: Tool result text to read.
+
+    Returns:
+        The distinctive tokens, lowercased, without duplicates.
+    """
+    found: set[str] = set()
+    for raw in text.split():
+        token = raw.strip(string.punctuation)
+        if len(token) >= _MIN_DISTINCTIVE_LENGTH and any(character.isdigit() for character in token):
+            found.add(token.lower())
+    return found
+
+
+def _is_recall_group(messages: Sequence[Message], group: dict[str, Any]) -> bool:
+    """Return whether a group is itself a record rather than ordinary tool work.
+
+    Shared by the strategy and the middleware for the same reason :func:`find_record_index` is:
+    one half must not count a record as work still to be covered while the other treats it as
+    the coverage.
+
+    Args:
+        messages: The conversation the span indexes into.
+        group: One span from :func:`group_messages`.
+
+    Returns:
+        True when the span contains a call to the recall tool.
+    """
+    return RECALL_TOOL_NAME in _called_function_names(messages, group)
+
+
+def _preserve_records(messages: list[Message]) -> None:
+    """Mark every recall record in the conversation as protected from removal.
+
+    Re-applied on every pass rather than set once, because compaction runs against a freshly
+    loaded conversation and the annotations a previous pass wrote are not there when the next
+    one starts -- the same reason the framework re-derives its own exclusion flags each time.
+
+    *Every* record, not only the newest. An older record is the sole account of the groups
+    behind it, and :meth:`ToolResultAnchoredSummarizationCompactionStrategy._drop_before`
+    already refuses to delete one; without this the fallback would shorten it instead, which
+    loses the same facts more quietly.
+
+    Both halves of the identity are required. The call must name the recall tool and the result
+    must carry :data:`RECORD_MARKER`, matching :func:`find_record_index`, so that an uninvited
+    call the gate refused -- which returns ordinary text and preserves nothing -- does not get
+    itself protected as though it had recorded something.
+
+    Args:
+        messages: The conversation, whose messages are annotated in place.
+    """
+    for group in group_messages(messages):
+        if not _is_recall_group(messages, group):
+            continue
+        members = messages[group["start_index"] : group["end_index"] + 1]
+        if not any(_record_text(message) for message in members):
+            continue
+        for message in members:
+            set_preserved(message, preserved=True, reason=PRESERVE_REASON)
+
+
+def _droppable_groups_after(messages: list[Message], record_index: int | None) -> int:
+    """Count the tool-call groups a record would be asked to cover.
+
+    Args:
+        messages: The conversation to measure.
+        record_index: Index of the newest record, or None when there is none, in which case
+            the count runs from the beginning of the conversation.
+
+    Returns:
+        How many non-recall tool-call groups sit after the record.
+    """
+    boundary = -1 if record_index is None else record_index
+    count = 0
+    for group in group_messages(messages):
+        if group.get("kind") != "tool_call" or group["start_index"] <= boundary:
+            continue
+        # A record is not work that needs recording. Counting one would make every record
+        # bring the next one closer, and a bound of one would force a record on every call.
+        if _is_recall_group(messages, group):
+            continue
+        count += 1
+    return count
 
 
 class RecallGate:
@@ -307,6 +562,12 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
         trigger_fraction: Fraction of the ceiling at which the record is first requested.
             Below it nothing happens: a record that is not needed costs an agent turn and
             buys nothing.
+        coverage_share: Share of a group's distinctive values the record must quote verbatim
+            before that group may be deleted. Exposed because the right value depends on how
+            many values a workload's results carry, which this module cannot know; see
+            :data:`DEFAULT_COVERAGE_SHARE` for where the default sits and why. Zero means any
+            group holding a distinctive value at all counts as covered, which restores the
+            behaviour this check replaced and is there so the two can be run side by side.
     """
 
     def __init__(
@@ -318,6 +579,7 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
         keep_tail_groups: int = 4,
         trigger_fraction: float = 0.6,
         fallback_fraction: float = 0.9,
+        coverage_share: float = DEFAULT_COVERAGE_SHARE,
         fallback: CompactionStrategy | None = None,
     ) -> None:
         """Validate and store the configuration.
@@ -337,12 +599,18 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
             raise ValueError("fallback_fraction must be greater than trigger_fraction.")
         if keep_head_groups < 0 or keep_tail_groups < 0:
             raise ValueError("keep_head_groups and keep_tail_groups must be >= 0.")
+        # Zero is admissible and 1.0 is admissible; a share above 1.0 is not, because no record
+        # can quote more of a group's values than the group contains, so the strategy would
+        # silently never delete anything and would read as a model that never complied.
+        if not 0.0 <= coverage_share <= 1.0:
+            raise ValueError("coverage_share must be in [0.0, 1.0].")
         self.max_input_tokens = max_input_tokens
         self.tokenizer = tokenizer
         self.keep_head_groups = keep_head_groups
         self.keep_tail_groups = keep_tail_groups
         self.trigger_fraction = trigger_fraction
         self.fallback_fraction = fallback_fraction
+        self.coverage_share = coverage_share
         self.fallback = fallback or AnchoredCompactionStrategy(
             max_input_tokens=max_input_tokens,
             tokenizer=tokenizer,
@@ -351,22 +619,71 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
         )
         self._records = 0
         self._fallbacks = 0
+        self._fallbacks_after_record = 0
+        # Group ids rather than a running total, so one group examined on ten later passes is
+        # one number rather than ten. See :attr:`groups_kept_uncovered`.
+        self._uncovered: set[str] = set()
 
     @property
     def fallbacks_used(self) -> int:
-        """Passes that gave up waiting and truncated instead.
+        """Passes that gave up waiting for a record and truncated instead.
 
-        Non-zero means the record arrived too late to help, or never arrived, and that row is
-        measuring the fallback rather than this design. Reported rather than hidden: a
-        strategy that quietly degrades into another one produces a number that belongs to
-        neither.
+        Non-zero means no record ever arrived, and that row is measuring the fallback rather
+        than this design. Reported rather than hidden: a strategy that quietly degrades into
+        another one produces a number that belongs to neither.
+
+        This path only. A record that did arrive and did not free enough is the same
+        degradation reached by the other route, and is counted by
+        :attr:`fallbacks_after_record` -- for a while it was counted nowhere, which is how a
+        row measuring the fallback came to carry no flag at all.
         """
         return self._fallbacks
+
+    @property
+    def fallbacks_after_record(self) -> int:
+        """Passes that had a record, dropped what it covered, and fell back anyway.
+
+        A different event from :attr:`fallbacks_used`, which counts the passes that gave up
+        waiting for a record that never arrived. This counts the passes where one did arrive
+        and did not free enough, so the fallback ran behind it and shortened whatever was
+        still in the prompt -- which, since the coverage check went in, is exactly the groups
+        the record failed to carry and this strategy had just declined to delete.
+
+        Kept apart from ``fallbacks_used`` because the two ask for opposite responses: no
+        record at all is a model that will not comply, while a record that did not free
+        enough is a ceiling, a bound, or a record too partial to be worth its size. What the
+        two mean for the *row* is the same, and is why this is reported at all: a non-zero
+        value says part of what that row measured is the fallback strategy rather than this
+        one. Nothing said so until it was counted -- a seed reporting four uncovered groups
+        was measured losing the same facts as the control, three messages shorter and 16,617
+        tokens lighter, which is shortening rather than deletion and had no flag anywhere.
+
+        Counted per pass, like ``fallbacks_used`` and unlike :attr:`groups_kept_uncovered`:
+        each pass shortens whatever is in the prompt at the time rather than taking a second
+        look at material already accounted for, so two passes are two losses.
+        """
+        return self._fallbacks_after_record
 
     @property
     def records_found(self) -> int:
         """Recall tool results seen in the history. Zero means the model never complied."""
         return self._records
+
+    @property
+    def groups_kept_uncovered(self) -> int:
+        """Tool groups a record failed to carry, and which were therefore not dropped.
+
+        Non-zero means the model wrote a partial record and this strategy declined to delete
+        what that record does not account for. The row then costs more than a complete record
+        would have cost and loses nothing, which is the trade the check makes deliberately;
+        :meth:`_drop_before` says why the alternative was silent loss.
+
+        Counted by group id, not per pass. The same group is re-examined on every later
+        compaction, so a per-pass tally would report one uncovered group as eighteen -- the
+        mistake :attr:`ToolResultRecallMiddleware.records_volunteered` already had to be fixed
+        for, and the reason a diagnostic has to be built to be read rather than merely emitted.
+        """
+        return len(self._uncovered)
 
     async def __call__(self, messages: list[Message]) -> bool:
         """Request a record, or drop what an existing record covers.
@@ -385,10 +702,22 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
         anchor = find_record_index(messages)
         if anchor is not None:
             self._records = max(self._records, 1)
+            # Before anything is deleted on the strength of a record, the record is put out of
+            # reach of the fallback that runs below. Not folded into ``changed``: annotating a
+            # message is not a change to the conversation the model sees, and reporting one
+            # would make a pass that did nothing else look as though it had compacted.
+            _preserve_records(messages)
             changed = self._drop_before(messages, anchor)
             # Even a good record may not be enough on its own: the groups after it are
             # untouched by design, and they can exceed the ceiling by themselves.
             if included_token_count(messages) > self.max_input_tokens:
+                # Counted, and counted apart from the fallback below. This is the other
+                # strategy running over what the record did not free -- which now includes
+                # every group the record did not carry -- so the row is partly measuring that
+                # other strategy. Until this counter existed only the pre-record path
+                # incremented anything, so a run that fell back here reported no FALLBACK at
+                # all and read as this design working.
+                self._fallbacks_after_record += 1
                 changed = await self.fallback(messages) or changed
             return changed
 
@@ -404,25 +733,133 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
         return await self.fallback(messages)
 
     def _drop_before(self, messages: list[Message], anchor: int) -> bool:
-        """Exclude every tool group that ends before the record.
+        """Exclude the tool groups the record demonstrably covers, and only those.
 
-        The record is what those groups have been reduced to, so they are redundant rather
-        than merely old. Everything from the record onward is left alone, and so is the head,
-        which carries the requirements that give the recorded values their meaning.
+        This used to exclude every tool group ending before the record, on the stated
+        assumption that the record had replaced them. The assumption was never checked, and it
+        does not hold on every model. Measured: gpt-5.6-luna writes a record covering two of
+        six tool groups; gpt-5.4-mini covers all of them. On the first, four groups were
+        deleted behind a record that never mentioned them and nothing said so, so the loss
+        arrived in the scores as compaction damage rather than as an instrument that had
+        stopped early. Raising the response cap, raising the stated target and rewriting the
+        prompt were each tried and each measured as a null result -- coverage did not move --
+        so the fix has to be here, in what the strategy is willing to delete.
+
+        **Coverage is checked in values, because models do not write tool names.** The first
+        version of this check asked whether the record contained the group's function name, on
+        the reading that :data:`RECALL_VALUES_DESCRIPTION` asks for the results "grouped by the
+        tool that produced it". Measured on both models, that is not the clause they comply
+        with. Luna's record reads *"extra0 deployment lookup returned codes: AB-123456, ..."*
+        and never writes ``lookup_extra0`` at all; gpt-5.4-mini, whose records carry every value
+        from every group, was scored ``UNCOVERED:4`` by the name rule and its compaction fell
+        from a 20% reduction to 5-6% in exchange for nothing. A check that penalises the model
+        that complied is a net negative, and this one was.
+
+        So the test is the clause the description actually leads with -- "Quote verbatim any
+        value that cannot be reconstructed or guessed" -- applied to what the group's tool
+        *results* contained. :func:`_distinctive_tokens` finds those values and states the rule
+        and its blind spots; a group is covered when the record quotes at least
+        ``coverage_share`` of them, case-insensitively. That also dissolves the repeated-name
+        ambiguity the count rule below was built for: two calls to one tool return two different
+        sets of values, and a record quoting both has demonstrably accounted for both.
+
+        **A group with no distinctive values falls back to the tool-name test.** By this rule
+        nothing in such a group is unreconstructable, so the value check has no evidence either
+        way -- and the two available shortcuts are both wrong. Calling it covered would let a
+        record that mentions nothing delete a group of prose findings, which is the silent loss
+        this whole method exists to stop. Calling it uncovered would make every prose-only tool
+        permanently undroppable, which is not a conservative choice but a broken one. The name
+        rule is a weaker instrument, and a weaker instrument is the right answer where the
+        stronger one has nothing to read.
+
+        **Repeated calls to the same tool cannot be told apart by name.** Six calls to
+        ``lookup_eu`` produce six groups and one name, and a record grouped by tool mentions
+        that name once, so the name alone cannot say which of the six it accounted for. The
+        count rule therefore demands as many mentions as there are groups and keeps all of them
+        when it does not get them. The demand is counted over every candidate, including those
+        the value rule will settle, so a value-covered group raises the bar for a name-checked
+        sibling sharing its tool. That over-demands, and it over-demands in the keeping
+        direction: the failure it buys is "compacted less than hoped", which shows up as cost
+        on a row anyone can read, against "lost facts silently", which shows up as a wrong
+        answer with no trace of where the fact went.
+
+        **Only the newest record is read.** Groups an older record covered are checked against
+        the newer record's text and kept when it does not carry them, so a run taking several
+        records compacts less than one taking a single complete record. Same conservative
+        direction, and the older record is itself never dropped, so what it holds stays
+        reachable.
 
         Returns:
             True if anything was excluded.
         """
         groups = group_messages(messages)
-        changed = False
+        record = _record_text(messages[anchor]).lower()
+
+        candidates: list[tuple[dict[str, Any], set[str], set[str]]] = []
         for position, group in enumerate(groups):
             if position < self.keep_head_groups or group.get("kind") != "tool_call":
                 continue
             if group["end_index"] >= anchor:
                 continue
+            if _is_recall_group(messages, group):
+                # An older record. Deleting it would destroy the only surviving account of the
+                # groups behind *it* -- the same loss this strategy exists to prevent, one
+                # level removed, and quieter, because the newer record looks like coverage.
+                continue
+            if any_preserved(messages[group["start_index"] : group["end_index"] + 1]):
+                # Something else has already declared this group irreplaceable. Not counted as
+                # uncovered: it was never a candidate for deletion, so reporting it would put a
+                # protected message in a diagnostic that means "the record fell short".
+                continue
+            candidates.append((
+                group,
+                _called_function_names(messages, group),
+                _distinctive_tokens(_group_result_text(messages, group)),
+            ))
+
+        # How many groups each name has to account for, counted over the droppable candidates
+        # alone. A group the head protects, or one sitting after the record, is not being
+        # replaced by this record and must not raise the bar for the groups that are.
+        demand: dict[str, int] = {}
+        for _, names, _ in candidates:
+            for name in names:
+                demand[name] = demand.get(name, 0) + 1
+        named = {name for name, needed in demand.items() if record.count(name.lower()) >= needed}
+
+        changed = False
+        for group, names, values in candidates:
+            if not self._is_covered(record, names=names, values=values, named=named):
+                self._uncovered.add(str(group["group_id"]))
+                continue
             for message in messages[group["start_index"] : group["end_index"] + 1]:
                 changed = set_excluded(message, excluded=True, reason="tool_summary_anchored") or changed
         return changed
+
+    def _is_covered(self, record: str, *, names: set[str], values: set[str], named: set[str]) -> bool:
+        """Return whether one group's contents demonstrably survive in ``record``.
+
+        Args:
+            record: The record's text, already lowercased.
+
+        Keyword Args:
+            names: The functions called inside the group.
+            values: The distinctive tokens its results contained, lowercased.
+            named: Function names the record mentions as often as they are called.
+
+        Returns:
+            True when the group may be deleted.
+        """
+        if values:
+            # ``ceil`` rather than rounding, so the constant is a genuine floor on the share:
+            # seven of eight values clears 0.8 and six does not. It also makes 1.0 mean every
+            # value and 0.0 mean none, which is what those two ends have to mean for the
+            # keyword to be usable as a dial across its whole range.
+            quoted = sum(1 for value in values if value in record)
+            return quoted >= ceil(len(values) * self.coverage_share)
+        # No names either means a span of results whose declaration sits outside it, so there
+        # is nothing at all to check the record against. Kept, on the same principle as
+        # everything else here.
+        return bool(names) and names.issubset(named)
 
     def _excluded(self, messages: list[Message]) -> int:
         """Return how many messages are currently excluded, for tests and diagnostics."""
@@ -447,6 +884,28 @@ class ToolResultRecallMiddleware(ChatMiddleware):
             ``None`` leaves whatever cap the run already sets, which is what this did before
             the parameter existed: the record inherited the cap sized for an ordinary answer,
             so a record asked to summarise everything had no bound of its own at all.
+        max_groups_before_record: How many tool-call groups one record may be asked to cover
+            before another is forced. ``None`` asks for one record and no more, which is what
+            this did before the parameter existed. It is a second trigger beside
+            ``trigger_fraction`` rather than a replacement for it: whichever fires first
+            forces the call.
+
+            It exists because coverage does not scale with how much there is to cover.
+            Measured: gpt-5.6-luna's record covered two of six tool groups, and raising the
+            response cap, raising the stated target and rewriting the prompt each left that
+            unchanged. What was still within reach was asking each record for less, which is
+            what this bounds. The strategy will now keep whatever a record does not cover, so
+            an unbounded ask degrades into compacting almost nothing rather than into losing
+            facts -- this is the parameter that buys the compaction back.
+
+            **The count is an approximation, and the direction it errs in is chosen.** This
+            middleware holds no reference to the strategy, so it cannot read
+            ``keep_head_groups`` and cannot tell a group the strategy protects from one it
+            would drop. It counts every non-recall tool-call group after the newest record,
+            which over-counts by at most the number of tool groups inside the head -- usually
+            none, since the head carries the task rather than tool work. Over-counting forces
+            a record slightly early and costs an agent turn; under-counting would let a record
+            be asked to cover more than the model will, which is the thing this prevents.
     """
 
     def __init__(
@@ -457,6 +916,7 @@ class ToolResultRecallMiddleware(ChatMiddleware):
         arm: Callable[[], None],
         trigger_fraction: float = 0.6,
         record_max_tokens: int | None = DEFAULT_RECORD_MAX_TOKENS,
+        max_groups_before_record: int | None = None,
     ) -> None:
         """Validate and store the configuration.
 
@@ -469,11 +929,17 @@ class ToolResultRecallMiddleware(ChatMiddleware):
             raise ValueError("trigger_fraction must be in (0.0, 1.0].")
         if record_max_tokens is not None and record_max_tokens <= 0:
             raise ValueError("record_max_tokens must be positive, or None to leave the run's cap in place.")
+        if max_groups_before_record is not None and max_groups_before_record <= 0:
+            raise ValueError(
+                "max_groups_before_record must be positive, or None to ask for a single record. "
+                "Zero groups per record is a record forced on every call, which is not a bound."
+            )
         self.max_input_tokens = max_input_tokens
         self.tokenizer = tokenizer
         self.arm = arm
         self.trigger_fraction = trigger_fraction
         self.record_max_tokens = record_max_tokens
+        self.max_groups_before_record = max_groups_before_record
         self._force_next = False
         self._forced = 0
         self._records_forced = 0
@@ -538,6 +1004,13 @@ class ToolResultRecallMiddleware(ChatMiddleware):
         known, so the check reads it on the way out and the option is set on the way in next
         time. The trigger sits well below the strategy's fallback threshold to absorb that
         one-call delay.
+
+        The same delay is why a forced call can be forced again: the record it produced is not
+        in ``context.messages`` yet, so the condition that fired still reads as true and the
+        next call is pinned too. That is existing behaviour rather than a new cost of
+        ``max_groups_before_record`` -- the middleware has always kept asking until a record
+        appears in the loaded history -- but with the group bound it recurs once per record
+        instead of once per run.
         """
         forced_this_call = self._force_next
         if forced_this_call:
@@ -581,7 +1054,8 @@ class ToolResultRecallMiddleware(ChatMiddleware):
         if not messages:
             self._force_next = False
             return
-        if find_record_index(messages) is not None:
+        record_index = find_record_index(messages)
+        if record_index is not None:
             # The transition is tracked on the instance, not read from the messages on the way
             # in. Before the pipeline runs, context.messages holds only the new turn, so a
             # pre-call check reports "no record" on every call and every later call counts as
@@ -594,8 +1068,21 @@ class ToolResultRecallMiddleware(ChatMiddleware):
                     self._records_forced += 1
                 else:
                     self._records_volunteered += 1
-            self._force_next = False
-            return
+            if self.max_groups_before_record is None:
+                # One record and no more, which is what this did before the group bound
+                # existed. Everything below would ask for another.
+                self._force_next = False
+                return
         annotate_message_groups(messages)
         annotate_token_counts(messages, tokenizer=self.tokenizer)
-        self._force_next = included_token_count(messages) > int(self.max_input_tokens * self.trigger_fraction)
+        # The token trigger asks for the *first* record and then goes quiet. It cannot be the
+        # thing that asks for a second: the size that fired it does not go away when a record
+        # arrives, so it would pin every remaining call in the run. Only the group bound
+        # re-arms, and it counts from the newest record rather than from the start.
+        over_tokens = record_index is None and included_token_count(messages) > int(
+            self.max_input_tokens * self.trigger_fraction
+        )
+        over_groups = self.max_groups_before_record is not None and (
+            _droppable_groups_after(messages, record_index) >= self.max_groups_before_record
+        )
+        self._force_next = over_tokens or over_groups

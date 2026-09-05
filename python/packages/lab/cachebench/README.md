@@ -206,6 +206,48 @@ Each seed also prints a one-line summary as it lands: strategy, seed, cost, fact
 accuracies.
 A row that has stopped preserving anything shows up there hours before the table would.
 
+#### Reading what the model recorded
+
+`tool_summary_anchored` has the model write the facts into a tool result and then drops the
+tool groups that result replaced, but only the groups the record demonstrably carries — the
+rest are kept, and counted as `UNCOVERED:<n>` in the flags column and as `groups_kept_uncovered`
+on each seed's record. "Demonstrably" means the record quotes at least `coverage_share` (0.8 by
+default) of the distinctive values the group's results contained: whitespace-delimited tokens of
+four characters or more with a digit in them. It used to mean the record contained the group's
+function name, which measured badly on both models — luna writes `extra0 deployment lookup
+returned codes: …` and never the function name, and mini's complete records scored `UNCOVERED:4`
+while its compaction fell from 20% to 5–6%. A group whose results hold no such values — prose
+findings, say — still falls back to the name test, because the value rule has nothing to read
+there.
+
+That count says how many groups fell short of the ask, not how far short any one of them fell.
+A record carrying seven of a group's eight values passes at the default share and the eighth is
+gone with nothing saying so.
+
+`--dump-record DIR` writes the full text of each record to `DIR/<strategy>-seed<n>.txt`, one
+file per strategy and seed, for reading by eye. It is read back out of the finished
+conversation after the run is over, so it adds nothing to any prompt and makes no call: the
+tokens, the cache hits and the cost are identical whether or not it is set. Seeds that took no
+record produce no file rather than an empty one.
+
+A record that arrives and still leaves the prompt over the ceiling makes the strategy fall back
+to shortening tool results, which is counted as `RECFALLBACK:<n>` and read the same way as
+`FALLBACK`: part of that row measures the fallback strategy rather than the one it is named
+for. It is the quieter of the two, because shortening in place leaves the message count nearly
+untouched while the values inside those messages go — and beside `UNCOVERED` it is shortening
+exactly the groups the coverage check had just declined to delete. It went uncounted until a
+seed flagged `UNCOVERED:4` was measured losing the control's facts three messages shorter and
+16,617 tokens lighter.
+
+`--max-groups-before-record N` forces a fresh record every N tool-call groups rather than asking
+one record to cover everything. Coverage does not scale with how much there is to cover:
+gpt-5.6-luna named two groups of six, and raising `--record-max-tokens`, raising
+`--record-target-tokens` and rewriting the tool's own guidance each left that unchanged. What
+was left was to ask each record for less. Since the strategy keeps whatever a record does not
+name, an unbounded ask degrades into compacting almost nothing, and this is what buys the
+compaction back. Each record costs an agent turn, so a small bound is not free; off by default,
+which asks for one record per run.
+
 #### Fill and the tried limit
 
 `--context-window` is the limit the run stands in for. It is simulated — the model itself
