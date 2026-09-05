@@ -19,10 +19,13 @@ both live here beside the middleware that arms them.
 
 **Two phases, split across a middleware and this strategy.**
 
-1. :class:`ToolResultRecallMiddleware` forces ``tool_choice`` to the recall tool on one call.
-   It sends no message at all: the tool's own description already says what to pass, and the
-   schema travels on every request anyway. Nothing is added to the prompt, and nothing extra
-   reaches the caller's stored history.
+1. :class:`ToolResultRecallMiddleware` forces ``tool_choice`` to the recall tool on the call
+   after the one where it saw the conversation grow past the trigger -- and again later, once
+   the agent has done tool work no existing record accounts for. It sends no message at all:
+   the tool's own description already says what to pass, and the schema travels on every
+   request anyway. Nothing is added to the prompt, and nothing extra reaches the caller's
+   stored history. :meth:`ToolResultRecallMiddleware._record_due` is where "no existing record
+   accounts for it" is defined, and it is defined nowhere else.
 2. The model makes the call, the agent executes it, and the result is persisted through the
    ordinary path. On a later pass this strategy finds that real tool result in the loaded
    history and drops the tool groups in front of it whose contents the record demonstrably
@@ -73,6 +76,16 @@ direction around: a partial record now costs tokens it should not have cost, ins
 losing facts nobody can trace. ``ToolResultRecallMiddleware``'s ``max_groups_before_record``
 is the other half, bounding how much any one record is asked to cover so partial coverage
 stops being the normal case.
+
+**Several records, and nothing merges them.** Once the size trigger may fire more than once, a
+long conversation accumulates records, and every one of them is preserved: unshrinkable,
+undroppable, and counted against the ceiling in full. That is a floor under the prompt that
+grows a record at a time, and
+:attr:`ToolResultAnchoredSummarizationCompactionStrategy.records_in_conversation` reports it,
+because a row whose compaction has stopped paying for a good reason and one whose unshrinkable
+part has quietly grown are otherwise the same row. Consolidating them is deliberately not done:
+an older record is the sole account of the groups behind *it*, so a merge rewrites the evidence
+rather than the bulk.
 
 **Coverage is measured in values, not in tool names, because models do not write tool names.**
 The first version of the check asked whether the record contained the group's function name,
@@ -125,8 +138,10 @@ if TYPE_CHECKING:
 
 __all__ = [
     "DEFAULT_COVERAGE_SHARE",
+    "DEFAULT_FALLBACK_FRACTION",
     "DEFAULT_RECORD_MAX_TOKENS",
     "DEFAULT_RECORD_TARGET_TOKENS",
+    "DEFAULT_TRIGGER_FRACTION",
     "RECALL_TOOL_NAME",
     "RECORD_MARKER",
     "RecallGate",
@@ -203,6 +218,42 @@ _MIN_DISTINCTIVE_LENGTH: Final[int] = 4
 #: into the caller's own conversation -- so the description and the ``values`` parameter are
 #: the entire prompt, and a target has to be baked into them at construction.
 DEFAULT_RECORD_TARGET_TOKENS: Final[int] = 2_000
+
+#: Fraction of the ceiling at which a record is first asked for.
+#:
+#: One constant read by both halves rather than a default written twice, because the middleware
+#: asks and the strategy waits: a caller who moved one without the other would either have the
+#: strategy dropping groups before anything had been recorded, or have the middleware recording
+#: what nothing was yet willing to drop.
+#:
+#: **0.8, and it was 0.6.** The trigger is a bet that enough conversation remains to repay a
+#: compaction, and 0.6 takes that bet far too early. With the 2,048-token output reservation
+#: these runs use, 0.6 of the input budget is 58% of a 60,000-token window: a record is forced,
+#: an agent turn is spent, and the cached prefix is broken part-way through a conversation that
+#: may well end before it ever needed compacting at all. The break-even derived in
+#: :data:`~._anchored.DEFAULT_MIN_GAIN_FRACTION` is the same argument from the other side -- an
+#: edit repays itself only over the turns that follow it, so it wants as many of them as
+#: possible, but the turns *before* the ceiling is approached are exactly the ones where the
+#: horizon is unknown and the compaction may turn out to have bought nothing. Waiting costs
+#: nothing until the ceiling is actually in reach; asking early costs a call, a re-read of the
+#: whole prefix, and the tool results the record then licenses deleting.
+DEFAULT_TRIGGER_FRACTION: Final[float] = 0.8
+
+#: Fraction of the ceiling at which the strategy stops waiting for a record and compacts
+#: without one.
+#:
+#: **0.95, and it was 0.9.** The move is forced by the trigger's. A record arrives one call late
+#: by construction: the middleware can only read the history on the way *out* of a call and can
+#: only pin the *next* one, so the conversation grows by a whole turn between the ask and the
+#: answer -- see :meth:`ToolResultRecallMiddleware.process`. With the trigger at 0.8, a give-up
+#: line at 0.9 leaves a single turn's growth of room, and one turn carrying a large tool result
+#: crosses it: the strategy then compacts without a record while the record it asked for is
+#: still in flight, which is the one outcome this whole design exists to avoid. The gap between
+#: the two has to be wide enough for the answer to land in.
+#:
+#: It cannot simply be raised to 1.0. Past this line the fallback still has to bring the
+#: conversation under the ceiling, and a fallback given no headroom has nothing to work in.
+DEFAULT_FALLBACK_FRACTION: Final[float] = 0.95
 
 #: What the recall tool is for, as the model reads it.
 #:
@@ -401,8 +452,8 @@ def _is_recall_group(messages: Sequence[Message], group: dict[str, Any]) -> bool
     return RECALL_TOOL_NAME in _called_function_names(messages, group)
 
 
-def _preserve_records(messages: list[Message]) -> None:
-    """Mark every recall record in the conversation as protected from removal.
+def _preserve_records(messages: list[Message]) -> int:
+    """Mark every recall record in the conversation as protected from removal, and count them.
 
     Re-applied on every pass rather than set once, because compaction runs against a freshly
     loaded conversation and the annotations a previous pass wrote are not there when the next
@@ -420,15 +471,24 @@ def _preserve_records(messages: list[Message]) -> None:
 
     Args:
         messages: The conversation, whose messages are annotated in place.
+
+    Returns:
+        How many records the conversation carries. Counted here rather than by a second walk
+        because this is already the one place that applies both halves of the identity, and a
+        counter disagreeing with what is protected would report a floor the prompt does not
+        actually have.
     """
+    records = 0
     for group in group_messages(messages):
         if not _is_recall_group(messages, group):
             continue
         members = messages[group["start_index"] : group["end_index"] + 1]
         if not any(_record_text(message) for message in members):
             continue
+        records += 1
         for message in members:
             set_preserved(message, preserved=True, reason=PRESERVE_REASON)
+    return records
 
 
 def _droppable_groups_after(messages: list[Message], record_index: int | None) -> int:
@@ -559,9 +619,16 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
         keep_head_groups: Groups at the start never touched, carrying the task and its
             requirements. Dropping these is what makes other strategies lose the labelling
             that gives surviving values their meaning.
+        keep_tail_groups: Recent groups the fallback keeps verbatim. Read only by the default
+            fallback built below; pass a ``fallback`` of your own and it is that strategy's
+            business instead.
         trigger_fraction: Fraction of the ceiling at which the record is first requested.
             Below it nothing happens: a record that is not needed costs an agent turn and
-            buys nothing.
+            buys nothing. See :data:`DEFAULT_TRIGGER_FRACTION` for where the default sits.
+        fallback_fraction: Fraction of the ceiling at which waiting stops and the conversation
+            is compacted without a record. Must be greater than ``trigger_fraction``, and by
+            enough for a record asked for at the trigger to arrive before this is crossed --
+            it arrives one call late by construction. See :data:`DEFAULT_FALLBACK_FRACTION`.
         coverage_share: Share of a group's distinctive values the record must quote verbatim
             before that group may be deleted. Exposed because the right value depends on how
             many values a workload's results carry, which this module cannot know; see
@@ -577,8 +644,8 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
         tokenizer: TokenizerProtocol,
         keep_head_groups: int = 3,
         keep_tail_groups: int = 4,
-        trigger_fraction: float = 0.6,
-        fallback_fraction: float = 0.9,
+        trigger_fraction: float = DEFAULT_TRIGGER_FRACTION,
+        fallback_fraction: float = DEFAULT_FALLBACK_FRACTION,
         coverage_share: float = DEFAULT_COVERAGE_SHARE,
         fallback: CompactionStrategy | None = None,
     ) -> None:
@@ -618,6 +685,7 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
             keep_tail_groups=keep_tail_groups,
         )
         self._records = 0
+        self._records_in_conversation = 0
         self._fallbacks = 0
         self._fallbacks_after_record = 0
         # Group ids rather than a running total, so one group examined on ten later passes is
@@ -666,8 +734,36 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
 
     @property
     def records_found(self) -> int:
-        """Recall tool results seen in the history. Zero means the model never complied."""
+        """Recall tool results seen in the history. Zero means the model never complied.
+
+        Saturates at one: it answers whether the model ever complied, not how often. How many
+        records a conversation ended up carrying is :attr:`records_in_conversation`, and the
+        two are different questions now that the middleware may ask more than once.
+        """
         return self._records
+
+    @property
+    def records_in_conversation(self) -> int:
+        """Records the conversation carries, at the most this strategy has seen it hold.
+
+        A count rather than the flag :attr:`records_found` is, because records accumulate and
+        nothing removes them. Every record observed is preserved -- neither shortened nor
+        dropped, by this strategy or by the fallback behind it -- so each one raises a floor
+        under the prompt that no later pass can lower. One is the cost of the design; several
+        is a conversation whose unshrinkable part is growing, and a row that says so can be
+        told apart from a row whose compaction simply stopped working.
+
+        Deliberately not consolidated. Merging two records would be tempting and wrong: an
+        older record is the sole surviving account of the groups behind *it*, so a merge is a
+        rewrite of the evidence rather than of the bulk, and a partial merge would lose facts
+        with nothing left to trace them to. The count is therefore the whole of the warning.
+
+        A maximum over passes rather than a running total, for the reason
+        :attr:`groups_kept_uncovered` is counted by group id: the same conversation is
+        re-examined on every later compaction, so a per-pass tally would report one record as
+        eighteen.
+        """
+        return self._records_in_conversation
 
     @property
     def groups_kept_uncovered(self) -> int:
@@ -706,7 +802,10 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
             # reach of the fallback that runs below. Not folded into ``changed``: annotating a
             # message is not a change to the conversation the model sees, and reporting one
             # would make a pass that did nothing else look as though it had compacted.
-            _preserve_records(messages)
+            #
+            # The count comes back from the same walk. Taken as a maximum because this runs on
+            # every later pass over the same conversation; see ``records_in_conversation``.
+            self._records_in_conversation = max(self._records_in_conversation, _preserve_records(messages))
             changed = self._drop_before(messages, anchor)
             # Even a good record may not be enough on its own: the groups after it are
             # untouched by design, and they can exceed the ceiling by themselves.
@@ -879,16 +978,33 @@ class ToolResultRecallMiddleware(ChatMiddleware):
             record on its own initiative -- it cannot be hidden, only disabled.
         trigger_fraction: Fraction of the ceiling at which the record is forced. Comfortably
             below the strategy's fallback threshold, because the decision is made one call
-            late -- see :meth:`process`.
+            late -- see :meth:`process`. Defaults to :data:`DEFAULT_TRIGGER_FRACTION`, the
+            same constant the strategy defaults to, so the two halves cannot silently disagree
+            about when a record is wanted.
+        repeat_records: Let the size trigger ask again once there is new tool work to record.
+            On by default. Off, it asks exactly once per conversation and never again, which
+            is what this did before repeats existed and is the setting a run has to use to be
+            comparable with one taken before them.
+
+            Repeating cannot be done by reading size alone, and the gate that used to sit here
+            is why: the size that fired the trigger does not go away when a record arrives,
+            because the record is added to the conversation rather than subtracted from it. A
+            trigger reading size alone would therefore pin every remaining call in the run.
+            What re-arms it is new *material* -- see :meth:`_record_due` for the rule, which is
+            stated there once and nowhere else.
+
+            This governs the size trigger only. ``max_groups_before_record`` is a caller
+            asking for repeats outright, so it keeps forcing them whatever this says.
         record_max_tokens: Cap put on the forced call's response, and on no other call.
             ``None`` leaves whatever cap the run already sets, which is what this did before
             the parameter existed: the record inherited the cap sized for an ordinary answer,
             so a record asked to summarise everything had no bound of its own at all.
         max_groups_before_record: How many tool-call groups one record may be asked to cover
-            before another is forced. ``None`` asks for one record and no more, which is what
-            this did before the parameter existed. It is a second trigger beside
+            before another is forced. ``None`` switches this bound off and leaves the size
+            trigger as the only thing that asks. It is a second trigger beside
             ``trigger_fraction`` rather than a replacement for it: whichever fires first
-            forces the call.
+            forces the call. ``None`` used to mean "one record per run" as well, which
+            conflated a bound with a policy; that half is now ``repeat_records``.
 
             It exists because coverage does not scale with how much there is to cover.
             Measured: gpt-5.6-luna's record covered two of six tool groups, and raising the
@@ -914,9 +1030,10 @@ class ToolResultRecallMiddleware(ChatMiddleware):
         max_input_tokens: int,
         tokenizer: TokenizerProtocol,
         arm: Callable[[], None],
-        trigger_fraction: float = 0.6,
+        trigger_fraction: float = DEFAULT_TRIGGER_FRACTION,
         record_max_tokens: int | None = DEFAULT_RECORD_MAX_TOKENS,
         max_groups_before_record: int | None = None,
+        repeat_records: bool = True,
     ) -> None:
         """Validate and store the configuration.
 
@@ -931,7 +1048,7 @@ class ToolResultRecallMiddleware(ChatMiddleware):
             raise ValueError("record_max_tokens must be positive, or None to leave the run's cap in place.")
         if max_groups_before_record is not None and max_groups_before_record <= 0:
             raise ValueError(
-                "max_groups_before_record must be positive, or None to ask for a single record. "
+                "max_groups_before_record must be positive, or None to leave the bound off. "
                 "Zero groups per record is a record forced on every call, which is not a bound."
             )
         self.max_input_tokens = max_input_tokens
@@ -940,6 +1057,7 @@ class ToolResultRecallMiddleware(ChatMiddleware):
         self.trigger_fraction = trigger_fraction
         self.record_max_tokens = record_max_tokens
         self.max_groups_before_record = max_groups_before_record
+        self.repeat_records = repeat_records
         self._force_next = False
         self._forced = 0
         self._records_forced = 0
@@ -1007,10 +1125,12 @@ class ToolResultRecallMiddleware(ChatMiddleware):
 
         The same delay is why a forced call can be forced again: the record it produced is not
         in ``context.messages`` yet, so the condition that fired still reads as true and the
-        next call is pinned too. That is existing behaviour rather than a new cost of
-        ``max_groups_before_record`` -- the middleware has always kept asking until a record
-        appears in the loaded history -- but with the group bound it recurs once per record
-        instead of once per run.
+        next call is pinned too. That is existing behaviour rather than a cost of repeats --
+        the middleware has always kept asking until a record appears in the loaded history --
+        but once records repeat it recurs once per record instead of once per run.
+
+        Whether the *next* call is pinned is the whole of the decision, and it is taken in
+        :meth:`_record_due`, which is the one place the rule is written down.
         """
         forced_this_call = self._force_next
         if forced_this_call:
@@ -1055,34 +1175,56 @@ class ToolResultRecallMiddleware(ChatMiddleware):
             self._force_next = False
             return
         record_index = find_record_index(messages)
-        if record_index is not None:
-            # The transition is tracked on the instance, not read from the messages on the way
-            # in. Before the pipeline runs, context.messages holds only the new turn, so a
-            # pre-call check reports "no record" on every call and every later call counts as
-            # a fresh one -- which is how an 18 appeared here for a single record.
-            if not self._seen_record:
-                self._seen_record = True
-                # Attributed, not merely counted. A record that arrived unpinned came from the
-                # model volunteering on a follow-up call, and that is a different claim.
-                if forced_this_call:
-                    self._records_forced += 1
-                else:
-                    self._records_volunteered += 1
-            if self.max_groups_before_record is None:
-                # One record and no more, which is what this did before the group bound
-                # existed. Everything below would ask for another.
-                self._force_next = False
-                return
+        # The transition is tracked on the instance, not read from the messages on the way in.
+        # Before the pipeline runs, context.messages holds only the new turn, so a pre-call
+        # check reports "no record" on every call and every later call counts as a fresh one --
+        # which is how an 18 appeared here for a single record.
+        if record_index is not None and not self._seen_record:
+            self._seen_record = True
+            # Attributed, not merely counted. A record that arrived unpinned came from the
+            # model volunteering on a follow-up call, and that is a different claim.
+            if forced_this_call:
+                self._records_forced += 1
+            else:
+                self._records_volunteered += 1
         annotate_message_groups(messages)
         annotate_token_counts(messages, tokenizer=self.tokenizer)
-        # The token trigger asks for the *first* record and then goes quiet. It cannot be the
-        # thing that asks for a second: the size that fired it does not go away when a record
-        # arrives, so it would pin every remaining call in the run. Only the group bound
-        # re-arms, and it counts from the newest record rather than from the start.
-        over_tokens = record_index is None and included_token_count(messages) > int(
-            self.max_input_tokens * self.trigger_fraction
-        )
-        over_groups = self.max_groups_before_record is not None and (
-            _droppable_groups_after(messages, record_index) >= self.max_groups_before_record
-        )
-        self._force_next = over_tokens or over_groups
+        self._force_next = self._record_due(messages, record_index)
+
+    def _record_due(self, messages: list[Message], record_index: int | None) -> bool:
+        """Return whether the next call should be pinned to the recall tool.
+
+        **The rule, written once so nobody has to derive it from three booleans.** Write
+        *pending* for the droppable tool work no record accounts for: the non-recall tool-call
+        groups after the newest record, or all of them when there is no record yet. Then
+
+        - the group bound asks whenever ``pending`` reaches ``max_groups_before_record``,
+          whatever else is true, because setting that bound is asking for repeats outright;
+        - the size trigger asks for the *first* record as soon as the prompt passes
+          ``trigger_fraction`` of the ceiling;
+        - it asks again only when ``pending`` is at least one -- and not at all when
+          ``repeat_records`` is off, which is what every run before repeats existed did.
+
+        **Why the second record needs ``pending`` and the first does not.** The size that fires
+        the trigger does not go away once a record exists: the record is *added* to the
+        conversation, and it is preserved, so the prompt is if anything larger afterwards. A
+        repeat reading size alone would therefore stay true for the rest of the run and pin
+        every remaining call. That is why the size trigger used to be gated on there being no
+        record at all, and it is the regression to watch for when un-gating it: a conversation
+        sitting above the trigger with nothing recorded since its last record is *settled* --
+        there is nothing a second record could carry that the first does not -- and must be
+        left alone until the agent does more tool work.
+
+        Args:
+            messages: The loaded conversation, already grouped and token-annotated.
+            record_index: Index of the newest record, or None when there is none.
+
+        Returns:
+            True when the next call should be forced.
+        """
+        pending = _droppable_groups_after(messages, record_index)
+        if self.max_groups_before_record is not None and pending >= self.max_groups_before_record:
+            return True
+        if record_index is not None and (not self.repeat_records or pending < 1):
+            return False
+        return included_token_count(messages) > int(self.max_input_tokens * self.trigger_fraction)

@@ -246,7 +246,61 @@ gpt-5.6-luna named two groups of six, and raising `--record-max-tokens`, raising
 was left was to ask each record for less. Since the strategy keeps whatever a record does not
 name, an unbounded ask degrades into compacting almost nothing, and this is what buys the
 compaction back. Each record costs an agent turn, so a small bound is not free; off by default,
-which asks for one record per run.
+which leaves the size trigger as the only thing that asks.
+
+#### One record or several
+
+The size trigger now asks more than once. It cannot do that on size alone — the size that fired
+it does not go away when a record arrives, because the record is *added* to the conversation and
+then preserved, so a trigger reading size would pin every remaining call in the run. What
+re-arms it is new material: at least one non-recall tool-call group after the newest record.
+A conversation sitting above the trigger with nothing recorded since its last record is settled,
+and is left alone.
+
+That matters because a record covers what existed when it was written and nothing after it.
+Without repeats, every group gathered later is uncoverable for the rest of the run: the strategy
+will not delete what no record carries, so those groups sit in the prompt to the end and the row
+reports `UNCOVERED` for work no record was ever asked to account for.
+
+The price is that records accumulate and nothing merges them — an older record is the sole
+account of the groups behind *it*, so a merge would rewrite the evidence rather than the bulk.
+Every record is preserved: unshrinkable, undroppable, counted against the ceiling in full. So
+each one raises a floor under the prompt that no later pass can lower, and `RECORDS:<n>` in the
+flags column, stored as `records_in_conversation` on each seed, is what says so. Read it
+alongside `REC:<n>`, which saturates at 1 and answers only whether the model ever complied.
+
+`--no-record-repeats` asks once and no more. Every run up to and including 39 was single-record,
+so a cell meant to sit on the same axis as those has to set it. It governs the size trigger
+alone: `--max-groups-before-record` is asking for repeats outright and keeps forcing them.
+
+#### Tuning the strategies
+
+Every constructor parameter a sweep would want to vary is a flag, because a knob that is only a
+default cannot be measured — the pair `anchored`/`anchored_min_gain` differ in exactly one
+setting, `min_gain_fraction`, and it was unreachable, so the pair had only ever been compared at
+one value of the thing being tested.
+
+- Anchored family: `--keep-head-groups`, `--keep-tail-groups`, `--band-share`, `--keep-tokens`
+  (0 derives the retention from `--band-share` instead of fixing it), `--min-gain-fraction`.
+- Record strategy: `--trigger-fraction`, `--fallback-fraction`, `--coverage-share`, plus the
+  record flags above. The trigger reaches both halves from one flag, so the ask and the wait
+  cannot be set apart.
+- Everything else: `--keep-last-groups` (sliding window, summarization target),
+  `--keep-last-tool-groups`, `--budget-fraction`.
+
+Ranges are checked by the strategies themselves, and every selected strategy is built before the
+run spends anything, so a value out of range fails at the command line rather than on the first
+paid call. `--dry-run` builds from the flags it is printing a plan for.
+
+The two record thresholds default to **0.8** and **0.95**, and they are one decision. 0.6 fired
+at 58% of a 60,000-token window: an agent turn and a broken cached prefix spent early in a
+conversation that may never have needed compacting, when the break-even only favours compaction
+with a long remaining horizon. Moving the trigger up forced the give-up line up with it, because
+the record arrives one call late by construction — the middleware can only read the history on
+the way out of a call and can only pin the next one — so a 0.9 line left a single turn's growth
+of room, and one turn carrying a large tool result crossed it, compacting without a record while
+the record was still in flight. `fallback_fraction` must exceed `trigger_fraction`; the strategy
+raises `ValueError` when it does not.
 
 #### Fill and the tried limit
 

@@ -26,6 +26,7 @@ from agent_framework_lab_cachebench.compaction._toolsummary import (
     DEFAULT_COVERAGE_SHARE,
     DEFAULT_RECORD_MAX_TOKENS,
     DEFAULT_RECORD_TARGET_TOKENS,
+    DEFAULT_TRIGGER_FRACTION,
     RECALL_TOOL_NAME,
     RECORD_MARKER,
     RecallGate,
@@ -180,9 +181,11 @@ def _rendered(messages: list[Message]) -> str:
 
 #: A ceiling that puts the eight-turn conversation between the two thresholds, so the default
 #: strategy asks and waits rather than giving up. Chosen from the fixture's own size: the
-#: conversation is about 16,000 tokens, which is 73% of this, between the 60% trigger and the
-#: 90% fallback.
-_WAITING_CEILING = 22_000
+#: conversation is about 17,000 tokens, which is 90% of this, between the 80% trigger and the
+#: 95% fallback. It has to be recomputed whenever either default moves -- at the old 60/90 pair
+#: this was 22,000, which the 80% trigger now sits above, so every test built on it would have
+#: measured a strategy that did nothing rather than one that acted.
+_WAITING_CEILING = 19_000
 
 
 def _strategy(**kwargs: Any) -> ToolResultAnchoredSummarizationCompactionStrategy:
@@ -271,11 +274,21 @@ async def test_the_fallback_fires_when_the_record_never_arrives() -> None:
     assert "EU-WEST-1" in _rendered(messages), "the fallback keeps the head anchor too"
 
 
-async def test_thresholds_the_wrong_way_around_are_rejected() -> None:
-    """A fallback at or below the trigger silently disables the whole design."""
+@pytest.mark.parametrize(
+    ("trigger", "fallback"),
+    [pytest.param(0.8, 0.8, id="equal"), pytest.param(0.9, 0.8, id="inverted")],
+)
+async def test_thresholds_the_wrong_way_around_are_rejected(trigger: float, fallback: float) -> None:
+    """A fallback at or below the trigger silently disables the whole design.
+
+    Equal is the quieter of the two and is why this is a range check rather than a comparison
+    left to the caller: at equal thresholds the strategy passes the trigger and the give-up
+    line on the same pass, so it never waits for a record at all and every row of that run
+    measures the fallback while reporting the name of this strategy.
+    """
     with pytest.raises(ValueError, match="fallback_fraction"):
         ToolResultAnchoredSummarizationCompactionStrategy(
-            max_input_tokens=1_000, tokenizer=TOKENIZER, trigger_fraction=0.8, fallback_fraction=0.8
+            max_input_tokens=1_000, tokenizer=TOKENIZER, trigger_fraction=trigger, fallback_fraction=fallback
         )
 
 
@@ -379,7 +392,7 @@ async def test_a_newer_record_never_drops_an_older_one() -> None:
     record before it: the same loss this strategy exists to prevent, one level removed and
     quieter, because a newer record that names the tools looks exactly like coverage.
     """
-    strategy = _strategy(max_input_tokens=11_000)
+    strategy = _strategy(max_input_tokens=_TWO_RECORD_CEILING)
     messages = _conversation(tool_turns=2, record=f"older record. {_covering_record(2)}")
     messages += _conversation(tool_turns=2, first_turn=2)[3:]
     messages += _record_messages(f"newer record. {_covering_record(4)}", call_id="rec2")
@@ -612,6 +625,10 @@ def test_the_value_rule_finds_what_cannot_be_reconstructed_and_leaves_prose_alon
 # region protecting the record from the strategy behind it
 
 
+#: The same choice as ``_WAITING_CEILING``, for the four-turn conversation carrying two
+#: records: about 8,800 tokens, which is 88% of this, between the trigger and the fallback.
+_TWO_RECORD_CEILING = 10_000
+
 #: Padding that makes the record big enough for the fallback to want to trim it. The anchored
 #: strategy's per-result floor is 150 tokens and this takes the record to about 590, so a
 #: record left unprotected is cut rather than merely eligible to be.
@@ -658,7 +675,7 @@ async def test_every_record_is_marked_protected_including_the_ones_a_newer_recor
     re-applied on every pass, because compaction runs against a freshly loaded conversation and
     the annotations of the previous pass are not in it.
     """
-    strategy = _strategy(max_input_tokens=11_000)
+    strategy = _strategy(max_input_tokens=_TWO_RECORD_CEILING)
     messages = _conversation(tool_turns=2, record=f"older record. {_covering_record(2)}")
     messages += _conversation(tool_turns=2, first_turn=2)[3:]
     messages += _record_messages(f"newer record. {_covering_record(4)}", call_id="rec2")
@@ -1176,3 +1193,199 @@ def test_a_group_bound_that_can_never_hold_a_record_is_refused(bound: int) -> No
         ToolResultRecallMiddleware(
             max_input_tokens=1_000, tokenizer=TOKENIZER, arm=lambda: None, max_groups_before_record=bound
         )
+
+
+# region repeating the record
+
+
+def _repeating(**kwargs: Any) -> ToolResultRecallMiddleware:
+    """Return a middleware whose token trigger fires on the eight-turn fixture from call one.
+
+    The ceiling is small and the trigger low, so size alone is above the line throughout. That
+    is the point: every test below is about what happens once size has stopped being the
+    interesting variable, which is the state the single-record gate used to hide.
+
+    Keyword Args:
+        kwargs: Overrides, so a test can turn repeats off or add a group bound.
+
+    Returns:
+        The middleware.
+    """
+    kwargs.setdefault("max_input_tokens", 1_000)
+    kwargs.setdefault("trigger_fraction", 0.1)
+    return ToolResultRecallMiddleware(tokenizer=TOKENIZER, arm=lambda: _armings.append(1), **kwargs)
+
+
+async def test_no_record_is_forced_while_nothing_new_has_been_recorded_since_the_last_one() -> None:
+    """The every-call regression, given its own test because un-gating the trigger invites it.
+
+    The size trigger used to be gated on there being no record at all, and the gate was not
+    caution: the size that fired it does not go away when a record arrives, because the record
+    is *added* to the conversation and then preserved, so the prompt is if anything larger
+    afterwards. Re-arm on size alone and every remaining call in the run is pinned to the
+    recall tool -- an agent turn each, a broken prefix each, and a conversation of records
+    about records.
+
+    What re-arms the trigger is therefore new material rather than size. A conversation sitting
+    far above the trigger with nothing recorded since its last record is settled, and five
+    calls in a row have to leave it alone.
+    """
+    _armings.clear()
+    middleware = _repeating()
+    settled = _conversation(tool_turns=8, record=_covering_record(8))
+
+    calls = [await _run(middleware, settled) for _ in range(5)]
+
+    assert not [options for options in calls if "tool_choice" in options], "a settled conversation was pinned"
+    assert middleware.forced_calls == 0
+    assert not _armings
+
+
+async def test_a_second_record_is_forced_once_new_groups_have_accumulated_above_the_trigger() -> None:
+    """One record covers what was there when it was written, and nothing after it.
+
+    Without repeats, every tool group gathered after the first record is uncoverable for the
+    rest of the run: the strategy will not delete what no record carries, so those groups sit
+    in the prompt to the end and the row reports ``UNCOVERED`` for work no record was ever
+    asked to account for. The size trigger has to be able to ask again -- and it may, because
+    the conversation has done something since.
+    """
+    _armings.clear()
+    middleware = _repeating()
+    settled = _conversation(tool_turns=8, record=_covering_record(8))
+    grown = [*settled, *_conversation(tool_turns=2, first_turn=8)[3:]]
+
+    quiet = await _run(middleware, settled)
+    await _run(middleware, grown)
+    again = await _run(middleware, grown)
+
+    assert "tool_choice" not in quiet
+    assert again["tool_choice"] == {"mode": "required", "required_function_name": RECALL_TOOL_NAME}
+    assert middleware.forced_calls == 1
+    assert len(_armings) == 1, "the tool is armed exactly when it is pinned"
+
+
+async def test_a_single_group_of_new_work_is_enough_to_ask_again() -> None:
+    """The bar is "something happened", not "enough happened".
+
+    ``max_groups_before_record`` is the knob for how much one record should be asked to cover.
+    Setting the bar higher here would duplicate that knob at a value nobody chose, and this
+    condition exists for one purpose only: keeping the trigger off a conversation in which
+    nothing has changed.
+    """
+    _armings.clear()
+    middleware = _repeating()
+    settled = _conversation(tool_turns=8, record=_covering_record(8))
+    grown = [*settled, *_conversation(tool_turns=1, first_turn=8)[3:]]
+
+    await _run(middleware, grown)
+    again = await _run(middleware, grown)
+
+    assert "tool_choice" in again
+
+
+async def test_turning_repeats_off_reproduces_the_single_record_run_exactly() -> None:
+    """Runs 26-39 were single-record, and a row compared against them has to be one too.
+
+    Not a historical note: those cells are on disk and are what the write-ups quote, and a
+    strategy that now takes three records where they took one has a different cost profile --
+    each record is an agent turn, and each is preserved for the rest of the run. Reproducing
+    them has to be one flag rather than a reconstruction, or the comparison stops being made.
+    """
+    _armings.clear()
+    asking = _repeating(repeat_records=False)
+    big = _conversation(tool_turns=8)
+
+    await _run(asking, big)
+
+    assert "tool_choice" in await _run(asking, big), "the first record is still asked for"
+
+    _armings.clear()
+    middleware = _repeating(repeat_records=False)
+    settled = _conversation(tool_turns=8, record=_covering_record(8))
+    grown = [*settled, *_conversation(tool_turns=4, first_turn=8)[3:]]
+
+    await _run(middleware, settled)
+    await _run(middleware, grown)
+    after = await _run(middleware, grown)
+
+    assert "tool_choice" not in after, "and no later one is, however much work has piled up"
+    assert middleware.forced_calls == 0
+    assert not _armings
+
+
+async def test_a_group_bound_keeps_forcing_records_even_with_repeats_switched_off() -> None:
+    """Setting the bound is asking for repeats outright, so the flag must not make it inert.
+
+    The two settings answer different questions -- one is "reproduce the older runs", the other
+    is "stop asking any one record to cover more than N groups" -- and a flag that quietly
+    disabled the bound would leave a run reporting a bound it was not applying.
+    """
+    _armings.clear()
+    middleware = _repeating(repeat_records=False, max_groups_before_record=2)
+    settled = _conversation(tool_turns=8, record=_covering_record(8))
+    grown = [*settled, *_conversation(tool_turns=2, first_turn=8)[3:]]
+
+    await _run(middleware, grown)
+    again = await _run(middleware, grown)
+
+    assert "tool_choice" in again
+    assert middleware.forced_calls == 1
+
+
+async def test_the_strategy_counts_every_record_the_conversation_carries() -> None:
+    """Records accumulate and nothing merges them, so the count is the whole of the warning.
+
+    Every record is preserved -- unshrinkable, undroppable, counted against the ceiling in
+    full -- so each one raises a floor under the prompt that no later pass can lower. Nothing
+    else in the run says so: the message count keeps rising and each pass still reports having
+    compacted. ``records_found`` cannot say it either, because it saturates at one and answers
+    whether the model ever complied.
+    """
+    strategy = _strategy(max_input_tokens=_TWO_RECORD_CEILING)
+    messages = _conversation(tool_turns=2, record=f"older record. {_covering_record(2)}")
+    messages += _conversation(tool_turns=2, first_turn=2)[3:]
+    messages += _record_messages(f"newer record. {_covering_record(4)}", call_id="rec2")
+
+    await strategy(messages)
+
+    assert strategy.records_in_conversation == 2
+    assert strategy.records_found == 1, "compliance is a different question from quantity"
+
+
+async def test_the_record_count_is_a_maximum_rather_than_a_running_total() -> None:
+    """The same conversation is re-examined on every later pass, so a tally would multiply it.
+
+    ``records_volunteered`` already had to be fixed for exactly this: it reported 18 for a
+    single record, because the check ran once per call rather than once per record. A count
+    reading 18 where the answer is 1 is not a rougher version of the truth, it is a number with
+    a different meaning.
+    """
+    strategy = _strategy(max_input_tokens=_TWO_RECORD_CEILING)
+    messages = _conversation(tool_turns=2, record=f"older record. {_covering_record(2)}")
+    messages += _conversation(tool_turns=2, first_turn=2)[3:]
+    messages += _record_messages(f"newer record. {_covering_record(4)}", call_id="rec2")
+
+    for _ in range(4):
+        await strategy(messages)
+
+    assert strategy.records_in_conversation == 2
+
+
+def test_the_default_thresholds_leave_a_whole_turn_for_the_record_to_arrive_in() -> None:
+    """The two defaults are one decision, and moving either alone breaks the design.
+
+    The record arrives one call late by construction: the middleware can only read the history
+    on the way out of a call and can only pin the next one. So the gap between asking and
+    giving up has to be wide enough for a turn's growth to fit inside it -- at a 0.8 trigger
+    the old 0.9 left a single turn's room, and one turn carrying a large tool result crossed
+    it, compacting without a record while the record was still in flight. The strategy and the
+    middleware read the same constant for the ask, so a run cannot move one and not the other.
+    """
+    strategy = ToolResultAnchoredSummarizationCompactionStrategy(max_input_tokens=1_000, tokenizer=TOKENIZER)
+    middleware = ToolResultRecallMiddleware(max_input_tokens=1_000, tokenizer=TOKENIZER, arm=lambda: None)
+
+    assert (strategy.trigger_fraction, strategy.fallback_fraction) == (DEFAULT_TRIGGER_FRACTION, 0.95)
+    assert DEFAULT_TRIGGER_FRACTION == 0.8, "0.6 fired at 58% of a 60,000-token window"
+    assert middleware.trigger_fraction == strategy.trigger_fraction, "the ask and the wait must be one number"
+    assert strategy.fallback_fraction - strategy.trigger_fraction >= 0.1, "no room for the record to land in"

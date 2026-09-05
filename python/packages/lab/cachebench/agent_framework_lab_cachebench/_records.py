@@ -83,7 +83,23 @@ __all__ = [
 #: ``None``, because those runs *could* fall back behind a record and counted nothing when they
 #: did. That is the version 4 case: not absent but unknowable, and a 0 would tell a reader that
 #: every older row stayed the strategy it is named for.
-SCHEMA_VERSION: Final[int] = 5
+#:
+#: 6 adds ``records_in_conversation``, and the bump is the version 3 argument: it separates a
+#: record whose run could take more than one recall record from one whose run could not. Before
+#: it the size trigger fired once per conversation by construction, so no run could accumulate
+#: records, and a reader comparing a cell across the change has to be able to see which side of
+#: it a row sits on -- the strategy's cost profile differs, because every record is preserved
+#: and raises a floor under the prompt.
+#:
+#: Its *value* reads back as ``None`` rather than as 1, which is the version 4 argument applied
+#: to a field the version 3 argument justified bumping for. What an older run could do is not
+#: in doubt; what it did is. Those runs took either one record or none depending on whether the
+#: model ever complied, and nobody wrote the number down. A 1 would credit every row with a
+#: record, including the rows that flag ``FALLBACK`` precisely because none arrived; a 0 would
+#: deny one to every row that took one. The flags on those records say which happened, and
+#: reading a count back out of a flag string is exactly the kind of inference this module
+#: refuses everywhere else.
+SCHEMA_VERSION: Final[int] = 6
 
 #: Versions this reader accepts, which is not only the current one.
 #:
@@ -109,7 +125,11 @@ SCHEMA_VERSION: Final[int] = 5
 #: ``fallbacks_after_record`` comes back as ``None`` for all of them, on the probe-count
 #: argument rather than the retry one: that path existed in every one of those runs and
 #: incremented nothing when it was taken.
-_READABLE_SCHEMAS: Final[frozenset[int]] = frozenset({2, 3, 4, SCHEMA_VERSION})
+#:
+#: Version 5 joins them unconditionally: it is the immediately preceding version, it measured
+#: everything this one does except how many records a conversation carried, and refusing it
+#: would discard cells written by the code as it stood a commit ago for a single absent column.
+_READABLE_SCHEMAS: Final[frozenset[int]] = frozenset({2, 3, 4, 5, SCHEMA_VERSION})
 
 #: The parameters that make two records the same cell, and so aggregable into one row.
 #:
@@ -458,6 +478,25 @@ class SeedRecord:
     one. Zero from a live run means what it says, including on the four strategies that take no
     record at all.
     """
+    records_in_conversation: int | None
+    """Recall records the conversation ended up carrying, at the strategy's highest reading.
+
+    The price of letting the size trigger ask more than once. Every record is preserved -- it
+    may be neither shortened nor dropped, by this strategy or by the fallback behind it -- and
+    nothing merges them, so each one raises a floor under the prompt that no later pass can
+    lower. A cell whose mean here is above one is a cell where part of what the money columns
+    show is that floor rather than the workload, and no other column says so: the message count
+    keeps rising and the compaction keeps looking as though it fired.
+
+    ``strategy_notes`` carries it as ``RECORDS:<n>``; the number is here so a cell can be meaned
+    on it, which is what separates "one seed's model volunteered twice" from "this cell
+    accumulates records".
+
+    ``None`` on a record written before schema 6, and not 1. Those runs could take at most one
+    record, but whether they took it depended on whether the model ever complied, and nobody
+    stored the answer as a number -- see :data:`SCHEMA_VERSION`. Zero from a live run means what
+    it says, including on the four strategies that take no record at all.
+    """
     strategy_notes: tuple[str, ...]
     dropped_options: tuple[str, ...]
     answer: str
@@ -599,6 +638,11 @@ class SeedRecord:
         # recovered from the record. Zero would say the row stayed the strategy it is named
         # for, which is the exact claim the counter was added because nobody could make.
         values.setdefault("fallbacks_after_record", None)
+        # None again, and for a third reason worth stating apart from the two above. A record
+        # written before schema 6 comes from a run whose size trigger fired once per
+        # conversation, so it took one record or none -- but which of the two is on the record
+        # only as a flag, and a count inferred from a flag string is not a count anybody took.
+        values.setdefault("records_in_conversation", None)
         try:
             return cls(cell=CellParams.from_dict(data["cell"]), **values)
         except (KeyError, TypeError) as error:
