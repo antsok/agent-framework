@@ -1430,6 +1430,29 @@ facts at the fixed payload where 5.4-mini kept all 53. So the break-even predict
 **direction** on both models at the same discount, and predicts **nothing** about which strategy
 to choose. Any recommendation naming a strategy has to be measured on the model being deployed.
 
+### The luna cells are less full than their labels, and the instrument said so
+
+Seven of the nine cells tripped `FILL OFF TARGET`. The seeded conversation landed **-3.1% to
+-12.0%** below its fill target, where all nine `gpt-5.4-mini` cells landed **+2.1% to +4.5%** and
+none tripped it. The filler sizing solves for the turns it sends and cannot predict how much the
+model writes back, and luna writes back less than 5.4-mini on the same turns.
+
+So the control's real fill runs 4 to 9 points under the label:
+
+| cell | label | luna actual | 5.4-mini actual |
+| --- | ---: | ---: | ---: |
+| fixed 60K / 0.86 | 86% | **77%** | 89% |
+| fixed 120K / 0.70 | 70% | **62%** | 71% |
+| fixed 200K / 0.86 | 86% | **79%** | -- |
+| share 0.80, 120K / 0.86 | 86% | 83% | 88% |
+
+**Within a cell this changes nothing** -- all six rows share one turn list and one actual fill, so
+every `vs none$` in this write-up stands. **Between the models it is a caveat**: the paired cells
+are close but not identical, and the two furthest off -- fixed 120K/0.70 at -12.0% and fixed
+200K/0.86 at -8.7% -- should not be read as the same operating point on both models. The cell
+carrying the cross-model conclusion, share 0.80 at 120,000, is -3.6% against mini's +2.1%, which
+is the closest pairing in the matrix and the reason that comparison is the one quoted.
+
 ### Luna is a noisier subject
 
 Control spreads run 6-35% against 5.4-mini's 3-31%, and single strategies reach 101% and 141%.
