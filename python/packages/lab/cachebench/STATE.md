@@ -586,3 +586,19 @@ own recorded hit rate the two extra attempts add EUR 0.011-0.017 per seed, 6.6-9
 seed's cost, and EUR 0.36 on a cell that cost EUR 4.58. Priced at the 95% hit a repeat of an
 identical prefix actually gets, EUR 0.27 on the cell, 2-8% per seed. The dominant term is the
 prompt, not the answer: the combined answer measured 112-526 output tokens.
+
+## 3h. The luna `tool_summary_anchored` row is void
+
+`TRUNCATED` on 36 of 45 luna records, 0 of 45 mini records, same
+`--record-max-tokens 4000 --record-target-tokens 2000` in both scripts. Untruncated records kept
+53/53 nine times out of nine; truncated ones landed on `5 + 8k` boundaries, mostly 21. The cap
+was sized at 2x the target on the assumption that it would never bind, which held on 5.4-mini
+and does not on a model that writes ~4x as much.
+
+**Consequence:** every luna `tool_summary_anchored` number -- cost and accuracy both -- is a
+misconfiguration, not the strategy. `RESULTS.md` says so at the row.
+
+**Open:** what cap luna's record actually needs (~12,000 estimated from the cut point), and
+whether a complete record at that size saves anything at all. One calibration seed answers both;
+nothing has been spent on it.
+
