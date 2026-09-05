@@ -156,6 +156,14 @@ trust.
 
 Runs before 24 predate that format and exist only as captured stdout.
 
+Run 36 is the calibration that corrected run 34/35's `tool_summary_anchored` reading. Fixed
+60K/0.86, three seeds an arm, `--record-max-tokens` 4,000 -> 24,000 and `--record-target-tokens`
+2,000 -> 8,000. Facts held at 21/53 in every record of both arms, so the cap was never what
+limited the record. It carries `truncation` as a third row for two reasons: as the reference the
+`vs none$` comparison needs, and because a run of `none,tool_summary_anchored` alone falsely trips
+`CONTROL DIVERGED` -- the MSGS check compares the control against the leanest strategy row, and
+with only that strategy the leanest row carries the record's own forced calls.
+
 Runs 34 and 35 are the same nine-cell matrix on `gpt-5.6-luna`, five seeds a cell, 390 records.
 **Seven of the nine print `FILL OFF TARGET`** (-3.1% to -12.0%), because the filler sizing was
 solved against 5.4-mini's reply length and luna writes shorter replies. The cells are internally

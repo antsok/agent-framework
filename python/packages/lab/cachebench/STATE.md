@@ -587,18 +587,30 @@ seed's cost, and EUR 0.36 on a cell that cost EUR 4.58. Priced at the 95% hit a 
 identical prefix actually gets, EUR 0.27 on the cell, 2-8% per seed. The dominant term is the
 prompt, not the answer: the combined answer measured 112-526 output tokens.
 
-## 3h. The luna `tool_summary_anchored` row is void
+## 3h. The luna `tool_summary_anchored` row, and a wrong diagnosis corrected
 
-`TRUNCATED` on 36 of 45 luna records, 0 of 45 mini records, same
-`--record-max-tokens 4000 --record-target-tokens 2000` in both scripts. Untruncated records kept
-53/53 nine times out of nine; truncated ones landed on `5 + 8k` boundaries, mostly 21. The cap
-was sized at 2x the target on the assumption that it would never bind, which held on 5.4-mini
-and does not on a model that writes ~4x as much.
+**First diagnosis, now withdrawn:** that `--record-max-tokens 4000` cut the record and caused the
+collapse. `TRUNCATED` did appear on 36 of 45 luna records and on none of mini's, and the nine
+untruncated ones all kept 53/53, so the correlation was real. The causation was not.
 
-**Consequence:** every luna `tool_summary_anchored` number -- cost and accuracy both -- is a
-misconfiguration, not the strategy. `RESULTS.md` says so at the row.
+**Run 36 settled it.** Fixed 60K/0.86, three seeds an arm, `truncation` present as a reference
+row. Cap 4,000 -> 24,000 and target 2,000 -> 8,000: facts stayed at **21/53 in all eleven records**
+across both arms and the archived cell. Raising the target moved cost from +57% to +95% and
+accuracy not at all. One seed still truncated at 24,000 -- luna wrote past 24,000 tokens -- and
+returned the same 21/53.
 
-**Open:** what cap luna's record actually needs (~12,000 estimated from the cut point), and
-whether a complete record at that size saves anything at all. One calibration seed answers both;
-nothing has been spent on it.
+**Actual mechanism.** Exactly one record is written (`REC:1`, all 45 records); fact counts are
+always `5 + 8k`; loss is uncorrelated with shrink (**r = 0.05** across 45 records). Luna expounds
+on two lookups of six and never reaches the rest. Not a setting.
 
+**Consequence.** On luna's fixed-payload cells the record is dominated by `truncation` -- same
+facts, half the shrink, plus a model call. It earns its keep only in the share-0.80 cells.
+
+**Instrument note.** Running `none,tool_summary_anchored` alone falsely trips `CONTROL DIVERGED`:
+the MSGS check compares the control against the leanest strategy row, and with only that strategy
+the leanest row carries the record's own forced calls (+13 messages). Any future single-strategy
+run of it must carry a message-neutral row such as `truncation`.
+
+**Process note.** `TaskStop` kills the wrapper, not the loop underneath; and overwriting a running
+bash script makes bash re-read it and spawn duplicate loops. Both happened here and both cost
+money. New variants get a new filename, and stale trees get killed by command-line match.

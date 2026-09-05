@@ -1430,47 +1430,65 @@ facts at the fixed payload where 5.4-mini kept all 53. So the break-even predict
 **direction** on both models at the same discount, and predicts **nothing** about which strategy
 to choose. Any recommendation naming a strategy has to be measured on the model being deployed.
 
-### `tool_summary_anchored` on luna is measuring a cut record, not the strategy
+### `tool_summary_anchored` on luna writes one record covering two lookups of six
 
-The row that led the 5.4-mini matrix collapses on luna -- 21 of 53 facts where mini kept 53 --
-and the cause is in the flags, not the strategy. **`TRUNCATED` appears on 36 of luna's 45
-records and on none of mini's 45.** It is not inferred from the record's length: the middleware
-counts the provider's own `finish_reason == "length"` on the forced call.
+The row that led the 5.4-mini matrix collapses on luna -- 21 of 53 facts where mini kept 53.
+**An earlier version of this section blamed `TRUNCATED`, and that was wrong.** Run 36 measured it
+and the cap is not the cause. The correlation was real and the causation was not; what follows is
+the measured version.
 
-The correlation is total:
+**Run 36, fixed 60K / 0.86, three seeds an arm, `truncation` carried as a reference row:**
 
-| | records | facts kept |
-| --- | ---: | --- |
-| no `TRUNCATED` | 9 | **53/53 in all nine** |
-| `TRUNCATED` | 36 | 21 x26, 53 x6, 13 x3, 46 x1 |
+| arm | record facts | record `vs none$` | truncation facts | truncation `vs none$` |
+| --- | ---: | ---: | ---: | ---: |
+| cap 4,000 / target 2,000 (runs 34/35, x5) | 21/53 | +56% | 19.6/53 | +31% |
+| cap **24,000** / target 2,000 (x3) | 21/53 | +57% | 17.7/53 | **-1%** |
+| cap 24,000 / target **8,000** (x3) | 21/53 | **+95%** | 19.0/53 | +10% |
 
-And every fact count in the set is exactly `5 + 8k` -- the five non-tool facts plus a whole
-number of eight-code lookups. The record is not degraded, it is **cut on a lookup boundary**:
-26 records covered two lookups of six before the cap stopped them, three covered one.
+**Eleven records at this cell, one number.** A 6x cap and a 4x stated target changed nothing about
+what the record covers. Raising the target only made it dearer.
 
-**Both runs passed the same `--record-max-tokens 4000 --record-target-tokens 2000`.** The cap
-was chosen at twice the target on the reasoning in `_toolsummary.py`'s own docstring -- that it
-"bounds the bill without ever being the thing that stops the writing". On 5.4-mini that held
-exactly. On luna it does not: the model was already measured writing about **four times** what
-mini writes per reply, which is why this run carries `--assumed-reply-tokens 602`, and the
-record overruns 4,000 the same way. Cut at 4,000 having covered a third of the lookups, luna's
-record wants roughly 12,000 tokens.
+Three findings pin the mechanism, and none of them is the cap:
 
-**The truncation is not benign.** The strategy deletes the tool results the record was meant to
-replace whether or not the record arrived whole, so everything past the cut is scored as
-compaction damage -- and the row also pays output price, 6x input, for tokens it then discards.
-So luna's `tool_summary_anchored` cost figures are not the strategy's either, in either
-direction: the -8% at 200K/share 0.80 is partly content the cut removed.
+1. **Truncation and fact loss are decoupled.** One seed at cap 24,000 still tripped `TRUNCATED` --
+   luna ran past **24,000 tokens** -- and returned the same 21/53 as the seeds that finished
+   cleanly. No mini record ever hit the ceiling at a 4,000 cap in 45 records, so every mini record
+   was under 4,000 tokens; luna's is more than six times that bound and covers a third as much.
+2. **Loss does not track how much was compacted.** Across all 45 luna records, facts kept against
+   snapshot shrink correlates at **r = 0.05**. One row shrank 8% and lost 32 facts; another shrank
+   64% and lost none.
+3. **`REC:1` in all 45 records** -- exactly one record is ever written -- and every fact count in
+   the set is `5 + 8k`, five non-tool facts plus a whole number of eight-code lookups. What
+   survives is exactly what that one record enumerated: six lookups, two, or one.
 
-**The one clean cell says the same thing from the other side.** Share 0.80 at 60,000 is the
-shortest conversation in the matrix at 37 messages, it is the only cell with zero truncations,
-and it is the only luna cell where the strategy kept 53/53 in all five seeds -- at +6%, inside
-the control's 17% spread.
+So luna writes at great length about the first two lookups and never reaches the other four. That
+is a property of the model's writing, not of a setting, and no bound reachable from the CLI moved
+it.
 
-This is a real limit on the strategy and not only a mis-set flag. A record that must enumerate
-everything grows with the material, so on a verbose model the two outcomes available are a cut
-record that loses facts or a complete record too large to save anything. Which of those luna
-gives at a raised cap is unmeasured.
+### And on luna the record is beaten by blind truncation
+
+Measured against `truncation` in the same cells, which is the comparison that asks whether the
+extra model call earns anything:
+
+| cell | record facts | record shrink | truncation facts | truncation shrink |
+| --- | ---: | ---: | ---: | ---: |
+| mini 120K / 0.86 | **53.0** | 12% | 21.8 | 35% |
+| mini 60K / 0.86 | **53.0** | 20% | 32.4 | 34% |
+| mini share 0.80, 120K | **53.0** | 49% | 23.6 | 55% |
+| luna 200K / 0.86 | 21.0 | 20% | 20.4 | **50%** |
+| luna 120K / 0.86 | 21.0 | 24% | 19.0 | **51%** |
+| luna 60K / 0.86 | 21.0 | 38% | 19.6 | **53%** |
+| luna share 0.80, 60K | **53.0** | 40% | 41.2 | 35% |
+| luna share 0.80, 120K | **40.2** | 59% | 38.0 | 33% |
+
+On mini the strategy does its job: at share 0.80 it shrinks 49% against truncation's 55% while
+keeping **53 facts against 23.6**. On luna's fixed-payload cells it is **dominated** -- at
+200K/0.86 truncation keeps the same facts with two and a half times the shrink, so the record buys
+nothing for an extra model call. It earns its keep on luna only where tool output dominates.
+
+**The usable statement:** the record's advantage over deleting the oldest messages is
+model-dependent, and on luna it survives only in the share-0.80 cells. Nothing in the CLI recovers
+it elsewhere.
 
 ### The luna cells are less full than their labels, and the instrument said so
 
