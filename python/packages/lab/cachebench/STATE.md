@@ -631,7 +631,32 @@ coverage means forcing per group, or validating that the record names each group
 dropped and re-forcing for the remainder. Unbuilt, unmeasured, and it trades one call for several.
 Do not retry a wording change without a reason the null result does not already cover.
 
-## 3j. Runs 38-39: the strategy destroyed its own record
+## 3j. Runs 38-39 -- LARGELY WITHDRAWN, see REVIEW-2026-09-06.md
+
+**Read the review first.** Verified corrections to what this section claimed:
+
+- The post-record fallback **could not have fired in runs 26-35** -- every archived peak is 30-45%
+  under its ceiling. "Runs 26-35 cannot be trusted on this axis" is **withdrawn**; they are the
+  cleanest measurement of the design. Section 3h's explanation of luna's 21/53 stands and 3j
+  wrongly overwrote it.
+- The coverage check is broken twice over: it tokenises `code_1=VALUE` whole, so a perfect record
+  scores zero, and it matches by substring, so it **can delete groups nothing recorded**. Every
+  UNCOVERED number is an artefact.
+- Run 39's -2% is not like-for-like (77% vs 85% fill, control moved +27%, NOT SUPPORTED printed).
+  Against run 34's control it is +25%.
+- Every trigger writes **two** records, repeats reach 4-5, and `repeat_records=True` shipped as the
+  default on unit tests alone. RECFALLBACK counts attempts, not effects.
+- Corrections to numbers stated: 270 records not 390; $36.08 not $48.77; 7 of 45 mini records had
+  already lost facts; a 46 exists so "every count is 5 + 8k" is false; three arms not four levers.
+
+**What still stands:** `_anchored.py` had no concept of a record, the run-38 trim was real, and
+protecting the record is a correct fix. It is not the explanation of the archive.
+
+**Next, in order:** fix the tokeniser and the substring match; fix the double record; re-examine
+the 0.8 trigger, which the project's own record-quality data argue against; then re-measure.
+Nothing should be swept until the coverage check is repaired.
+
+## 3j-original. Runs 38-39: the strategy destroyed its own record
 
 **Root cause.** The post-record fallback (`AnchoredCompactionStrategy`) shortens tool results in
 place, and the record is a tool result. `_anchored.py` had no concept of it. A dumped luna record

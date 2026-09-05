@@ -1386,7 +1386,7 @@ Cost: $84.69, roughly EUR 78.
 ## Runs 34 and 35 — the same matrix on a second model
 
 `gpt-5.6-luna`, same deployment, same repaired instrument, nine cells at 60,000, 120,000 and
-200,000 tokens. 390 records, five seeds a cell, no errors, $48.77. Both models carry the same
+200,000 tokens. 270 records, five seeds a cell, no errors, $36.08. Both models carry the same
 **10x cache discount**, which is what the break-even says should govern the outcome.
 
 | cell | tool_summary | anchored | min_gain | truncation | context_window | control spread |
@@ -1464,6 +1464,28 @@ Three findings pin the mechanism, and none of them is the cap:
 So luna writes at great length about the first two lookups and never reaches the other four. That
 is a property of the model's writing, not of a setting, and no bound reachable from the CLI moved
 it.
+
+### Runs 38 and 39 -- WITHDRAWN in large part, see REVIEW-2026-09-06.md
+
+> **Correction, 6 September.** Three adversarial reviewers took this section apart and I verified
+> what they found. The central claim below -- that the strategy was destroying its own record, and
+> that this explains the archived luna results -- **does not reach the archive**. Every archived
+> peak prompt sits 30-45% under its ceiling, so the post-record fallback could not have fired in
+> runs 26-35, and "runs 26-35 cannot be trusted" is withdrawn: they are the cleanest measurement
+> of record-then-drop as designed. The archived luna 21/53 means what section 3h said. The record
+> trim was real, but only under run-38 code.
+>
+> The coverage check this section credits is **broken and can itself lose data**: it tokenises
+> `code_1=VALUE` as one string, so a record quoting every value scores zero, and it matches by
+> substring, so a group holding `2026` is "covered" by any date. Every UNCOVERED figure below is
+> an artefact.
+>
+> Run 39's "-2%, ranking above the control" is not like-for-like -- 77% fill against 85%, half the
+> swing is the control moving, and the instrument printed NOT SUPPORTED. Against run 34's control
+> it is +25%. "The first row in this project to hold every fact without costing more" is false;
+> run 33 did it thirty lines above.
+>
+> The text below is kept as written so the correction can be checked against it.
 
 ### Runs 38 and 39 -- the defect was in the strategy, and fixing it changes the answer
 
@@ -1610,7 +1632,7 @@ Control spreads run 6-35% against 5.4-mini's 3-31%, and single strategies reach 
 Five seeds resolve less here, and no luna cost figure under roughly 40% should be read as
 meaning anything.
 
-Cost: $48.77, roughly EUR 45.
+Cost: $36.08, roughly EUR 33.
 
 ---
 
