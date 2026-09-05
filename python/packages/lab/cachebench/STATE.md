@@ -631,3 +631,31 @@ coverage means forcing per group, or validating that the record names each group
 dropped and re-forcing for the remainder. Unbuilt, unmeasured, and it trades one call for several.
 Do not retry a wording change without a reason the null result does not already cover.
 
+## 3j. Runs 38-39: the strategy destroyed its own record
+
+**Root cause.** The post-record fallback (`AnchoredCompactionStrategy`) shortens tool results in
+place, and the record is a tool result. `_anchored.py` had no concept of it. A dumped luna record
+held 4 lookups and 32 identifiers; the prompt held 2 lookups' worth.
+
+**Two defects it hid behind.** The post-record fallback incremented no counter, so a row silently
+became a different strategy. And coverage was keyed on function names no model writes -- luna
+writes "extra0 deployment lookup returned codes: ...". That check cost mini 14 points of shrink
+and made it lose 9 facts (run 38, the only seed where `RECFALLBACK` fired).
+
+**Fixed.** `_preserve.py` marks the record unshrinkable, honoured by all three anchored removal
+paths; coverage re-based on values; `RECFALLBACK` counter; `--max-groups-before-record` wired.
+
+**Result (60K/0.86, 3 seeds a model).** luna 21/53 -> 53/53, +56% -> -2%, ranking above the
+control. mini holds 53/53 at +32%.
+
+**Still open, and this is the live question.** Coverage succeeded on 1 of 3 mini seeds and 0 of 3
+luna seeds. Mini's other two seeds compacted nothing while paying for a record. All luna's
+compaction now comes from the fallback, not from record-and-drop. `DEFAULT_COVERAGE_SHARE = 0.8`
+is chosen, not derived, and is **not plumbed to the CLI** -- `_build_tool_summary_anchored` takes
+defaults and `StrategyOptions` has no field. Plumbing it and sweeping the share is the next step,
+before any conclusion about whether record-and-drop earns its extra call.
+
+**Not re-measured.** Runs 26-35 predate all of this. Every `tool_summary_anchored` row in them
+ran the unflagged fallback whenever a record did not free enough, so an unknown share of each was
+measuring the anchored strategy. `RECFALLBACK` did not exist to say so.
+
