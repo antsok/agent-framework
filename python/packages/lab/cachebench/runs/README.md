@@ -155,3 +155,10 @@ from them through the same aggregation the live run uses, so nothing here has to
 trust.
 
 Runs before 24 predate that format and exist only as captured stdout.
+
+Runs 34 and 35 are the same nine-cell matrix on `gpt-5.6-luna`, five seeds a cell, 390 records.
+**Seven of the nine print `FILL OFF TARGET`** (-3.1% to -12.0%), because the filler sizing was
+solved against 5.4-mini's reply length and luna writes shorter replies. The cells are internally
+sound -- one turn list and one actual fill per cell -- but they sit 4 to 9 points below the fill
+their filenames claim, so a cell here is not exactly the same operating point as the run-32/33
+cell of the same name. `RESULTS.md` reports the deficit per cell.
