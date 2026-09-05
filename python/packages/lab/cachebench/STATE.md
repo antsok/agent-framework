@@ -614,3 +614,20 @@ run of it must carry a message-neutral row such as `truncation`.
 **Process note.** `TaskStop` kills the wrapper, not the loop underneath; and overwriting a running
 bash script makes bash re-read it and spawn duplicate loops. Both happened here and both cost
 money. New variants get a new filename, and stale trees get killed by command-line match.
+
+## 3i. Run 37: instruction does not move the record either
+
+`RECALL_VALUES_DESCRIPTION` rewritten for breadth-first coverage, a per-result prose cap, and a
+split tie-break. Three seeds a model at fixed 60K/0.86, default bounds. Luna 21/53 x3 (unchanged),
+mini 53/53 x3 (unchanged), shrink and output both inside the existing seed range. **Reverted.**
+The suspected clause -- "keep exactness over brevity" -- is cleared rather than convicted.
+
+Four levers have now failed on 21/53 across fourteen records at this cell: the cap, the target,
+the prompt, and both bounds together.
+
+**What is left is structural.** One record is asked to cover every result (`REC:1`, all records),
+and `tool_choice` pins one call, with a turn's pin applying to its first call only. Guaranteeing
+coverage means forcing per group, or validating that the record names each group about to be
+dropped and re-forcing for the remainder. Unbuilt, unmeasured, and it trades one call for several.
+Do not retry a wording change without a reason the null result does not already cover.
+

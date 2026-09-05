@@ -1465,6 +1465,45 @@ So luna writes at great length about the first two lookups and never reaches the
 is a property of the model's writing, not of a setting, and no bound reachable from the CLI moved
 it.
 
+### Instruction does not move it either -- run 37
+
+The obvious response to "luna expounds on two lookups of six" is to tell it not to. That was
+tried and it does nothing. `RECALL_VALUES_DESCRIPTION` was rewritten to put breadth before
+depth -- "give every result its own group before expanding on any of them" -- to cap prose at
+"a sentence or two for each result", and to split the tie-break so exactness governed only the
+quoted values while coverage governed between results. The old tie-break, "keep exactness over
+brevity", was the clause most suspected of licensing the sprawl.
+
+Same cell, default cap and target, so the prompt was the only difference:
+
+| | facts | shrink (mean) | output (mean) | truncated |
+| --- | --- | ---: | ---: | ---: |
+| mini, old prompt (x5) | 53,53,53,53,53 | 20% | 18,167 | 0/5 |
+| mini, new prompt (x3) | 53,53,53 | 21% | 16,311 | 1/3 |
+| luna, old prompt (x5) | 21,21,21,21,21 | 38% | 20,398 | 5/5 |
+| luna, new prompt (x3) | 21,21,21 | 43% | 23,148 | 3/3 |
+
+No accuracy change on either model, and shrink and output both moved less than the seed range
+already spans -- mini's shrink runs 12-30% across five seeds of the *old* prompt alone. **The
+change was reverted**, and the suspected clause is cleared: removing "keep exactness over
+brevity" changed nothing, so it was not causing the sprawl either.
+
+So four levers have now failed on the same number, fourteen records at this cell:
+
+| lever | range tried | luna facts |
+| --- | --- | ---: |
+| `--record-max-tokens` | 4,000 -> 24,000 | 21/53 |
+| `--record-target-tokens` | 2,000 -> 8,000 | 21/53 |
+| record prompt | depth-first -> breadth-first | 21/53 |
+| both bounds together | -- | 21/53 |
+
+**What is left is structural, not textual.** `REC:1` in every record: one call is asked to cover
+every result, and `tool_choice` is pinned for one call only, a turn's pin applying to its first
+call alone. A design that guaranteed coverage would have to force per group, or check the record
+names each group it is about to drop and re-force for the remainder -- the middleware already
+forces twice, so the machinery exists. That is unbuilt and unmeasured, and it trades one model
+call for several.
+
 ### And on luna the record is beaten by blind truncation
 
 Measured against `truncation` in the same cells, which is the comparison that asks whether the

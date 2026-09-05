@@ -156,6 +156,12 @@ trust.
 
 Runs before 24 predate that format and exist only as captured stdout.
 
+Run 37 is the prompt A/B, three seeds a model at the same cell with default bounds: a
+breadth-first rewrite of `RECALL_VALUES_DESCRIPTION` against the shipped wording. Null on both
+models, so the rewrite was reverted and only the evidence is kept. The `.sh` reproduces it against
+whatever wording is in the tree, which is now the original -- checking out `af1ac1e59`'s successor
+and re-running would produce the shipped arm, not the tested one.
+
 Run 36 is the calibration that corrected run 34/35's `tool_summary_anchored` reading. Fixed
 60K/0.86, three seeds an arm, `--record-max-tokens` 4,000 -> 24,000 and `--record-target-tokens`
 2,000 -> 8,000. Facts held at 21/53 in every record of both arms, so the cap was never what
