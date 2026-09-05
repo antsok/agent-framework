@@ -1465,6 +1465,58 @@ So luna writes at great length about the first two lookups and never reaches the
 is a property of the model's writing, not of a setting, and no bound reachable from the CLI moved
 it.
 
+### Runs 38 and 39 -- the defect was in the strategy, and fixing it changes the answer
+
+Four levers failed because all four acted on what the model *writes*. The thing destroying the
+data was downstream of the record entirely.
+
+**`--dump-record` settled it.** Luna's record, read off disk, covers **four lookups and all 32
+identifiers** -- a competent record. The prompt the questions were answered from held two
+lookups' worth. The strategy calls a fallback when a record does not free enough, that fallback
+defaults to `AnchoredCompactionStrategy`, which shortens tool results in place, and **the record
+is a tool result**. `_anchored.py` had no concept of a record, so it trimmed the one artefact the
+strategy exists to produce. 16,617 tokens left the prompt while three messages did, which is
+shortening rather than deletion.
+
+**Run 38 caught it happening on the good model.** A coverage check keyed on the group's function
+name -- which no model writes -- held back four of `gpt-5.4-mini`'s groups, left the prompt over
+the ceiling, and fired the fallback. Mini lost **nine facts**, the first fact it has lost in 45
+records, on the one seed where the newly added `RECFALLBACK` flag fired. The regression made the
+pre-existing bug reproduce on the model that never fails.
+
+**Run 39, both fixes in, three seeds a model, same cell:**
+
+| | `vs none$` | facts | acc1 | snap% |
+| --- | ---: | ---: | ---: | ---: |
+| luna, archived (x5) | +56% | 21/53 | 41% | 48% |
+| luna, run 39 (x3) | **-2%** | **53/53** | **100%** | 50% |
+| mini, archived (x5) | +47% | 53/53 | 100% | 71% |
+| mini, run 39 (x3) | +32% | 53/53 | 100% | 83% |
+
+`tool_summary_anchored` ranks **above the uncompacted control on luna** -- the first row in this
+project to hold every fact without costing more. At a 24% spread that is parity rather than a
+saving, and the movement is what matters: +56% at 41% accuracy to parity at 100%.
+
+`RECFALLBACK` fires five times a seed on luna now and costs nothing, which is the protection
+working: the fallback shortens the ordinary content around the record, and the record survives.
+
+### What is still wrong, and it is the useful half
+
+**Retention is fixed. Usefulness is not.** Value-based coverage succeeded on **one mini seed of
+three**; the other two compacted **nothing at all** (-0% and -1% shrink) while still paying for a
+record and an extra model call. Luna's coverage never succeeded in three seeds -- all its
+compaction now comes from the fallback shortening around a protected record, not from the
+record-and-drop design the strategy is named for.
+
+So the failure mode has moved from "loses facts silently" to "costs a call and does nothing",
+which is the right direction and not the destination. The design earns its extra call only when
+coverage succeeds, and coverage is currently unstable seed to seed on the same model with the
+same prompt -- it turns on how verbatim that particular record happened to be.
+
+`DEFAULT_COVERAGE_SHARE = 0.8` is a chosen threshold, not a derived one, and is not plumbed to
+the CLI, so no sweep can tune it yet. That is the first thing to try before concluding anything
+about the design.
+
 ### Instruction does not move it either -- run 37
 
 The obvious response to "luna expounds on two lookups of six" is to tell it not to. That was

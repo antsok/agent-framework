@@ -1,0 +1,8 @@
+[recorded by compaction] Earlier tool results may have been shortened, and this is their compaction record. Treat values in this record as authoritative for the tool it names, and treat information as absent only if it appears nowhere, including here.
+Earlier deployment lookup results, authoritative exact values:
+- early deployment lookup returned records with codes: code_1=TL-BA44A9, code_2=TL-8E9A2A, code_3=TL-03F365, code_4=TL-013DA5, code_5=TL-A561C6, code_6=TL-C6D469, code_7=TL-F26987, code_8=TL-BFF6F2. Its notes contained repeated deployment pipeline terms but did not provide a deployment region or fallback host.
+- extra0 deployment lookup returned codes: TL-2E6494, TL-848E51, TL-BCFD01, TL-5192E1, TL-C6DB41, TL-4CFCFF, TL-3ACA06, TL-1BEDB9. No deployment region or fallback host was provided.
+- extra1 deployment lookup returned codes: TL-AF684C, TL-A1290D, TL-C7F538, TL-8ED0F9, TL-1A4F33, TL-6D8344, TL-37228C, TL-947E33. No deployment region or fallback host was provided.
+- extra2 deployment lookup returned codes: TL-C92B2C, TL-05A0B0, TL-2B8B23, TL-799B62, TL-393CC2, TL-7EBFE3, TL-D6EE9E, TL-12987B. No deployment region or fallback host was provided.
+- Prior requirements from the user: RQ-1B7D6F requires every section numbered; RQ-B2E9DB requires the report to end with a risk table; RQ-864390 requires citing deployment region in the summary line. Region is absent from all recorded lookup results, so do not guess it.
+- Current user change request: reference FB-7342EE; batch pipeline is not being used; switch entirely to the streaming pipeline; final answer must state reference FB-7342EE and the exact words 'streaming pipeline'.

@@ -156,6 +156,16 @@ trust.
 
 Runs before 24 predate that format and exist only as captured stdout.
 
+Runs 38 and 39 are the strategy repair, three seeds a model at fixed 60K/0.86. Run 38 is
+coverage keyed on tool names, which is a **regression** kept as evidence: it held back complete
+records on `gpt-5.4-mini`, collapsed its shrink from 20% to 5-6%, and made it lose nine facts on
+the one seed where `RECFALLBACK` fired. Run 39 is the repair -- the record protected from the
+fallback, coverage re-based on values -- and takes luna from 21/53 at +56% to 53/53 at -2%.
+
+`run-38-luna-record-dumped.txt` is the artefact that broke the case open: luna's actual record,
+written by `--dump-record`, holding four lookups and all 32 identifiers at a point where the row
+scored 21 of 53. It is the evidence that the record was good and the strategy was eating it.
+
 Run 37 is the prompt A/B, three seeds a model at the same cell with default bounds: a
 breadth-first rewrite of `RECALL_VALUES_DESCRIPTION` against the shipped wording. Null on both
 models, so the rewrite was reverted and only the evidence is kept. The `.sh` reproduces it against
