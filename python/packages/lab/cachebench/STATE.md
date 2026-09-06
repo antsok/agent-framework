@@ -752,3 +752,29 @@ supported by this;** off is the safer default and the knob wants documenting aga
 
 Neither sub-zero figure is resolvable (NOT SUPPORTED at 35% and 46% spreads).
 
+## 3l. Run 41: the clean baseline
+
+First measurement on repaired code (coverage by values, record protected, one record per trigger,
+repeats off, reservation fixed). 60K/0.86, 5 seeds, 5 arms, 4 rows per invocation. 100 records,
+no throttling or errors. **Not comparable with runs 26-40** -- the reservation fix moved every
+threshold.
+
+`vs none$`: luna -1% (fixed), -3% (share 0.80), +7% (share 0.80 with repeats); mini +25% (fixed),
++10% (share 0.80). Two arms name the record, both NOT SUPPORTED (1% gap on a 36% spread, 3% on
+19%); three name `none`.
+
+**The record holds 53/53 in all 25 rows.** `anchored` 35-53, `truncation` 21-45. Reliable
+retention is the property nothing else has.
+
+**Repeats: 63-66% shrink, 10% dearer** than repeats-off on the same workload. Confirms the default
+should stay off, and confirms that `snap%` does not predict cost -- I misread it twice during the
+run.
+
+**Open: the coverage cliff.** `unc` and shrink move one-for-one and flip within an arm (mini share
+0.80: unc 4,3,0,4,3 -> shrink -2%,9%,41%,-1%,8%). Clears in 4/5 fixed rows, 2/6 share rows.
+`--coverage-share` is the next sweep and is now reportable.
+
+**Caveats:** the two share-0.80 cells differ in tool share (84% luna, 94% mini) so cross-model
+reading there is not like-for-like; `mini-fixed` +5.3% and `luna-share80-repeats` -6.5% off fill.
+Within-arm comparisons unaffected.
+
