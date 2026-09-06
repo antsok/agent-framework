@@ -32,7 +32,14 @@ from ._live import (
 )
 from ._providers import build_provider, parse_provider_selector, provider_names
 from ._recall import COMBINED_SCOPE, RecallScenario, RecallScore
-from ._records import CellParams, SeedRecord, append_seed_record, group_by_cell, read_seed_records
+from ._records import (
+    CellParams,
+    SeedRecord,
+    StrategySettings,
+    append_seed_record,
+    group_by_cell,
+    read_seed_records,
+)
 from ._strategies import (
     STRATEGIES_NEEDING_SUMMARIZER,
     StrategyOptions,
@@ -588,12 +595,17 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--from-jsonl",
+        nargs="+",
+        metavar="PATH",
         default=None,
         help=(
-            "Render the table and verdict from a --results-jsonl file instead of running "
+            "Render the table and verdict from --results-jsonl files instead of running "
             "anything. Handles a file whose cells are incomplete, and states which strategies "
             "and how many seeds each cell holds, so a partial result cannot be read as a "
-            "finished one."
+            "finished one. Several paths, or a directory of them, are read as one body of "
+            "records: they group into cells by what they measured rather than by which file "
+            "they came from, and a body holding more than one cell is followed by the "
+            "cross-cell comparison."
         ),
     )
     parser.add_argument(
@@ -2047,6 +2059,60 @@ def _strategy_options(args: argparse.Namespace, tokenizer: Any, summarizer: Any 
     )
 
 
+def _strategy_settings(
+    args: argparse.Namespace, options: StrategyOptions, *, summarizer: str | None
+) -> StrategySettings:
+    """Return the settings block the cell records, read off what the run will actually build.
+
+    Taken from the built :class:`StrategyOptions` rather than from ``args``, for the reason
+    :func:`_strategy_options` exists at all: the flag and the value disagree wherever the CLI
+    resolves one into the other, and a block copied from the flags would describe a
+    configuration next to a table produced by another. ``--keep-tokens 0`` is the plain case --
+    zero is the absence of a fixed retention, and reading the flag would record a cell as
+    keeping no tokens when it derived its retention from the band.
+
+    The four record settings have no home on ``StrategyOptions``: they are handed to
+    :func:`run_live` rather than to a strategy constructor. They are resolved here, once, and
+    the seed loop passes *these* values on -- so the run cannot be configured with one number
+    and record another.
+
+    Args:
+        args: Parsed command line arguments.
+        options: The options every strategy of this run is built from.
+
+    Keyword Args:
+        summarizer: ``provider:model`` of the summarizer client, resolved, or None when the run
+            built none.
+
+    Returns:
+        The settings.
+    """
+    return StrategySettings(
+        keep_last_groups=options.keep_last_groups,
+        keep_last_tool_call_groups=options.keep_last_tool_call_groups,
+        keep_head_groups=options.keep_head_groups,
+        keep_tail_groups=options.keep_tail_groups,
+        keep_tokens=options.keep_tokens,
+        band_share=options.band_share,
+        min_gain_fraction=options.min_gain_fraction,
+        trigger_fraction=options.trigger_fraction,
+        fallback_fraction=options.fallback_fraction,
+        coverage_share=options.coverage_share,
+        token_budget_fraction=options.token_budget_fraction,
+        max_output_tokens=options.max_output_tokens,
+        answer_max_tokens=args.answer_max_tokens,
+        tokenizer=args.tokenizer,
+        summarizer=summarizer,
+        # 0 is the absence of a bound on all three, the convention --fill and --keep-tokens
+        # share. Resolved here so that the value recorded and the value passed to run_live are
+        # one expression rather than two that have to agree.
+        record_max_tokens=args.record_max_tokens or None,
+        record_target_tokens=args.record_target_tokens or None,
+        max_groups_before_record=args.max_groups_before_record or None,
+        repeat_records=not args.no_record_repeats,
+    )
+
+
 def _build_or_exit(strategies: Sequence[str], options: StrategyOptions) -> None:
     """Build every selected strategy once, before the run spends anything.
 
@@ -2205,8 +2271,461 @@ def _cells_from_records(records: Sequence[SeedRecord]) -> list[CellStats]:
     return [_aggregate(strategy, seeds) for strategy, seeds in by_strategy.items()]
 
 
+def _setting_text(value: Any) -> str:
+    """Return one setting's value as the comparison column shows it.
+
+    Args:
+        value: The recorded value.
+
+    Returns:
+        The rendered value. Booleans read as on/off, because ``repeat_records=False`` beside
+        ``repeat_records=True`` is two words a reader has to diff character by character.
+        ``None`` reads as ``none``, which is what every field allowing it means by it: no
+        bound, no fixed retention, no client of its own.
+    """
+    if isinstance(value, bool):
+        return "on" if value else "off"
+    if value is None:
+        return "none"
+    if isinstance(value, float):
+        return f"{value:g}"
+    if isinstance(value, int):
+        return f"{value:,}"
+    return str(value)
+
+
+def _differing_settings(cells: Sequence[CellParams]) -> tuple[str, ...]:
+    """Return the settings that are not the same across every cell that recorded any.
+
+    The comparison column shows these and nothing else. Twenty identical fields beside two that
+    differ is a column nobody reads, and the one question it exists to answer -- what is
+    different between these rows -- is the one the identical fields bury.
+
+    Cells with no settings at all take no part in deciding this. They cannot agree or disagree
+    with anything, so folding them in would mark every field as differing and print the whole
+    block against rows that are not comparable on it anyway; they are labelled unrecorded
+    instead.
+
+    Args:
+        cells: The cells being compared.
+
+    Returns:
+        The field names, in the order the settings block declares them.
+    """
+    recorded = [cell.settings.to_dict() for cell in cells if cell.settings is not None]
+    if len(recorded) < 2:
+        return ()
+    return tuple(name for name, value in recorded[0].items() if any(other[name] != value for other in recorded[1:]))
+
+
+def _settings_label(cell: CellParams, names: Sequence[str], *, mixed: bool) -> str:
+    """Return how one cell's settings read in a comparison against others.
+
+    Args:
+        cell: The cell.
+        names: The settings that differ across the comparison, from :func:`_differing_settings`.
+
+    Keyword Args:
+        mixed: Whether any cell in the comparison recorded no settings at all. It changes what
+            silence means for the cells that did: among recorded cells alone, nothing differing
+            means they agree, and beside an unrecorded one it means only that this cell said
+            what it ran.
+
+    Returns:
+        The differing settings and their values; ``not recorded`` for a cell written before the
+        settings reached the file, which is a statement about the record rather than about the
+        run; and ``same settings`` when every cell recorded them and none differs.
+    """
+    if cell.settings is None:
+        return "not recorded"
+    if names:
+        values = cell.settings.to_dict()
+        return " ".join(f"{name}={_setting_text(values[name])}" for name in names)
+    return "recorded" if mixed else "same settings"
+
+
+@dataclass(frozen=True, slots=True)
+class _Combination:
+    """One ``(strategy, settings)`` pair, as one cell measured it.
+
+    The unit the cross-cell section ranks. A strategy name is not enough on its own: the point
+    of the section is that one name measured under two configurations is two findings, and the
+    per-cell tables cannot show that, because those two rows are now in different tables.
+    """
+
+    cell: CellParams
+    stats: CellStats
+    bar: float
+    """The accuracy threshold this row's own cell was read under, applied to this row."""
+    relative: float
+    """This row's ``acc1`` as a share of its own cell's control."""
+
+    @property
+    def cost(self) -> float:
+        """Return the workload cost this row is ranked on: ``seed$``, never the invoice."""
+        return self.stats.seeding_cost if self.stats.seeding_cost is not None else 0.0
+
+    @property
+    def spread(self) -> float:
+        """Return the gap between this row's cheapest and dearest seed, on the ranked cost."""
+        return self.stats.seeding_cost_spread or 0.0
+
+    @property
+    def eligible(self) -> bool:
+        """Return whether this row cleared the same accuracy bar its own cell's verdict used."""
+        return self.relative >= self.bar
+
+
+def _combinations(
+    cells: Sequence[CellStats], params: CellParams, excluded: set[str], bar: float
+) -> tuple[list[_Combination], list[str]]:
+    """Reduce one cell's rows to the combinations the cross-cell section can rank.
+
+    Args:
+        cells: The cell's rows.
+        params: The cell's parameters.
+        excluded: Rows this cell already dropped from its own verdict.
+        bar: The accuracy threshold this cell was read under.
+
+    Returns:
+        The rankable combinations, and one line per row set aside saying why it was. Set aside
+        rather than ranked with a caveat: a row excluded from its own cell's verdict is
+        excluded from this one on the same grounds, and a row that cannot say what its probing
+        cost would otherwise be ranked on its invoice against rows ranked on their workload.
+    """
+    split = _split_measured(cells)
+    control = next((cell for cell in cells if cell.strategy == "none"), None)
+    base = None if control is None else _to_joint(control, split=split)
+    combinations: list[_Combination] = []
+    aside: list[str] = []
+    for stats in cells:
+        if stats.strategy in excluded:
+            aside.append(f"{stats.strategy} was already out of its own cell's verdict")
+        elif stats.seeding_cost is None:
+            aside.append(f"{stats.strategy} never counted its probing apart, so it has no seed$ to be ranked on")
+        elif base is None:
+            aside.append(f"{stats.strategy} sits in a cell holding no control, so nothing judges its accuracy")
+        else:
+            combinations.append(
+                _Combination(
+                    cell=params,
+                    stats=stats,
+                    bar=bar,
+                    relative=relative_correctness(_to_joint(stats, split=split), base),
+                )
+            )
+    return combinations, aside
+
+
+def _combination_row(combination: _Combination, names: Sequence[str], *, mixed: bool) -> str:
+    """Render one combination's line of the cross-cell table.
+
+    Args:
+        combination: The row.
+        names: The settings that differ across the comparison.
+
+    Keyword Args:
+        mixed: Whether any cell in the comparison recorded no settings.
+
+    Returns:
+        One line.
+    """
+    stats = combination.stats
+    control = "*" if stats.strategy == "none" else " "
+    return (
+        f"    {stats.strategy:<28}{_money(stats.seeding_cost):>9}{combination.spread:>8.0%} "
+        f"{stats.correctness:>6.0%}{control}{combination.relative:>8.0%}{len(stats.records):>7}  "
+        f"{_settings_label(combination.cell, names, mixed=mixed)}"
+    )
+
+
+def _workload_finding(eligible: Sequence[_Combination]) -> list[str]:
+    """Return what may be said about the cheapest combination, or why nothing may be.
+
+    The spread guard is :func:`_stability_note`'s, applied to the two cheapest rows rather than
+    to a recommendation and its control. A ranking is worth reporting only when the gap between
+    the options is wider than the gap between repeats of one option, and these gaps are
+    routinely narrower than that: run 40's two record arms differ by 7% on ``seed$`` while the
+    seeds inside one of them differ by 35%.
+
+    Args:
+        eligible: The rows that cleared their own cells' bars, cheapest first.
+
+    Returns:
+        The lines.
+    """
+    if not eligible:
+        return ["", "    Nothing here cleared the accuracy bar its own cell applied, so nothing is ranked."]
+    best = eligible[0]
+    if len(eligible) < 2:
+        return [
+            "",
+            f"    Only {best.stats.strategy} cleared the bar, so there is nothing to rank it against.",
+        ]
+    second = eligible[1]
+    if min(len(best.stats.records), len(second.stats.records)) < 2:
+        return [
+            "",
+            "    NOT SUPPORTED: one of the two cheapest rows rests on a single seed and measures no",
+            "    spread at all, so the gap between them cannot be told from noise. Nothing is named best.",
+        ]
+    margin = 0.0 if second.cost <= 0 else (second.cost - best.cost) / second.cost
+    worst = max(best.spread, second.spread)
+    if margin <= 0:
+        return [
+            "",
+            "    NOT SUPPORTED: the two cheapest rows that clear the bar cost the same, so the order",
+            "    between them is the tie-break and not a finding. Nothing is named best.",
+        ]
+    if worst > margin:
+        return [
+            "",
+            f"    NOT SUPPORTED: seeds of one of these varied by {worst:.0%}, wider than the {margin:.0%} gap",
+            "    between the two cheapest rows that clear the bar. Nothing is named best.",
+        ]
+    names = _differing_settings([best.cell, second.cell])
+    mixed = best.cell.settings is None or second.cell.settings is None
+    # Named only when they differ. Two rows of one configuration are separated by the strategy
+    # and nothing else, and printing "at same settings" twice would suggest otherwise.
+    best_at = f" at {_settings_label(best.cell, names, mixed=mixed)}" if names else ""
+    second_at = f" at {_settings_label(second.cell, names, mixed=mixed)}" if names else ""
+    lines = [
+        "",
+        f"    BEST: {best.stats.strategy}{best_at}, {margin:.0%} cheaper on seed$ than",
+        f"    {second.stats.strategy}{second_at}, and wider than the {worst:.0%} either varied by.",
+    ]
+    if mixed:
+        lines.append(
+            "    One of the two did not record its settings, so this is a gap between two rows and "
+            "not between two configurations."
+        )
+    return lines
+
+
+def _setting_effects(combinations: Sequence[_Combination]) -> list[str]:
+    """Return what each strategy's own settings did to it, or why that cannot be said.
+
+    The ranking above answers which row is cheapest; this answers the question the settings
+    were varied to ask. They are not the same question, and the ranking alone reads badly when
+    a setting no strategy in the cell consults has split its rows anyway -- two ``none`` rows
+    ten percent apart under ``repeat_records`` are the noise floor, not an effect, and the only
+    thing that says so is the guard applied to that pair.
+
+    So the guard is applied per strategy as well as to the two cheapest overall: same rule,
+    same numbers, asked of one strategy's arms. Only arms that cleared their own cell's bar are
+    compared, because a cheaper arm that stopped answering is not a cheaper arm.
+
+    Args:
+        combinations: Every rankable row of one model at one workload.
+
+    Returns:
+        The lines, or none at all when no strategy here was measured under two settings.
+    """
+    arms: dict[str, list[_Combination]] = {}
+    for combination in combinations:
+        if combination.eligible:
+            arms.setdefault(combination.stats.strategy, []).append(combination)
+    compared = {name: sorted(rows, key=lambda row: row.cost) for name, rows in arms.items() if len(rows) > 1}
+    if not compared:
+        return []
+    lines = ["", "    Per strategy, what its own settings did, under the same guard:"]
+    for name, rows in sorted(compared.items()):
+        best, second = rows[0], rows[1]
+        names = _differing_settings([best.cell, second.cell])
+        mixed = best.cell.settings is None or second.cell.settings is None
+        cheaper = _settings_label(best.cell, names, mixed=mixed)
+        dearer = _settings_label(second.cell, names, mixed=mixed)
+        margin = 0.0 if second.cost <= 0 else (second.cost - best.cost) / second.cost
+        worst = max(best.spread, second.spread)
+        verdict = "resolved" if margin > 0 and worst <= margin else "NOT RESOLVED"
+        lines.append(
+            f"      {name:<28}[{cheaper}] {margin:.0%} cheaper than [{dearer}], seeds varied by {worst:.0%}: {verdict}"
+        )
+    return lines
+
+
+def _workload_ranking(combinations: Sequence[_Combination]) -> list[str]:
+    """Return the ranked table and the finding for one model at one workload.
+
+    Ranked on ``seed$`` behind each row's own accuracy bar, which is the per-cell verdict's own
+    rule applied across cells rather than a second one: a row its own table put below the line
+    is below the line here too, so the two cannot disagree about which rows are usable.
+
+    Args:
+        combinations: Every rankable row of one model at one workload.
+
+    Returns:
+        The lines.
+    """
+    cells = [combination.cell for combination in combinations]
+    names = _differing_settings(cells)
+    mixed = any(cell.settings is None for cell in cells)
+    ordered = sorted(combinations, key=lambda combination: (not combination.eligible, combination.cost))
+    eligible = [combination for combination in ordered if combination.eligible]
+    header = f"    {'strategy':<28}{'seed$':>9}{'seed$+-':>9}{'acc1':>7}{'vs none':>9}{'seeds':>7}  settings"
+    lines = [header, "    " + "-" * (len(header) - 4)]
+    for index, combination in enumerate(ordered):
+        if index == len(eligible):
+            lines.append("    " + " below the bar their own cells applied ".center(len(header) - 4, "-"))
+        lines.append(_combination_row(combination, names, mixed=mixed))
+    unrecorded = sum(1 for combination in combinations if combination.cell.settings is None)
+    if unrecorded:
+        lines += [
+            "",
+            f"    {unrecorded} of these rows come from cells written before the settings reached the file.",
+            "    What those runs were configured with is unknown, so their costs are comparable and no",
+            "    difference between them and any other row here can be attributed to a setting.",
+        ]
+    return lines + _setting_effects(combinations) + _workload_finding(eligible)
+
+
+#: What the cross-cell section is and, more to the point, what it refuses to be.
+_ACROSS_PREAMBLE: Final[tuple[str, ...]] = (
+    "Across cells: the cheapest combination that still answers, per model and per workload.",
+    "",
+    "A combination is a strategy and the settings it ran under, which is what the per-cell",
+    "tables above cannot show: two settings are two cells and so two tables, leaving the reader",
+    "to diff them by eye. Ranked on seed$ behind the same accuracy bar each cell's own verdict",
+    "applied, and refused whenever the gap between the two cheapest is inside the spread of the",
+    "seeds it rests on.",
+    "",
+    "Never ranked across workloads. A different window, fill, payload or narration is a",
+    "different conversation, so a smaller number under one of them is a smaller job rather than",
+    "a better strategy -- this project has already read one such comparison the wrong way.",
+    "Models are kept apart for that reason and one more: they are priced differently, and every",
+    "ranking here is on money.",
+)
+
+#: One cell as the cross-cell section receives it: parameters, rows, what its own verdict
+#: excluded, and the bar it was read under. A tuple rather than a fourth dataclass because
+#: :func:`_render_from_records` already holds all four and this is the handoff, not a new fact.
+_CellGroup = tuple[CellParams, Sequence[CellStats], set[str], float]
+
+
+def _across_cells(groups: Sequence[_CellGroup]) -> str:
+    """Return the comparison that answers what is best for a model, over the cells in hand.
+
+    Args:
+        groups: One entry per cell.
+
+    Returns:
+        The rendered section.
+    """
+    lines = ["", "=" * 100, *_ACROSS_PREAMBLE]
+    by_model: dict[tuple[Any, ...], list[_CellGroup]] = {}
+    for group in groups:
+        by_model.setdefault(group[0].model_key, []).append(group)
+    for model_groups in by_model.values():
+        first = model_groups[0][0]
+        pricing = first.pricing
+        lines += [
+            "",
+            (
+                f"Model: {first.provider}:{first.model}  agent {first.agent_kind}  at "
+                f"${pricing.input_per_million:.2f}/M in, ${pricing.cached_read_per_million:.3f}/M cached, "
+                f"${pricing.output_per_million:.2f}/M out"
+            ),
+        ]
+        by_workload: dict[tuple[Any, ...], list[_CellGroup]] = {}
+        for group in model_groups:
+            by_workload.setdefault(group[0].workload_key, []).append(group)
+        if len(by_workload) > 1:
+            lines.append(
+                f"  {len(by_workload)} workloads below, each ranked on its own. They are different "
+                "conversations and are never ranked against each other."
+            )
+        for workload_groups in by_workload.values():
+            lines += _workload_section(workload_groups)
+    return "\n".join(lines)
+
+
+def _workload_section(groups: Sequence[_CellGroup]) -> list[str]:
+    """Return one model's one workload: its heading, what was set aside, and its ranking.
+
+    Args:
+        groups: The cells of one model at one workload.
+
+    Returns:
+        The lines.
+    """
+    combinations: list[_Combination] = []
+    aside: list[str] = []
+    bars: set[float] = set()
+    for params, cells, excluded, bar in groups:
+        found, skipped = _combinations(cells, params, excluded, bar)
+        combinations += found
+        aside += skipped
+        bars.add(bar)
+    bar_text = f"{min(bars):.0%}" if len(bars) == 1 else ", ".join(f"{bar:.0%}" for bar in sorted(bars))
+    lines = [
+        "",
+        f"  Workload: {groups[0][0].workload_label}",
+        f"  {len(groups)} cell(s), {len(combinations)} rankable row(s), acc1 bar {bar_text} of each cell's control",
+    ]
+    lines += [f"    set aside: {reason}" for reason in aside]
+    return lines + (_workload_ranking(combinations) if combinations else [])
+
+
+def _results_paths(entries: Sequence[str]) -> tuple[Path, ...]:
+    """Return the results files named by ``--from-jsonl``, expanding any directory among them.
+
+    A sweep writes one file per cell, so the material for a comparison is routinely a directory
+    or a shell glob rather than a single path. Concatenating them by hand works and is what was
+    done -- and it is also how two arms of one experiment came to be merged into one table, so
+    reading them here is the safer half of the same convenience: records group into cells by
+    what they measured, and the file they arrived in decides nothing.
+
+    Sorted within a directory, so a rebuild is reproducible; left in the order given otherwise,
+    since the order named is the order meant.
+
+    Args:
+        entries: The paths as given.
+
+    Returns:
+        The files to read, in order and without repeats.
+
+    Raises:
+        SystemExit: If a path is neither a file nor a directory, or a directory holds no
+            ``.jsonl`` files at all -- an empty comparison is a mistyped path far more often
+            than it is a finding.
+    """
+    paths: list[Path] = []
+    for entry in entries:
+        path = Path(entry)
+        if path.is_dir():
+            found = sorted(path.glob("*.jsonl"))
+            if not found:
+                raise SystemExit(f"No .jsonl files in {path}.")
+            paths += found
+        elif path.is_file():
+            paths.append(path)
+        else:
+            raise SystemExit(f"No results file at {path}.")
+    return tuple(dict.fromkeys(paths))
+
+
+def _sources(paths: Sequence[Path]) -> str:
+    """Return how the header names where the records came from.
+
+    One path reads as itself, which is what it did before several were allowed and is what the
+    only line printed above a single cell's table should say.
+
+    Args:
+        paths: The files read.
+
+    Returns:
+        The description.
+    """
+    return str(paths[0]) if len(paths) == 1 else f"{len(paths)} files"
+
+
 def _render_from_records(args: argparse.Namespace) -> int:
-    """Rebuild the table from a results file, running nothing.
+    """Rebuild the tables from results files, running nothing.
+
+    One cell renders exactly as it did when there was only ever one file: the header names the
+    path, the table is the table, and nothing about settings is printed, because a single cell
+    is not a comparison and has nothing to be comparable with. More than one cell adds the
+    cross-cell section, which is where a settings comparison is either made or refused.
 
     Args:
         args: Parsed command line arguments.
@@ -2215,20 +2734,21 @@ def _render_from_records(args: argparse.Namespace) -> int:
         A process exit code.
 
     Raises:
-        SystemExit: If the file cannot be read or holds no records.
+        SystemExit: If the files cannot be read or hold no records.
     """
-    path = Path(args.from_jsonl)
-    if not path.is_file():
-        raise SystemExit(f"No results file at {path}.")
-    try:
-        records = read_seed_records(path)
-    except (OSError, ValueError) as error:
-        raise SystemExit(str(error)) from error
+    paths = _results_paths(args.from_jsonl)
+    records: list[SeedRecord] = []
+    for path in paths:
+        try:
+            records += read_seed_records(path)
+        except (OSError, ValueError) as error:
+            raise SystemExit(str(error)) from error
     if not records:
-        raise SystemExit(f"{path} holds no records.")
+        raise SystemExit(f"{_sources(paths)} holds no records.")
 
     groups = group_by_cell(records)
-    print(f"{len(records)} seed records from {path}, in {len(groups)} cell(s).")
+    print(f"{len(records)} seed records from {_sources(paths)}, in {len(groups)} cell(s).")
+    rendered: list[_CellGroup] = []
     for cell_params, cell_records in groups:
         cells = _cells_from_records(cell_records)
         incomplete, oversized, diverged = _excluded_cells(cells)
@@ -2250,6 +2770,9 @@ def _render_from_records(args: argparse.Namespace) -> int:
             except ValueError as error:
                 print(f"Cannot summarize: {error}")
         print(_render(verdict, cells, excluded, show_answers=args.show_answers, min_correctness=bar))
+        rendered.append((cell_params, cells, excluded, bar))
+    if len(rendered) > 1:
+        print(_across_cells(rendered))
     return 0
 
 
@@ -2417,11 +2940,21 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
             flush=True,
         )
     summarizer_client: Any = None
+    summarizer_selector: str | None = None
     if args.summarizer_provider is not None:
         sum_provider, sum_model = parse_provider_selector(args.summarizer_provider)
-        summarizer_client = build_provider(
-            sum_provider, temperature=0.0, response_max_tokens=1_024, model=sum_model
-        ).client
+        summarizer_runtime = build_provider(sum_provider, temperature=0.0, response_max_tokens=1_024, model=sum_model)
+        summarizer_client = summarizer_runtime.client
+        # The model the provider settled on, not the selector that was typed. A run naming only
+        # a provider records which model summarized for it, which is the difference between two
+        # cells whose summarizing rows disagree.
+        summarizer_selector = f"{sum_provider}:{summarizer_runtime.model}"
+
+    # Built once, above the seed loop, and both recorded and passed on from here. The loop
+    # rebuilds StrategyOptions per seed only to hand it a fresh metered summarizer; every
+    # number in it is fixed by the command line, so reading them here cannot describe a
+    # different configuration from the one each seed runs under.
+    settings = _strategy_settings(args, _strategy_options(args, tokenizer), summarizer=summarizer_selector)
 
     cell_params = CellParams(
         provider=provider,
@@ -2447,6 +2980,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
         price_output=pricing.output_per_million,
         min_correctness=min_correctness,
         plan=plan,
+        settings=settings,
     )
     results_path = Path(args.results_jsonl) if args.results_jsonl is not None else None
     # None unless asked for, and read once here so the seed loop below has nothing to decide.
@@ -2495,15 +3029,14 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
                 fact_placement=args.fact_placement,
                 probe_repeats=args.probe_repeats,
                 combined_repeats=args.combined_repeats,
-                # 0 means "no bound of my own", for both: the cap falls back to the run's
-                # --answer-max-tokens and the description states no target. Same convention as
-                # --fill 0, which hands sizing back to the manual flags.
-                record_max_tokens=args.record_max_tokens or None,
-                record_target_tokens=args.record_target_tokens or None,
-                # Same convention again: 0 switches the group bound off and leaves the size
-                # trigger as the only thing that asks.
-                max_groups_before_record=args.max_groups_before_record or None,
-                repeat_records=not args.no_record_repeats,
+                # Off the recorded settings rather than off the flags, so what the record says
+                # this cell was configured with and what the seed was configured with are one
+                # expression. Resolving "0 means no bound of my own" twice is how a cell comes
+                # to be labelled with a configuration it did not run.
+                record_max_tokens=settings.record_max_tokens,
+                record_target_tokens=settings.record_target_tokens,
+                max_groups_before_record=settings.max_groups_before_record,
+                repeat_records=settings.repeat_records,
             )
             # Scored, written and reported here rather than when the cell ends. A seed that
             # has been paid for is durable the moment it exists, and the line that follows is
