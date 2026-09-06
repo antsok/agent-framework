@@ -320,28 +320,75 @@ after #7912", not as an isolated bisect of that PR.
 so the framework would change under processes that have already started. This is why runs 28
 and 29 were taken after the rebase completed rather than around it.
 
-## 3d. Known bug: the output reservation is not the output cap
+## 3d. FIXED 2026-09-06: the output reservation is now the output cap — RE-BASELINE
 
-**Fix this after the `gpt-5.4-mini` series is finished and before any other model is run.**
-Agreed 2026-08-31. Fixing it mid-series would move every strategy's trigger threshold and make
-the cells already measured incomparable with the ones after; leaving it past the series would
-put the same flaw into a second model's baseline.
+**Runs 26 to 40 sit on the old arithmetic and are not comparable with anything measured after
+this.** Every strategy triggers on a fraction of the input budget, and the input budget has
+moved, so a cell taken before this and a cell taken after it are two different instruments.
+Do not put them in one table, and do not read a difference between them as an effect.
 
-**What is wrong.** Strategies size their input budget as `--context-window` minus
+**What was wrong.** Strategies size their input budget as `--context-window` minus
 `--max-output-tokens`, which the runs set to 2,048. But the value actually sent on the request
-is `--answer-max-tokens`, which the runs set to **12,000** (`_providers.py` builds
-`{"max_tokens": response_max_tokens}` from it). So at a 60,000 window the strategies believe
-57,952 tokens of input are available when a reply may consume 12,000, leaving 48,000. The
-budget every threshold is a fraction of is overstated by about 10,000 tokens.
+was `--answer-max-tokens`, which the runs set to **12,000** (`_providers.py` builds
+`{"max_tokens": response_max_tokens}` from it). So at a 60,000 window the strategies believed
+57,952 tokens of input were available when a reply could consume 12,000, leaving 48,000. The
+budget every threshold was a fraction of was overstated by about 10,000 tokens.
 
-**Why it does not bite yet.** `gpt-5.4-mini` has independent ceilings -- 272,000 input and
-128,000 output -- so a long reply cannot push a legal prompt over the limit, and
+**Why it never bit.** `gpt-5.4-mini` has independent ceilings -- 272,000 input and 128,000
+output -- so a long reply could not push a legal prompt over the limit, and
 `LiveOutcome.disqualified` checks the prompt alone. On a model whose window is shared between
-input and output the instrument would report an overflowing run as clean.
+input and output the instrument would have reported an overflowing run as clean.
 
-**The fix** is to make the number used for the arithmetic the number actually sent, rather than
-having two. Whichever way round, it needs a clean re-baseline of every cell, which is why it
-waits for a model boundary.
+**Which fix was taken: send what is reserved, option (b).** Ordinary calls now carry
+`--max-output-tokens` as `max_tokens`; `--answer-max-tokens` is sent on the closing questions
+and on nothing else. The alternative was to reserve what is sent -- budget becomes
+`window - answer_max_tokens` -- and it was rejected on three grounds:
+
+- It reserves 12,000 tokens on every seeding call for replies that measure ~150 tokens on
+  `gpt-5.4-mini` and ~602 on `gpt-5.6-luna`. That is a 20% haircut on a 60,000 window paid on
+  every turn to insure against a reply no model here writes.
+- It makes `--max-output-tokens` vestigial in the live runner. Two flags would name one
+  quantity, which is the shape of the defect rather than a fix for it.
+- The distinction the two flags draw is real and is the one this makes honest. A seeding reply
+  is appended to the history and re-sent on every turn after it, so the budget the thresholds
+  are fractions of must hold room for one. Nothing follows a closing answer -- the snapshot is
+  restored before the next probe -- so its length is never re-sent, while the answer itself has
+  to enumerate everything planted or be scored as lost facts.
+
+**One number per call path, reserved and sent.**
+
+| call path | number | reserved by | sent by |
+| --- | --- | --- | --- |
+| seeding turns | `--max-output-tokens` | `StrategyOptions.input_budget_tokens` = window − it | `runtime.options["max_tokens"]` |
+| closing questions | `--answer-max-tokens` | window − it, checked before the run spends | `run_live(answer_max_tokens=...)`, per call |
+| forced recall record | `--record-max-tokens` | the seeding reservation, checked before the run spends | the recall middleware, per call |
+| summarizer | 1,024, fixed | not against this window — its own client, its own bill | its own `build_provider` |
+
+**A third path had the same defect, found while fixing this.** A recall record is a tool call
+the model writes *into* the conversation, and every record is preserved there for the rest of
+the run, so that reply is re-sent on every later turn exactly as a seeding reply is. Its
+reservation is therefore `--max-output-tokens` too, which makes `--record-max-tokens` a
+tightening of the run's cap for one call rather than a cap of its own — and the shipped
+defaults have it the other way round, 4,000 against a 2,048 reservation. Not clamped, because a
+configuration silently narrowed is a configuration nobody ran; the run warns instead, and only
+when `tool_summary_anchored` is selected, since no other row forces the call. Runs 26 to 40 are
+on the loose side of this as well.
+
+The closing reservation is checked rather than compacted to. Compacting the snapshot on the way
+into a probe would move the material the answers are scored against, which the drift counter
+exists to catch rather than to cause. So the run warns, before it spends anything and under
+`--dry-run` too, when the fill target does not leave `--answer-max-tokens` of headroom. It is a
+warning and not a refusal because every archived cell fails it: at 60,000 and 0.86 fill the
+seeded prompt aims at 51,600 tokens and a 12,000-token answer does not fit beside it. That is
+worth knowing before the next model is chosen -- on a shared-window model those cells are not
+runnable as written.
+
+**What to do with the archive.** Runs 26 to 40 stay as they are and stay quotable for what they
+measured; `RESULTS.md` and `REPORT-GPT-5-4-MINI.md` are readings of that instrument. The next
+run is the first point of the new baseline, and any cell to be compared against an archived one
+has to be re-taken. The schema does not separate them -- `max_output_tokens` and
+`answer_max_tokens` are both on the settings block and neither changed value, only what the run
+did with them -- so this section is the record of where the line falls.
 
 ## 3e. Everything before run 32 is withdrawn on cost — read this first
 
@@ -701,7 +748,7 @@ Repeats: better on luna on every axis (40-42% shrink, recfb=0, the only sub-zero
 mini on every axis (negative shrink on all three seeds). Conditional on whether one record can
 cover everything, which the framework cannot know. **`repeat_records=True` as the default is not
 supported by this;** off is the safer default and the knob wants documenting against `UNCOVERED`.
-Not yet changed.
+**Changed: the default is now off, and `--record-repeats` turns it on.**
 
 Neither sub-zero figure is resolvable (NOT SUPPORTED at 35% and 46% spreads).
 

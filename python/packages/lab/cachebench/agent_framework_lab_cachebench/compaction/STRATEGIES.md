@@ -204,7 +204,8 @@ at all, and it is the regression to watch for. What re-arms it is new material: 
 non-recall tool-call group after the newest record. `_record_due` is the one place that rule is
 written down.
 
-Repeats are needed because a record covers what existed when it was written and nothing after it.
+Repeats are **off by default**. They are needed because a record covers what existed when it was
+written and nothing after it.
 Without them, every group gathered later is uncoverable for the rest of the run, so it sits in the
 prompt to the end and the row reports `UNCOVERED` for work no record was ever asked to account
 for. The price is accumulation: every record is preserved — unshrinkable, undroppable, counted
@@ -212,9 +213,16 @@ against the ceiling in full — and nothing merges them, because an older record
 of the groups behind *it* and a merge rewrites the evidence rather than the bulk. So each record
 raises a floor under the prompt that no later pass can lower, and `records_in_conversation` is what
 says so. It is a different question from `records_found`, which saturates at 1 and answers only
-whether the model ever complied. `repeat_records=False` restores the single-record behaviour every
-run up to and including 39 had; it governs the size trigger alone, since setting
-`max_groups_before_record` is asking for repeats outright.
+whether the model ever complied. `repeat_records=True` turns repeats on; the default is the
+single-record behaviour every run up to and including 39 had, and it governs the size trigger
+alone, since setting `max_groups_before_record` is asking for repeats outright.
+
+Off is the default because on is conditional and the condition is not knowable from inside the
+strategy. `groups_kept_uncovered` — the `UNCOVERED:<n>` flag — is the signal: non-zero means one
+record is not covering everything, which is when repeats pay. Where a record is already complete
+they can only cost, since every record is preserved and a second one is duplication added as
+unshrinkable prompt. Measured in run 40: negative shrink on all three `gpt-5.4-mini` seeds
+(-1%, -4%, -2%), and better on every axis on `gpt-5.6-luna`, whose record named two of six groups.
 
 **Coverage is measured in values, not in tool names.** The check that went in first asked
 whether the record contained the group's function name, reading `RECALL_VALUES_DESCRIPTION`'s

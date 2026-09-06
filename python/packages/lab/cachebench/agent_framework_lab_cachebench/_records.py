@@ -35,6 +35,7 @@ __all__ = [
     "CellParams",
     "SeedRecord",
     "StrategySettings",
+    "WorkloadSettings",
     "append_seed_record",
     "group_by_cell",
     "read_seed_records",
@@ -76,9 +77,12 @@ __all__ = [
 #: version 4 one: the number is knowable and it is zero, rather than unknowable and reported
 #: as zero. The bump is there so a reader can tell which of the two zeroes a row is showing.
 #:
-#: 5 also adds ``fallbacks_after_record``, and deliberately without a further bump. There is no
-#: version 5 record for a 6 to date it against: the bump above is unreleased, and every recorded
-#: cell on disk is version 2, 3 or 4. What separates the two fields is not the version but what
+#: 5 also adds ``fallbacks_after_record``, and deliberately without a further bump. There was no
+#: version 5 record for a 6 to date it against when this was written: the bump above was
+#: unreleased, and every recorded cell on disk was version 2, 3 or 4. (Runs since have written
+#: 5 and 6, so the cells on disk are now 2 through 6; the argument is unaffected, because it is
+#: about what the two fields' absence means and not about how many files carry them.) What
+#: separates the two fields is not the version but what
 #: their absence means, and the values say that themselves -- ``groups_kept_uncovered`` reads
 #: back as 0, which is what those runs did, and ``fallbacks_after_record`` reads back as
 #: ``None``, because those runs *could* fall back behind a record and counted nothing when they
@@ -116,7 +120,27 @@ __all__ = [
 #: have run, and would key it as though it shared one with a cell written today. ``None`` keys
 #: as ``None``, which equals no other configuration, so an old cell refuses to merge with a new
 #: one rather than quietly joining it.
-SCHEMA_VERSION: Final[int] = 7
+#:
+#: 8 adds the resolved workload flags, and it is version 7 again one category along. Version 7
+#: put the strategies' configuration on the key and left five options that change the
+#: *conversation* on no key at all: whether tool calls were pinned, whether the retrieval clause
+#: was appended, whether the closing question was one sweeping ask or several scoped ones, what
+#: temperature was sent, and whether the service was left holding the history. Two runs differing
+#: in any of them ask the model a different thing, and until now they keyed as one cell and were
+#: meaned into one row -- the same defect version 7 fixed for the settings, on the half of the
+#: command line the settings block deliberately does not cover. They are not settings and are
+#: not recorded as such: a strategy setting moves what compaction does to one conversation,
+#: these move which conversation it is.
+#:
+#: Their value reads back as ``None`` rather than as today's defaults, which is the version 4
+#: argument and not version 7's. The defaults have not moved here: every one of these flags
+#: existed, with the value it has now, for every run that ever wrote a record. What has never
+#: been on the record is whether a run *set* one, and runs did -- run 21 and the unpinned void
+#: run both used ``--no-force-tool-calls``, and the reply-cap probe used ``--sweeping-question``
+#: and ``--no-retrieval-guidance``. A default here would therefore not be a stale value but a
+#: guess about a command line nobody wrote down, and it would key an archived cell as having
+#: held the same conversation as one run today. ``None`` equals only ``None``.
+SCHEMA_VERSION: Final[int] = 8
 
 #: Versions this reader accepts, which is not only the current one.
 #:
@@ -151,7 +175,12 @@ SCHEMA_VERSION: Final[int] = 7
 #: configured with, and it says that by carrying no settings at all rather than by carrying a
 #: plausible set. Refusing it would discard every cell on disk over a block none of them could
 #: have written.
-_READABLE_SCHEMAS: Final[frozenset[int]] = frozenset({2, 3, 4, 5, 6, SCHEMA_VERSION})
+#:
+#: Version 7 joins on that same argument, for the workload block instead of the settings one.
+#: Everything it measured this version still measures; what it cannot say is which of the five
+#: workload flags its run set, and it says so by carrying no workload block rather than one
+#: filled in from today's defaults.
+_READABLE_SCHEMAS: Final[frozenset[int]] = frozenset({2, 3, 4, 5, 6, 7, SCHEMA_VERSION})
 
 #: The parameters that make two records the same cell, and so aggregable into one row.
 #:
@@ -181,6 +210,14 @@ _READABLE_SCHEMAS: Final[frozenset[int]] = frozenset({2, 3, 4, 5, 6, SCHEMA_VERS
 #: strategy in the cell consults will not pool, and will be reported as two combinations whose
 #: difference the cross-cell section names. A split that is visible is undone by hand; a merge
 #: that is silent is the defect.
+#:
+#: ``workload`` is the other half of the same omission, and sits above ``settings`` rather than
+#: inside it because the two are read for different things. A setting says what compaction did
+#: to a conversation; these say which conversation it was -- pinned tool calls or the model's
+#: own, the retrieval clause or not, scoped closing questions or one sweeping ask, a temperature
+#: or none, the history on the client or on the service. Being in this tuple and outside
+#: :data:`_MODEL_KEY_FIELDS` also puts it in :attr:`CellParams.workload_key`, which is what stops
+#: two of them being ranked against each other as though one strategy had beaten another.
 _CELL_KEY_FIELDS: Final[tuple[str, ...]] = (
     "provider",
     "model",
@@ -201,6 +238,7 @@ _CELL_KEY_FIELDS: Final[tuple[str, ...]] = (
     "price_input",
     "price_cached",
     "price_output",
+    "workload",
     "settings",
 )
 
@@ -252,6 +290,99 @@ def _plan_from_dict(data: Mapping[str, Any]) -> FillPlan:
 
 
 @dataclass(frozen=True, slots=True)
+class WorkloadSettings:
+    """Which conversation was had, for the five options no other field on the cell records.
+
+    Everything else on :class:`CellParams` describes the shape of the workload -- how long it
+    was, how much of it was tool output, where the codes sat. These describe what was *asked*
+    and how it was sent: whether the harness pinned each lookup or let the model choose, whether
+    the retrieval clause was appended to the instructions, whether the conversation closed with
+    several scoped questions or one sweeping one, what temperature the request carried, and
+    whether the service was left holding the history. Each of them moves the answers, and none
+    of them was on any key, so two runs differing in one were one cell and one mean.
+
+    Not part of :class:`StrategySettings`, and the split is the point rather than tidiness. A
+    strategy setting changes what compaction does to a conversation; these change which
+    conversation it is. Filed together they would be ranked together, and the cross-cell section
+    would offer to name a "best" across two different questions -- which it must never do, and
+    which being in :attr:`CellParams.workload_key` is what prevents.
+
+    Recorded from the resolved values, on the same rule the settings block follows: the flags
+    are negative and the values are not, ``--no-temperature`` resolves to a temperature of
+    ``None`` rather than to a boolean, and the run is configured from these fields rather than
+    from a second reading of ``args``.
+
+    Every field is required, so a live run cannot omit one and inherit a plausible value. The
+    only way a record carries no workload block is by predating it, where the whole of it is
+    ``None`` -- see :data:`SCHEMA_VERSION`.
+    """
+
+    force_tool_calls: bool
+    """Whether each lookup turn pinned ``tool_choice`` to the function it wanted.
+
+    Off, the model gathers its own facts and often fewer of them: measured at 3 of 6 scopes
+    reached and a 33% input swing between identical runs on one model. A cell that let the model
+    choose is not measuring the same conversation as one that did not.
+    """
+    retrieval_guidance: bool
+    """Whether the instructions carried the clause telling the model to quote every identifier.
+
+    It is worth up to the whole accuracy column: the control scored 33% without it and 100% with
+    it at a 900-token answer cap.
+    """
+    subset_questions: bool
+    """Whether the conversation closed with several scoped questions or one sweeping ask.
+
+    Recorded as the resolved positive, which is what ``build_live_scenario`` is handed;
+    ``--sweeping-question`` is the flag that turns it off. It changes the number of closing
+    turns, the length of the answers and therefore what ``acc1`` is a mean over.
+    """
+    temperature: float | None
+    """The sampling temperature sent, or ``None`` when the request omitted the field entirely.
+
+    The value, not the flag, because ``--no-temperature`` names an omission rather than a
+    number. A provider that rejects the option mid-run is a different event and is recorded per
+    seed on ``dropped_options`` as ``NO:temp``: this says what the run asked for, that says what
+    the provider allowed.
+    """
+    server_history: bool
+    """Whether the service was allowed to keep the conversation.
+
+    On, the agent sends only the new turn, so no strategy can compact anything and every row
+    matches the control -- which measures the service rather than compaction. Recorded because
+    a cell that measured the service must never be pooled with one that measured compaction,
+    and nothing else on the record would say which it was.
+    """
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serializable mapping of these flags."""
+        return asdict(self)
+
+
+def _workload_from_dict(data: Mapping[str, Any]) -> WorkloadSettings:
+    """Rebuild the workload block from its serialized form.
+
+    Field by field rather than by splatting, for the reason :func:`_plan_from_dict` is: a file
+    carrying a key this version does not know about is refused here rather than somewhere less
+    obvious. Nothing is read leniently, because only a record carrying the whole block carries
+    any of it -- an older one has no ``workload`` object for this function to be given.
+
+    Args:
+        data: The ``workload`` object from a record's cell parameters.
+
+    Returns:
+        The flags.
+    """
+    return WorkloadSettings(
+        force_tool_calls=bool(data["force_tool_calls"]),
+        retrieval_guidance=bool(data["retrieval_guidance"]),
+        subset_questions=bool(data["subset_questions"]),
+        temperature=None if data["temperature"] is None else float(data["temperature"]),
+        server_history=bool(data["server_history"]),
+    )
+
+
+@dataclass(frozen=True, slots=True)
 class StrategySettings:
     """What the strategies of a cell were configured with, resolved rather than as typed.
 
@@ -286,15 +417,24 @@ class StrategySettings:
     max_output_tokens: int
     """The output reservation, which every anchored and composed ceiling is the window less.
 
+    Also the cap sent on every ordinary call, and the one a forced record call falls back to.
+    Reserved and sent are one number here, which they were not before schema 8: the arithmetic
+    deducted this while the request carried ``answer_max_tokens``, so a cell recorded at a
+    60,000 window and a 2,048 reservation was thresholding against 57,952 tokens of input while
+    a reply could take 12,000 of them. A record from that era is separated from one after it by
+    the schema, not by this field, since the pair of numbers is unchanged and only what was
+    done with them moved.
+
     Not implied by ``context_window`` on the cell beside it: the strategies are sized against
     the difference, so two runs at one window and two reservations compacted to two different
     ceilings while every workload column matched.
     """
     answer_max_tokens: int
-    """The cap sent on every call, and the one the forced record call falls back to.
+    """The cap sent on the closing questions, and reserved out of the window for them.
 
-    Here because ``record_max_tokens`` is allowed to be ``None``, and ``None`` means "whatever
-    this is". Without it a recorded cap of ``None`` reads as unbounded when it was bounded.
+    Its own field rather than derived, because it is the only output number a run can set that
+    no threshold is a fraction of: nothing follows a closing answer, so its length is never
+    re-sent, and the calls that do get re-sent carry ``max_output_tokens`` instead.
     """
     tokenizer: str
     """Name of the counter every threshold was measured with.
@@ -437,6 +577,14 @@ class CellParams:
     Kept whole rather than reduced to its target, so the achieved fill can be checked against
     it from the file exactly as the live run checks it.
     """
+    workload: WorkloadSettings | None = None
+    """Which conversation was had, and part of what makes two records one cell.
+
+    ``None`` on a record written before schema 8, where the five flags are unknowable rather
+    than defaulted -- see :data:`SCHEMA_VERSION`. A reader must treat that as "not comparable on
+    what was asked" and not as "the same question as everything else": ``None`` equals only
+    ``None``, so those cells group with each other and with nothing that carries a block.
+    """
     settings: StrategySettings | None = None
     """What the strategies were configured with, and part of what makes two records one cell.
 
@@ -484,6 +632,10 @@ class CellParams:
         judged on moves with these, so two cells that differ anywhere here are two jobs and not
         two answers to one question -- which is why the label names the narration, the placement
         and the filler sizing that :attr:`label` leaves to the file name.
+
+        The workload flags are named for the same reason and are not optional here: they are in
+        :attr:`workload_key`, so two cells differing in one become two sections of the cross-cell
+        report, and a heading that did not say which is which would print the two identically.
         """
         fill = f"fill {self.fill:.0%}" if self.fill > 0 else "fill manual"
         payload = f"payload {self.tool_result_tokens:,}x{self.tool_turns}"
@@ -493,15 +645,38 @@ class CellParams:
             f"window {self.context_window:,}  {fill}  {payload}  "
             f"narration {self.narration}  facts {self.fact_placement}  "
             f"filler {self.filler_turns}x{self.filler_tokens:,}  "
-            f"probes {self.probe_repeats}  combined {self.combined_repeats}"
+            f"probes {self.probe_repeats}  combined {self.combined_repeats}  "
+            f"{self.workload_flags}"
+        )
+
+    @property
+    def workload_flags(self) -> str:
+        """Return the five workload flags as the workload heading names them.
+
+        Every one of them, always, rather than only the ones that differ from the defaults.
+        Printing the non-default ones alone would make silence mean "the defaults", which is
+        precisely what a record that predates the block cannot say -- and that record is the one
+        this has to be distinguishable from.
+        """
+        if self.workload is None:
+            return "flags not recorded"
+        flags = self.workload
+        return (
+            f"tools {'pinned' if flags.force_tool_calls else 'free'} "
+            f"guidance {'on' if flags.retrieval_guidance else 'off'} "
+            f"questions {'scoped' if flags.subset_questions else 'sweeping'} "
+            f"temp {'none' if flags.temperature is None else f'{flags.temperature:g}'} "
+            f"history {'server' if flags.server_history else 'client'}"
         )
 
     @property
     def workload_key(self) -> tuple[Any, ...]:
         """Return what makes two cells the same conversation, model and settings aside.
 
-        The cell key less the model, the rates and the settings: what was asked of the agent,
-        rather than who was asked or how the strategies were tuned.
+        The cell key less the model, the rates and the strategy settings: what was asked of the
+        agent, rather than who was asked or how the strategies were tuned. The workload block
+        stays in, because pinning the tool calls or dropping the retrieval clause changes what
+        was asked as surely as the fill fraction does.
         """
         return tuple(
             getattr(self, name) for name in _CELL_KEY_FIELDS if name not in _MODEL_KEY_FIELDS and name != "settings"
@@ -546,6 +721,11 @@ class CellParams:
         # though it shared one with a cell written today -- see SCHEMA_VERSION.
         settings: dict[str, Any] | None = values.get("settings")
         values["settings"] = _settings_from_dict(settings) if settings is not None else None
+        # The same rule for the same reason, one category along. The defaults of these five have
+        # not moved, but whether a run set one was never written down and runs did set them, so
+        # filling them in would be a guess about a command line rather than a stale value.
+        workload: dict[str, Any] | None = values.get("workload")
+        values["workload"] = _workload_from_dict(workload) if workload is not None else None
         return cls(**values)
 
 

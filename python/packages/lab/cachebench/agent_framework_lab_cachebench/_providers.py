@@ -86,9 +86,12 @@ def _require_env(name: str) -> str:
 def _base_options(temperature: float | None, response_max_tokens: int) -> dict[str, Any]:
     """Return the options every provider shares.
 
-    Output is capped hard because the benchmark discards model answers entirely and
-    replays scripted replies instead. Only the prompt side is being measured, so short
-    completions keep a full sweep inexpensive.
+    ``max_tokens`` here is the cap on an *ordinary* call, and the live runner replaces it
+    per call where a different one is wanted -- the closing questions, which have to
+    enumerate everything, and the recall record. It is the caller's job to pass the same
+    number it reserved out of the context window when sizing the strategies: the replay
+    modes discard the model's answers and replay scripted replies, so a hard cap is free
+    there, but a live run's reply becomes history and is re-sent on every later turn.
     """
     options: dict[str, Any] = {"max_tokens": response_max_tokens}
     if temperature is not None:

@@ -260,7 +260,8 @@ which leaves the size trigger as the only thing that asks.
 
 #### One record or several
 
-The size trigger now asks more than once. It cannot do that on size alone — the size that fired
+The size trigger *can* ask more than once, but does not unless `--record-repeats` says so. It
+cannot do that on size alone — the size that fired
 it does not go away when a record arrives, because the record is *added* to the conversation and
 then preserved, so a trigger reading size would pin every remaining call in the run. What
 re-arms it is new material: at least one non-recall tool-call group after the newest record.
@@ -284,9 +285,17 @@ wrote two records, because the middleware re-decided on the exit of the call it 
 where the record it asked for is not yet in the loaded history. Archived rows show it as
 `FORCED:2, RECFORCED:1`.
 
-`--no-record-repeats` asks once and no more. Every run up to and including 39 was single-record,
-so a cell meant to sit on the same axis as those has to set it. It governs the size trigger
-alone: `--max-groups-before-record` is asking for repeats outright and keeps forcing them.
+`--record-repeats` turns them on; the default is one record per conversation, which is what every
+run up to and including 39 did, so a cell is on the same axis as those unless it asks otherwise.
+
+**Read `UNCOVERED` before setting it.** Repeats help exactly when one record cannot cover the
+whole conversation, and a non-zero `UNCOVERED:<n>` is what says that is happening. At
+`UNCOVERED:0` they can only cost, because a second record is duplication added to the prompt as
+preserved, unshrinkable tokens: run 40 measured them on `gpt-5.4-mini`, whose records are already
+complete, at **-1%, -4% and -2% shrink** on three seeds, and on `gpt-5.6-luna`, whose record named
+two of six groups, better on every axis. Which of the two a model is is not something a framework
+can know in advance, which is why the default is the one that cannot hurt. It governs the size
+trigger alone: `--max-groups-before-record` is asking for repeats outright and keeps forcing them.
 
 #### Tuning the strategies
 

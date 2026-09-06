@@ -1446,10 +1446,11 @@ async def run_live(
     allow_server_history: bool = False,
     probe_repeats: int = DEFAULT_PROBE_REPEATS,
     combined_repeats: int = DEFAULT_COMBINED_REPEATS,
+    answer_max_tokens: int | None = None,
     record_max_tokens: int | None = DEFAULT_RECORD_MAX_TOKENS,
     record_target_tokens: int | None = DEFAULT_RECORD_TARGET_TOKENS,
     max_groups_before_record: int | None = None,
-    repeat_records: bool = True,
+    repeat_records: bool = False,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> LiveOutcome:
     """Seed a conversation against a real agent, snapshot it, then probe the snapshot.
@@ -1520,9 +1521,25 @@ async def run_live(
             so the two need different numbers of attempts to be equally settled -- and the runs
             that matter set ``probe_repeats`` to 1, the per-scope repeat spread having measured
             0 to 2 points.
+        answer_max_tokens: Cap put on the closing questions' own calls, and on no others.
+            ``None`` leaves the run's ordinary cap in place on those too.
+
+            The seeding calls carry ``runtime.options["max_tokens"]``, which the caller sets to
+            the same number it reserved out of the window when it sized ``options``: the reply
+            to a seeding turn is appended to the history and re-sent on every turn after it, so
+            the budget the strategies threshold against has to hold room for one. There is
+            exactly one number on that path and it is both reserved and sent.
+
+            A closing answer is different in the one way that matters here: nothing follows it.
+            The snapshot is restored before the next probe, so the answer is scored and thrown
+            away and no later prompt pays for its length -- while the answer itself has to be
+            long enough to enumerate what the run is asking for, at roughly 12 tokens per
+            labelled code, because a truncated answer is scored as lost facts and reads as
+            compaction damage. So the closing calls carry their own number, which the caller
+            reserves out of the same window for that call and sends here.
         record_max_tokens: Cap on the recall record's own call, used only by
-            ``tool_summary_anchored``. Without it that call inherits ``--answer-max-tokens``,
-            which is sized for a reply to the user, so the one call instructed to summarise
+            ``tool_summary_anchored``. Without it that call inherits the run's ordinary cap,
+            which is sized for a seeding reply, so the one call instructed to summarise
             everything is the one call with no bound of its own. ``None`` restores that.
         record_target_tokens: Length the recall tool's description asks the record to aim for.
             The cap above cannot do this job -- a model does not plan to fit one, and a cut
@@ -1537,10 +1554,14 @@ async def run_live(
             compacting almost nothing; this is what buys the compaction back.
         repeat_records: Let the size trigger ask for a further record once the agent has done
             tool work no existing record accounts for, used only by ``tool_summary_anchored``.
-            On by default. Off, one record is asked for and no more, which is what every run
-            up to and including 39 did -- so a row meant to be compared against those has to
-            set it. It governs the size trigger alone; ``max_groups_before_record`` is a caller
-            asking for repeats outright and keeps forcing them either way.
+            Off by default, which is also what every run up to and including 39 did, so a row
+            left alone is comparable with those. On, records accumulate and every one of them
+            is preserved: worth it only when one record cannot cover the conversation, which
+            the ``UNCOVERED:<n>`` flag is what says. Run 40 measured both sides -- negative
+            shrink on all three ``gpt-5.4-mini`` seeds, whose records were already complete,
+            and better on every axis on ``gpt-5.6-luna``, whose record named two of six groups.
+            It governs the size trigger alone; ``max_groups_before_record`` is a caller asking
+            for repeats outright and keeps forcing them either way.
         sleep: How the backoff between re-sent attempts is taken, throttled and disconnected
             alike. Injectable only so that a test can prove the retries are bounded, and prove
             it against the schedule itself, without spending the bound in wall clock.
@@ -1701,8 +1722,18 @@ async def run_live(
             reconnects += connection_budget.retries
             reconnected_seconds += connection_budget.seconds
 
-    async def _send(text: str, *, turn_index: int, label: str) -> Any:
+    async def _send(text: str, *, turn_index: int, label: str, max_tokens: int | None = None) -> Any:
         """Send one turn, dropping an option the provider rejects and retrying once.
+
+        Args:
+            text: The user turn.
+
+        Keyword Args:
+            turn_index: Position in the scenario's turn list, which decides the pinned tool.
+            label: How this call is named in an error.
+            max_tokens: Output cap for this call alone, replacing the run's ordinary one.
+                ``None`` leaves it. Only the closing questions pass one; see ``run_live``'s
+                ``answer_max_tokens`` for why they are the exception.
 
         Returns:
             The agent response, or None when the turn could not be sent at all.
@@ -1738,6 +1769,10 @@ async def run_live(
             # Per-turn options carry the runtime's own options too: this replaces the
             # per-call option set rather than adding to it.
             turn_options: dict[str, Any] = {k: v for k, v in runtime.options.items() if k not in dropped}
+            # After the drop filter and gated on it, so a provider that rejected max_tokens
+            # outright does not have it put straight back by the closing questions.
+            if max_tokens is not None and "max_tokens" not in dropped:
+                turn_options["max_tokens"] = max_tokens
             if "tool_choice" not in dropped:
                 if turn_index in forced:
                     # Name the function, not just "required". Requiring *a* call still lets
@@ -1800,6 +1835,7 @@ async def run_live(
                     question,
                     turn_index=len(seed_turns) + offset,
                     label=f"probe {offset + 1} repeat {repeat}",
+                    max_tokens=answer_max_tokens,
                 )
                 if response is None:
                     if error is None:
