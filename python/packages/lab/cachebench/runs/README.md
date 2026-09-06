@@ -156,6 +156,14 @@ trust.
 
 Runs before 24 predate that format and exist only as captured stdout.
 
+Run 42 is every registered strategy in one cell, `gpt-5.6-luna` at 60,000/0.86, five seeds, 90
+records, split one file per seed because the merged file exceeds the repository's 500 KB limit --
+`--from-jsonl` takes all five paths and reads them as one body. **Its cost axis is void and its
+accuracy axis is sound**: five concurrent invocations of eighteen strategies overran the endpoint
+quota, so 18 records throttled including the control in every seed, and the cell also seeded -5.3%
+off target. Throttling delays requests without changing what the model is sent, so facts and
+`acc1` are unaffected. Read it for the retention ordering across the whole field, not for money.
+
 Run 40 is the repaired coverage check measured at 60K/0.86, three seeds, four rows in one
 invocation so `anchored` -- the strategy the record strategy falls back to -- is compared on the
 same conversations rather than across runs. Four arms: each model with and without record
