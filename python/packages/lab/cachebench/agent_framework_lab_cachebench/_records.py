@@ -34,6 +34,7 @@ __all__ = [
     "SCHEMA_VERSION",
     "CellParams",
     "SeedRecord",
+    "StrategySettings",
     "append_seed_record",
     "group_by_cell",
     "read_seed_records",
@@ -99,7 +100,23 @@ __all__ = [
 #: deny one to every row that took one. The flags on those records say which happened, and
 #: reading a count back out of a flag string is exactly the kind of inference this module
 #: refuses everywhere else.
-SCHEMA_VERSION: Final[int] = 6
+#: 7 adds the resolved strategy settings, and the bump is the version 4 argument rather than
+#: the version 3 one. Before it a record said what workload it measured and said nothing about
+#: what the strategies were configured with, so two runs differing only in a setting keyed as
+#: one cell, pooled into one row and were given one verdict. That is not hypothetical either:
+#: run 40's two ``repeat_records`` arms, concatenated into one file, printed a single
+#: ``tool_summary_anchored`` row at +1% against the control, out of arms that had measured -7%
+#: and +9%. The settings are part of the cell key from here, which is what stops it recurring.
+#:
+#: Their value reads back as ``None`` rather than as today's defaults, and that is the point of
+#: the version. What an older run was configured with is unknowable from the record: the
+#: defaults have moved under it -- ``repeat_records`` did not exist, and ``coverage_share``,
+#: ``min_gain_fraction`` and the two record bounds were unreachable from the command line at
+#: all -- so filling them in would credit every archived cell with a configuration it may never
+#: have run, and would key it as though it shared one with a cell written today. ``None`` keys
+#: as ``None``, which equals no other configuration, so an old cell refuses to merge with a new
+#: one rather than quietly joining it.
+SCHEMA_VERSION: Final[int] = 7
 
 #: Versions this reader accepts, which is not only the current one.
 #:
@@ -129,7 +146,12 @@ SCHEMA_VERSION: Final[int] = 6
 #: Version 5 joins them unconditionally: it is the immediately preceding version, it measured
 #: everything this one does except how many records a conversation carried, and refusing it
 #: would discard cells written by the code as it stood a commit ago for a single absent column.
-_READABLE_SCHEMAS: Final[frozenset[int]] = frozenset({2, 3, 4, 5, SCHEMA_VERSION})
+#: Version 6 joins them on the probe-count argument rather than the retry one. Everything it
+#: measured this version still measures; the one thing it cannot say is what its strategies were
+#: configured with, and it says that by carrying no settings at all rather than by carrying a
+#: plausible set. Refusing it would discard every cell on disk over a block none of them could
+#: have written.
+_READABLE_SCHEMAS: Final[frozenset[int]] = frozenset({2, 3, 4, 5, 6, SCHEMA_VERSION})
 
 #: The parameters that make two records the same cell, and so aggregable into one row.
 #:
@@ -144,6 +166,21 @@ _READABLE_SCHEMAS: Final[frozenset[int]] = frozenset({2, 3, 4, 5, SCHEMA_VERSION
 #: likewise nearly implied by ``filler_turns`` and ``filler_tokens`` -- the key states the
 #: parameter that was set and not only the number it produced, so a file holding a sweep can
 #: be read back against the sweep's own axes.
+#:
+#: ``settings`` is the field the key was missing. Everything above it says what workload was
+#: measured and none of it said what the strategies were configured with, so two runs differing
+#: only in a setting were one cell -- see :data:`SCHEMA_VERSION` for the row that produced.
+#: Every settings comparison this project has made stayed separate only because the files were
+#: kept apart by hand.
+#:
+#: It is the whole settings block rather than the settings a cell's strategies happen to read.
+#: Deriving the read set would need the strategy list, which is deliberately *not* in the key --
+#: a cell abandoned and resumed names two different lists and has to stay one cell -- so the
+#: read set is only knowable once the records are grouped, which is what this key decides. The
+#: cost of taking all of it is real and points one way: two runs differing in a setting no
+#: strategy in the cell consults will not pool, and will be reported as two combinations whose
+#: difference the cross-cell section names. A split that is visible is undone by hand; a merge
+#: that is silent is the defect.
 _CELL_KEY_FIELDS: Final[tuple[str, ...]] = (
     "provider",
     "model",
@@ -161,6 +198,23 @@ _CELL_KEY_FIELDS: Final[tuple[str, ...]] = (
     "tool_turns",
     "filler_tool_turns",
     "markers_per_tool",
+    "price_input",
+    "price_cached",
+    "price_output",
+    "settings",
+)
+
+#: The part of the key that says who was asked, rather than what was asked of them.
+#:
+#: Split out of the key rather than listed twice, so a field added to one is added to the
+#: other: :attr:`CellParams.workload_key` is the key less these and less ``settings``, and a
+#: workload field that quietly landed in neither would let two conversations be ranked against
+#: each other. The rates are here and not in the workload because every ranking below is on
+#: cost, and a cost measured at two price lists is two numbers in one column.
+_MODEL_KEY_FIELDS: Final[tuple[str, ...]] = (
+    "provider",
+    "model",
+    "agent_kind",
     "price_input",
     "price_cached",
     "price_output",
@@ -194,6 +248,113 @@ def _plan_from_dict(data: Mapping[str, Any]) -> FillPlan:
         # this plan. Demanding them here would refuse every record already on disk.
         tool_result_tokens=int(data.get("tool_result_tokens", 0)),
         tool_share=float(data.get("tool_share", 0.0)),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class StrategySettings:
+    """What the strategies of a cell were configured with, resolved rather than as typed.
+
+    The knobs, beside the workload the fields above already describe. Every value here is one
+    that was handed to a constructor, taken from the object the run built rather than from the
+    flag that named it, so a cell whose retention was derived, whose ``0`` meant "no bound of
+    my own" or whose summarizer was picked by a provider selector records what the strategies
+    actually ran with. The flag and the value disagree often enough for that to matter:
+    ``--keep-tokens 0`` is a derivation, not a retention of nothing.
+
+    Every field is required. The missing default is the guard the retry counters have: a live
+    run cannot omit one and quietly inherit a plausible number, and the only way a record
+    carries no settings at all is by predating the block, where the whole of it is ``None``.
+
+    A test pins this against :class:`~._strategies.StrategyOptions` field by field, because the
+    failure the block exists to prevent is precisely a knob that reaches a constructor without
+    reaching the record: the row moves, the file says nothing, and two cells merge.
+    """
+
+    keep_last_groups: int
+    keep_last_tool_call_groups: int
+    keep_head_groups: int
+    keep_tail_groups: int
+    keep_tokens: int | None
+    """Fixed retention per collapsed tool result, or ``None`` when it was derived from the band."""
+    band_share: float
+    min_gain_fraction: float
+    trigger_fraction: float
+    fallback_fraction: float
+    coverage_share: float
+    token_budget_fraction: float
+    max_output_tokens: int
+    """The output reservation, which every anchored and composed ceiling is the window less.
+
+    Not implied by ``context_window`` on the cell beside it: the strategies are sized against
+    the difference, so two runs at one window and two reservations compacted to two different
+    ceilings while every workload column matched.
+    """
+    answer_max_tokens: int
+    """The cap sent on every call, and the one the forced record call falls back to.
+
+    Here because ``record_max_tokens`` is allowed to be ``None``, and ``None`` means "whatever
+    this is". Without it a recorded cap of ``None`` reads as unbounded when it was bounded.
+    """
+    tokenizer: str
+    """Name of the counter every threshold was measured with.
+
+    A strategy fires on a token count, so two runs counting differently fire at different
+    points of the same conversation. Recorded as the name rather than the object, which is what
+    a file can carry and what ``--tokenizer`` selects.
+    """
+    summarizer: str | None
+    """``provider:model`` of the client the summarizing strategies used, or ``None`` for none.
+
+    Resolved, so a run that named only a provider records the model that provider chose. Two
+    summarizers are two strategies wearing one name, and only their rows move.
+    """
+    record_max_tokens: int | None
+    record_target_tokens: int | None
+    max_groups_before_record: int | None
+    repeat_records: bool
+
+    def to_dict(self) -> dict[str, Any]:
+        """Return a JSON-serializable mapping of these settings."""
+        return asdict(self)
+
+
+def _settings_from_dict(data: Mapping[str, Any]) -> StrategySettings:
+    """Rebuild the settings block from its serialized form.
+
+    Field by field rather than by splatting, for the reason :func:`_plan_from_dict` is: a file
+    carrying a key this version does not know about is refused here rather than somewhere less
+    obvious. Nothing is read leniently, because only a record carrying the whole block carries
+    any of it -- an older one has no ``settings`` object for this function to be given.
+
+    Args:
+        data: The ``settings`` object from a record's cell parameters.
+
+    Returns:
+        The settings.
+    """
+    return StrategySettings(
+        keep_last_groups=int(data["keep_last_groups"]),
+        keep_last_tool_call_groups=int(data["keep_last_tool_call_groups"]),
+        keep_head_groups=int(data["keep_head_groups"]),
+        keep_tail_groups=int(data["keep_tail_groups"]),
+        keep_tokens=None if data["keep_tokens"] is None else int(data["keep_tokens"]),
+        band_share=float(data["band_share"]),
+        min_gain_fraction=float(data["min_gain_fraction"]),
+        trigger_fraction=float(data["trigger_fraction"]),
+        fallback_fraction=float(data["fallback_fraction"]),
+        coverage_share=float(data["coverage_share"]),
+        token_budget_fraction=float(data["token_budget_fraction"]),
+        max_output_tokens=int(data["max_output_tokens"]),
+        answer_max_tokens=int(data["answer_max_tokens"]),
+        tokenizer=str(data["tokenizer"]),
+        summarizer=None if data["summarizer"] is None else str(data["summarizer"]),
+        record_max_tokens=None if data["record_max_tokens"] is None else int(data["record_max_tokens"]),
+        record_target_tokens=None if data["record_target_tokens"] is None else int(data["record_target_tokens"]),
+        max_groups_before_record=(
+            None if data["max_groups_before_record"] is None else int(data["max_groups_before_record"])
+        ),
+        repeat_records=bool(data["repeat_records"]),
     )
 
 
@@ -276,6 +437,14 @@ class CellParams:
     Kept whole rather than reduced to its target, so the achieved fill can be checked against
     it from the file exactly as the live run checks it.
     """
+    settings: StrategySettings | None = None
+    """What the strategies were configured with, and part of what makes two records one cell.
+
+    ``None`` on a record written before schema 7, where the settings are unknowable rather than
+    defaulted -- see :data:`SCHEMA_VERSION`. A reader must treat that as "not comparable on
+    settings" and not as "the same settings as everything else": ``None`` equals only ``None``,
+    so those cells group with each other and with nothing that carries a block.
+    """
 
     @property
     def key(self) -> tuple[Any, ...]:
@@ -307,6 +476,46 @@ class CellParams:
             f"probes {self.probe_repeats}  combined {self.combined_repeats}"
         )
 
+    @property
+    def workload_label(self) -> str:
+        """Return the conversation this cell measured, with the model and its settings left out.
+
+        The axis a cross-cell comparison is allowed to rank within. Everything a strategy is
+        judged on moves with these, so two cells that differ anywhere here are two jobs and not
+        two answers to one question -- which is why the label names the narration, the placement
+        and the filler sizing that :attr:`label` leaves to the file name.
+        """
+        fill = f"fill {self.fill:.0%}" if self.fill > 0 else "fill manual"
+        payload = f"payload {self.tool_result_tokens:,}x{self.tool_turns}"
+        if self.tool_share > 0:
+            payload += f" at share {self.tool_share:.0%}"
+        return (
+            f"window {self.context_window:,}  {fill}  {payload}  "
+            f"narration {self.narration}  facts {self.fact_placement}  "
+            f"filler {self.filler_turns}x{self.filler_tokens:,}  "
+            f"probes {self.probe_repeats}  combined {self.combined_repeats}"
+        )
+
+    @property
+    def workload_key(self) -> tuple[Any, ...]:
+        """Return what makes two cells the same conversation, model and settings aside.
+
+        The cell key less the model, the rates and the settings: what was asked of the agent,
+        rather than who was asked or how the strategies were tuned.
+        """
+        return tuple(
+            getattr(self, name) for name in _CELL_KEY_FIELDS if name not in _MODEL_KEY_FIELDS and name != "settings"
+        )
+
+    @property
+    def model_key(self) -> tuple[Any, ...]:
+        """Return what makes two cells the same model at the same rates.
+
+        The rates are in here rather than in the workload because a cost measured at two price
+        lists is two numbers in one column, and every ranking below is on cost.
+        """
+        return tuple(getattr(self, name) for name in _MODEL_KEY_FIELDS)
+
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable mapping of these parameters."""
         return asdict(self)
@@ -332,6 +541,11 @@ class CellParams:
         values.setdefault("combined_repeats", int(values.get("probe_repeats", 1)))
         plan: dict[str, Any] | None = values.get("plan")
         values["plan"] = _plan_from_dict(plan) if plan is not None else None
+        # Absent means unknown, and unknown stays unknown. Filling in this version's defaults
+        # would hand every archived cell a configuration nobody recorded and let it key as
+        # though it shared one with a cell written today -- see SCHEMA_VERSION.
+        settings: dict[str, Any] | None = values.get("settings")
+        values["settings"] = _settings_from_dict(settings) if settings is not None else None
         return cls(**values)
 
 

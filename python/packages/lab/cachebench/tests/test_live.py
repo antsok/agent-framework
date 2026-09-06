@@ -15,7 +15,7 @@ import contextlib
 import json
 import re
 from collections.abc import Mapping, Sequence
-from dataclasses import replace
+from dataclasses import fields, replace
 from pathlib import Path
 from statistics import fmean
 from types import SimpleNamespace
@@ -113,6 +113,7 @@ from agent_framework_lab_cachebench._records import (
     SCHEMA_VERSION,
     CellParams,
     SeedRecord,
+    StrategySettings,
     append_seed_record,
     group_by_cell,
     read_seed_records,
@@ -4798,6 +4799,31 @@ def test_the_recorded_cells_on_disk_still_read() -> None:
         assert all(record.correctness_samples for record in records), f"{path.name} lost its samples"
 
 
+def test_the_raw_archive_still_reads_and_still_refuses_the_records_it_should() -> None:
+    """The raw archive is the other half of what a schema change can silently orphan.
+
+    Two opposite claims live in one directory, and a bump that broke either would look the
+    same from outside. The ``oldprompt-*`` cells are ordinary readable records and must keep
+    opening; the ``void-*`` ones are version 1, written before the seed/snapshot/probe rebuild,
+    and their accuracy columns answer a question this reader no longer asks -- they are refused
+    on purpose, and a change that started accepting them would quietly average two different
+    measurements into one row.
+    """
+    raw = sorted((Path(__file__).parents[1] / "runs" / "raw").glob("*.jsonl"))
+    assert raw, "no raw cells were found, so this passed without reading anything"
+
+    for path in raw:
+        if path.name.startswith("void-"):
+            with pytest.raises(ValueError, match="schema 1"):
+                read_seed_records(path)
+        else:
+            records = read_seed_records(path)
+            assert records, f"{path.name} read as empty"
+            assert all(record.cell.settings is None for record in records), (
+                f"{path.name} predates the settings block and must read back as unknown, not as defaults"
+            )
+
+
 def test_the_solved_sizing_survives_the_file() -> None:
     """The fill check has to be reproducible from the file.
 
@@ -4921,7 +4947,7 @@ def test_from_jsonl_needs_no_provider() -> None:
     args = build_parser().parse_args(["--from-jsonl", "results.jsonl"])
 
     assert args.provider is None
-    assert args.from_jsonl == "results.jsonl"
+    assert args.from_jsonl == ["results.jsonl"], "one path is still one path, in the list several arrive in"
 
 
 async def test_a_run_without_a_provider_is_refused() -> None:
@@ -4930,6 +4956,442 @@ async def test_a_run_without_a_provider_is_refused() -> None:
 
     with pytest.raises(SystemExit, match="provider is required"):
         await run_live_comparison(args)
+
+
+def _settings(**overrides: Any) -> StrategySettings:
+    """Return a settings block shaped like the one a live run resolves and records."""
+    defaults: dict[str, Any] = {
+        "keep_last_groups": 6,
+        "keep_last_tool_call_groups": 4,
+        "keep_head_groups": 3,
+        "keep_tail_groups": 4,
+        "keep_tokens": None,
+        "band_share": 0.25,
+        "min_gain_fraction": 0.3,
+        "trigger_fraction": 0.6,
+        "fallback_fraction": 0.9,
+        "coverage_share": 0.8,
+        "token_budget_fraction": 0.5,
+        "max_output_tokens": 2_048,
+        "answer_max_tokens": 12_000,
+        "tokenizer": "estimator",
+        "summarizer": None,
+        "record_max_tokens": 4_000,
+        "record_target_tokens": 2_000,
+        "max_groups_before_record": None,
+        "repeat_records": True,
+    }
+    return StrategySettings(**{**defaults, **overrides})
+
+
+async def _priced_records(cell: CellParams, rows: Mapping[str, Sequence[tuple[float, float]]]) -> list[SeedRecord]:
+    """Return records with the two numbers the cross-cell ranking reads and nothing else moving.
+
+    The probe counts are zeroed so that ``seed$`` is exactly the cost given, which is what makes
+    a spread and a margin arithmetic rather than a property of the stub's replies.
+
+    Args:
+        cell: The cell they all belong to.
+        rows: One entry per strategy, holding a ``(cost, correctness)`` pair per seed.
+
+    Returns:
+        The records.
+    """
+    outcome, scenario = await _probed(StubChatClient(usage=UsageDetails(input_token_count=1_000)), repeats=1)
+    base = _record(outcome, scenario)
+    return [
+        replace(
+            base,
+            cell=cell,
+            strategy=strategy,
+            seed=seed,
+            cost=cost,
+            probe_input_tokens=0,
+            probe_cached_tokens=0,
+            probe_output_tokens=0,
+            correctness_samples=(correctness,),
+            combined_samples=(correctness,),
+        )
+        for strategy, seeds in rows.items()
+        for seed, (cost, correctness) in enumerate(seeds, start=1)
+    ]
+
+
+def _written(path: Path, records: Sequence[SeedRecord]) -> Path:
+    """Write records to a results file and return the path, for a test that reads one back."""
+    for record in records:
+        append_seed_record(path, record)
+    return path
+
+
+async def _rebuilt(capsys: pytest.CaptureFixture[str], *paths: Path) -> str:
+    """Rebuild the tables from results files and return everything printed."""
+    capsys.readouterr()
+    await run_live_comparison(build_parser().parse_args(["--from-jsonl", *(str(path) for path in paths)]))
+    return capsys.readouterr().out
+
+
+def _across(printed: str) -> str:
+    """Return just the cross-cell section, so an assertion about it cannot match a per-cell table."""
+    return printed[printed.index("Across cells:") :] if "Across cells:" in printed else ""
+
+
+async def test_two_cells_differing_only_in_a_record_repeat_setting_do_not_merge(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The defect: a strategy setting was not on the record, so two arms of one experiment pooled.
+
+    Run 40 measured ``tool_summary_anchored`` at -7% and +9% against the control on the two
+    sides of ``--no-record-repeats``. Concatenated into one file they keyed identically, were
+    meaned into a single row reading +1%, and were given one verdict, with nothing anywhere
+    saying that two configurations had been averaged. Every settings comparison this project
+    has made stayed separate only because the files were kept apart by hand.
+    """
+    off = _cell_params(settings=_settings(repeat_records=False))
+    on = _cell_params(settings=_settings(repeat_records=True))
+    rows = {"none": [(0.030, 1.0), (0.030, 1.0)], "tool_summary_anchored": [(0.010, 1.0), (0.010, 1.0)]}
+    path = _written(tmp_path / "arms.jsonl", await _priced_records(off, rows) + await _priced_records(on, rows))
+
+    records = read_seed_records(path)
+    printed = await _rebuilt(capsys, path)
+    ranked = [line for line in _across(printed).splitlines() if line.startswith("    tool_summary_anchored ")]
+
+    assert len(group_by_cell(records)) == 2, "one setting apart is two cells, not one row"
+    assert off.key != on.key, "the setting has to be in the key, not merely on the record"
+    assert printed.count("Cell: ") == 2
+    assert len(ranked) == 2, "the two arms have to be two rows"
+    assert [line.endswith("repeat_records=off") for line in ranked] == [True, False]
+    assert [line.endswith("repeat_records=on") for line in ranked] == [False, True]
+
+
+async def test_a_setting_no_strategy_in_the_cell_reads_still_splits_the_cell(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The key is every recorded setting, not the ones the cell's strategies happen to consult.
+
+    ``token_budget_fraction`` reaches only the ``token_budget_*`` family, and neither of the
+    rows here is one of them, so these two cells measured the same thing and will not pool. That
+    is the chosen cost of the safe direction: deriving the consulted set needs the strategy
+    list, which is deliberately not in the key so that a resumed cell stays one cell, and so is
+    knowable only after grouping -- which is what the key decides. A split shows up as two rows
+    with the difference named beside them and is undone by hand; a merge shows up as nothing.
+    """
+    half = _cell_params(settings=_settings(token_budget_fraction=0.5))
+    quarter = _cell_params(settings=_settings(token_budget_fraction=0.25))
+    rows = {"none": [(0.030, 1.0), (0.030, 1.0)], "truncation": [(0.020, 1.0), (0.020, 1.0)]}
+    path = _written(tmp_path / "unread.jsonl", await _priced_records(half, rows) + await _priced_records(quarter, rows))
+
+    printed = await _rebuilt(capsys, path)
+
+    assert len(group_by_cell(read_seed_records(path))) == 2, "err towards not merging: a difference is a difference"
+    assert "token_budget_fraction=0.5" in _across(printed)
+    assert "token_budget_fraction=0.25" in _across(printed)
+
+
+async def test_records_without_settings_load_and_are_reported_as_not_settings_comparable(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Every cell on disk predates the settings block, and must still open and still say so.
+
+    Their configuration is unknowable rather than defaulted, so the block reads back as None:
+    a cell whose settings nobody wrote down must not key as though it shared a configuration
+    with one written today, and the output must not imply that a comparison between them is a
+    comparison of settings. The costs are still costs; what cannot be said is why they differ.
+    """
+    unknown = _cell_params()
+    known = _cell_params(settings=_settings())
+    rows = {"none": [(0.030, 1.0), (0.030, 1.0)], "truncation": [(0.020, 1.0), (0.020, 1.0)]}
+    path = _written(tmp_path / "old.jsonl", await _priced_records(unknown, rows) + await _priced_records(known, rows))
+
+    stored = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    printed = await _rebuilt(capsys, path)
+
+    assert unknown.settings is None
+    assert stored[0]["cell"]["settings"] is None, "an unknown block is written as absent, not as this run's defaults"
+    assert unknown.key != known.key, "unknown settings are not the same settings"
+    assert all(record.cell.settings is None for record in read_seed_records(path) if record.cell == unknown)
+    assert "not recorded" in _across(printed)
+    assert "cells written before the settings reached the file" in _across(printed)
+    assert "attributed to a setting" in _across(printed)
+
+
+async def test_a_record_written_before_the_settings_block_reads_back_as_unknown() -> None:
+    """A schema 6 line has no settings object at all, and must not be given this run's defaults.
+
+    The defaults have moved under those runs -- ``repeat_records`` did not exist, and
+    ``coverage_share``, ``min_gain_fraction`` and the two record bounds were unreachable from
+    the command line -- so filling them in would credit every archived cell with a configuration
+    it may never have run, and would let it key as though it shared one with a cell written
+    today. That is the version 4 argument: not absent, unknowable.
+    """
+    written = _cell_params(settings=_settings()).to_dict()
+    del written["settings"]
+
+    assert CellParams.from_dict(written).settings is None, "a configuration nobody recorded is not the default one"
+
+
+def test_every_strategy_option_that_changes_behaviour_reaches_the_recorded_settings() -> None:
+    """A knob that reaches a constructor without reaching the file is the defect, one field along.
+
+    ``StrategyOptions`` is where every strategy is built from, so a field added there and not
+    here moves rows while the record says nothing, and two cells that differ in it merge --
+    which is exactly what happened to the whole block. The two exceptions are carried
+    elsewhere: the window is on the cell already, and the tokenizer and the summarizer are
+    objects, recorded by the name and the selector that chose them.
+    """
+    recorded = {field.name for field in fields(StrategySettings)}
+    carried_by_the_cell = {"max_context_window_tokens"}
+    by_name = {"tokenizer", "summarizer"}
+
+    missing = {field.name for field in fields(StrategyOptions)} - recorded - carried_by_the_cell - by_name
+
+    assert not missing, f"these change what a strategy does and no record would say so: {sorted(missing)}"
+
+
+async def test_the_settings_recorded_are_the_resolved_ones_rather_than_the_flags(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """The flag and the value disagree wherever the CLI resolves one into the other.
+
+    ``0`` means "no bound of my own" on three of these flags, and a block copied from the
+    command line would record a cell as keeping no tokens and capping the record at nothing
+    when it derived its retention from the band and left the run's own cap in place. The four
+    record settings are checked against what ``run_live`` was handed, because they have no home
+    on ``StrategyOptions`` and are the half most easily resolved twice.
+    """
+    _stub_provider(monkeypatch)
+    path = tmp_path / "resolved.jsonl"
+    live = run_live
+    seen: list[dict[str, Any]] = []
+
+    async def capture(*args: Any, **kwargs: Any) -> LiveOutcome:
+        seen.append({name: kwargs[name] for name in ("record_max_tokens", "record_target_tokens", "repeat_records")})
+        return await live(*args, **kwargs)
+
+    monkeypatch.setattr("agent_framework_lab_cachebench._live_cli.run_live", capture)
+    await run_live_comparison(
+        build_parser().parse_args(
+            _live_argv(
+                "--results-jsonl",
+                str(path),
+                "--strategies",
+                "none",
+                "--repeats",
+                "1",
+                "--keep-tokens",
+                "0",
+                "--record-max-tokens",
+                "0",
+                "--band-share",
+                "0.4",
+                "--no-record-repeats",
+            )
+        )
+    )
+
+    (record,) = read_seed_records(path)
+    settings = record.cell.settings
+
+    assert settings is not None
+    assert settings.keep_tokens is None, "0 is the absence of a fixed retention, not a retention of nothing"
+    assert settings.record_max_tokens is None, "0 leaves the run's own cap in place"
+    assert settings.repeat_records is False
+    assert settings.band_share == 0.4
+    assert settings.tokenizer == "estimator"
+    assert seen == [
+        {
+            "record_max_tokens": settings.record_max_tokens,
+            "record_target_tokens": settings.record_target_tokens,
+            "repeat_records": settings.repeat_records,
+        }
+    ], "the run must be configured with the values the record carries, not with a second resolution of the flags"
+
+
+async def test_the_cross_cell_report_names_a_winner_when_the_gap_clears_the_spread(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Two settings, one workload, one model: the question the per-cell tables cannot answer.
+
+    Each arm is a table of its own, so the reader is left diffing two tables by eye, which is
+    how the merged version of this went unnoticed. Ranked on seed$ behind the same accuracy bar
+    each cell applied, a gap of half the cost against seeds that varied by one percent is a
+    finding and is reported as one.
+    """
+    off = _cell_params(settings=_settings(repeat_records=False))
+    on = _cell_params(settings=_settings(repeat_records=True))
+    steady = {"none": [(0.030, 1.0), (0.0301, 1.0)]}
+    path = _written(
+        tmp_path / "clear.jsonl",
+        await _priced_records(off, {**steady, "tool_summary_anchored": [(0.0100, 1.0), (0.0101, 1.0)]})
+        + await _priced_records(on, {**steady, "tool_summary_anchored": [(0.0200, 1.0), (0.0202, 1.0)]}),
+    )
+
+    section = _across(await _rebuilt(capsys, path))
+
+    assert "BEST: tool_summary_anchored at repeat_records=off" in section
+    assert "50% cheaper on seed$" in section
+    assert "NOT SUPPORTED" not in section
+
+
+async def test_the_cross_cell_report_refuses_a_winner_when_the_gap_is_inside_the_spread(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A ranking is worth reporting only when the options differ by more than one option's repeats.
+
+    This is the ordinary case rather than the exception: run 40's two record arms differ by 7%
+    on seed$ while the seeds inside one of them differ by 35%, and both of that run's sub-zero
+    cost figures were withdrawn by hand for exactly this reason. The refusal is in the register
+    of the per-cell NOT SUPPORTED line because it is the same guard.
+    """
+    off = _cell_params(settings=_settings(repeat_records=False))
+    on = _cell_params(settings=_settings(repeat_records=True))
+    steady = {"none": [(0.030, 1.0), (0.0301, 1.0)]}
+    path = _written(
+        tmp_path / "noisy.jsonl",
+        await _priced_records(off, {**steady, "tool_summary_anchored": [(0.0100, 1.0), (0.0200, 1.0)]})
+        + await _priced_records(on, {**steady, "tool_summary_anchored": [(0.0210, 1.0), (0.0212, 1.0)]}),
+    )
+
+    section = _across(await _rebuilt(capsys, path))
+
+    assert "NOT SUPPORTED: seeds of one of these varied by 50%" in section
+    assert "Nothing is named best." in section
+    assert "BEST:" not in section
+
+
+async def test_the_cross_cell_report_says_per_strategy_what_a_setting_did_to_it(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The ranking says which row is cheapest; this says what the setting the run varied did.
+
+    They are different questions, and the ranking alone reads badly whenever a setting no
+    strategy in the cell consults has split its rows anyway: the control is keyed on every
+    recorded setting like everything else, so its two arms sit apart on the table with a gap
+    that is the noise floor and nothing else. The guard applied to that pair is the only thing
+    that says so, which is why it is applied to every strategy's arms and not only to the two
+    cheapest rows overall.
+    """
+    off = _cell_params(settings=_settings(repeat_records=False))
+    on = _cell_params(settings=_settings(repeat_records=True))
+    steady = {"none": [(0.030, 1.0), (0.0301, 1.0)]}
+    path = _written(
+        tmp_path / "effects.jsonl",
+        await _priced_records(off, {**steady, "tool_summary_anchored": [(0.0100, 1.0), (0.0101, 1.0)]})
+        + await _priced_records(on, {**steady, "tool_summary_anchored": [(0.0200, 1.0), (0.0202, 1.0)]}),
+    )
+
+    lines = {
+        line.split()[0]: line
+        for line in _across(await _rebuilt(capsys, path)).splitlines()
+        if line.startswith("      ")
+    }
+
+    assert "[repeat_records=off] 50% cheaper than [repeat_records=on]" in lines["tool_summary_anchored"]
+    assert lines["tool_summary_anchored"].endswith("seeds varied by 1%: resolved")
+    assert lines["none"].endswith("NOT RESOLVED"), "the control reads no setting, so its arms are the noise floor"
+
+
+async def test_the_cross_cell_report_refuses_to_rank_two_workloads_against_each_other(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A different fill or window is a different job, and a smaller number under it is not a win.
+
+    The cheapest row of a 40% fill is cheaper than everything at 86% for reasons that have
+    nothing to do with the strategy, and this project has already read one such comparison the
+    wrong way. So the sections are per workload, they say how many there are, and no ranking
+    ever spans two of them.
+    """
+    settings = _settings()
+    wide = _cell_params(settings=settings, context_window=120_000)
+    narrow = _cell_params(settings=settings, context_window=60_000)
+    empty = _cell_params(settings=settings, context_window=60_000, fill=0.4)
+    rows = {"none": [(0.030, 1.0), (0.030, 1.0)], "truncation": [(0.020, 1.0), (0.020, 1.0)]}
+    path = _written(
+        tmp_path / "workloads.jsonl",
+        await _priced_records(wide, rows) + await _priced_records(narrow, rows) + await _priced_records(empty, rows),
+    )
+
+    section = _across(await _rebuilt(capsys, path))
+
+    assert "3 workloads below, each ranked on its own" in section
+    assert "never ranked against each other" in section
+    assert section.count("Workload: ") == 3
+    assert section.count("2 rankable row(s)") == 3, "each workload ranks its own rows and no others"
+    assert "window 120,000" in section
+    assert "fill 40%" in section
+
+
+async def test_the_cross_cell_report_shows_only_the_settings_that_differ(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Twenty identical fields beside the two that differ is a column nobody reads.
+
+    The question the column exists to answer is what separates these rows, and the identical
+    fields bury it. So ``repeat_records=on`` against ``repeat_records=off``, and not the band
+    share, the coverage share or the sixteen others both arms shared.
+    """
+    off = _cell_params(settings=_settings(repeat_records=False))
+    on = _cell_params(settings=_settings(repeat_records=True))
+    rows = {"none": [(0.030, 1.0), (0.030, 1.0)], "truncation": [(0.020, 1.0), (0.020, 1.0)]}
+    path = _written(tmp_path / "narrow.jsonl", await _priced_records(off, rows) + await _priced_records(on, rows))
+
+    section = _across(await _rebuilt(capsys, path))
+
+    assert "repeat_records=off" in section
+    assert "repeat_records=on" in section
+    for unchanged in ("band_share", "coverage_share", "keep_head_groups", "trigger_fraction", "tokenizer"):
+        assert unchanged not in section, f"{unchanged} is the same in both arms and says nothing about the difference"
+
+
+async def test_a_single_cell_renders_exactly_as_it_did_before_the_comparison_existed(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """One cell is not a comparison, so nothing about settings belongs in its output.
+
+    The rebuilt table is read beside the live one it is meant to reproduce, and a section that
+    appeared under one and not the other would be a difference between the two paths on the one
+    question -- do these agree -- that the file exists to answer.
+    """
+    _stub_provider(monkeypatch)
+    path = tmp_path / "one.jsonl"
+    await run_live_comparison(build_parser().parse_args(_live_argv("--results-jsonl", str(path))))
+    live = capsys.readouterr().out
+
+    printed = await _rebuilt(capsys, path)
+
+    assert "in 1 cell(s)." in printed
+    assert str(path) in printed.splitlines()[0], "one path still names itself, as it did before several were allowed"
+    assert "Across cells:" not in printed
+    assert "settings" not in printed
+    assert _table(printed) == _table(live)
+
+
+async def test_several_paths_and_a_directory_read_as_one_body_of_records(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """A sweep writes one file per cell, so the material for a comparison is a directory.
+
+    Concatenating them by hand works, and is also how two arms of one experiment came to be
+    merged into one table. Reading them here is the safer half of the same convenience: the
+    records group by what they measured, and the file they arrived in decides nothing.
+    """
+    directory = tmp_path / "sweep"
+    directory.mkdir()
+    rows = {"none": [(0.030, 1.0), (0.030, 1.0)], "truncation": [(0.020, 1.0), (0.020, 1.0)]}
+    off_cell = _cell_params(settings=_settings(repeat_records=False))
+    on_cell = _cell_params(settings=_settings(repeat_records=True))
+    off = _written(directory / "off.jsonl", await _priced_records(off_cell, rows))
+    on = _written(directory / "on.jsonl", await _priced_records(on_cell, rows))
+
+    listed = await _rebuilt(capsys, off, on)
+    scanned = await _rebuilt(capsys, directory)
+
+    assert "in 2 cell(s)" in listed
+    assert "2 files" in listed, "several paths are not one path and the header must not claim to be one"
+    assert _across(scanned) == _across(listed), "a directory is the files in it"
+
+    with pytest.raises(SystemExit, match="No results file at"):
+        await run_live_comparison(build_parser().parse_args(["--from-jsonl", str(tmp_path / "nothing.jsonl")]))
 
 
 # endregion
