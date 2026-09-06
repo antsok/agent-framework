@@ -108,7 +108,7 @@ from agent_framework_lab_cachebench._live_cli import (
     build_parser,
     run_live_comparison,
 )
-from agent_framework_lab_cachebench._recall import COMBINED_SCOPE
+from agent_framework_lab_cachebench._recall import COMBINED_SCOPE, render_codes
 from agent_framework_lab_cachebench._records import (
     SCHEMA_VERSION,
     CellParams,
@@ -3740,10 +3740,14 @@ async def test_a_run_that_was_not_cut_short_says_nothing() -> None:
 
 #: A ceiling that leaves the eight-turn fixture between the strategy's two thresholds, so it
 #: acts on the record rather than sitting below the trigger or giving up above the fallback.
-#: The conversation is about 17,000 tokens, which is 90% of this. It was 22,000 while the
-#: thresholds were 0.6 and 0.9; at 0.8 that puts the fixture *below* the trigger, and every
-#: test built on it would have asserted against a strategy that did nothing.
-_RECORD_CEILING = 19_000
+#: The conversation is about 17,100 tokens, which is 78% of this, between the 60% trigger and
+#: the 90% give-up line.
+#:
+#: It was 19,000 while the thresholds were briefly 0.8 and 0.95, and comes back with them. Both
+#: ways of getting this wrong are silent: a fixture below the trigger asserts against a strategy
+#: that returned without acting, and one above the give-up line asserts against the fallback
+#: strategy instead of this one. At 0.6/0.9 the 19,000 value would have been the second.
+_RECORD_CEILING = 22_000
 
 
 def _tool_conversation(tool_turns: int, *, covered: int) -> list[Message]:
@@ -3780,7 +3784,17 @@ def _tool_conversation(tool_turns: int, *, covered: int) -> list[Message]:
             ),
             Message(
                 role="tool",
-                contents=[{"type": "function_result", "call_id": call_id, "result": f"CODE-{index} " + "x" * 8_000}],
+                contents=[
+                    {
+                        "type": "function_result",
+                        "call_id": call_id,
+                        # Rendered by the live tool's own function, so a fixture cannot drift
+                        # into a shape the benchmark never emits: the coverage check is read
+                        # against ``code_N=VALUE`` pairs in a real run, and was measuring
+                        # label-copying for as long as the fixtures fed it bare values.
+                        "result": render_codes((f"CODE-{index}",)) + " " + "x" * 8_000,
+                    }
+                ],
                 message_id=f"t_res_{index}",
             ),
         ]
@@ -3973,8 +3987,9 @@ async def test_the_post_record_fallback_count_survives_the_file_and_an_older_rec
 
 #: A ceiling that leaves the two-record fixture between the strategy's thresholds, chosen the
 #: same way ``_RECORD_CEILING`` is: four tool turns and two records come to about 8,800 tokens,
-#: which is 88% of this.
-_TWO_RECORD_CEILING = 10_000
+#: which is 73% of this. It was 10,000, putting the same fixture two points under the give-up
+#: line, where a sentence added to a record would change which strategy the test measured.
+_TWO_RECORD_CEILING = 12_000
 
 
 def _two_record_conversation() -> list[Message]:

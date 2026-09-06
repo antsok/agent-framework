@@ -570,11 +570,17 @@ class LiveOutcome:
     records_in_conversation: int = 0
     """Records the conversation ended up carrying, at the most the strategy saw it hold.
 
-    One is the design working. Several is the design working repeatedly, and the price of that
-    is a floor under the prompt: every record is preserved, so it can be neither shortened nor
+    Every record is a floor under the prompt: preserved, so it can be neither shortened nor
     dropped, and nothing merges them. Reported as a number beside the ``RECORDS`` flag for the
     reason ``groups_kept_uncovered`` is -- a flag says a row is affected, a number can be meaned
     over the seeds of a cell and asked how far the floor rose.
+
+    Read it against ``FORCED``, not against one. A record per forced call is the mechanism
+    working, however many times the middleware asked; more records than asks is a defect, and
+    was one -- every trigger event wrote two, because the middleware re-decided on the exit of
+    the call it had pinned, where the record it asked for is not yet in the loaded history.
+    Runs taken before that was fixed carry the doubling, and ``FORCED:2, RECFORCED:1`` in the
+    archived flags is what it looks like.
 
     Zero on every strategy that keeps no such count, which is all of them but
     ``tool_summary_anchored``.

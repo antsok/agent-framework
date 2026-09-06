@@ -379,13 +379,13 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Share of the input budget at which tool_summary_anchored asks for its record, on "
             "both halves at once: the strategy waits at this line and the middleware reads the "
-            "strategy's own value, so the ask and the wait cannot be set apart. It is a bet "
-            "that enough conversation remains to repay the compaction, and it was 0.6 until it "
-            "was measured as one taken far too early -- 0.6 of the budget is 58%% of a "
-            "60,000-token window at the default output reservation, which spends an agent turn "
-            "and breaks the cached prefix in a conversation that may end before it ever needed "
-            "compacting. Waiting costs nothing until the ceiling is in reach. Must be below "
-            "--fallback-fraction. Default %(default)s."
+            "strategy's own value, so the ask and the wait cannot be set apart. Every archived "
+            "run used this value; it was briefly 0.8 on the argument that 0.6 fires at 58%% of "
+            "a 60,000-token window, which was arithmetic rather than a measured cost. What is "
+            "measured points the other way: the record degrades with the bulk it must read -- "
+            "53/53 facts at 8,000-token results, 18/53 at 25,200 -- so a later ask is a bigger "
+            "ask and a worse record, and it also leaves fewer turns for the compaction to repay "
+            "itself over. Must be below --fallback-fraction. Default %(default)s."
         ),
     )
     parser.add_argument(
@@ -398,11 +398,12 @@ def build_parser() -> argparse.ArgumentParser:
             "record has to arrive in, and it is a whole turn wide by construction: the "
             "middleware can only read the history on the way out of a call and can only pin "
             "the next one, so the conversation grows by a turn between the ask and the answer. "
-            "At a 0.8 trigger the old 0.9 left one turn's room, and one turn carrying a large "
-            "tool result crossed it -- compacting without a record while the record was still "
-            "in flight, which is the single outcome this strategy exists to avoid. It cannot "
-            "go to 1.0 either: past this line the fallback still has to fit the conversation "
-            "under the ceiling. Must exceed --trigger-fraction. Default %(default)s."
+            "At the 0.6 default trigger that gap is three tenths of the budget, which is "
+            "several turns rather than one. It was briefly 0.95, to widen the gap under a 0.8 "
+            "trigger against a give-up that no archived run has ever taken -- no run carries a "
+            "FALLBACK flag. It cannot go to 1.0 either: past this line the fallback still has "
+            "to fit the conversation under the ceiling. Must exceed --trigger-fraction. "
+            "Default %(default)s."
         ),
     )
     parser.add_argument(
