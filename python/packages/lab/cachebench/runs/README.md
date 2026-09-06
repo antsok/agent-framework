@@ -156,6 +156,19 @@ trust.
 
 Runs before 24 predate that format and exist only as captured stdout.
 
+Run 40 is the repaired coverage check measured at 60K/0.86, three seeds, four rows in one
+invocation so `anchored` -- the strategy the record strategy falls back to -- is compared on the
+same conversations rather than across runs. Four arms: each model with and without record
+repeats. The repairs hold (`UNCOVERED:0`, one record per trigger, no fallback on mini's
+no-repeat seeds), and the cost axis still refuses: +9%/-7% on luna, +44%/+98% on mini. Read
+`RESULTS.md` for why the snapshot axis and the cost axis disagree there.
+
+**These records are schema 6 and carry neither the strategy settings nor the workload flags**, so
+the two arms of each model are indistinguishable inside the files; the cross-cell report correctly
+says the settings are not recorded, and the workload heading says `flags not recorded`, rather than
+either being inferred from the filenames. Everything in this directory is schema 2 to 6, and all of
+it predates both blocks.
+
 Runs 38 and 39 are the strategy repair, three seeds a model at fixed 60K/0.86. Run 38 is
 coverage keyed on tool names, which is a **regression** kept as evidence: it held back complete
 records on `gpt-5.4-mini`, collapsed its shrink from 20% to 5-6%, and made it lose nine facts on

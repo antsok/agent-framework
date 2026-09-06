@@ -1407,7 +1407,10 @@ Cost: $84.69, roughly EUR 78.
 and four window sizes. Every negative figure sits inside its control's spread, on both.
 
 **The cache penalty is the mechanism, on both.** Whenever a strategy edits the prefix its hit
-rate falls -- to 75-91% on luna against controls at 94-98% -- and the cost follows.
+rate falls -- to **56-97%** on luna against controls at 94-98% -- and the cost follows. (An
+earlier version of this line said 75-91%. Recomputed from the 270 records: the compacting rows
+span 56% to 97%, so the penalty is both deeper and more variable than stated, and the ranges
+overlap the controls at the top end.)
 
 **`context_window` is dearest or near-dearest almost everywhere**, +17% to +39% on luna in seven
 of nine cells. The two exceptions are instructive rather than reassuring: at 120,000/0.86 and
@@ -1644,6 +1647,28 @@ nothing for an extra model call. It earns its keep on luna only where tool outpu
 **The usable statement:** the record's advantage over deleting the oldest messages is
 model-dependent, and on luna it survives only in the share-0.80 cells. Nothing in the CLI recovers
 it elsewhere.
+
+### Corrections carried out of the 6 September review
+
+Three statements in the sections above were wrong or unsupported and are corrected here rather
+than silently edited, so the review can be checked against them.
+
+- **Hit rates.** Stated as 75-91% for compacting rows; actually **56-97%**. Corrected in place
+  above.
+- **Five rows in this matrix carry `DRIFT`** and are quoted with no caveat: `anchored` at
+  200K/0.86 seeds 2 and 5 (5 and 12), `anchored_min_gain` at 200K/0.86 seed 4 (12),
+  `context_window` at 200K share 0.80 seed 3 (5), and `anchored` at 60K share 0.80 seed 4 (9).
+  `DRIFT` means a probe's prompt was not the snapshot verbatim, so those rows overstate what
+  reached the model, and their accuracy figures should be read as upper bounds.
+- **"Which strategy is least bad is model-specific ... the two models disagree completely"** rests
+  on a 12-point gap that sits inside both rows' own spreads (25% and 22%), and luna's mean of
+  40/53 at that cell is `[21, 53, 53, 53, 21]` -- three of five seeds matched mini exactly. The
+  defensible version is that the models **do not resolve the same at that cell**, not that they
+  disagree.
+- **The `control spread` column** in the matrix tables mixes axes: it is neither the control row's
+  `seed$+-` nor exactly its `run$` spread, while `vs none$` is on `seed$`. Treat it as indicative
+  of scale rather than as a matched error bar. The conclusion it supports -- every negative sits
+  inside its control's spread -- survives on either axis.
 
 ### The luna cells are less full than their labels, and the instrument said so
 

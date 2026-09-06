@@ -1121,9 +1121,20 @@ class ToolResultRecallMiddleware(ChatMiddleware):
             same constant the strategy defaults to, so the two halves cannot silently disagree
             about when a record is wanted.
         repeat_records: Let the size trigger ask again once there is new tool work to record.
-            On by default. Off, it asks exactly once per conversation and never again, which
-            is what this did before repeats existed and is the setting a run has to use to be
-            comparable with one taken before them.
+            **Off by default**, which is also what this did before repeats existed, so a run
+            left alone is comparable with one taken before them.
+
+            Off is the default because on is conditional and the condition is not knowable
+            from here. Repeats help exactly when one record cannot cover the whole
+            conversation, and the signal for that is the strategy's own
+            ``groups_kept_uncovered`` -- the ``UNCOVERED:<n>`` flag -- being non-zero: those
+            are groups the record never named and the strategy refused to drop. Where a record is
+            already complete, a second one is duplication, and duplication here is preserved,
+            unshrinkable prompt. Measured in run 40: on ``gpt-5.4-mini``, whose records carry
+            every value from every group, repeats produced negative shrink on all three seeds
+            (-1%, -4%, -2%); on ``gpt-5.6-luna``, whose record covered two of six groups, they
+            were better on every axis. A framework cannot tell those two models apart in
+            advance, so the safe default is the one that cannot hurt the complete-record case.
 
             Repeating cannot be done by reading size alone, and the gate that used to sit here
             is why: the size that fired the trigger does not go away when a record arrives,
@@ -1172,7 +1183,7 @@ class ToolResultRecallMiddleware(ChatMiddleware):
         trigger_fraction: float = DEFAULT_TRIGGER_FRACTION,
         record_max_tokens: int | None = DEFAULT_RECORD_MAX_TOKENS,
         max_groups_before_record: int | None = None,
-        repeat_records: bool = True,
+        repeat_records: bool = False,
     ) -> None:
         """Validate and store the configuration.
 

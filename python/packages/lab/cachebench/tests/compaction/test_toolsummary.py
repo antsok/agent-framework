@@ -1523,14 +1523,20 @@ def _repeating(**kwargs: Any) -> ToolResultRecallMiddleware:
     is the point: every test below is about what happens once size has stopped being the
     interesting variable, which is the state the single-record gate used to hide.
 
+    Repeats are asked for by name, because the constructor's default is off: run 40 measured
+    them costing shrink on a model whose records were already complete, so a caller that says
+    nothing gets the behaviour that cannot hurt. The tests below are about what the repeating
+    trigger does, so they have to say so.
+
     Keyword Args:
-        kwargs: Overrides, so a test can turn repeats off or add a group bound.
+        kwargs: Overrides, so a test can turn repeats off again or add a group bound.
 
     Returns:
         The middleware.
     """
     kwargs.setdefault("max_input_tokens", 1_000)
     kwargs.setdefault("trigger_fraction", 0.1)
+    kwargs.setdefault("repeat_records", True)
     return ToolResultRecallMiddleware(tokenizer=TOKENIZER, arm=lambda: _armings.append(1), **kwargs)
 
 

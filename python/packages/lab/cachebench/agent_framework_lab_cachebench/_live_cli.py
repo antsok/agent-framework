@@ -36,6 +36,7 @@ from ._records import (
     CellParams,
     SeedRecord,
     StrategySettings,
+    WorkloadSettings,
     append_seed_record,
     group_by_cell,
     read_seed_records,
@@ -300,11 +301,17 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=2_048,
         help=(
-            "The model's maximum output tokens per response, which is subtracted from "
-            "--context-window to give the input budget every threshold is a fraction of. "
-            "This is the model's ceiling, not the size of reply you want: setting it too low "
-            "inflates the budget and can push a strategy's trigger above what the service "
-            "will accept, which disables compaction with no warning."
+            "The output reservation for ordinary calls: subtracted from --context-window to "
+            "give the input budget every threshold is a fraction of, and sent as max_tokens on "
+            "every seeding call. One number, reserved and sent, which it was not until now -- "
+            "the arithmetic used this while the request carried --answer-max-tokens, so at a "
+            "60,000 window with a 12,000 answer cap the strategies believed 57,952 tokens of "
+            "input were available when 48,000 were. Runs 26 to 40 sit on that arithmetic and "
+            "are not comparable with anything measured after it. Size it to the longest reply "
+            "a seeding turn may write, since a reply cut here is a turn the conversation "
+            "carries short: measured at ~150 tokens on gpt-5.4-mini and ~602 on gpt-5.6-luna. "
+            "Too low also inflates the budget and can push a trigger above what the service "
+            "will accept, which disables compaction with no warning. Default %(default)s."
         ),
     )
     parser.add_argument(
@@ -312,12 +319,16 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=4_000,
         help=(
-            "Cap sent as max_tokens on every request, which the provider honours exactly. "
-            "Must comfortably exceed the longest closing answer: at roughly 12 tokens per "
-            "labelled code, enumerating 53 of them costs ~640 tokens before any prose, and a "
-            "truncated answer is scored as lost facts and reads as compaction damage. Raising "
-            "it is nearly free, since replies average ~150 tokens and models do not pad to "
-            "the cap."
+            "Cap sent as max_tokens on the closing questions, and on no other call. Those are "
+            "the only calls nothing follows -- the snapshot is restored before the next probe, "
+            "so an answer's length is never re-sent -- and the only ones that have to enumerate "
+            "everything the run planted: at roughly 12 tokens per labelled code, 53 of them "
+            "cost ~640 tokens before any prose, and a truncated answer is scored as lost facts "
+            "and reads as compaction damage. It is reserved out of --context-window for those "
+            "calls, so a cell whose seeded conversation leaves less headroom than this asks for "
+            "is warned about before anything is spent. It was formerly sent on every request "
+            "while --max-output-tokens was the number reserved; see that flag. Default "
+            "%(default)s."
         ),
     )
     parser.add_argument(
@@ -326,12 +337,12 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_RECORD_MAX_TOKENS,
         help=(
             "Cap sent as max_tokens on the one call tool_summary_anchored forces, and on no "
-            "other. Without it that call inherits --answer-max-tokens, so the one call asked "
+            "other. Without it that call inherits --max-output-tokens, so the one call asked "
             "to summarise every earlier tool result is the one call with no bound of its own. "
             "It bounds the bill and nothing else: a model does not plan to fit a cap, and a "
             "tool call cut at one loses its arguments rather than shortening them, which is "
-            "why the size is asked for by --record-target-tokens instead. 0 to leave "
-            "--answer-max-tokens in place."
+            "why the size is asked for by --record-target-tokens instead. 0 to leave the run's "
+            "ordinary cap, --max-output-tokens, in place."
         ),
     )
     parser.add_argument(
@@ -364,19 +375,23 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
-        "--no-record-repeats",
+        "--record-repeats",
         action="store_true",
         help=(
-            "Ask for one recall record per conversation and no more, whatever else accumulates. "
-            "Every run up to and including 39 was single-record, because the size trigger was "
-            "gated on there being no record yet, so a row meant to be compared against those "
-            "has to set this. Left off, the trigger asks again once the agent has done tool "
-            "work no existing record accounts for -- which is the condition that keeps it from "
-            "asking on every remaining call, since the size that fired it does not go away when "
-            "a record arrives. Each further record costs an agent turn and is preserved for the "
-            "rest of the run, so RECORDS:<n> in the flags column is the price of leaving this "
-            "off. --max-groups-before-record is unaffected: setting a group bound is asking for "
-            "repeats outright, and it keeps forcing them either way."
+            "Let the size trigger ask for a further recall record once the agent has done tool "
+            "work no existing record accounts for. Off by default, which is also what every run "
+            "up to and including 39 did, so a row is comparable with those unless this is set. "
+            "Read UNCOVERED before setting it: a non-zero UNCOVERED:<n> in the flags column "
+            "means one record is not covering the whole conversation -- the strategy keeps every "
+            "group the record never named -- and that is the condition repeats are for. At "
+            "UNCOVERED:0 they can only cost: run 40 measured them on gpt-5.4-mini, whose records "
+            "are already complete, at -1%%, -4%% and -2%% shrink on three seeds, because a second "
+            "record is duplication added to the prompt as preserved, unshrinkable tokens. On "
+            "gpt-5.6-luna, whose record covered two of six groups, they were better on every "
+            "axis. Whether one record can cover everything is a property of the model and the "
+            "workload, which is why this is a flag and not a default. --max-groups-before-record "
+            "is unaffected: setting a group bound is asking for repeats outright, and it keeps "
+            "forcing them either way."
         ),
     )
     parser.add_argument(
@@ -1734,8 +1749,9 @@ _LEGEND: Final[tuple[str, ...]] = (
     "            the evidence rather than the bulk. So each one raises a floor under the",
     "            prompt that no later pass can lower, and a row above 1 here is a row whose",
     "            money columns are partly that floor rather than the workload. Runs up to",
-    "            39 were single-record by construction and carry no such number;",
-    "            --no-record-repeats reproduces them. FORCED:<n> times it asked for",
+    "            39 were single-record by construction and carry no such number; the default",
+    "            reproduces them and --record-repeats is what asks for more. FORCED:<n>",
+    "            times it asked for",
     "            one, TRUNCATED:<n> forced calls the provider cut at --record-max-tokens, so",
     "            that record may cover only part of what it was asked to preserve and the",
     "            missing part is scored as compaction damage. UNCOVERED:<n> tool-call groups",
@@ -1982,8 +1998,15 @@ def _render(
     return "\n".join(lines)
 
 
-def _plan_or_exit(args: argparse.Namespace, tokenizer: Any) -> FillPlan | None:
+def _plan_or_exit(args: argparse.Namespace, tokenizer: Any, workload: WorkloadSettings) -> FillPlan | None:
     """Solve the fill sizing, or exit explaining why this cell cannot be built.
+
+    Args:
+        args: Parsed command line arguments.
+        tokenizer: The run's token counter.
+        workload: The resolved workload flags, two of which change how large the conversation
+            is: the retrieval clause lengthens the instructions and a sweeping close replaces
+            several question turns with one.
 
     Returns:
         The plan, or None when --fill 0 asked for manual sizing.
@@ -2012,8 +2035,8 @@ def _plan_or_exit(args: argparse.Namespace, tokenizer: Any) -> FillPlan | None:
             narration=args.narration,
             fact_placement=args.fact_placement,
             reply_tokens=args.assumed_reply_tokens,
-            retrieval_guidance=not args.no_retrieval_guidance,
-            subset_questions=not args.sweeping_question,
+            retrieval_guidance=workload.retrieval_guidance,
+            subset_questions=workload.subset_questions,
             filler_turn_tokens=args.filler_tokens,
         )
     except ValueError as error:
@@ -2109,7 +2132,38 @@ def _strategy_settings(
         record_max_tokens=args.record_max_tokens or None,
         record_target_tokens=args.record_target_tokens or None,
         max_groups_before_record=args.max_groups_before_record or None,
-        repeat_records=not args.no_record_repeats,
+        repeat_records=args.record_repeats,
+    )
+
+
+def _workload_settings(args: argparse.Namespace) -> WorkloadSettings:
+    """Return the workload block the cell records, resolved once for the whole run.
+
+    The five flags that change the conversation rather than the strategies, and the last part of
+    the command line that was on no key at all: two runs differing in any of them keyed as one
+    cell and were meaned into one row. Resolved here rather than at each use for the reason
+    :func:`_strategy_settings` is -- ``not args.sweeping_question`` appears at three call sites
+    and ``not args.no_retrieval_guidance`` at three more, and a run that inverts one of them in
+    one place and not another measures a conversation no record describes.
+
+    Built before the provider, because everything in it is decided by the command line alone and
+    the dry run needs the same values the real run will use.
+
+    Args:
+        args: Parsed command line arguments.
+
+    Returns:
+        The flags.
+    """
+    return WorkloadSettings(
+        force_tool_calls=not args.no_force_tool_calls,
+        retrieval_guidance=not args.no_retrieval_guidance,
+        subset_questions=not args.sweeping_question,
+        # The value rather than the flag: --no-temperature names an omission, and what is sent
+        # is either 0.0 or no field at all. Recording the boolean would leave a reader to know
+        # which number the other branch meant.
+        temperature=None if args.no_temperature else 0.0,
+        server_history=args.server_history,
     )
 
 
@@ -2589,9 +2643,11 @@ _ACROSS_PREAMBLE: Final[tuple[str, ...]] = (
     "applied, and refused whenever the gap between the two cheapest is inside the spread of the",
     "seeds it rests on.",
     "",
-    "Never ranked across workloads. A different window, fill, payload or narration is a",
-    "different conversation, so a smaller number under one of them is a smaller job rather than",
-    "a better strategy -- this project has already read one such comparison the wrong way.",
+    "Never ranked across workloads. A different window, fill, payload, narration or workload",
+    "flag is a different conversation, so a smaller number under one of them is a smaller job",
+    "rather than a better strategy -- this project has already read one such comparison the",
+    "wrong way. The flags are named on each workload heading, and read 'flags not recorded' for",
+    "a cell written before they reached the file, which is a statement about the record.",
     "Models are kept apart for that reason and one more: they are priced differently, and every",
     "ranking here is on money.",
 )
@@ -2802,7 +2858,47 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
     min_correctness = DEFAULT_MIN_CORRECTNESS if args.min_correctness is None else args.min_correctness
     tokenizer = build_tokenizer(args.tokenizer)
     retained = args.keep_last_tool_groups
-    plan = _plan_or_exit(args, tokenizer)
+    # Resolved once, above everything that reads it: the sizing, the dry run, the provider, each
+    # seed's scenario and each seed's run all take their values from here, so the conversation
+    # the record describes is the conversation that was had.
+    workload = _workload_settings(args)
+    plan = _plan_or_exit(args, tokenizer, workload)
+    # The other half of "reserved and sent". --max-output-tokens is deducted from the window by
+    # the strategies, so its reservation is structural; --answer-max-tokens is deducted from the
+    # same window on the closing calls alone, and nothing compacts to it -- compacting the
+    # snapshot on the way into a probe would move the material the answers are scored against,
+    # which the drift counter exists to catch rather than to cause. So the reservation is
+    # checked here instead, against the size the cell is being sized to reach, and it is a
+    # warning rather than a refusal because every archived cell fails it and has to stay
+    # reproducible: at 60,000 and 0.86 the seeded prompt aims at 51,600 tokens and a 12,000
+    # answer does not fit beside it.
+    answer_headroom = args.context_window - args.answer_max_tokens
+    if plan is not None and plan.target_tokens > answer_headroom:
+        print(
+            f"WARNING: --answer-max-tokens {args.answer_max_tokens:,} reserves the window down to "
+            f"{answer_headroom:,} tokens on the closing calls, and this cell is sized to reach "
+            f"{plan.target_tokens:,}. A model whose window covers input and output together "
+            "cannot write that answer from that snapshot, and it is the closing answers that "
+            "carry the accuracy columns. Lower --fill, lower --answer-max-tokens, or raise "
+            "--context-window.",
+            flush=True,
+        )
+    # The third call path, and the one place the same defect survives the fix above. A recall
+    # record is a tool call the model writes into the conversation, and every record is
+    # preserved for the rest of the run, so that reply is re-sent on every later turn exactly
+    # as a seeding reply is -- which makes --max-output-tokens its reservation too, and makes
+    # --record-max-tokens a tightening of the run's cap for one call rather than a cap of its
+    # own. The shipped defaults have it the other way round: 4,000 against a 2,048 reservation.
+    if "tool_summary_anchored" in strategies and args.record_max_tokens > args.max_output_tokens:
+        print(
+            f"WARNING: --record-max-tokens {args.record_max_tokens:,} is above the "
+            f"--max-output-tokens {args.max_output_tokens:,} the input budget reserves. The "
+            "record is written into the conversation and preserved there, so it is re-sent on "
+            "every later turn like any other reply, and the budget holds room for the smaller "
+            "number. It is meant to bound that one call below the run's cap, not above it: "
+            "raise --max-output-tokens, or lower --record-max-tokens.",
+            flush=True,
+        )
     filler_turns = plan.filler_turns if plan else args.filler_turns
     filler_tokens = plan.filler_tokens if plan else args.filler_tokens
     # The plan's size rather than the flag's, because --tool-share derives one and then this
@@ -2838,7 +2934,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
             markers_per_tool=args.markers_per_tool,
             filler_tool_turns=args.filler_tool_turns,
             narration=args.narration,
-            subset_questions=not args.sweeping_question,
+            subset_questions=workload.subset_questions,
         )
         questions = max(scenario.answer_turn_count, 1)
         # The same fallback run_live applies: a scenario that declares no scopes closes with
@@ -2893,8 +2989,8 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
 
     runtime = build_provider(
         provider,
-        temperature=None if args.no_temperature else 0.0,
-        response_max_tokens=args.answer_max_tokens,
+        temperature=workload.temperature,
+        response_max_tokens=args.max_output_tokens,
         model=model_override,
     )
     pricing = _resolve_pricing(args, provider, runtime.model)
@@ -2923,7 +3019,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
     # every setting silently measures the same thing. Measured on Foundry before this was
     # forced: a 16-turn conversation reported a one-message prompt on every row.
     stores_by_default = bool(getattr(runtime.client, "STORES_BY_DEFAULT", False))
-    if wants_client_side_history(runtime.client, allow_server_history=args.server_history):
+    if wants_client_side_history(runtime.client, allow_server_history=workload.server_history):
         # run_live forces this itself; setting it here too keeps the note honest about what
         # the run will actually do.
         runtime.options["store"] = False
@@ -2980,6 +3076,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
         price_output=pricing.output_per_million,
         min_correctness=min_correctness,
         plan=plan,
+        workload=workload,
         settings=settings,
     )
     results_path = Path(args.results_jsonl) if args.results_jsonl is not None else None
@@ -3008,7 +3105,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
                 markers_per_tool=args.markers_per_tool,
                 filler_tool_turns=args.filler_tool_turns,
                 narration=args.narration,
-                subset_questions=not args.sweeping_question,
+                subset_questions=workload.subset_questions,
             )
             options = _strategy_options(
                 args,
@@ -3023,12 +3120,21 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
                 scenario=scenario,
                 agent_kind=args.agent,
                 tool_result_tokens=tool_result_tokens,
-                force_tool_calls=not args.no_force_tool_calls,
+                force_tool_calls=workload.force_tool_calls,
                 narration=args.narration,
-                retrieval_guidance=not args.no_retrieval_guidance,
+                retrieval_guidance=workload.retrieval_guidance,
                 fact_placement=args.fact_placement,
+                # Passed rather than left to the default, which is not a tidy-up: run_live
+                # forces store=False whenever the client stores by default and it is not told
+                # otherwise, so --server-history printed its warning here and was then undone
+                # one frame down. The flag measured nothing.
+                allow_server_history=workload.server_history,
                 probe_repeats=args.probe_repeats,
                 combined_repeats=args.combined_repeats,
+                # The cap for the closing answers, and the only calls that carry it. Ordinary
+                # calls carry --max-output-tokens, which is the number the strategies reserved
+                # out of the window; see the flag's help for why the two are not one.
+                answer_max_tokens=settings.answer_max_tokens,
                 # Off the recorded settings rather than off the flags, so what the record says
                 # this cell was configured with and what the seed was configured with are one
                 # expression. Resolving "0 means no bound of my own" twice is how a cell comes

@@ -16,6 +16,7 @@ import json
 import re
 from collections.abc import Mapping, Sequence
 from dataclasses import fields, replace
+from inspect import signature
 from pathlib import Path
 from statistics import fmean
 from types import SimpleNamespace
@@ -105,15 +106,18 @@ from agent_framework_lab_cachebench._live_cli import (
     _strategy_options,
     _summarizer_cost,
     _to_joint,
+    _workload_settings,
     build_parser,
     run_live_comparison,
 )
+from agent_framework_lab_cachebench._providers import _base_options
 from agent_framework_lab_cachebench._recall import COMBINED_SCOPE, render_codes
 from agent_framework_lab_cachebench._records import (
     SCHEMA_VERSION,
     CellParams,
     SeedRecord,
     StrategySettings,
+    WorkloadSettings,
     append_seed_record,
     group_by_cell,
     read_seed_records,
@@ -779,7 +783,7 @@ def test_every_argument_the_runner_reads_is_defined() -> None:
         "trigger_fraction",
         "fallback_fraction",
         "coverage_share",
-        "no_record_repeats",
+        "record_repeats",
         "min_correctness",
         "summarizer_provider",
         "no_force_tool_calls",
@@ -4309,14 +4313,36 @@ def _live_argv(*extra: str) -> list[str]:
     ]
 
 
-def _stub_provider(monkeypatch: pytest.MonkeyPatch) -> None:
-    """Point the live CLI at the stub client, so a whole comparison runs offline."""
+def _stub_provider(monkeypatch: pytest.MonkeyPatch) -> list[ProviderRuntime]:
+    """Point the live CLI at the stub client, so a whole comparison runs offline.
 
-    def build(name: str, **_: Any) -> ProviderRuntime:
+    The per-request options are built by the real :func:`_base_options`, not invented here, so
+    a test asking what the run sent is asking about the code path a live run takes. Anything
+    that swallowed ``response_max_tokens`` would make every assertion about output caps vacuous.
+
+    Returns:
+        The runtimes as they are built, so a test can read what reached the client.
+    """
+    built: list[ProviderRuntime] = []
+
+    def build(
+        name: str,
+        *,
+        temperature: float | None = None,
+        response_max_tokens: int = 0,
+        model: str | None = None,
+    ) -> ProviderRuntime:
         usage = UsageDetails(input_token_count=1_000, output_token_count=20, cache_read_input_token_count=300)
-        return ProviderRuntime(client=StubChatClient(usage=usage), model="stub-model")
+        runtime = ProviderRuntime(
+            client=StubChatClient(usage=usage),
+            model=model or "stub-model",
+            options=_base_options(temperature, response_max_tokens),
+        )
+        built.append(runtime)
+        return runtime
 
     monkeypatch.setattr("agent_framework_lab_cachebench._live_cli.build_provider", build)
+    return built
 
 
 def _table(printed: str) -> str:
@@ -4329,11 +4355,12 @@ async def test_the_record_repeat_setting_reaches_the_run_that_installs_the_middl
 ) -> None:
     """A reproducibility flag that stops at the parser is worse than not having one.
 
-    The whole value of ``--no-record-repeats`` is that a cell can be put back on the axis runs
-    26-39 were measured on. A flag that parsed, appeared in the archived command line, and then
-    never reached the middleware would produce a cell labelled single-record that was not one,
-    and the comparison it exists for would be made against the wrong thing with nothing saying
-    so.
+    ``--record-repeats`` is off by default, so the default is the axis runs 26-39 were measured
+    on and the flag is what leaves it. A flag that parsed, appeared in the archived command
+    line, and then never reached the middleware would produce a cell labelled repeating that was
+    not one, and the comparison it exists for would be made against the wrong thing with nothing
+    saying so. Run 40 is why the default is this way round: repeats cost ``gpt-5.4-mini``
+    shrink on all three seeds, whose records were already complete.
     """
     _stub_provider(monkeypatch)
     live = run_live
@@ -4347,10 +4374,10 @@ async def test_the_record_repeat_setting_reaches_the_run_that_installs_the_middl
 
     await run_live_comparison(build_parser().parse_args(_live_argv()))
     default = list(seen)
-    await run_live_comparison(build_parser().parse_args(_live_argv("--no-record-repeats")))
+    await run_live_comparison(build_parser().parse_args(_live_argv("--record-repeats")))
 
-    assert default and all(default), "repeats are on unless the run asks otherwise"
-    assert not any(seen[len(default) :]), "and off for every strategy-seed of a run that does"
+    assert default and not any(default), "repeats are off unless the run asks for them"
+    assert all(seen[len(default) :]), "and on for every strategy-seed of a run that does"
 
 
 async def test_every_finished_seed_is_on_disk_before_the_cell_is(
@@ -5042,7 +5069,7 @@ async def test_two_cells_differing_only_in_a_record_repeat_setting_do_not_merge(
     """The defect: a strategy setting was not on the record, so two arms of one experiment pooled.
 
     Run 40 measured ``tool_summary_anchored`` at -7% and +9% against the control on the two
-    sides of ``--no-record-repeats``. Concatenated into one file they keyed identically, were
+    sides of the record-repeat setting. Concatenated into one file they keyed identically, were
     meaned into a single row reading +1%, and were given one verdict, with nothing anywhere
     saying that two configurations had been averaged. Every settings comparison this project
     has made stayed separate only because the files were kept apart by hand.
@@ -5130,6 +5157,355 @@ async def test_a_record_written_before_the_settings_block_reads_back_as_unknown(
     assert CellParams.from_dict(written).settings is None, "a configuration nobody recorded is not the default one"
 
 
+def _workload(**overrides: Any) -> WorkloadSettings:
+    """Return a workload block shaped like the one a live run resolves and records."""
+    defaults: dict[str, Any] = {
+        "force_tool_calls": True,
+        "retrieval_guidance": True,
+        "subset_questions": True,
+        "temperature": 0.0,
+        "server_history": False,
+    }
+    return WorkloadSettings(**{**defaults, **overrides})
+
+
+async def test_two_cells_differing_only_in_a_workload_flag_do_not_merge(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The half of the command line the settings block deliberately does not cover.
+
+    Five options change the conversation rather than the strategies -- pinned tool calls, the
+    retrieval clause, one sweeping closing question against several scoped ones, the temperature,
+    and who holds the history -- and none of them was on any key. Two runs differing in one keyed
+    identically, were meaned into one row and were given one verdict, which is exactly the defect
+    that made ``repeat_records`` a recorded setting one category along. Letting the model choose
+    its own tool calls was measured reaching 3 of 6 scopes against 6 of 6, so these are not two
+    readings of one question.
+    """
+    pinned = _cell_params(workload=_workload(), settings=_settings())
+    free = _cell_params(workload=_workload(force_tool_calls=False), settings=_settings())
+    rows = {"none": [(0.030, 1.0), (0.030, 1.0)], "truncation": [(0.020, 1.0), (0.020, 1.0)]}
+    path = _written(tmp_path / "flags.jsonl", await _priced_records(pinned, rows) + await _priced_records(free, rows))
+
+    printed = await _rebuilt(capsys, path)
+    across = _across(printed)
+
+    assert len(group_by_cell(read_seed_records(path))) == 2, "one flag apart is two cells, not one row"
+    assert pinned.key != free.key, "the flag has to be in the key, not merely on the record"
+    assert pinned.workload_key != free.workload_key, "and in the workload key, or the two get ranked together"
+    assert printed.count("Cell: ") == 2
+    assert "2 workloads below" in across, "two conversations are never ranked against each other"
+    assert "tools pinned" in across
+    assert "tools free" in across
+
+
+async def test_records_without_the_workload_block_load_and_say_the_flags_are_unrecorded(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """Every cell on disk predates the workload block, and must still open and still say so.
+
+    Which flags those runs set is unknowable from the record, so the block reads back as None and
+    the heading says ``flags not recorded`` rather than naming this version's defaults. A cell
+    that cannot say what it asked must not be presented as having asked the same thing as one
+    written today, and it must not be refused either: that would discard every paid-for seed in
+    ``runs/``.
+    """
+    unknown = _cell_params(settings=_settings())
+    known = _cell_params(workload=_workload(), settings=_settings())
+    rows = {"none": [(0.030, 1.0), (0.030, 1.0)], "truncation": [(0.020, 1.0), (0.020, 1.0)]}
+    path = _written(tmp_path / "old.jsonl", await _priced_records(unknown, rows) + await _priced_records(known, rows))
+
+    stored = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines()]
+    printed = await _rebuilt(capsys, path)
+
+    assert unknown.workload is None
+    assert stored[0]["cell"]["workload"] is None, "an unknown block is written as absent, not as this run's defaults"
+    assert unknown.key != known.key, "unknown flags are not the same flags"
+    assert all(record.cell.workload is None for record in read_seed_records(path) if record.cell == unknown)
+    assert "flags not recorded" in printed
+    assert "tools pinned" in printed
+
+
+async def test_a_record_written_before_the_workload_block_reads_back_as_unknown() -> None:
+    """A schema 7 line has no workload object, and must not be given this version's defaults.
+
+    Unlike the settings block, the defaults here have not moved: every one of the five flags has
+    had its present value for as long as records have existed. What no record says is whether a
+    run *set* one, and runs did -- run 21 and the unpinned void run used ``--no-force-tool-calls``,
+    the reply-cap probe used ``--sweeping-question`` and ``--no-retrieval-guidance``. Filling
+    these in would therefore not be a stale value but a guess about a command line nobody wrote
+    down, and it would key an archived cell as having held the conversation a run today holds.
+    """
+    written = _cell_params(workload=_workload()).to_dict()
+    del written["workload"]
+
+    assert CellParams.from_dict(written).workload is None, "a conversation nobody described is not the default one"
+    assert CellParams.from_dict(written).workload_flags == "flags not recorded"
+
+
+def test_every_boolean_flag_that_changes_a_run_is_recorded_somewhere() -> None:
+    """A flag that changes the run and reaches no key is the defect this session was fixing.
+
+    Every one of these was reachable, and three of them were used by archived runs, while the
+    cell said nothing about any of them. The buckets are the point: a new ``store_true`` flag has
+    to be sorted into one of the three deliberately, and one that changes the conversation and is
+    left out of the workload block fails here rather than at the point where two cells silently
+    merge months later.
+    """
+    booleans = {name for name, value in vars(build_parser().parse_args(["azure"])).items() if isinstance(value, bool)}
+    changes_the_conversation = {
+        "no_force_tool_calls",
+        "no_retrieval_guidance",
+        "sweeping_question",
+        "no_temperature",
+        "server_history",
+    }
+    a_strategy_setting = {"record_repeats"}
+    changes_nothing_measured = {"show_answers", "dry_run"}
+
+    assert booleans == changes_the_conversation | a_strategy_setting | changes_nothing_measured, (
+        "a new boolean flag belongs in CellParams.workload, in StrategySettings, or in neither "
+        "because it changes nothing measured -- pick one here"
+    )
+    assert len(fields(WorkloadSettings)) == len(changes_the_conversation), "one recorded field per flag"
+
+
+async def test_the_workload_flags_recorded_are_the_ones_the_run_was_configured_with(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Resolved values, and the same expression the run is driven from.
+
+    The flags are negative and the values are not, and ``--no-temperature`` names an omission
+    rather than a number, so a block copied from the command line would record a boolean where
+    the request simply carries no temperature field. Checked against what ``run_live`` was handed
+    as well as against the record, because a second resolution of the same flags is how a cell
+    comes to be labelled with a conversation it did not have.
+
+    ``allow_server_history`` is checked for a reason of its own: it was not passed at all, so
+    ``run_live`` re-derived it from its own default and forced ``store=False`` one frame below
+    the warning ``--server-history`` had just printed. The flag measured nothing.
+    """
+    built = _stub_provider(monkeypatch)
+    path = tmp_path / "resolved-flags.jsonl"
+    live = run_live
+    seen: list[dict[str, Any]] = []
+
+    async def capture(*args: Any, **kwargs: Any) -> LiveOutcome:
+        names = ("force_tool_calls", "retrieval_guidance", "allow_server_history")
+        seen.append({name: kwargs[name] for name in names})
+        return await live(*args, **kwargs)
+
+    monkeypatch.setattr("agent_framework_lab_cachebench._live_cli.run_live", capture)
+    await run_live_comparison(
+        build_parser().parse_args(
+            _live_argv(
+                "--results-jsonl",
+                str(path),
+                "--strategies",
+                "none",
+                "--repeats",
+                "1",
+                "--no-force-tool-calls",
+                "--no-temperature",
+            )
+        )
+    )
+
+    (record,) = read_seed_records(path)
+    (runtime,) = built
+    flags = record.cell.workload
+
+    assert flags is not None
+    assert flags.force_tool_calls is False
+    assert flags.retrieval_guidance is True
+    assert flags.subset_questions is True
+    assert flags.server_history is False
+    assert flags.temperature is None, "--no-temperature omits the field; the value sent is what is recorded"
+    assert "temperature" not in runtime.options, "and the omission is what the request actually carried"
+    assert seen == [{"force_tool_calls": False, "retrieval_guidance": True, "allow_server_history": False}], (
+        "the run must be driven from the values the record carries, not from a second reading of the flags"
+    )
+
+
+def test_the_workload_block_is_what_the_run_resolves_from_the_flags() -> None:
+    """Every flag inverted at once, so no pair of them can be swapped without this noticing."""
+    args = build_parser().parse_args(
+        _live_argv(
+            "--no-force-tool-calls",
+            "--no-retrieval-guidance",
+            "--sweeping-question",
+            "--no-temperature",
+            "--server-history",
+        )
+    )
+
+    assert _workload_settings(args) == WorkloadSettings(
+        force_tool_calls=False,
+        retrieval_guidance=False,
+        subset_questions=False,
+        temperature=None,
+        server_history=True,
+    )
+    assert _workload_settings(build_parser().parse_args(_live_argv())) == _workload()
+
+
+def test_record_repeats_are_off_unless_a_run_asks_for_them() -> None:
+    """Run 40 does not support them as a default, and the flag reads the way round that says so.
+
+    Repeats were better on ``gpt-5.6-luna``, whose record named two of six tool groups, and worse
+    on every axis on ``gpt-5.4-mini``, whose records are complete: -1%, -4% and -2% shrink on the
+    three seeds, because a second record is duplication added to the prompt as preserved,
+    unshrinkable tokens. Whether one record can cover a conversation is a property of the model
+    and the workload, which a framework cannot know, so the default is the one that cannot hurt.
+    A ``--no-record-repeats`` flag would be a double negative over an off default, so the flag is
+    the positive form.
+    """
+    parser = build_parser()
+
+    assert parser.parse_args(["azure"]).record_repeats is False
+    assert parser.parse_args(["azure", "--record-repeats"]).record_repeats is True
+    assert signature(run_live).parameters["repeat_records"].default is False
+    assert signature(ToolResultRecallMiddleware).parameters["repeat_records"].default is False
+    assert "UNCOVERED" in parser.format_help(), "the help has to name the signal that says repeats would help"
+
+
+def test_a_sixty_thousand_token_window_budgets_against_the_number_it_sends() -> None:
+    """The reservation and the request were two different numbers, and the budget was the loser.
+
+    Strategies size their input budget as the window less ``--max-output-tokens``, while the
+    request carried ``--answer-max-tokens``: at 60,000 and 12,000 the thresholds were fractions
+    of 57,952 tokens when a reply could take 12,000 of them, leaving 48,000. Fixed by sending
+    what is reserved rather than by reserving what is sent, so the budget keeps its size and the
+    ordinary calls get the cap the arithmetic assumed. Runs 26 to 40 sit on the old arithmetic.
+    """
+    args = build_parser().parse_args(_live_argv("--max-output-tokens", "2048", "--answer-max-tokens", "12000"))
+    options = _strategy_options(args, TOKENIZER)
+
+    assert options.max_context_window_tokens == 60_000
+    assert options.input_budget_tokens == 57_952, "the window less the reservation, and nothing else"
+    assert _base_options(0.0, args.max_output_tokens)["max_tokens"] == options.max_output_tokens, (
+        "the number deducted from the window is the number the ordinary calls send"
+    )
+
+
+async def test_each_call_path_sends_the_output_cap_that_was_reserved_for_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """One number per path: the seeding calls the reservation, the closing calls the answer cap.
+
+    A seeding reply is appended to the history and re-sent on every turn after it, so the budget
+    the strategies threshold against has to hold room for one -- and it holds room for
+    ``--max-output-tokens``, which is therefore what those calls must send. Nothing follows a
+    closing answer: the snapshot is restored before the next probe, so its length is never
+    re-sent, while the answer itself has to enumerate everything planted or be scored as lost
+    facts. So it carries ``--answer-max-tokens``, and no other call does.
+    """
+    built = _stub_provider(monkeypatch)
+    path = tmp_path / "caps.jsonl"
+    await run_live_comparison(
+        build_parser().parse_args(
+            _live_argv(
+                "--results-jsonl",
+                str(path),
+                "--strategies",
+                "none",
+                "--repeats",
+                "1",
+                "--max-output-tokens",
+                "2048",
+                "--answer-max-tokens",
+                "12000",
+            )
+        )
+    )
+
+    (runtime,) = built
+    (record,) = read_seed_records(path)
+    settings = record.cell.settings
+    caps = [options.get("max_tokens") for options in cast("StubChatClient", runtime.client).options_seen]
+    closing = caps.index(12_000)
+
+    assert settings is not None
+    assert settings.max_output_tokens == 2_048
+    assert settings.answer_max_tokens == 12_000
+    assert set(caps) == {2_048, 12_000}, "no call may carry a cap neither of the two flags named"
+    assert set(caps[:closing]) == {settings.max_output_tokens}, "seeding sends what the budget reserved"
+    assert set(caps[closing:]) == {settings.answer_max_tokens}, "and only the closing answers send the other"
+    assert record.cell.context_window - settings.max_output_tokens == 57_952, (
+        "and the budget the thresholds are fractions of is the window less that same number"
+    )
+
+
+async def test_a_cell_sized_past_the_answer_reservation_says_so_before_it_spends(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The answer cap is a reservation out of the window, not only a cap on the reply.
+
+    Nothing compacts to it -- compacting the snapshot on the way into a probe would move the
+    material the answers are scored against, which the drift counter exists to catch rather than
+    to cause -- so the reservation is checked against the size the cell is aimed at instead. A
+    warning rather than a refusal, because every archived cell fails it: at 60,000 and 0.86 the
+    seeded prompt aims at 51,600 tokens and a 12,000-token answer does not fit beside it. Raised
+    from the plan, so ``--dry-run`` reaches it and a run learns this before it has spent anything.
+    """
+    capsys.readouterr()
+
+    await run_live_comparison(
+        build_parser().parse_args(_live_argv("--fill", "0.86", "--answer-max-tokens", "12000", "--dry-run"))
+    )
+    warned = capsys.readouterr().out
+    await run_live_comparison(
+        build_parser().parse_args(_live_argv("--fill", "0.86", "--answer-max-tokens", "2000", "--dry-run"))
+    )
+    quiet = capsys.readouterr().out
+
+    assert "--answer-max-tokens 12,000 reserves the window down to 48,000" in warned
+    assert "51,600" in warned, "and names the size the cell is aimed at"
+    assert "reserves the window down to" not in quiet, "silent when the answer fits beside the conversation"
+
+
+async def test_a_record_cap_above_the_reservation_is_named_as_the_same_defect(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The third call path, and the one the two-flag fix does not reach.
+
+    A recall record is a tool call the model writes into the conversation, and every record is
+    preserved there for the rest of the run, so that reply is re-sent on every later turn just
+    as a seeding reply is. Its reservation is therefore ``--max-output-tokens`` as well, and
+    ``--record-max-tokens`` only makes sense as a tightening of the run's cap for one call. The
+    shipped defaults have it the other way round -- 4,000 against a 2,048 reservation -- which
+    is the same "reserved one number, sent another" the closing calls had. Warned rather than
+    clamped: a configuration silently narrowed is a configuration nobody ran.
+
+    Only for the strategy that forces a record. Every other row leaves the flag inert, and a
+    warning about a call that will never be made is noise the real ones get lost in.
+    """
+    capsys.readouterr()
+
+    await run_live_comparison(
+        build_parser().parse_args(
+            _live_argv("--strategies", "none,tool_summary_anchored", "--record-max-tokens", "4000", "--dry-run")
+        )
+    )
+    forcing = capsys.readouterr().out
+    await run_live_comparison(
+        build_parser().parse_args(
+            _live_argv("--strategies", "none,truncation", "--record-max-tokens", "4000", "--dry-run")
+        )
+    )
+    not_forcing = capsys.readouterr().out
+    await run_live_comparison(
+        build_parser().parse_args(
+            _live_argv("--strategies", "none,tool_summary_anchored", "--record-max-tokens", "2000", "--dry-run")
+        )
+    )
+    within = capsys.readouterr().out
+
+    assert "--record-max-tokens 4,000 is above the --max-output-tokens 2,048" in forcing
+    assert "is above the --max-output-tokens" not in not_forcing, "no record is forced, so no call carries it"
+    assert "is above the --max-output-tokens" not in within, "silent when the one call fits inside the reservation"
+
+
 def test_every_strategy_option_that_changes_behaviour_reaches_the_recorded_settings() -> None:
     """A knob that reaches a constructor without reaching the file is the defect, one field along.
 
@@ -5184,7 +5560,6 @@ async def test_the_settings_recorded_are_the_resolved_ones_rather_than_the_flags
                 "0",
                 "--band-share",
                 "0.4",
-                "--no-record-repeats",
             )
         )
     )
