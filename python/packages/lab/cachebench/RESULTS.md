@@ -1465,6 +1465,48 @@ So luna writes at great length about the first two lookups and never reaches the
 is a property of the model's writing, not of a setting, and no bound reachable from the CLI moved
 it.
 
+### Run 40 -- the repaired check, measured, and the cost axis says no
+
+60,000 / 0.86, three seeds, four rows in one invocation so `anchored` -- the strategy this one
+falls back to -- is compared on the same conversations rather than across runs. Thresholds back at
+0.6/0.9, so this is comparable with the archive. 28 records, no throttling, retries or errors.
+
+**The repairs hold.** `unc=0` on every no-repeat row, `recs=1` per trigger where every archived row
+carried two, and `recfb=0` on all three mini no-repeat seeds -- the first rows in this project
+where the record covered its groups, they were dropped on its authority, the prompt landed under
+the ceiling, and the fallback never ran. Mini's shrink returned to 17-22% from the 5-6% the broken
+check had collapsed it to.
+
+**And the cost axis contradicts the snapshot axis, which is the point of having both.**
+
+| arm | `vs none$` | facts | snap% | control hit | record hit |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| luna, no repeats | +9% | 53/53 | 60% | 96% | 85% |
+| luna, repeats | **-7%** | 53/53 | 51% | 96% | 92% |
+| mini, no repeats | **+44%** | 53/53 | 72% | 81% | 68% |
+| mini, repeats | **+98%** | 50/53 | 91% | 80% | 71% |
+
+Mini's no-repeat arm removes 17-22% of the snapshot and costs **44% more**. The cache explains it:
+the hit rate falls 81% -> 68% and output rises 9,278 -> 13,261 tokens at 6x the input price. A
+smaller prompt bought with a broken prefix and a longer answer is not a cheaper prompt. Any reading
+of these arms on `snap%` alone -- including the one I published mid-run, that mini's record was
+"doing four times the compaction of anchored for the same retention" -- is wrong.
+
+**What the record is actually good at is not being cheap.** Across all twelve seeds it holds
+53/53 in eleven of them. On the same conversations `anchored` reads 39, 44, 52, 52 and `truncation`
+20, 20, 29, 29. It is the only row that retains reliably, and it charges +9% to +98% for it.
+
+**Repeats are model-dependent, and there is no good global default.** On luna they are better on
+every axis -- 40-42% shrink against 18-32%, `recfb=0`, and the only sub-zero cost figure in the
+matrix. On mini they are worse on every axis: negative shrink on all three seeds (-1%, -4%, -2%),
+because a second record on a model whose first one was already complete is pure duplication, added
+as preserved unshrinkable tokens. The mechanism is coherent -- repeats help exactly when one record
+cannot cover everything -- and it is conditional on the model, which the framework cannot know.
+
+Neither sub-zero figure is resolvable. Luna's -7% carries `NOT SUPPORTED` against a 35% spread, and
+mini-repeat's `anchored` at -11% carries it against 46%. **Nothing here is resolvably cheaper than
+not compacting**, which is the same answer this project has given at every cell it has measured.
+
 ### Runs 38 and 39 -- WITHDRAWN in large part, see REVIEW-2026-09-06.md
 
 > **Correction, 6 September.** Three adversarial reviewers took this section apart and I verified
