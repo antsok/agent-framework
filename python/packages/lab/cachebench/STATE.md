@@ -684,3 +684,24 @@ before any conclusion about whether record-and-drop earns its extra call.
 ran the unflagged fallback whenever a record did not free enough, so an unknown share of each was
 measuring the anchored strategy. `RECFALLBACK` did not exist to say so.
 
+## 3k. Run 40: the repaired check measured
+
+Repairs confirmed live: `unc=0` on every no-repeat row, `recs=1` per trigger, `recfb=0` on all
+three mini no-repeat seeds. Mini's shrink restored to 17-22% from 5-6%.
+
+Cost, from the instrument: luna +9% (no repeats) / **-7%** (repeats); mini **+44%** / **+98%**.
+Mini removes 17-22% of the snapshot and costs 44% more because the hit rate falls 81% -> 68% and
+output rises 9,278 -> 13,261. **I published a mid-run reading off `snap%` that the cost axis
+refutes.** Do not read these arms on shrink.
+
+The record holds 53/53 in eleven of twelve seeds; `anchored` reads 39/44/52/52, `truncation`
+20/20/29/29. Reliability is what it buys, at +9% to +98%.
+
+Repeats: better on luna on every axis (40-42% shrink, recfb=0, the only sub-zero cost), worse on
+mini on every axis (negative shrink on all three seeds). Conditional on whether one record can
+cover everything, which the framework cannot know. **`repeat_records=True` as the default is not
+supported by this;** off is the safer default and the knob wants documenting against `UNCOVERED`.
+Not yet changed.
+
+Neither sub-zero figure is resolvable (NOT SUPPORTED at 35% and 46% spreads).
+
