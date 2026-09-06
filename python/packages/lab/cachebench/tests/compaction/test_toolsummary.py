@@ -14,16 +14,17 @@ catch it.
 
 from __future__ import annotations
 
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from typing import Any
 
 import pytest
 from agent_framework import CharacterEstimatorTokenizer, Message
-from agent_framework._compaction import project_included_messages
+from agent_framework._compaction import included_token_count, project_included_messages
 from agent_framework_lab_cachebench.compaction._anchored import REMOVAL_MARKER
 from agent_framework_lab_cachebench.compaction._preserve import is_preserved, set_preserved
 from agent_framework_lab_cachebench.compaction._toolsummary import (
     DEFAULT_COVERAGE_SHARE,
+    DEFAULT_FALLBACK_FRACTION,
     DEFAULT_RECORD_MAX_TOKENS,
     DEFAULT_RECORD_TARGET_TOKENS,
     DEFAULT_TRIGGER_FRACTION,
@@ -75,6 +76,26 @@ def _record_messages(values: str, *, call_id: str = "rec") -> list[Message]:
     ]
 
 
+def _render_values(values: Sequence[str]) -> str:
+    """Return values rendered the way a tool result renders them, as ``code_N=VALUE`` pairs.
+
+    The shape is replicated here rather than imported. ``compaction/`` is meant to be lifted
+    out whole, and its tests travel with it, so reaching into the benchmark for the renderer
+    would be the boundary crossing ``test_boundary`` exists to refuse -- but the *shape* has to
+    match, because a fixture that hands the strategy bare values tests a rendering no tool
+    emits. That is the gap that let the coverage check ship measuring whether the model had
+    copied the benchmark's label format: every value was compounded with its own label, no
+    record quoting values plainly matched any of them, and 443 tests said nothing.
+
+    Args:
+        values: The verifiable values one tool result carries.
+
+    Returns:
+        A semicolon-separated list of labelled values.
+    """
+    return "; ".join(f"code_{index + 1}={value}" for index, value in enumerate(values))
+
+
 def _conversation(
     tool_turns: int,
     payload_chars: int = 8_000,
@@ -102,10 +123,12 @@ def _conversation(
             without colliding on message ids, call ids or tool names.
         tool_name: One name shared by every turn, instead of a name per turn.
         result_values: What each turn's result carries in front of the filler, as a function of
-            the turn index, instead of the default ``CODE-<n>``. Coverage is now decided on the
-            values a result contains, so a test has to be able to say what those are -- and, by
-            returning text with no digit in it, to build a result that yields no values at all
-            and so falls through to the tool-name rule.
+            the turn index, instead of the default single ``CODE-<n>``. Coverage is now decided
+            on the values a result contains, so a test has to be able to say what those are --
+            and, by returning text with no digit in it, to build a result that yields no values
+            at all and so falls through to the tool-name rule. Anything standing in for a
+            *value* should be passed through :func:`_render_values`, because that is how a tool
+            result presents one; anything standing in for prose should not.
 
     Returns:
         The messages.
@@ -118,7 +141,7 @@ def _conversation(
     for offset in range(tool_turns):
         index = first_turn + offset
         call_id = f"call_{index}"
-        values = result_values(index) if result_values else f"CODE-{index}"
+        values = result_values(index) if result_values else _render_values([f"CODE-{index}"])
         messages += [
             Message(role="user", contents=[f"Look up {index}."], message_id=f"u_{index}"),
             Message(
@@ -156,6 +179,11 @@ def _covering_record(tool_turns: int, *, first_turn: int = 0) -> str:
     ``RECALL_VALUES_DESCRIPTION`` asks for the results "grouped by the tool that produced it",
     so this is what a compliant record looks like, and it is what the strategy checks against.
 
+    The values are quoted bare, without the ``code_N=`` labels the results carry, because that
+    is what "quote verbatim any value that cannot be reconstructed" produces and what every
+    measured record actually looks like. A record has to cover a labelled result while writing
+    plain values, or the check is measuring formatting compliance.
+
     Args:
         tool_turns: How many turns the record accounts for.
 
@@ -181,11 +209,16 @@ def _rendered(messages: list[Message]) -> str:
 
 #: A ceiling that puts the eight-turn conversation between the two thresholds, so the default
 #: strategy asks and waits rather than giving up. Chosen from the fixture's own size: the
-#: conversation is about 17,000 tokens, which is 90% of this, between the 80% trigger and the
-#: 95% fallback. It has to be recomputed whenever either default moves -- at the old 60/90 pair
-#: this was 22,000, which the 80% trigger now sits above, so every test built on it would have
-#: measured a strategy that did nothing rather than one that acted.
-_WAITING_CEILING = 19_000
+#: conversation measures 17,011 tokens, 17,137 with a record, which is 78% of this -- between
+#: the 60% trigger and the 90% give-up line, and not close to either.
+#:
+#: **Recompute it whenever a default moves, and check the margin rather than the sign.** This
+#: was 22,000, went to 19,000 while the thresholds were briefly 0.8 and 0.95, and comes back
+#: with them. 19,000 is not merely a different number at 0.6/0.9: it puts the fixture at 90.2%,
+#: which is *past* the give-up line, so the tests here would have measured the fallback
+#: strategy. The failure in the other direction is quieter and worse -- a fixture below the
+#: trigger asserts against a strategy that returned without doing anything, and passes.
+_WAITING_CEILING = 22_000
 
 
 def _strategy(**kwargs: Any) -> ToolResultAnchoredSummarizationCompactionStrategy:
@@ -337,6 +370,32 @@ async def test_a_fallback_taken_behind_a_record_is_counted_apart_from_one_taken_
     assert "CODE-3" not in rendered, "and another, which is the loss the count exists to make visible"
 
 
+async def test_a_fallback_that_changed_nothing_is_not_counted_as_one() -> None:
+    """The flag says another strategy shortened part of this row, so a no-op must not raise it.
+
+    The count was taken before the await and regardless of its answer, so it counted attempts.
+    A fallback with nothing left to shed returns False and touches nothing, and archived rows
+    carry ``RECFALLBACK:5`` and ``RECFALLBACK:6`` -- numbers that, counted that way, are
+    somewhere between five or six losses and none at all. A flag whose whole purpose is to say
+    "part of this row was measured by a different strategy" cannot be readable as either.
+    """
+    calls = 0
+
+    async def inert(messages: list[Message]) -> bool:
+        nonlocal calls
+        calls += 1
+        return False
+
+    strategy = _strategy(max_input_tokens=500, trigger_fraction=0.1, fallback_fraction=0.9, fallback=inert)
+    messages = _conversation(tool_turns=6, record=_covering_record(2))
+
+    assert await strategy(messages) is True, "the record still licensed two groups being dropped"
+
+    assert calls == 1, "the fallback was still asked: it is the answer that is not a loss"
+    assert strategy.fallbacks_after_record == 0
+    assert strategy.fallbacks_used == 0
+
+
 # region coverage, which is what a record is allowed to delete
 
 
@@ -363,6 +422,27 @@ async def test_a_partial_record_leaves_the_groups_it_never_named_in_place() -> N
         assert f"CODE-{index} x" in rendered, f"lookup_{index} is unmentioned, so its group stays whole"
     assert strategy.groups_kept_uncovered == 4
     assert strategy.fallbacks_used == 0, "keeping more is not the same as failing to compact at all"
+
+
+async def test_the_uncovered_count_describes_the_conversation_now_rather_than_its_history() -> None:
+    """A shortfall a later record made good must stop being reported as a shortfall.
+
+    The count is read as "this row is carrying groups a complete record would have replaced",
+    and that is a statement about the prompt at the end of the run. Accumulated across passes it
+    said something else: a run whose second record covered everything the first had missed, and
+    which therefore finished carrying nothing extra at all, still reported ``UNCOVERED:6``. Two
+    opposite outcomes with the same number is worse than no number.
+    """
+    strategy = _strategy(max_input_tokens=14_000)
+    messages = _conversation(tool_turns=6, record="the lookups all completed.")
+
+    assert await strategy(messages) is False, "a record quoting nothing licenses nothing"
+    assert strategy.groups_kept_uncovered == 6
+
+    messages += _record_messages(_covering_record(6), call_id="rec2")
+
+    assert await strategy(messages) is True
+    assert strategy.groups_kept_uncovered == 0, "the second record covered them, and they are gone"
 
 
 async def test_a_complete_record_still_drops_every_group_it_covers() -> None:
@@ -404,6 +484,35 @@ async def test_a_newer_record_never_drops_an_older_one() -> None:
     assert "newer record." in rendered
     assert "x" * 100 not in rendered, "the bulk the newer record does cover is still dropped"
     assert strategy.fallbacks_used == 0, "the fallback sheds records of its own, so it must not be what ran"
+
+
+async def test_an_older_record_still_covers_what_it_carried_when_the_newer_one_says_nothing() -> None:
+    """Coverage is read off every record the conversation still holds, not off the last one.
+
+    Every record is preserved, so every record is still in the prompt and still answering for
+    what it carries. Reading only the newest made that depend on which record happened to be
+    last: a model writing *"already recorded above"* -- which is a reasonable thing to write,
+    and cheaper than repeating itself -- left every group scoring as uncovered while a complete
+    account of them sat one message earlier, and the row paid for keeping bulk that was
+    genuinely redundant. The union is what the conversation actually still holds.
+
+    The first two groups here are covered by the older record alone; the last two are covered by
+    neither, and stay.
+    """
+    strategy = _strategy(max_input_tokens=_TWO_RECORD_CEILING)
+    messages = _conversation(tool_turns=2, record=_covering_record(2))
+    messages += _conversation(tool_turns=2, first_turn=2)[3:]
+    messages += _record_messages("everything is already recorded above.", call_id="rec2")
+
+    assert await strategy(messages) is True
+    rendered = _rendered(messages)
+
+    assert "CODE-0 x" not in rendered, "the older record quotes this group's value, and still does"
+    assert "CODE-1 x" not in rendered
+    assert "CODE-2 x" in rendered, "no record carries this one"
+    assert "CODE-3 x" in rendered
+    assert strategy.groups_kept_uncovered == 2
+    assert strategy.fallbacks_used == 0
 
 
 @pytest.mark.parametrize(
@@ -455,15 +564,16 @@ async def test_values_settle_two_calls_to_one_tool_that_the_name_cannot() -> Non
     messages = _conversation(
         tool_turns=2,
         tool_name="lookup",
-        result_values=lambda index: f"AB-10000{index} CD-20000{index}",
+        result_values=lambda index: _render_values([f"AB-10000{index}", f"CD-20000{index}"]),
         record="first call returned AB-100000 and CD-200000; second returned AB-100001 and CD-200001.",
     )
 
     assert await strategy(messages) is True
 
+    rendered = _rendered(messages)
     assert strategy.groups_kept_uncovered == 0, "one mention of the name, and both groups still accounted for"
-    assert "AB-100000 x" not in _rendered(messages)
-    assert "AB-100001 x" not in _rendered(messages)
+    assert _render_values(["AB-100000", "CD-200000"]) not in rendered
+    assert _render_values(["AB-100001", "CD-200001"]) not in rendered
 
 
 def _codes(index: int) -> list[str]:
@@ -488,7 +598,7 @@ def _prose_record(index: int) -> str:
 
 def _bulk_of(index: int) -> str:
     """Return a string that appears in one lookup's result and nowhere else, filler included."""
-    return f"{_codes(index)[-1]} x"
+    return f"{_render_values(_codes(index))} x"
 
 
 async def test_a_record_quoting_a_groups_values_covers_it_though_it_never_names_the_tool() -> None:
@@ -506,7 +616,7 @@ async def test_a_record_quoting_a_groups_values_covers_it_though_it_never_names_
     """
     strategy = _strategy(max_input_tokens=16_000)
     record = " ".join(_prose_record(index) for index in range(2))
-    messages = _conversation(tool_turns=6, result_values=lambda index: " ".join(_codes(index)), record=record)
+    messages = _conversation(tool_turns=6, result_values=lambda index: _render_values(_codes(index)), record=record)
 
     assert "lookup_0" not in record, "the fixture is only the luna case if the tool name is genuinely absent"
     assert await strategy(messages) is True
@@ -530,7 +640,7 @@ async def test_a_record_that_names_a_tool_but_quotes_none_of_its_values_covers_n
     strategy = _strategy(max_input_tokens=16_000)
     messages = _conversation(
         tool_turns=6,
-        result_values=lambda index: " ".join(_codes(index)),
+        result_values=lambda index: _render_values(_codes(index)),
         record="lookup_0, lookup_1, lookup_2, lookup_3, lookup_4 and lookup_5 all returned deployment codes.",
     )
 
@@ -563,6 +673,90 @@ async def test_a_group_with_no_values_to_quote_falls_back_to_the_tool_name() -> 
     assert strategy.groups_kept_uncovered == 4, "neither automatically covered nor automatically uncovered"
 
 
+async def test_a_record_quoting_bare_values_covers_a_result_that_labelled_them() -> None:
+    """The live shape, which every fixture here used to avoid.
+
+    A tool result renders its values as ``code_N=VALUE``; a record quotes them plainly, because
+    that is what "quote verbatim any value that cannot be reconstructed" asks for and what every
+    measured record does. Those two have to meet, and for a while they did not: the whole
+    ``code_1=TL-BA44A9`` was read as one token, so the only record that could ever cover a group
+    was one that had copied the benchmark's own label format. Every UNCOVERED figure the project
+    published was measuring formatting compliance rather than preservation.
+    """
+    strategy = _strategy(max_input_tokens=5_000)
+    messages = _conversation(
+        tool_turns=2,
+        result_values=lambda index: _render_values([f"TL-BA44A{index}", f"TL-BB44A{index}"]),
+        record="the two lookups returned TL-BA44A0, TL-BB44A0, TL-BA44A1 and TL-BB44A1.",
+    )
+
+    assert "code_1" not in messages[-1].contents[0].result, "the record must not be quoting the labels"
+    assert await strategy(messages) is True
+
+    assert strategy.groups_kept_uncovered == 0
+    assert _render_values(["TL-BA44A0", "TL-BB44A0"]) not in _rendered(messages)
+
+
+async def test_a_value_that_is_only_a_substring_of_the_record_does_not_count_as_quoted() -> None:
+    """The coverage check was licensing the deletion it exists to prevent.
+
+    ``value in record`` on lowercased text is not a test of whether the record carries the
+    value. Replayed exactly: a group holding ``2026`` and ``1234`` was scored fully covered by
+    *"ZZ-999999 was recorded on 2026-08-31 as AB-123456"*, in which neither value appears as a
+    value at all -- ``2026`` inside a date, ``1234`` inside an unrelated identifier -- and the
+    group was then deleted, with nothing anywhere preserving what it held. Any four-to-six digit
+    number is a substring of some longer identifier or date, so this was not a corner case.
+
+    Both sides are tokenised now, and membership is the test.
+    """
+    strategy = _strategy(max_input_tokens=5_000)
+    messages = _conversation(
+        tool_turns=2,
+        result_values=lambda _: _render_values(["2026", "1234"]),
+        record="ZZ-999999 was recorded on 2026-08-31 as AB-123456.",
+    )
+
+    assert await strategy(messages) is False, "a record carrying neither value licenses no deletion"
+
+    assert strategy.groups_kept_uncovered == 2
+    assert _rendered(messages).count(_render_values(["2026", "1234"])) == 2, "both groups are still whole"
+
+
+@pytest.mark.parametrize(
+    ("tool_name", "record"),
+    [
+        pytest.param("get", "get_status reported healthy. get_status reported healthy.", id="get-inside-get_status"),
+        pytest.param(
+            "read_file",
+            "read_file_lines returned the head. read_file_lines returned the tail.",
+            id="read_file-inside-read_file_lines",
+        ),
+    ],
+)
+async def test_a_tool_name_that_is_only_a_prefix_of_a_mentioned_one_is_not_a_mention(
+    tool_name: str, record: str
+) -> None:
+    """The name fallback had the same defect as the value rule, and prefixes are the norm.
+
+    ``record.count("get")`` is satisfied by ``get_status``, so a record that discusses a
+    different tool entirely licensed deleting the groups of this one. Tool names share prefixes
+    as a matter of course -- ``read_file`` and ``read_file_lines``, ``get`` and ``get_status``
+    -- so this is what a real toolset looks like rather than a contrived collision. The record
+    here even satisfies the *count*: it mentions the longer name once per group.
+
+    The results carry no digit, so no value can be quoted and the name rule is what decides.
+    """
+    strategy = _strategy(max_input_tokens=5_000)
+    messages = _conversation(
+        tool_turns=2, tool_name=tool_name, record=record, result_values=lambda _: "the deployment is healthy"
+    )
+
+    assert await strategy(messages) is False
+
+    assert strategy.groups_kept_uncovered == 2
+    assert "the deployment is healthy x" in _rendered(messages)
+
+
 @pytest.mark.parametrize(
     ("share", "kept"),
     [
@@ -585,7 +779,7 @@ async def test_the_coverage_share_decides_how_much_of_a_group_must_be_quoted(sha
     strategy = _strategy(max_input_tokens=5_000, coverage_share=share)
     messages = _conversation(
         tool_turns=2,
-        result_values=lambda index: f"V{index}-1000 V{index}-2000 V{index}-3000 V{index}-4000",
+        result_values=lambda index: _render_values([f"V{index}-{step}000" for step in range(1, 5)]),
         record=" ".join(f"V{index}-1000, V{index}-2000, V{index}-3000" for index in range(2)),
     )
 
@@ -605,6 +799,25 @@ async def test_the_coverage_share_decides_how_much_of_a_group_must_be_quoted(sha
         ),
         pytest.param("The region is EU-WEST and the status is healthy.", set(), id="no-digit-no-value"),
         pytest.param("The 3rd of v2 at 10% (1).", set(), id="too-short-to-be-a-value"),
+        pytest.param(
+            "code_1=TL-BA44A9; code_2=TL-BA44A1; code_3=TL-BA44A2",
+            {"tl-ba44a9", "tl-ba44a1", "tl-ba44a2"},
+            id="labelled-pairs-yield-the-value-not-the-label",
+        ),
+        pytest.param(
+            '{"id":"AB-123456","count":42,"seen":"2026-08-31T09:00:00Z"}',
+            {"ab-123456", "2026-08-31t09:00:00z"},
+            id="json",
+        ),
+        pytest.param(
+            "deployment: AB-123456\nversion: v1.2.3\nregion: eu-west",
+            {"ab-123456", "v1.2.3"},
+            id="key-colon-space-value",
+        ),
+        pytest.param("AB-123456,CD-234567,healthy,42", {"ab-123456", "cd-234567"}, id="csv"),
+        pytest.param("'AB-123456' and \"CD-234567\" and [EF-345678]", {"ab-123456", "cd-234567", "ef-345678"}),
+        pytest.param("token=SGVsbG8yMw==", {"sgvsbg8ymw"}, id="trailing-equals-is-not-a-value-boundary"),
+        pytest.param("id:AB-123456", {"id:ab-123456"}, id="unspaced-colon-is-not-separated"),
     ],
 )
 def test_the_value_rule_finds_what_cannot_be_reconstructed_and_leaves_prose_alone(
@@ -612,12 +825,20 @@ def test_the_value_rule_finds_what_cannot_be_reconstructed_and_leaves_prose_alon
 ) -> None:
     """The rule is stated so it can be argued with, and this is the statement executed.
 
-    Whitespace-delimited tokens, punctuation stripped from both ends, kept when at least four
-    characters remain and one of them is a digit. Deliberately not fitted to this benchmark's
-    hex codes: a rule that was would need refitting for every workload, which is the mistake
-    the recall tool's own description already had to be rewritten out of. The cost is the
-    second case -- an alphabetic value is invisible to it -- which is why a group yielding
-    nothing falls back to the tool name rather than being ruled either way.
+    Split on whitespace and on the punctuation that separates values -- commas, semicolons,
+    quotes, brackets, pipes -- read only the part after the last ``=``, strip punctuation from
+    both ends of what remains, and keep it when at least four characters are left and one of
+    them is a digit. Deliberately not fitted to this benchmark's hex codes: a rule that was
+    would need refitting for every workload, which is the mistake the recall tool's own
+    description already had to be rewritten out of.
+
+    Three of these cases are the limits rather than the successes, and they are here to be
+    argued with. An alphabetic value is invisible, which is why a group yielding nothing falls
+    back to the tool name rather than being ruled either way. A colon is not a separator,
+    because a timestamp is built out of colons and splitting on them would destroy the values
+    the record is asked to quote -- so ``id: AB-1`` and ``{"id":"AB-1"}`` are separated by the
+    space and the quotes, and bare ``id:AB-1`` is not separated at all. And ``=`` is read from
+    the right, so a value whose only ``=`` is trailing padding keeps its whole self.
     """
     assert _distinctive_tokens(text) == expected
 
@@ -626,8 +847,11 @@ def test_the_value_rule_finds_what_cannot_be_reconstructed_and_leaves_prose_alon
 
 
 #: The same choice as ``_WAITING_CEILING``, for the four-turn conversation carrying two
-#: records: about 8,800 tokens, which is 88% of this, between the trigger and the fallback.
-_TWO_RECORD_CEILING = 10_000
+#: records: 8,769 tokens, which is 73% of this, between the 60% trigger and the 90% give-up
+#: line. It was 10,000, which puts the same fixture at 88% -- inside the band, but two
+#: percentage points from giving up, so a sentence added to a record's text would silently
+#: change which strategy the test was measuring.
+_TWO_RECORD_CEILING = 12_000
 
 #: Padding that makes the record big enough for the fallback to want to trim it. The anchored
 #: strategy's per-result floor is 150 tokens and this takes the record to about 590, so a
@@ -863,6 +1087,100 @@ async def test_a_single_record_is_attributed_exactly_once() -> None:
     assert middleware.records_forced + middleware.records_volunteered == 1
 
 
+async def test_one_trigger_event_forces_exactly_one_call() -> None:
+    """One ask, one record. It was one ask and two, in every run this project has taken.
+
+    The decision is made on the way out of a call and applied to the next, so the exit of a
+    *forced* call reads a history that predates the record it just asked for: the condition that
+    fired still reads as true and the next call is pinned as well. Reproduced in a real pipeline
+    at ``records_in_conversation=2`` with repeats switched off, four to five with them on, and
+    visible in every archived row as ``FORCED:2, RECFORCED:1``. Each surplus record is an agent
+    turn, a broken prefix, a permanent addition to the floor under the prompt, and one seeding
+    turn robbed of its own pinned lookup.
+
+    So a forced call decides nothing, and the call after it -- the first that can see the
+    record -- decides on what is actually there.
+    """
+    _armings.clear()
+    middleware = _repeating()
+    big = _conversation(tool_turns=8)
+    recorded = _conversation(tool_turns=8, record=_covering_record(8))
+
+    calls = [
+        await _run(middleware, big),
+        await _run(middleware, big),
+        # The record the forced call wrote is not in the loaded history until the next call.
+        await _run(middleware, recorded),
+        await _run(middleware, recorded),
+    ]
+
+    assert [("tool_choice" in options) for options in calls] == [False, True, False, False]
+    assert middleware.forced_calls == 1
+    assert len(_armings) == 1, "a second arming is a second record"
+
+
+async def test_a_record_that_surfaced_after_the_forced_call_is_still_attributed_to_the_forcing() -> None:
+    """Volunteering is a claim about the model, and it must not be made about our own ask.
+
+    A forced call cannot see its own record, so the record surfaces on the call after it. Credit
+    that call and every forced record reads as volunteered -- which is the difference between a
+    mechanism and a coincidence, and is exactly what ``records_volunteered`` exists to keep
+    apart. Before the middleware stopped re-deciding on a forced call's exit, this came out
+    right only because the surplus second forced call was there to be credited.
+    """
+    _armings.clear()
+    middleware = _repeating()
+    big = _conversation(tool_turns=8)
+
+    await _run(middleware, big)
+    await _run(middleware, big)
+    await _run(middleware, _conversation(tool_turns=8, record=_covering_record(8)))
+
+    assert middleware.records_forced == 1
+    assert middleware.records_volunteered == 0, "the middleware pinned the call that wrote it"
+
+
+async def test_a_forced_call_that_wrote_no_record_is_asked_again_one_call_later() -> None:
+    """Suppressing the re-ask is a deferral, not a surrender.
+
+    A forced call can fail to produce a record -- cut off mid-arguments, or the option refused
+    -- and the ask has to survive that. The suppression lasts exactly one call: the next one
+    looks at the loaded history, finds nothing recorded, and asks again. A suppression that
+    outlived the evidence would leave the strategy waiting for a record nobody was writing,
+    until it gave up and compacted without one.
+    """
+    _armings.clear()
+    middleware = _repeating()
+    big = _conversation(tool_turns=8)
+
+    calls = [await _run(middleware, big) for _ in range(4)]
+
+    assert [("tool_choice" in options) for options in calls] == [False, True, False, True]
+    assert middleware.forced_calls == 2
+
+
+async def test_a_restored_snapshot_clears_the_outstanding_ask_as_well_as_the_pending_one() -> None:
+    """A rewind takes the forced call with it, so the middleware must not still be waiting on it.
+
+    ``forget_pending`` exists because the decision to force belongs to the conversation rather
+    than to the middleware. The same is true of an ask already outstanding: restoring a snapshot
+    taken before the forced call means the record that call was writing is not in the state
+    being restored to, so a record appearing afterwards did not come from our ask, and crediting
+    it to the forcing would claim a mechanism where there was a coincidence.
+    """
+    _armings.clear()
+    middleware = _repeating()
+
+    await _run(middleware, _conversation(tool_turns=8))
+    await _run(middleware, _conversation(tool_turns=8))
+    middleware.forget_pending()
+    await _run(middleware, _conversation(tool_turns=8, record=_covering_record(8)))
+
+    assert middleware.forced_calls == 1
+    assert middleware.records_volunteered == 1, "the ask that record would have answered was discarded"
+    assert middleware.records_forced == 0
+
+
 # region the tool, which is the whole of the prompt
 
 
@@ -988,13 +1306,13 @@ async def test_the_cap_is_set_on_the_forced_call_and_on_no_other() -> None:
         # Nothing is known about the history before the first call, so it cannot be forced.
         await _run(middleware, big),
         await _run(middleware, big),
-        # The middleware keeps asking until a record exists, so the record has to arrive
-        # before an unforced call can happen again.
+        # The call after the forced one is where the record becomes visible, and it is not
+        # itself pinned: one ask, one record.
         await _run(middleware, recorded),
         await _run(middleware, recorded),
     ]
 
-    assert [("tool_choice" in options) for options in calls] == [False, True, True, False]
+    assert [("tool_choice" in options) for options in calls] == [False, True, False, False]
     for options in calls:
         assert ("max_tokens" in options) is ("tool_choice" in options), options
         assert options.get("max_tokens", 777) == 777
@@ -1360,15 +1678,25 @@ async def test_the_record_count_is_a_maximum_rather_than_a_running_total() -> No
     single record, because the check ran once per call rather than once per record. A count
     reading 18 where the answer is 1 is not a rougher version of the truth, it is a number with
     a different meaning.
+
+    **The fixture has to stay above the trigger, and the previous one did not.** Written with
+    records that covered their groups, the first pass dropped enough to put the conversation
+    below the trigger, so every later pass returned at the first line of ``__call__`` without
+    reaching the counter -- and the test passed just as well against ``+=`` as against ``max``,
+    which is to say it asserted nothing. These records quote nothing, so nothing is dropped, the
+    conversation stays where it started, and all four passes reach the count.
     """
     strategy = _strategy(max_input_tokens=_TWO_RECORD_CEILING)
-    messages = _conversation(tool_turns=2, record=f"older record. {_covering_record(2)}")
+    messages = _conversation(tool_turns=2, record="older record, quoting nothing.")
     messages += _conversation(tool_turns=2, first_turn=2)[3:]
-    messages += _record_messages(f"newer record. {_covering_record(4)}", call_id="rec2")
+    messages += _record_messages("newer record, quoting nothing.", call_id="rec2")
 
     for _ in range(4):
-        await strategy(messages)
+        assert await strategy(messages) is False, "nothing here is covered, so nothing may be dropped"
 
+    assert included_token_count(messages) > int(_TWO_RECORD_CEILING * DEFAULT_TRIGGER_FRACTION), (
+        "a fixture that falls below the trigger stops reaching the counter, and this stops testing it"
+    )
     assert strategy.records_in_conversation == 2
 
 
@@ -1377,15 +1705,24 @@ def test_the_default_thresholds_leave_a_whole_turn_for_the_record_to_arrive_in()
 
     The record arrives one call late by construction: the middleware can only read the history
     on the way out of a call and can only pin the next one. So the gap between asking and
-    giving up has to be wide enough for a turn's growth to fit inside it -- at a 0.8 trigger
-    the old 0.9 left a single turn's room, and one turn carrying a large tool result crossed
-    it, compacting without a record while the record was still in flight. The strategy and the
-    middleware read the same constant for the ask, so a run cannot move one and not the other.
+    giving up has to be wide enough for a turn's growth to fit inside it, and at 0.6/0.9 it is
+    three tenths of the ceiling. The strategy and the middleware read the same constant for the
+    ask, so a run cannot move one and not the other.
+
+    **These are the values every archived run used, and that is the point of pinning them.** A
+    row is only comparable with the archive if it was taken under the same configuration, and
+    both defaults were briefly moved -- to 0.8 and 0.95 -- on reasoning rather than measurement,
+    which would have made the next run a fourth variant rather than a comparison. This test
+    previously asserted 0.8 while quoting "0.6 fired at 58% of a 60,000-token window" as though
+    it were a finding; it was arithmetic about where the line falls, and no run had ever used
+    the value it was defending.
     """
     strategy = ToolResultAnchoredSummarizationCompactionStrategy(max_input_tokens=1_000, tokenizer=TOKENIZER)
     middleware = ToolResultRecallMiddleware(max_input_tokens=1_000, tokenizer=TOKENIZER, arm=lambda: None)
 
-    assert (strategy.trigger_fraction, strategy.fallback_fraction) == (DEFAULT_TRIGGER_FRACTION, 0.95)
-    assert DEFAULT_TRIGGER_FRACTION == 0.8, "0.6 fired at 58% of a 60,000-token window"
+    defaults = (DEFAULT_TRIGGER_FRACTION, DEFAULT_FALLBACK_FRACTION)
+
+    assert (strategy.trigger_fraction, strategy.fallback_fraction) == defaults
+    assert (DEFAULT_TRIGGER_FRACTION, DEFAULT_FALLBACK_FRACTION) == (0.6, 0.9), "runs 26-39 were taken at 0.6/0.9"
     assert middleware.trigger_fraction == strategy.trigger_fraction, "the ask and the wait must be one number"
     assert strategy.fallback_fraction - strategy.trigger_fraction >= 0.1, "no room for the record to land in"

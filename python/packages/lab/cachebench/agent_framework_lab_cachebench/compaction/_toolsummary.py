@@ -116,6 +116,7 @@ skips preserved messages in each of its three removal paths.
 from __future__ import annotations
 
 import string
+from collections import Counter
 from collections.abc import Awaitable, Callable, Sequence
 from math import ceil
 from typing import TYPE_CHECKING, Any, Final
@@ -205,11 +206,27 @@ DEFAULT_COVERAGE_SHARE: Final[float] = 0.8
 #: Shortest token :func:`_distinctive_tokens` will treat as a value worth quoting.
 #:
 #: Three characters and under is where ordinary prose with a digit in it lives -- "3rd", "v2",
-#: "10%", "1)" -- and none of that is a value a later question could depend on. Four is also
-#: the point below which substring matching starts producing accidental hits: "a12" occurs
-#: inside any longer identifier containing it, so a short token would count itself covered by
-#: an unrelated mention.
+#: "10%", "1)" -- and none of that is a value a later question could depend on. It is also
+#: where collisions live: a record about anything at all is likely to contain "42" or "v3"
+#: somewhere, and a token that short would be matched by a mention that has nothing to do with
+#: the group it came from.
 _MIN_DISTINCTIVE_LENGTH: Final[int] = 4
+
+#: Characters that end a token, over and above whitespace.
+#:
+#: These are the characters that *separate* values in the shapes a tool result arrives in --
+#: CSV rows, JSON objects, semicolon-delimited pairs, bracketed and quoted forms -- so a value
+#: sitting next to one of them has to come out as a token in its own right.
+#:
+#: What is deliberately absent is the punctuation that lives *inside* values, because splitting
+#: on it would shred the very things :data:`RECALL_VALUES_DESCRIPTION` calls unreconstructable:
+#: ``-`` and ``_`` in identifiers, ``.`` in versions and hostnames, ``/`` and ``\`` in paths and
+#: URLs, and ``:`` in clock times and timestamps. ``=`` is absent for a different reason and is
+#: handled separately in :func:`_tokens`.
+_SEPARATORS: Final[str] = ",;|\"'`()[]{}<>"
+
+#: :data:`_SEPARATORS` as a translation table, built once rather than per call.
+_SEPARATOR_TABLE: Final[dict[int, str]] = str.maketrans(dict.fromkeys(_SEPARATORS, " "))
 
 #: Record length stated in the tool's own description, which is the only channel that makes
 #: the model aim for a size.
@@ -226,34 +243,48 @@ DEFAULT_RECORD_TARGET_TOKENS: Final[int] = 2_000
 #: strategy dropping groups before anything had been recorded, or have the middleware recording
 #: what nothing was yet willing to drop.
 #:
-#: **0.8, and it was 0.6.** The trigger is a bet that enough conversation remains to repay a
-#: compaction, and 0.6 takes that bet far too early. With the 2,048-token output reservation
-#: these runs use, 0.6 of the input budget is 58% of a 60,000-token window: a record is forced,
-#: an agent turn is spent, and the cached prefix is broken part-way through a conversation that
-#: may well end before it ever needed compacting at all. The break-even derived in
-#: :data:`~._anchored.DEFAULT_MIN_GAIN_FRACTION` is the same argument from the other side -- an
-#: edit repays itself only over the turns that follow it, so it wants as many of them as
-#: possible, but the turns *before* the ceiling is approached are exactly the ones where the
-#: horizon is unknown and the compaction may turn out to have bought nothing. Waiting costs
-#: nothing until the ceiling is actually in reach; asking early costs a call, a re-read of the
-#: whole prefix, and the tool results the record then licenses deleting.
-DEFAULT_TRIGGER_FRACTION: Final[float] = 0.8
+#: **0.6, and it was briefly 0.8.** Every measured run of this strategy used 0.6. 0.8 was
+#: reasoned to and never run, and the reasoning does not survive the project's own data.
+#:
+#: The argument for moving it was that 0.6 of the input budget is 58% of a 60,000-token window,
+#: so a record is forced part-way through a conversation that might have ended without ever
+#: needing compaction. That is arithmetic about when the trigger fires, not evidence that firing
+#: there hurt anything: no run has reported a cost for it, and no run has used the alternative.
+#:
+#: What *is* measured runs the other way. **The record degrades with the bulk it is asked to
+#: read.** At 8,000-token tool results the record carried 53 of 53 facts; at 16,000 it carried
+#: 46; at 25,200 it carried 18. The same shape appears in context: at a 120,000-token window the
+#: record frays somewhere around 96,000 tokens of accumulated conversation. A trigger at 0.8 of
+#: that window asks for the record at 94,400 tokens -- at the fraying point, with everything
+#: gathered so far to summarise -- where 0.6 asks at 70,800, comfortably inside where records
+#: were complete. A later trigger is a bigger ask and a worse record, and a worse record is the
+#: failure this whole strategy exists to avoid.
+#:
+#: The break-even argument points the same way once it is read correctly. An edit repays itself
+#: over the turns that *follow* it, so it wants as many of them as possible -- and firing later
+#: leaves fewer of them, not more. Waiting does not make the compaction cheaper; it makes the
+#: record worse and gives it less time to pay for itself.
+DEFAULT_TRIGGER_FRACTION: Final[float] = 0.6
 
 #: Fraction of the ceiling at which the strategy stops waiting for a record and compacts
 #: without one.
 #:
-#: **0.95, and it was 0.9.** The move is forced by the trigger's. A record arrives one call late
-#: by construction: the middleware can only read the history on the way *out* of a call and can
-#: only pin the *next* one, so the conversation grows by a whole turn between the ask and the
-#: answer -- see :meth:`ToolResultRecallMiddleware.process`. With the trigger at 0.8, a give-up
-#: line at 0.9 leaves a single turn's growth of room, and one turn carrying a large tool result
-#: crosses it: the strategy then compacts without a record while the record it asked for is
-#: still in flight, which is the one outcome this whole design exists to avoid. The gap between
-#: the two has to be wide enough for the answer to land in.
+#: **0.9, and it was briefly 0.95.** It moves with the trigger, and back with it. A record
+#: arrives one call late by construction: the middleware can only read the history on the way
+#: *out* of a call and can only pin the *next* one, so the conversation grows by a whole turn
+#: between the ask and the answer -- see :meth:`ToolResultRecallMiddleware.process`. The gap
+#: between the two lines has to be wide enough for that turn to land in, and at a 0.6 trigger
+#: it is three tenths of the ceiling, which is several turns rather than one.
+#:
+#: 0.95 was set to widen that gap under a 0.8 trigger, against a scenario -- the strategy
+#: compacting without a record while the record is still in flight -- that has never been
+#: observed: no archived run carries a ``FALLBACK`` flag at all. Keeping a value chosen for a
+#: trigger that has been reverted would leave a run that matches the archive in name but not in
+#: configuration.
 #:
 #: It cannot simply be raised to 1.0. Past this line the fallback still has to bring the
 #: conversation under the ceiling, and a fallback given no headroom has nothing to work in.
-DEFAULT_FALLBACK_FRACTION: Final[float] = 0.95
+DEFAULT_FALLBACK_FRACTION: Final[float] = 0.9
 
 #: What the recall tool is for, as the model reads it.
 #:
@@ -389,13 +420,67 @@ def _group_result_text(messages: Sequence[Message], group: dict[str, Any]) -> st
     return "\n".join(parts)
 
 
+def _tokens(text: str) -> list[str]:
+    """Split ``text`` into the words a record and a tool result can be compared through.
+
+    **The rule.** Break on whitespace and on :data:`_SEPARATORS`; strip punctuation from both
+    ends of each piece; keep only what follows the last remaining ``=``; lowercase it. Order is
+    preserved and duplicates are kept, because the tool-name test counts mentions rather than
+    merely looking for them.
+
+    **Why ``=`` is not simply another separator.** ``key=value`` is the shape the values in a
+    tool result actually arrive in, and the two halves are not equal. The key is the schema --
+    the tool wrote it, it repeats on every row, and it is reconstructable from the conversation
+    -- while the value is the datum. Splitting symmetrically would put every key in the set a
+    record has to quote from, so a record quoting every value and none of the labels would
+    score half; keeping the compound is worse still, and is the defect this replaces, where
+    ``code_1=TL-BA44A9`` matched only a record that had copied the benchmark's own label
+    format. Reading the value side alone leaves one token per value, which is the thing the
+    record is asked for. Punctuation is stripped before the split rather than after it, so
+    base64 padding is gone by the time the last ``=`` is looked for and such a value keeps its
+    whole self; a value with an ``=`` genuinely inside it, such as a query string, is read from
+    after that one and loses the part in front.
+
+    **Shapes this handles**, all of which yield the bare value as a token of its own:
+    ``key=value``, ``key: value``, ``key = value``, CSV and semicolon-delimited rows, JSON
+    objects and arrays with quoted keys or values, bracketed and parenthesised lists, and any
+    of those quoted.
+
+    **Shapes this does not handle.**
+
+    - *Unquoted, unspaced ``key:value``.* A colon is not a separator, because clock times and
+      timestamps are built out of colons and splitting on them would destroy exactly the values
+      the record is asked to quote. ``{"id":"AB-1"}`` is fine -- the quotes separate it -- and
+      so is ``id: AB-1``; bare ``id:AB-1`` keeps the compound.
+    - *Values containing a separator.* A quoted string with a comma inside it comes out as two
+      tokens. The record is read with this same function, so a record quoting it verbatim comes
+      out as the same two tokens and still matches; what is lost is the one-token form.
+    - *Windows paths and escapes.* The backslash is not a separator, so a path like
+      ``C:/logs/app2.log`` written with backslashes stays whole, and a JSON string with escaped
+      quotes keeps its escapes.
+
+    Args:
+        text: The text to read.
+
+    Returns:
+        The tokens, lowercased, in order, duplicates included.
+    """
+    found: list[str] = []
+    for piece in text.translate(_SEPARATOR_TABLE).split():
+        token = piece.strip(string.punctuation)
+        _, equals, value = token.rpartition("=")
+        if equals:
+            token = value
+        if token:
+            found.append(token.lower())
+    return found
+
+
 def _distinctive_tokens(text: str) -> set[str]:
     """Return the tokens in ``text`` that look like values nothing could reconstruct.
 
-    **The rule.** Split on whitespace; strip punctuation from both ends of each token; keep
-    what is left when it is at least :data:`_MIN_DISTINCTIVE_LENGTH` characters long and
-    contains at least one digit. Results are lowercased, because the comparison against the
-    record is case-insensitive.
+    **The rule.** Tokenise with :func:`_tokens`, then keep what is at least
+    :data:`_MIN_DISTINCTIVE_LENGTH` characters long and contains at least one digit.
 
     It is deliberately generic and deliberately crude. The temptation is to match this
     benchmark's hex identifiers, and a rule fitted to those would be worthless on the next
@@ -416,10 +501,7 @@ def _distinctive_tokens(text: str) -> set[str]:
     - *Its own leftovers.* A result already shortened by the anchored fallback carries that
       strategy's marker, whose character count is a digit-bearing token no record will ever
       quote. It costs the group one token's worth of coverage, in the keeping direction again.
-    - *Substrings.* A value is "quoted" when it appears anywhere in the record, so a record
-      mentioning ``AB-1234567`` also satisfies a group whose value was ``AB-123456``. Bounded
-      by the length floor, and biased toward finding coverage; the alternative, tokenising the
-      record too, would miss every value the model wrapped in punctuation it chose itself.
+    - *Whatever :func:`_tokens` cannot separate*, which that function lists.
 
     Args:
         text: Tool result text to read.
@@ -427,12 +509,11 @@ def _distinctive_tokens(text: str) -> set[str]:
     Returns:
         The distinctive tokens, lowercased, without duplicates.
     """
-    found: set[str] = set()
-    for raw in text.split():
-        token = raw.strip(string.punctuation)
-        if len(token) >= _MIN_DISTINCTIVE_LENGTH and any(character.isdigit() for character in token):
-            found.add(token.lower())
-    return found
+    return {
+        token
+        for token in _tokens(text)
+        if len(token) >= _MIN_DISTINCTIVE_LENGTH and any(character.isdigit() for character in token)
+    }
 
 
 def _is_recall_group(messages: Sequence[Message], group: dict[str, Any]) -> bool:
@@ -688,8 +769,8 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
         self._records_in_conversation = 0
         self._fallbacks = 0
         self._fallbacks_after_record = 0
-        # Group ids rather than a running total, so one group examined on ten later passes is
-        # one number rather than ten. See :attr:`groups_kept_uncovered`.
+        # The group ids the most recent pass declined to drop, replaced rather than added to.
+        # See :attr:`groups_kept_uncovered`.
         self._uncovered: set[str] = set()
 
     @property
@@ -704,6 +785,11 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
         degradation reached by the other route, and is counted by
         :attr:`fallbacks_after_record` -- for a while it was counted nowhere, which is how a
         row measuring the fallback came to carry no flag at all.
+
+        Counted on the decision rather than on its effect, which is where this differs from
+        :attr:`fallbacks_after_record`. Reaching this line at all means the record never came
+        and the strategy is no longer waiting for one, and that is true of the row whether or
+        not the fallback then found anything to shed.
         """
         return self._fallbacks
 
@@ -729,6 +815,12 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
         Counted per pass, like ``fallbacks_used`` and unlike :attr:`groups_kept_uncovered`:
         each pass shortens whatever is in the prompt at the time rather than taking a second
         look at material already accounted for, so two passes are two losses.
+
+        **Effects, not attempts.** Only a fallback that reported having changed something is
+        counted. A fallback with nothing left to shed returns False and touches nothing, and
+        counting the call rather than its answer made ``RECFALLBACK:5`` mean anything between
+        five losses and none -- an unreadable number on a flag whose entire purpose is to say
+        that part of a row was measured by another strategy.
         """
         return self._fallbacks_after_record
 
@@ -749,9 +841,17 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
         A count rather than the flag :attr:`records_found` is, because records accumulate and
         nothing removes them. Every record observed is preserved -- neither shortened nor
         dropped, by this strategy or by the fallback behind it -- so each one raises a floor
-        under the prompt that no later pass can lower. One is the cost of the design; several
-        is a conversation whose unshrinkable part is growing, and a row that says so can be
-        told apart from a row whose compaction simply stopped working.
+        under the prompt that no later pass can lower, and a row whose unshrinkable part has
+        grown can be told apart from a row whose compaction simply stopped working.
+
+        **Read it against the number of times a record was asked for**, which is
+        :attr:`ToolResultRecallMiddleware.forced_calls`, and not against one. With
+        ``repeat_records`` on, several records is the middleware asking several times, which is
+        the design working rather than a symptom; with it off there should be a single ask and
+        a single record. What no setting explains is more records than asks: this read 2 for a
+        single trigger event until the middleware stopped re-deciding on the exit of a call it
+        had itself pinned, and while it did, a description of one record as "the cost of the
+        design" described a number no run had ever produced.
 
         Deliberately not consolidated. Merging two records would be tempting and wrong: an
         older record is the sole surviving account of the groups behind *it*, so a merge is a
@@ -774,10 +874,18 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
         would have cost and loses nothing, which is the trade the check makes deliberately;
         :meth:`_drop_before` says why the alternative was silent loss.
 
-        Counted by group id, not per pass. The same group is re-examined on every later
-        compaction, so a per-pass tally would report one uncovered group as eighteen -- the
-        mistake :attr:`ToolResultRecallMiddleware.records_volunteered` already had to be fixed
-        for, and the reason a diagnostic has to be built to be read rather than merely emitted.
+        **The state as it now stands, not a history of it.** The set is rebuilt by every pass
+        that reads a record rather than added to, because the question this answers is how much
+        of the conversation is sitting in the prompt uncovered *at the end* -- which is what the
+        row's cost is made of. Accumulating instead reported groups a later record went on to
+        cover and this strategy then deleted, so a run that recovered completely could still
+        finish carrying ``UNCOVERED:4``: a flag saying "this row kept four groups it should not
+        have needed to" against a row that kept none.
+
+        A set of group ids rather than a tally, for the reason
+        :attr:`ToolResultRecallMiddleware.records_volunteered` had to be fixed: the same group
+        is re-examined on every later compaction, and counting each look would report one
+        uncovered group as eighteen.
         """
         return len(self._uncovered)
 
@@ -816,8 +924,15 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
                 # other strategy. Until this counter existed only the pre-record path
                 # incremented anything, so a run that fell back here reported no FALLBACK at
                 # all and read as this design working.
-                self._fallbacks_after_record += 1
-                changed = await self.fallback(messages) or changed
+                #
+                # Counted after the await and on its answer. Incrementing before it counted
+                # the attempt, and a fallback with nothing left to shorten returns False and
+                # touches nothing: ``RECFALLBACK:5`` could be five no-ops, which is the
+                # opposite of what the flag is read as meaning.
+                shortened = await self.fallback(messages)
+                if shortened:
+                    self._fallbacks_after_record += 1
+                changed = shortened or changed
             return changed
 
         if used < int(self.max_input_tokens * self.fallback_fraction):
@@ -862,6 +977,18 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
         ambiguity the count rule below was built for: two calls to one tool return two different
         sets of values, and a record quoting both has demonstrably accounted for both.
 
+        **Both sides are tokenised, and the comparison is membership rather than substring.**
+        Asking whether a value occurs anywhere in the record's text is not a test of whether the
+        record carries it: a group holding ``2026`` and ``1234`` was "covered" by a record
+        reading *"ZZ-999999 was recorded on 2026-08-31 as AB-123456"*, in which neither value
+        appears as a value at all, and the group was then deleted. Any short number is a
+        substring of some longer identifier or date, so the check built to stop silent deletion
+        was itself licensing it. The record is therefore read with the same tokeniser as the
+        results and a value counts only when it is one of the record's own tokens. The tool-name
+        test below counts whole tokens for the same reason: ``record.count("get")`` is satisfied
+        by ``get_status``, and prefix-sharing names like ``read_file`` and ``read_file_lines``
+        are the normal case rather than a contrived one.
+
         **A group with no distinctive values falls back to the tool-name test.** By this rule
         nothing in such a group is unreconstructable, so the value check has no evidence either
         way -- and the two available shortcuts are both wrong. Calling it covered would let a
@@ -882,17 +1009,25 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
         on a row anyone can read, against "lost facts silently", which shows up as a wrong
         answer with no trace of where the fact went.
 
-        **Only the newest record is read.** Groups an older record covered are checked against
-        the newer record's text and kept when it does not carry them, so a run taking several
-        records compacts less than one taking a single complete record. Same conservative
-        direction, and the older record is itself never dropped, so what it holds stays
-        reachable.
+        **Every record at or before the anchor is read, not only the newest.** They are all
+        preserved -- :func:`_preserve_records` protects each one, and the loop below refuses to
+        delete any of them -- so every one of them is still in the prompt and still answering
+        for what it carries. Reading only the newest made coverage depend on which record
+        happened to be last: a model that writes *"already recorded above"* leaves every group
+        reading as uncovered while a complete account of them sits preserved one message
+        earlier. The union is what the conversation actually still holds, so it is what the
+        deletion is licensed against.
 
         Returns:
             True if anything was excluded.
         """
         groups = group_messages(messages)
-        record = _record_text(messages[anchor]).lower()
+        record = "\n".join(text for message in messages[: anchor + 1] if (text := _record_text(message)))
+        # Tokenised once, and kept in both shapes the two rules need: a set for "is this value
+        # in the record", a count for "is this name mentioned as often as it was called".
+        record_tokens = _tokens(record)
+        quoted = set(record_tokens)
+        mentions = Counter(record_tokens)
 
         candidates: list[tuple[dict[str, Any], set[str], set[str]]] = []
         for position, group in enumerate(groups):
@@ -923,22 +1058,27 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
         for _, names, _ in candidates:
             for name in names:
                 demand[name] = demand.get(name, 0) + 1
-        named = {name for name, needed in demand.items() if record.count(name.lower()) >= needed}
+        named = {name for name, needed in demand.items() if mentions[name.lower()] >= needed}
 
         changed = False
+        # Rebuilt every pass rather than accumulated, so the count answers "how much is the
+        # record still failing to carry" rather than "how much has it ever failed to carry".
+        # See ``groups_kept_uncovered``.
+        uncovered: set[str] = set()
         for group, names, values in candidates:
-            if not self._is_covered(record, names=names, values=values, named=named):
-                self._uncovered.add(str(group["group_id"]))
+            if not self._is_covered(quoted, names=names, values=values, named=named):
+                uncovered.add(str(group["group_id"]))
                 continue
             for message in messages[group["start_index"] : group["end_index"] + 1]:
                 changed = set_excluded(message, excluded=True, reason="tool_summary_anchored") or changed
+        self._uncovered = uncovered
         return changed
 
-    def _is_covered(self, record: str, *, names: set[str], values: set[str], named: set[str]) -> bool:
-        """Return whether one group's contents demonstrably survive in ``record``.
+    def _is_covered(self, quoted: set[str], *, names: set[str], values: set[str], named: set[str]) -> bool:
+        """Return whether one group's contents demonstrably survive in the record.
 
         Args:
-            record: The record's text, already lowercased.
+            quoted: Every token the record contains, lowercased.
 
         Keyword Args:
             names: The functions called inside the group.
@@ -953,8 +1093,7 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
             # seven of eight values clears 0.8 and six does not. It also makes 1.0 mean every
             # value and 0.0 mean none, which is what those two ends have to mean for the
             # keyword to be usable as a dial across its whole range.
-            quoted = sum(1 for value in values if value in record)
-            return quoted >= ceil(len(values) * self.coverage_share)
+            return len(values & quoted) >= ceil(len(values) * self.coverage_share)
         # No names either means a span of results whose declaration sits outside it, so there
         # is nothing at all to check the record against. Kept, on the same principle as
         # everything else here.
@@ -1064,6 +1203,7 @@ class ToolResultRecallMiddleware(ChatMiddleware):
         self._records_volunteered = 0
         self._records_truncated = 0
         self._seen_record = False
+        self._awaiting_record = False
 
     def forget_pending(self) -> None:
         """Drop the decision to force a record on the next call.
@@ -1073,8 +1213,14 @@ class ToolResultRecallMiddleware(ChatMiddleware):
         being seeded would fire on the first question asked of the snapshot and on none of the
         others, so that one probe would carry a prompt the rest do not. Restoring the snapshot
         has to restore this too.
+
+        The outstanding ask goes with it, and for the same reason. A restore rewinds the
+        conversation past the forced call, so the record that call was writing is not in the
+        state being restored to; leaving the middleware waiting for it would suppress the next
+        ask on the evidence of a turn that no longer exists.
         """
         self._force_next = False
+        self._awaiting_record = False
 
     @property
     def forced_calls(self) -> int:
@@ -1123,11 +1269,23 @@ class ToolResultRecallMiddleware(ChatMiddleware):
         time. The trigger sits well below the strategy's fallback threshold to absorb that
         one-call delay.
 
-        The same delay is why a forced call can be forced again: the record it produced is not
-        in ``context.messages`` yet, so the condition that fired still reads as true and the
-        next call is pinned too. That is existing behaviour rather than a cost of repeats --
-        the middleware has always kept asking until a record appears in the loaded history --
-        but once records repeat it recurs once per record instead of once per run.
+        **The exit of a forced call decides nothing.** The same delay that makes the decision
+        late makes the forced call's own history stale: the record the model has just written
+        is not in ``context.messages``, so the condition that fired still reads as true, and
+        re-deciding there pins the next call as well. That is one trigger event and two
+        records, measured -- ``records_in_conversation=2`` with repeats switched off, four to
+        five with them on -- each one an agent turn, a broken prefix and a permanent addition
+        to the floor under the prompt, and each one taking its call's own pinned tool choice
+        away from it. So a forced call leaves the decision alone and the ask stays outstanding.
+        The call after it is the first that can see the record, and it decides on that: if the
+        record arrived, :meth:`_record_due` reads it and settles; if the model was cut off
+        before writing one, nothing is there, and the trigger fires again one call later than
+        it otherwise would have.
+
+        The outstanding ask is also what makes the attribution honest. A record surfaces on the
+        call *after* the one that was pinned, so crediting the call it became visible on would
+        report every forced record as volunteered -- and, before this, the count was right only
+        because the second forced call was there to be credited.
 
         Whether the *next* call is pinned is the whole of the decision, and it is taken in
         :meth:`_record_due`, which is the one place the rule is written down.
@@ -1171,22 +1329,28 @@ class ToolResultRecallMiddleware(ChatMiddleware):
             self._records_truncated += 1
 
         messages = list(context.messages)
-        if not messages:
-            self._force_next = False
-            return
-        record_index = find_record_index(messages)
+        record_index = find_record_index(messages) if messages else None
         # The transition is tracked on the instance, not read from the messages on the way in.
         # Before the pipeline runs, context.messages holds only the new turn, so a pre-call
         # check reports "no record" on every call and every later call counts as a fresh one --
         # which is how an 18 appeared here for a single record.
         if record_index is not None and not self._seen_record:
             self._seen_record = True
-            # Attributed, not merely counted. A record that arrived unpinned came from the
-            # model volunteering on a follow-up call, and that is a different claim.
-            if forced_this_call:
+            # Attributed to the ask, not to the call the record became visible on: a forced
+            # call cannot see its own record, so the record surfaces one call later and
+            # crediting that call would report every forced record as volunteered. A record
+            # that arrived with nothing outstanding came from the model volunteering on an
+            # unpinned follow-up call, and that is a different claim.
+            if forced_this_call or self._awaiting_record:
                 self._records_forced += 1
             else:
                 self._records_volunteered += 1
+        # One trigger event, one record. A forced call's own history predates the record it
+        # asked for, so there is nothing here to decide on; see :meth:`process`.
+        self._awaiting_record = forced_this_call
+        if forced_this_call or not messages:
+            self._force_next = False
+            return
         annotate_message_groups(messages)
         annotate_token_counts(messages, tokenizer=self.tokenizer)
         self._force_next = self._record_due(messages, record_index)

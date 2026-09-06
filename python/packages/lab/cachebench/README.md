@@ -212,8 +212,14 @@ A row that has stopped preserving anything shows up there hours before the table
 tool groups that result replaced, but only the groups the record demonstrably carries — the
 rest are kept, and counted as `UNCOVERED:<n>` in the flags column and as `groups_kept_uncovered`
 on each seed's record. "Demonstrably" means the record quotes at least `coverage_share` (0.8 by
-default) of the distinctive values the group's results contained: whitespace-delimited tokens of
-four characters or more with a digit in them. It used to mean the record contained the group's
+default) of the distinctive values the group's results contained: tokens of four characters or
+more with a digit in them, split on whitespace and on the punctuation that separates values, and
+read from after the last `=` so that `code_1=TL-BA44A9` yields the value rather than the label.
+The record is tokenised the same way and a value counts only when it is one of the record's own
+tokens. Both halves of that had to be fixed: reading the compound meant a group was covered only
+by a record that had copied the harness's label format, and testing `value in record` meant a
+group holding `2026` was "covered" by any record mentioning a 2026 date, and then deleted. It
+used to mean the record contained the group's
 function name, which measured badly on both models — luna writes `extra0 deployment lookup
 returned codes: …` and never the function name, and mini's complete records scored `UNCOVERED:4`
 while its compaction fell from 20% to 5–6%. A group whose results hold no such values — prose
@@ -222,7 +228,9 @@ there.
 
 That count says how many groups fell short of the ask, not how far short any one of them fell.
 A record carrying seven of a group's eight values passes at the default share and the eighth is
-gone with nothing saying so.
+gone with nothing saying so. It describes where the conversation stands at the last pass that
+read a record, not every shortfall the run ever had: a group a later record covered and the
+strategy then deleted is not still reported as kept.
 
 `--dump-record DIR` writes the full text of each record to `DIR/<strategy>-seed<n>.txt`, one
 file per strategy and seed, for reading by eye. It is read back out of the finished
@@ -237,7 +245,9 @@ for. It is the quieter of the two, because shortening in place leaves the messag
 untouched while the values inside those messages go — and beside `UNCOVERED` it is shortening
 exactly the groups the coverage check had just declined to delete. It went uncounted until a
 seed flagged `UNCOVERED:4` was measured losing the control's facts three messages shorter and
-16,617 tokens lighter.
+16,617 tokens lighter. It counts passes where the fallback actually changed something: counting
+the attempt made `RECFALLBACK:5` mean anything between five losses and five no-ops, and archived
+rows carry exactly that number.
 
 `--max-groups-before-record N` forces a fresh record every N tool-call groups rather than asking
 one record to cover everything. Coverage does not scale with how much there is to cover:
@@ -267,7 +277,12 @@ account of the groups behind *it*, so a merge would rewrite the evidence rather 
 Every record is preserved: unshrinkable, undroppable, counted against the ceiling in full. So
 each one raises a floor under the prompt that no later pass can lower, and `RECORDS:<n>` in the
 flags column, stored as `records_in_conversation` on each seed, is what says so. Read it
-alongside `REC:<n>`, which saturates at 1 and answers only whether the model ever complied.
+alongside `REC:<n>`, which saturates at 1 and answers only whether the model ever complied, and
+against `FORCED:<n>`, which is how many times a record was asked for: one record per ask is the
+mechanism working, and more records than asks is a defect. It was one — every trigger event
+wrote two records, because the middleware re-decided on the exit of the call it had just pinned,
+where the record it asked for is not yet in the loaded history. Archived rows show it as
+`FORCED:2, RECFORCED:1`.
 
 `--no-record-repeats` asks once and no more. Every run up to and including 39 was single-record,
 so a cell meant to sit on the same axis as those has to set it. It governs the size trigger
@@ -292,15 +307,19 @@ Ranges are checked by the strategies themselves, and every selected strategy is 
 run spends anything, so a value out of range fails at the command line rather than on the first
 paid call. `--dry-run` builds from the flags it is printing a plan for.
 
-The two record thresholds default to **0.8** and **0.95**, and they are one decision. 0.6 fired
-at 58% of a 60,000-token window: an agent turn and a broken cached prefix spent early in a
-conversation that may never have needed compacting, when the break-even only favours compaction
-with a long remaining horizon. Moving the trigger up forced the give-up line up with it, because
-the record arrives one call late by construction — the middleware can only read the history on
-the way out of a call and can only pin the next one — so a 0.9 line left a single turn's growth
-of room, and one turn carrying a large tool result crossed it, compacting without a record while
-the record was still in flight. `fallback_fraction` must exceed `trigger_fraction`; the strategy
-raises `ValueError` when it does not.
+The two record thresholds default to **0.6** and **0.9**, which is what every archived run used.
+They were briefly moved to 0.8 and 0.95 on the argument that 0.6 fires at 58% of a 60,000-token
+window — an agent turn and a broken cached prefix spent early in a conversation that may never
+have needed compacting. That is arithmetic about where the line falls rather than a measured
+cost, and no run had used the replacement. The measurements point the other way: the record
+degrades with the bulk it must read — 53/53 facts at 8,000-token tool results, 46/53 at 16,000,
+18/53 at 25,200 — so a later trigger is a bigger ask and a worse record. The break-even argument
+also inverts: an edit repays over the turns that follow it, and firing later leaves fewer of
+them. The give-up line moves with the trigger because the record arrives one call late by
+construction — the middleware can only read the history on the way out of a call and can only
+pin the next one — and at 0.6/0.9 the gap it has to land in is three tenths of the budget.
+`fallback_fraction` must exceed `trigger_fraction`; the strategy raises `ValueError` when it
+does not.
 
 #### Fill and the tried limit
 
