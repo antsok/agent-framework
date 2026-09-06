@@ -1468,6 +1468,44 @@ So luna writes at great length about the first two lookups and never reaches the
 is a property of the model's writing, not of a setting, and no bound reachable from the CLI moved
 it.
 
+### Run 42 -- every strategy at one high-fill cell, accuracy only
+
+All 18 registered strategies in one cell, `gpt-5.6-luna`, 60,000/0.86, five seeds, 90 records.
+**The cost axis of this run is not usable and the accuracy axis is.**
+
+**Why the cost axis is out.** Five concurrent invocations of eighteen strategies is roughly 4.5x
+the per-invocation load of run 41's five arms of four, so about 2.7M tokens a minute against a
+2M ceiling. 18 of 90 records were throttled with rate-limit retries -- including **the control in
+all five seeds**, which is the baseline every `vs none$` is taken against. For the one strategy
+with both kinds of seed, the throttled records cost 49% more than the clean one on 4% more input
+(n=1, so suggestive rather than conclusive). The cell also seeded -5.3% off its fill target. The
+table prints `VERDICT: tool_summary_anchored` at -6% with `NOT SUPPORTED` against a 37% spread;
+that verdict is not being claimed.
+
+**Why the accuracy axis stands.** Throttling delays a request; it does not change what the model
+is sent or what it writes. Facts and `acc1` are unaffected.
+
+| strategy | facts | acc1 |
+| --- | ---: | ---: |
+| `none`, `tool_summary_anchored` | **53/53** | 100% |
+| `anchored_no_assistant` | 51/53 | 94% |
+| `selective_tool_call`, `anchored` | 50/53 | 92-94% |
+| `tool_result` | 49/53 | 93% |
+| `anchored_min_gain` | 46/53 | 88% |
+| `token_budget_summarize` | 40/53 | 76% |
+| `context_window_lazy` | 36/53 | 69% |
+| `context_window` | 24/53 | 46% |
+| `truncation`, `token_budget_fallback`, `token_budget_tools_first`, `token_budget_truncate_first`, `context_window_aggressive`, `summarization` | 16-20/53 | 31-39% |
+| `sliding_window` | **8/53** | 17% |
+
+`tool_summary_anchored` is the only compacting strategy that retains everything, which matches all
+25 rows of run 41 on a field four times wider. `summarization` -- the ladder the framework leads
+with -- sits at 18/53, level with blind truncation.
+
+**Method note for the next run.** Concurrency has to be sized against strategies-per-invocation,
+not invocations. Run 41's five-way parallelism was clean at four rows each; the same parallelism
+at eighteen rows each was not.
+
 ### Run 41 -- the clean baseline
 
 The first measurement on code with the coverage check repaired, the record protected, one record
