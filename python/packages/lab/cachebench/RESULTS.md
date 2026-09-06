@@ -1468,6 +1468,56 @@ So luna writes at great length about the first two lookups and never reaches the
 is a property of the model's writing, not of a setting, and no bound reachable from the CLI moved
 it.
 
+### Run 41 -- the clean baseline
+
+The first measurement on code with the coverage check repaired, the record protected, one record
+per trigger, repeats off by default, and the output reservation paid off. 60,000/0.86, five seeds,
+five arms, four rows in each invocation so `anchored` is compared on the same conversations rather
+than across runs. **100 records, no throttling, retries or errors.** Not comparable with runs
+26-40: the reservation fix moved every threshold.
+
+| arm | `vs none$` | facts | acc1 | seed spread |
+| --- | ---: | ---: | ---: | ---: |
+| luna, fixed payload | **-1%** | 53/53 | 100% | 32% |
+| luna, share 0.80 | **-3%** | 53/53 | 100% | 19% |
+| luna, share 0.80, repeats | +7% | 53/53 | 100% | 17% |
+| mini, fixed payload | +25% | 53/53 | 100% | 79% |
+| mini, share 0.80 | +10% | 53/53 | 96% | 33% |
+
+**Retention is the finding.** The record row holds 53/53 in **all 25 rows** -- both models, both
+payloads, repeats on and off, coverage succeeding and failing, fallback firing and not. On the
+same conversations `anchored` reads 35-53 and `truncation` 21-45. No other strategy retains
+reliably, and this is the first run where that comparison is made inside single invocations.
+
+**Cost still refuses to resolve.** Two arms name `tool_summary_anchored` and both print
+`NOT SUPPORTED` -- a 1% gap against a 36% spread, and 3% against 19%. Three arms name `none`. So
+on luna the record is at parity with not compacting and on mini it costs 10-25% more, which is
+the same answer this project has given at every cell it has measured.
+
+**More compaction is not less money, stated as plainly as the data allow.** The repeats arm cuts
+the snapshot 63-66% against the no-repeat arm's 40%, and the cross-cell report puts it **10%
+dearer** on the same workload:
+
+    tool_summary_anchored  $0.0240  repeat_records=off
+    tool_summary_anchored  $0.0266  repeat_records=on
+
+Two records break the cached prefix twice and write more output, and output is priced at six
+times input. Anyone reading `snap%` as a proxy for cost -- as I did twice during this run --
+gets the sign wrong.
+
+**The coverage threshold sits on a cliff.** `unc` and shrink move together one-for-one, and which
+side a seed lands on flips within an arm: mini at share 0.80 read `unc` of 4, 3, 0, 4, 3 with
+shrink of -2%, 9%, 41%, -1%, 8%. Coverage clears the 0.8 bar in 4 of 5 fixed-payload rows and 2 of
+6 share-0.80 rows, so the margin narrows as results grow, but it is a cliff rather than a
+threshold anyone has calibrated. **`--coverage-share` is the sweep worth running next**, and it is
+newly reportable.
+
+**Caveats.** The two share-0.80 cells are not the same workload: matched tool results (41,273
+tokens) but different filler, so luna's tool share is 84% and mini's 94% -- cross-model reading at
+that cell is not like-for-like. `mini-fixed` seeded +5.3% over target and `luna-share80-repeats`
+-6.5%, both outside tolerance. Within-arm comparisons, which is where every number above comes
+from, are unaffected.
+
 ### Run 40 -- the repaired check, measured, and the cost axis says no
 
 60,000 / 0.86, three seeds, four rows in one invocation so `anchored` -- the strategy this one
