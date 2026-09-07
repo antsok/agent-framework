@@ -1,5 +1,11 @@
 # Does context compaction save money? — final report
 
+> **SUPERSEDED, 7 September 2026.** The current report is
+> [`REPORT-2026-09-07.md`](REPORT-2026-09-07.md), written against runs 41 and 42 on a twice-repaired
+> instrument. This document is kept unedited as the record of the replay-harness study. Read it for
+> the cross-provider cache arithmetic, which stands; do not read it for any statement about how a
+> live agent behaves, what a strategy retains, or what compaction costs.
+
 **Date:** 27 August 2026
 **Models:** `gpt-5.6-luna`, `gpt-5.4-mini`, `z-ai/glm-5.2`, `z-ai/glm-5.3-flash`, (`gemini-3.7-flash` excluded)
 **Routes:** Azure Foundry (Responses API), OpenRouter (Chat Completions)

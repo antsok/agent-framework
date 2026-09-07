@@ -1,542 +1,525 @@
-# cachebench — compaction vs. prompt caching
+# cachebench — using the tool
 
-Measures what Agent Framework's compaction strategies cost you in provider prompt-cache
-hits, across providers, at mid and large context sizes.
+A benchmark that measures what Agent Framework's compaction strategies cost in provider
+prompt-cache hits, and what they destroy while doing it. This file is about **running it**:
+installing, pointing it at a provider, every command-line option, reading the table it prints,
+and re-rendering or comparing results you already paid for.
 
-## Why this exists
+The other four documents answer different questions:
 
-Provider prompt caches match on **exact prefixes**. Every compaction strategy in
-`agent_framework._compaction` works by excluding or rewriting messages *inside* an
-existing history. So compaction breaks the cached prefix by construction — the only
-questions are how badly, how often, and whether the prompt tokens it saves are worth more
-than the cache reads it destroys.
+| | |
+| --- | --- |
+| [`STRATEGIES.md`](STRATEGIES.md) | what each of the eighteen strategies does, and what it retained |
+| [`REPORT-2026-09-07.md`](REPORT-2026-09-07.md) | what the measurements mean, and what has been withdrawn |
+| [`RESULTS.md`](RESULTS.md) | every run, with its own caveats |
+| [`TESTING.md`](TESTING.md) | how the package is tested and why |
 
-That trade-off is not obvious in either direction:
+## Install
 
-- Compacting **more** shrinks every prompt but re-breaks the prefix, forcing a full
-  re-prefill at full price.
-- Compacting **less** keeps the cache warm but sends more tokens, most of them discounted.
-
-There is a cadence that minimises real cost, and it differs per provider because cache
-discounts, minimum cacheable sizes, and TTLs differ.
-
-## How it measures
-
-Conversations are **scripted, not live**. Each turn appends fixed request messages,
-compaction runs over the history exactly as `CompactionProvider.before_run` would, the
-projection goes to the provider, and then a *scripted* reply is appended — the model's real
-answer is discarded. That is what lets every provider and every strategy replay a
-byte-identical conversation, which is the only way cross-provider numbers mean anything.
-
-Two independent measurement channels:
-
-| Channel | Source | Available on |
-|---|---|---|
-| **Reported** | `cache_read_input_token_count` in `UsageDetails`, which Agent Framework already normalises across providers | Providers that report it |
-| **Local prefix oracle** | This package recomputes how much of each prompt stayed byte-identical to the previous one | Always |
-
-The oracle is the theoretical ceiling: a provider can never serve more cache than the
-prefix that survived. Comparing the two gives `real%` — how much of the reusable prefix the
-provider actually delivered. On providers that report nothing, the oracle plus latency is
-all you get, and the tool says so rather than printing a misleading 0%.
-
-Matching is at **message granularity**: a message that changed at all contributes zero
-reusable tokens. The oracle therefore never overstates reuse.
-
-## Provider support
-
-| Provider | Cache reporting | Engages | Notes |
-|---|---|---|---|
-| `azure` | yes | automatic | 1,024-token minimum, 128-token increments before GPT-5.6. TTL 5–10 min idle, 1 hour absolute. Cache reads discounted ~50%. |
-| `openrouter` | yes | automatic | Returns `cached_tokens` and `cache_discount`, via the standard `agent_framework_openai` path. **Pin `OPENROUTER_PROVIDER_ORDER`** — otherwise routing changes upstream between turns and you are measuring the router, not the cache. |
-| `mistral` | yes | automatic, **intermittent** | Caches with no `prompt_cache_key` at all. But engagement is erratic — see below — so a single repeat is noise. Cache reads billed at **10%** of input; pass `--cache-read-ratio 0.1`. |
-| `foundry` | unknown | — | Depends on the deployed model. |
-| `ollama` | **no** | automatic, but invisible | Caching demonstrably happens and is never reported. Judge Ollama by `reuse%` and latency only. |
-
-Ollama measured directly against `ollama.com` on 2026-08-25 with a 6,000-token shared
-prefix, across `glm-5.2`, `minimax-m3`, `gpt-oss:120b` and `mistral-large-3:675b`, on both
-`/api/chat` and `/v1/chat/completions`: **no cache field on any of them**, and
-`prompt_eval_count` stayed pinned at the full prompt size on every call. Yet `glm-5.2` went
-4,078 ms cold → 1,157 ms → 1,056 ms warm on that identical prefix. Prefix KV reuse is real
-there; the usage payload just never mentions it. Two independent filters would hide it even
-if the server did send one: the local daemon reshapes cloud responses (it drops
-`prompt_eval_duration`, `load_duration` and `eval_duration` on `:cloud` models), and the
-`ollama` SDK's `ChatResponse` is a closed pydantic model that discards unknown fields.
-Re-check with `samples/probe_ollama_usage.py`, which bypasses the SDK.
-
-> **Mistral engages caching intermittently.** Measured 2026-08-25 on
-> `mistral-large-latest`, three identical 6k-token-prefix calls reported
-> `cached_tokens` of 0, 0, 6000 without a key — and 0, 6000, 0 with one. Across two full
-> `mid` sweeps the same cell swung from 42.1% to 29.0% hit rate on byte-identical input.
-> Treat any single-repeat Mistral number as noise: use `--repeats` and read the spread,
-> not the value. `prompt_cache_key` is *not* the switch — it made no measurable
-> difference — so no provider sends one unless you pass `--prompt-cache-key`.
-
-Environment variables per provider:
+The package is `agent-framework-lab` with the `cachebench` extra, which pulls in the provider
+clients (`openai`, `mistral`, `ollama`, `foundry`). From a checkout:
 
 ```bash
-# azure — direct Azure OpenAI deployment (distinct from the foundry project route)
+cd python
+uv sync --all-extras --all-groups
+```
+
+That puts five executables on the path. Note the **underscores** — `pyproject.toml` declares them
+that way, so `cachebench-live` is not a command even though argparse prints it in the usage line.
+
+| command | what it does |
+| --- | --- |
+| `cachebench` | the replay harness: byte-identical scripted transcripts, comparable **across** providers |
+| `cachebench_live` | the live-agent harness: a real agent, real replies, real tool calls, one model at a time |
+| `cachebench_advise` | one model against several strategies, with a cheapest-strategy recommendation |
+| `cachebench_recall` | what each strategy destroys, on one planted conversation |
+| `cachebench_summary` | cost and correctness together on one conversation, with a recommendation |
+
+Everything below covers the first two. The other three take a subset of the same flags and print
+their own `--help`.
+
+## Credentials and provider selection
+
+A provider is selected as `provider` or `provider:model`. The model rides in the selector rather
+than only in the environment because comparing two models on one provider is a first-class case —
+cache behaviour differs by model family at least as much as by provider. Only the first colon
+separates, so `openrouter:z-ai/glm-5.2:free` works.
+
+```bash
+# azure — a direct Azure OpenAI deployment, distinct from the foundry project route
 AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, AZURE_OPENAI_CHAT_COMPLETION_MODEL
-# foundry — also needs a working DefaultAzureCredential (`az login`, or a managed
-# identity when deployed); a project endpoint alone is rejected by the client
+#   optional: AZURE_OPENAI_API_VERSION, AZURE_OPENAI_MODEL (fallback for the model name)
+
+# foundry — also needs a working DefaultAzureCredential (`az login`, or a managed identity
+#   when deployed). A project endpoint on its own is rejected by the client.
 FOUNDRY_PROJECT_ENDPOINT, FOUNDRY_MODEL
-# openrouter — model must be a real slug, e.g. z-ai/glm-5.2; check /api/v1/models
-OPENROUTER_API_KEY, OPENROUTER_MODEL, OPENROUTER_PROVIDER_ORDER  # e.g. "openai"
-# mistral — MISTRAL_MODEL is accepted as a fallback
+
+# openrouter — the model must be a real slug, e.g. z-ai/glm-5.2
+OPENROUTER_API_KEY, OPENROUTER_MODEL
+#   optional: OPENROUTER_BASE_URL, OPENROUTER_PROVIDER_ORDER (e.g. "openai")
+
+# mistral — MISTRAL_MODEL is accepted as a fallback for the model name
 MISTRAL_API_KEY, MISTRAL_CHAT_MODEL
-# ollama (cloud) — model drops the ":cloud" suffix on the direct API
-OLLAMA_MODEL, OLLAMA_HOST=https://ollama.com, OLLAMA_API_KEY
+
+# ollama (cloud) — the model drops the ":cloud" suffix on the direct API
+OLLAMA_MODEL
+#   optional: OLLAMA_HOST (defaults to https://ollama.com), OLLAMA_API_KEY
 ```
 
-A provider that fails to construct is skipped with a warning rather than aborting the
-sweep, so one missing credential does not cost you every other provider's cells.
+**Pin `OPENROUTER_PROVIDER_ORDER` if you use OpenRouter.** It dispatches to an upstream provider
+that can change between requests, and a different upstream is a different cache; without the pin
+you are measuring the router. Setting it also disables fallbacks.
 
-## Usage
+Under `cachebench` (replay), a provider that fails to construct is skipped with a warning rather
+than aborting the sweep, so one missing credential does not cost you every other provider's cells.
 
-Validate the matrix and see prompt sizes without spending anything:
+### What each provider reports
+
+| provider | cache reporting | notes |
+| --- | --- | --- |
+| `azure` | yes | automatic caching. 1,024-token minimum; 128-token increments before GPT-5.6 |
+| `openrouter` | yes | returns `cached_tokens` and `cache_discount`. Pin the provider order |
+| `mistral` | yes | automatic but **intermittent** — use `--repeats` and read the spread, not the value. Cache reads billed at 10% of input, so pass `--cache-read-ratio 0.1` |
+| `foundry` | unknown | depends on the deployed model |
+| `ollama` | **no** | caches and never reports it. Judge by `reuse%` and latency only |
+
+`prompt_cache_key` is not the switch on any provider measured so far — every one of them caches
+without it — so nothing sends one unless you pass `--prompt-cache-key`. An older deployment can
+reject the unknown field.
+
+## The two harnesses, and when to use which
+
+**`cachebench` replays a scripted transcript.** Each turn appends fixed request messages,
+compaction runs over the history exactly as `CompactionProvider.before_run` would, the projection
+goes to the provider, and then a *scripted* reply is appended — the model's real answer is
+discarded. That is what lets every provider and every strategy replay a byte-identical
+conversation, and it is the only mode whose numbers compare **across** providers.
 
 ```bash
+# validate the matrix and see prompt sizes without spending anything
 cachebench --dry-run --providers azure --sizes mid,large --strategies none,context_window,truncation
-```
 
-A cheap live sweep (the defaults: one provider, `mid`, four strategies, one repeat):
-
-```bash
+# the defaults: one provider, the mid transcript, four strategies, one repeat
 cachebench --providers azure
-```
 
-Compare models on the same provider with `provider:model` — cache behaviour varies by model
-family at least as much as it varies by provider:
-
-```bash
+# two models on one provider, plus a third elsewhere
 cachebench --providers "openrouter:openai/gpt-5.4-mini,openrouter:z-ai/glm-5.2,foundry:gpt-5.6-luna"
 ```
 
-The full cross-provider comparison:
+**`cachebench_live` drives a real agent.** It writes its own replies and calls a real tool, so the
+history compaction acts on is the history an agent would actually accumulate. Two things only
+exist here: replies become history, so a strategy that compacts badly produces a worse reply which
+becomes worse history which it compacts again; and a turn is no longer one model call, since a
+turn that uses a tool bills several prompts of different sizes.
 
 ```bash
-cachebench \
-  --providers azure,mistral,openrouter,ollama \
-  --sizes mid,large \
-  --strategies none,context_window,context_window_aggressive,context_window_lazy,truncation,sliding_window,tool_result \
-  --repeats 3
+cachebench_live foundry:gpt-5.6-luna --agent harness --strategies none,truncation,anchored
 ```
 
-Results are printed as a table and written to `--out` as per-turn JSONL plus a summary CSV.
+The cost of that realism is comparability. Two models write different replies, so their histories
+diverge from the first turn. **Live numbers compare strategies within one model, never models with
+each other.**
 
-### Replayed or live
+### How a live run is structured
 
-The four commands above replay a scripted transcript: the assistant's replies are canned and
-the model's output is discarded, so every provider receives a byte-identical prompt. That is
-what makes their numbers comparable across providers, and it is the right mode for asking how
-a *prompt* caches.
+Three phases, and the split is the measurement design rather than plumbing.
 
-`cachebench-live` gives that up deliberately. It drives the same scenario through a real
-`Agent` that writes its own replies and calls a real tool, so the history compaction acts on
-is the history an agent would actually accumulate:
+- **Seed** drives every turn except the closing questions, exactly as an agent in use would. Only
+  the user-side turn list is shared between strategies; the replies, and so the histories, diverge
+  from the first turn.
+- **Snapshot** is a deep copy of the session state taken once seeding ends. Deep, because
+  compaction records its decisions by mutating the messages themselves.
+- **Probe** restores the snapshot, asks one closing question, and throws the answer away. Each
+  per-scope question is asked `--probe-repeats` times and the one combined question
+  `--combined-repeats` times, independently.
 
-```bash
-cachebench-live openrouter:openai/gpt-5.6-luna
-```
+So no probe's answer can reach another probe's context, no question is asked from a context an
+earlier question compacted further, and survival is scored against the snapshot — which is by
+construction exactly the context every probe was answered from. None of the three held when the
+closing questions were ordinary appended turns: each answer re-listed codes into the history, and
+the same strategy read 53/53 on a run that emitted 10,941 output tokens and 18/53 on one that
+emitted 4,873.
 
-Two things only exist in this mode. Replies become history, so a strategy that compacts badly
-produces a worse reply, which becomes worse history, which it compacts again — replay cannot
-show that compounding. And a turn is no longer one model call: a turn that uses a tool bills
-several prompts, each a different size.
+## Live options, by purpose
 
-The cost is comparability. Two models write different replies, so their histories diverge from
-the first turn. **Live numbers compare strategies within one model, never models with each
-other.** Use the replay commands for cross-provider work.
+Defaults are as `cachebench_live --help` prints them. Every constructor parameter a sweep would
+want to vary is a flag, because a knob that is only a default cannot be measured.
 
-#### Seed, snapshot, probe
+### Choosing what runs
 
-A live run has three phases, and the split is the measurement design rather than plumbing.
+| flag | default | |
+| --- | --- | --- |
+| `provider` (positional) | — | `provider` or `provider:model`. Omitted only with `--from-jsonl` |
+| `--strategies` | 11 of the 18 | comma-separated; see [`STRATEGIES.md`](STRATEGIES.md) |
+| `--agent` | `plain` | `harness` swaps in `create_harness_agent`, which is what production code calls. Its optional providers are switched off, because each adds tools and system-prompt text to every measured prompt |
+| `--repeats` | 1 | seeds per strategy — whole conversations driven from scratch. This is the axis that measures compaction's own reliability. 3 or more is what makes a ranking defensible |
+| `--seed-offset` | 0 | number the seeds from here. The seed number goes into the scenario salt, so two invocations that both start at seed 1 build byte-identical conversations; offsetting is what makes several single-seed invocations into different seeds rather than one seed measured repeatedly |
 
-The **seed** phase drives every turn except the closing questions, exactly as an agent in use
-would. Only the user-side turn list is shared between strategies; the replies, and so the
-histories, diverge from the first turn.
+### Sizing the workload
 
-The **snapshot** is a deep copy of the session state taken once seeding ends. Deep because
-compaction records its decisions by mutating the messages themselves.
+| flag | default | |
+| --- | --- | --- |
+| `--context-window` | 32,000 | the limit the run stands in for. Simulated, so it is enforced here: any call whose prompt exceeds it disqualifies that row, and a cell that disqualifies at all leaves the ranking |
+| `--fill` | 0.7 | share of that limit the seeded conversation is sized to reach, solved analytically from the payload and filler sizes. Pass 0 to size manually from `--filler-turns` and `--filler-tokens` |
+| `--filler-turns` | 6 | padding turns between planted facts. Ignored unless `--fill` is 0 |
+| `--filler-tokens` | 2,000 | size of each filler turn; under `--fill`, the size the solver keeps them near while it picks how many |
+| `--tool-result-tokens` | 4,000 | approximate size of each tool result. **Ignored when `--tool-share` is set** |
+| `--tool-share` | 0.0 | share of the seeded conversation that is tool-result text, deriving the result size from the fill target instead. **Wins when both are given**, and needs `--fill` |
+| `--assumed-reply-tokens` | 150 | how large the model's own replies are assumed to be when solving for the fill. The one term the solver cannot compute, and it is per model: ~150 on `gpt-5.4-mini`, ~602 on `gpt-5.6-luna`. Measure it from a one-seed probe before sizing a matrix on a new model |
+| `--tool-turns` | 6 | tool-call groups to plant. Must exceed `--keep-last-tool-groups` or tool-oriented compaction never fires |
+| `--filler-tool-turns` | 0 | extra tool calls whose results carry no codes: bulk without anything to remember |
+| `--markers-per-tool` | 2 | verifiable codes each tool result carries. More codes raise the resolution of the accuracy measure and make narration a weaker substitute for preservation |
 
-Every closing question is then asked as a **probe**: the snapshot is restored, the question is
-put, and the answer is thrown back into nothing. Each per-scope question is asked
-`--probe-repeats` times (3 by default) and the one combined question `--combined-repeats`
-times (also 3), independently — see [the two accuracy columns](#the-two-accuracy-columns) for
-why the counts are separate. No probe's answer can reach another probe's context, no question
-is asked from a context an earlier question compacted further, and survival is scored against
-the snapshot, which is by construction exactly the context every probe was answered from.
+**Absolute is right within one window and wrong across two.** 3,500-token results are 6% of a
+60,000-token context and 3% of a 120,000-token one, so a sweep over window sizes with
+`--tool-result-tokens` is a sweep over two variables. That disabled a strategy once: the anchored
+family shortens each banded result to a share of the *ceiling*, so its allowance grew from ~2,900
+to ~5,900 tokens while the results stayed at 3,500, and at 120,000 it planned nothing while its
+rows were read as measurements. `--tool-share` holds the proportions.
 
-None of the three held when the closing questions were ordinary turns appended to the
-conversation. Each answer re-listed codes into the history as assistant text, so `survived`
-was scored against a prompt the previous answers had written: the same strategy read 53/53 on
-a run that emitted 10,941 output tokens and 18/53 on one that emitted 4,873.
+The achieved fill and the achieved share are both measured on the uncompacted run and flagged if
+they land more than 5% from target. A payload that will not fit inside the smallest cell is
+refused with an error rather than quietly overshooting.
 
-#### Results are durable per seed
+### Shaping the scenario
 
-A cell is every strategy times `--repeats` seeds, and at realistic sizes it runs for hours.
-Its table only exists once all of it has finished, so anything that stops the process in
-between used to discard every seed that had already completed — and already been paid for.
-The 60,000/0.86 cell ran all fifteen strategy-seeds over three and a half hours, died before
-printing, and left nothing.
+| flag | default | |
+| --- | --- | --- |
+| `--narration` | `neutral` | how hard the scenario pushes the model to restate tool values. `neutral` says nothing either way, leaving the framework's own guidance as the only driver — the configuration a typical caller gets. Also `prompted`, `suppressed` |
+| `--fact-placement` | `spread` | where the codes sit inside each tool result, which decides what is being measured. `spread` gives each its own labelled line, so the score is how much compaction preserved. `buried` puts them inline in prose, so retrieval under noise is scored too — and compaction can then beat the control by deleting the haystack. `head` puts them all at the front, where every tool-oriented strategy preserves them for free |
+| `--no-retrieval-guidance` | off | drop the clause telling the model to quote every identifier it is asked for. Only safe with an adequate `--answer-max-tokens`: at 900 the control scored 33% without the clause and 100% with it, which measures the cap and not retrieval |
+| `--sweeping-question` | off | close with one question demanding every code at once instead of several targeted ones. Needs a large `--answer-max-tokens` — enumerating 53 codes is ~640 tokens before prose, and a truncated answer is scored as lost facts |
 
-`--results-jsonl PATH` appends one JSON object per seed, written and closed the moment that
-seed is scored. Each line carries the cell parameters, the cost and token components, what
-survived and what was lost, every per-probe correctness sample, and any error — everything the
-table reads, so nothing has to be re-scored later against a scenario that is salted per seed
-and gone with the process.
+### Output caps, which are three different reservations
 
-```bash
-cachebench-live foundry --results-jsonl runs/stage1.jsonl ...
-cachebench-live --from-jsonl runs/stage1.jsonl
-```
+| flag | default | reserved by | sent on |
+| --- | --- | --- | --- |
+| `--max-output-tokens` | 2,048 | subtracted from `--context-window` to give the input budget every threshold is a fraction of | every seeding call |
+| `--answer-max-tokens` | 4,000 | checked against the fill target before the run spends anything | the closing questions, and nothing else |
+| `--record-max-tokens` | 4,000 | the seeding reservation | the one call `tool_summary_anchored` forces. `0` leaves the run's own cap in place |
 
-`--from-jsonl` rebuilds the table and the verdict from that file and runs nothing, so it needs
-no provider. It is the same aggregation the live path uses, over the same records, which is
-what makes a recovered cell the cell that was measured rather than a second reading of it.
+These are separate because a seeding reply is appended to the history and re-sent on every later
+turn, while nothing follows a closing answer — the snapshot is restored before the next probe, so
+its length is never re-sent, and it is the one call that has to enumerate everything planted.
+**One number per call path, reserved and sent**, which was not true until 6 September: the
+arithmetic used `--max-output-tokens` while the request carried `--answer-max-tokens`, so at a
+60,000-token window with a 12,000-token answer cap the strategies believed 57,952 tokens of input
+were available when 48,000 were. Runs 26 to 40 sit on that arithmetic.
 
-The file is appended to, never truncated: a sweep can point every cell at one path, and a run
-resumed after a crash extends what is already there. Records are grouped back into cells by
-what they measured, so one file holds a whole sweep and each cell gets its own table. A cell
-that is missing strategies or seeds still renders, and says which of each it holds against
-what the run set out to take — every mean in the table is over what is present, and nothing in
-the table itself would otherwise distinguish four strategy-seeds from fifteen.
+Sizing `--max-output-tokens` too low also inflates the budget and can push a trigger above what
+the service will accept, which disables compaction with no warning.
 
-Each seed also prints a one-line summary as it lands: strategy, seed, cost, facts, and both
-accuracies.
-A row that has stopped preserving anything shows up there hours before the table would.
+### Tuning the strategies
 
-#### Reading what the model recorded
-
-`tool_summary_anchored` has the model write the facts into a tool result and then drops the
-tool groups that result replaced, but only the groups the record demonstrably carries — the
-rest are kept, and counted as `UNCOVERED:<n>` in the flags column and as `groups_kept_uncovered`
-on each seed's record. "Demonstrably" means the record quotes at least `coverage_share` (0.8 by
-default) of the distinctive values the group's results contained: tokens of four characters or
-more with a digit in them, split on whitespace and on the punctuation that separates values, and
-read from after the last `=` so that `code_1=TL-BA44A9` yields the value rather than the label.
-The record is tokenised the same way and a value counts only when it is one of the record's own
-tokens. Both halves of that had to be fixed: reading the compound meant a group was covered only
-by a record that had copied the harness's label format, and testing `value in record` meant a
-group holding `2026` was "covered" by any record mentioning a 2026 date, and then deleted. It
-used to mean the record contained the group's
-function name, which measured badly on both models — luna writes `extra0 deployment lookup
-returned codes: …` and never the function name, and mini's complete records scored `UNCOVERED:4`
-while its compaction fell from 20% to 5–6%. A group whose results hold no such values — prose
-findings, say — still falls back to the name test, because the value rule has nothing to read
-there.
-
-That count says how many groups fell short of the ask, not how far short any one of them fell.
-A record carrying seven of a group's eight values passes at the default share and the eighth is
-gone with nothing saying so. It describes where the conversation stands at the last pass that
-read a record, not every shortfall the run ever had: a group a later record covered and the
-strategy then deleted is not still reported as kept.
-
-`--dump-record DIR` writes the full text of each record to `DIR/<strategy>-seed<n>.txt`, one
-file per strategy and seed, for reading by eye. It is read back out of the finished
-conversation after the run is over, so it adds nothing to any prompt and makes no call: the
-tokens, the cache hits and the cost are identical whether or not it is set. Seeds that took no
-record produce no file rather than an empty one.
-
-A record that arrives and still leaves the prompt over the ceiling makes the strategy fall back
-to shortening tool results, which is counted as `RECFALLBACK:<n>` and read the same way as
-`FALLBACK`: part of that row measures the fallback strategy rather than the one it is named
-for. It is the quieter of the two, because shortening in place leaves the message count nearly
-untouched while the values inside those messages go — and beside `UNCOVERED` it is shortening
-exactly the groups the coverage check had just declined to delete. It went uncounted until a
-seed flagged `UNCOVERED:4` was measured losing the control's facts three messages shorter and
-16,617 tokens lighter. It counts passes where the fallback actually changed something: counting
-the attempt made `RECFALLBACK:5` mean anything between five losses and five no-ops, and archived
-rows carry exactly that number.
-
-`--max-groups-before-record N` forces a fresh record every N tool-call groups rather than asking
-one record to cover everything. Coverage does not scale with how much there is to cover:
-gpt-5.6-luna named two groups of six, and raising `--record-max-tokens`, raising
-`--record-target-tokens` and rewriting the tool's own guidance each left that unchanged. What
-was left was to ask each record for less. Since the strategy keeps whatever a record does not
-name, an unbounded ask degrades into compacting almost nothing, and this is what buys the
-compaction back. Each record costs an agent turn, so a small bound is not free; off by default,
-which leaves the size trigger as the only thing that asks.
-
-#### One record or several
-
-The size trigger *can* ask more than once, but does not unless `--record-repeats` says so. It
-cannot do that on size alone — the size that fired
-it does not go away when a record arrives, because the record is *added* to the conversation and
-then preserved, so a trigger reading size would pin every remaining call in the run. What
-re-arms it is new material: at least one non-recall tool-call group after the newest record.
-A conversation sitting above the trigger with nothing recorded since its last record is settled,
-and is left alone.
-
-That matters because a record covers what existed when it was written and nothing after it.
-Without repeats, every group gathered later is uncoverable for the rest of the run: the strategy
-will not delete what no record carries, so those groups sit in the prompt to the end and the row
-reports `UNCOVERED` for work no record was ever asked to account for.
-
-The price is that records accumulate and nothing merges them — an older record is the sole
-account of the groups behind *it*, so a merge would rewrite the evidence rather than the bulk.
-Every record is preserved: unshrinkable, undroppable, counted against the ceiling in full. So
-each one raises a floor under the prompt that no later pass can lower, and `RECORDS:<n>` in the
-flags column, stored as `records_in_conversation` on each seed, is what says so. Read it
-alongside `REC:<n>`, which saturates at 1 and answers only whether the model ever complied, and
-against `FORCED:<n>`, which is how many times a record was asked for: one record per ask is the
-mechanism working, and more records than asks is a defect. It was one — every trigger event
-wrote two records, because the middleware re-decided on the exit of the call it had just pinned,
-where the record it asked for is not yet in the loaded history. Archived rows show it as
-`FORCED:2, RECFORCED:1`.
-
-`--record-repeats` turns them on; the default is one record per conversation, which is what every
-run up to and including 39 did, so a cell is on the same axis as those unless it asks otherwise.
-
-**Read `UNCOVERED` before setting it.** Repeats help exactly when one record cannot cover the
-whole conversation, and a non-zero `UNCOVERED:<n>` is what says that is happening. At
-`UNCOVERED:0` they can only cost, because a second record is duplication added to the prompt as
-preserved, unshrinkable tokens: run 40 measured them on `gpt-5.4-mini`, whose records are already
-complete, at **-1%, -4% and -2% shrink** on three seeds, and on `gpt-5.6-luna`, whose record named
-two of six groups, better on every axis. Which of the two a model is is not something a framework
-can know in advance, which is why the default is the one that cannot hurt. It governs the size
-trigger alone: `--max-groups-before-record` is asking for repeats outright and keeps forcing them.
-
-#### Tuning the strategies
-
-Every constructor parameter a sweep would want to vary is a flag, because a knob that is only a
-default cannot be measured — the pair `anchored`/`anchored_min_gain` differ in exactly one
-setting, `min_gain_fraction`, and it was unreachable, so the pair had only ever been compared at
-one value of the thing being tested.
-
-- Anchored family: `--keep-head-groups`, `--keep-tail-groups`, `--band-share`, `--keep-tokens`
-  (0 derives the retention from `--band-share` instead of fixing it), `--min-gain-fraction`.
-- Record strategy: `--trigger-fraction`, `--fallback-fraction`, `--coverage-share`, plus the
-  record flags above. The trigger reaches both halves from one flag, so the ask and the wait
-  cannot be set apart.
-- Everything else: `--keep-last-groups` (sliding window, summarization target),
-  `--keep-last-tool-groups`, `--budget-fraction`.
-
-Ranges are checked by the strategies themselves, and every selected strategy is built before the
-run spends anything, so a value out of range fails at the command line rather than on the first
+Ranges are checked by the strategies themselves, and every selected strategy is **built before the
+run spends anything**, so a value out of range fails at the command line rather than on the first
 paid call. `--dry-run` builds from the flags it is printing a plan for.
 
-The two record thresholds default to **0.6** and **0.9**, which is what every archived run used.
-They were briefly moved to 0.8 and 0.95 on the argument that 0.6 fires at 58% of a 60,000-token
-window — an agent turn and a broken cached prefix spent early in a conversation that may never
-have needed compacting. That is arithmetic about where the line falls rather than a measured
-cost, and no run had used the replacement. The measurements point the other way: the record
-degrades with the bulk it must read — 53/53 facts at 8,000-token tool results, 46/53 at 16,000,
-18/53 at 25,200 — so a later trigger is a bigger ask and a worse record. The break-even argument
-also inverts: an edit repays over the turns that follow it, and firing later leaves fewer of
-them. The give-up line moves with the trigger because the record arrives one call late by
-construction — the middleware can only read the history on the way out of a call and can only
-pin the next one — and at 0.6/0.9 the gap it has to land in is three tenths of the budget.
-`fallback_fraction` must exceed `trigger_fraction`; the strategy raises `ValueError` when it
-does not.
+**Anchored family** — `anchored`, `anchored_no_assistant`, `anchored_min_gain`, and the fallback
+inside `tool_summary_anchored`:
 
-#### Fill and the tried limit
+| flag | default | |
+| --- | --- | --- |
+| `--keep-head-groups` | 3 | groups at the start never touched: the task, its requirements, the corrections to them |
+| `--keep-tail-groups` | 4 | recent groups kept verbatim — the working set. Too large and every new turn shifts a large block out of the tail and re-bills it |
+| `--band-share` | 0.25 | share of the input budget the band's oldest tool result may keep, the n-th keeping an n-th of that. Lowering it makes the strategy act, and measured against the break-even it still cannot pay on a small payload: even at 0.01, shedding 94% of every result, the 18,114 tokens removed fall short of the ~29,900 the edit re-bills |
+| `--keep-tokens` | 0 (derive) | fix retention at a flat number of tokens per collapsed result instead. Exposed to make the old comparison runnable, not because it is a good setting: 600 characters is 0.9% of a result at a 60,000-token window and 0.3% at 272,000, and the strategy scored 32 of 53 facts in the first case and 11 in the second |
+| `--min-gain-fraction` | 0.29 | share of the tokens *behind* a collapse that `anchored_min_gain` must remove before making it. Derived from `R > B(p−c)/(p+T·c)` at the measured prices with twenty turns remaining. `T` divides — ten remaining turns need 43% of `B`, forty need 17% — so raise it for shorter conversations |
 
-`--context-window` is the limit the run stands in for. It is simulated — the model itself
-accepts far more — so it is enforced here: any call whose prompt exceeds it disqualifies that
-row, and a cell that disqualifies at all leaves the ranking rather than being starred. Before
-this, the 60,000 control ran at 78,003 tokens and was ranked anyway, which made every
-"cheaper than not compacting" at that size a comparison with a baseline no model that size
-could have produced.
+**The record strategy** — `tool_summary_anchored`:
 
-`--fill` is the share of that limit the seeded conversation is sized to reach, solved
-analytically from the payload and filler sizes rather than by running one strategy and
-adjusting. The filler is the dial; the payload — how many tool results, how large, how many
-codes each — is a run-level parameter, varied between runs and compared across them, never
-inside one matrix. So a fill fraction means "how much irrelevant context surrounds a fixed set
-of facts", and a payload that will not fit inside the smallest cell is refused with an error
-rather than quietly overshooting. The achieved fill is measured on the uncompacted run and
-flagged if it lands more than 5% from the target.
+| flag | default | |
+| --- | --- | --- |
+| `--trigger-fraction` | 0.6 | share of the input budget at which it asks for its record. Reaches both halves at once: the middleware reads the strategy's own value, so the ask and the wait cannot be set apart. Must be below `--fallback-fraction` |
+| `--fallback-fraction` | 0.9 | share at which it stops waiting and compacts without a record. The gap is what the record has to arrive in, and it is a whole turn wide by construction. Cannot be 1.0 — past that line the fallback still has to fit the conversation under the ceiling |
+| `--coverage-share` | 0.8 | share of a group's distinctive values the record must quote before the group may be deleted. A threshold, not a derivation: at eight values per result 0.8 tolerates exactly one unrecognisable value, and at two values per group the share can only be 0, 0.5 or 1. `1.0` is as brittle as the tool-name rule it replaced; `0` restores the older any-value-at-all behaviour, so the two can be run side by side |
+| `--record-target-tokens` | 2,000 | length the recall tool's own description asks the record to aim for. The only channel that makes the model plan for a size, since the middleware sends no message. `0` states no target |
+| `--max-groups-before-record` | 0 (off) | force a fresh record every N tool groups, alongside the size trigger. One record asked to cover a whole conversation is a record a model may only partly write — `gpt-5.6-luna` named two of six groups, and raising the cap, raising the target and rewriting the tool's guidance each left that unchanged. Each record costs an agent turn |
+| `--record-repeats` | off | let the size trigger ask again once new tool work has accumulated. **Read `UNCOVERED` before setting it**: at `UNCOVERED:0` repeats can only cost. Off is also what every run up to and including 39 did, so a row is comparable with those unless this is set |
 
-`--tool-share` states the payload as a share of that target instead of an absolute size, and
-derives the size of each tool result from it. Absolute is right within one window and wrong
-across two: 3,500-token results are 6% of a 60,000-token context and 3% of a 120,000-token
-one, so a sweep over window sizes is a sweep over two variables. It disabled a strategy that
-way — `AnchoredCompactionStrategy` shortens each banded result to a share of the *ceiling*, so
-its allowance grew from about 2,900 tokens to about 5,900 while the results stayed at 3,500,
-and at 120,000 it planned nothing at all while its rows were read as measurements. A share
-holds the proportions, so two window sizes are one cell at two scales.
+`0.6` and `0.9` are what every archived run used. They were briefly 0.8 and 0.95 on the argument
+that 0.6 fires at 58% of a 60,000-token window — arithmetic about where the line falls rather than
+a measured cost. What is measured points the other way: the record degrades with the bulk it must
+read, 53/53 facts at 8,000-token results against 18/53 at 25,200, so a later ask is a bigger ask
+and a worse record, and it leaves fewer turns for the edit to repay itself over.
 
-It wins when `--tool-result-tokens` is also given, needs `--fill` since it is a share of that
-target, and `0` restores the stated size the same way `--fill 0` restores manual sizing. The
-share covers *every* tool result including the code-free ones `--filler-tool-turns` adds, so
-turning those on divides one budget over more results rather than adding to it — which is
-deliberate: what the strategies act on is tool groups, bearing or not. A share the rest of the
-conversation cannot fit inside is refused with an error naming what to move, and the achieved
-share is reported and flagged beside the achieved fill, to the same 5% tolerance.
+**Everything else:**
 
-#### The two accuracy columns
+| flag | default | |
+| --- | --- | --- |
+| `--keep-last-groups` | 6 | groups `sliding_window` keeps, and the target `summarization` compacts to. Unreachable before this flag existed, which fixed the worst-performing row in the table at one setting |
+| `--keep-last-tool-groups` | 4 | tool-call groups the tool-oriented strategies retain verbatim. The framework's own default; with fewer groups than this in the scenario they collapse nothing at all |
+| `--budget-fraction` | 0.5 | fraction of the input budget the `token_budget_*` family compacts down to |
+| `--summarizer-provider` | — | required by `summarization` and `token_budget_summarize`. Prefer the same model as the one under test: summarizer tokens are priced at the tested model's rates, so a cheaper summarizer is billed at the wrong price. Those calls never reach the agent's middleware, and charging them at zero would score the one strategy that spends money to preserve information as though preserving it were free |
 
-One run is scored twice, and the columns say so: **`acc1`** is the scoped questions —
-requirements plus one per tool lookup, seven of them in the cells recorded so far — each reply
-scored only against the values its own question asked for; **`acc2`** is the one combined
-question, which asks for all 53 values at once from a context they are scattered through.
-They were `acc` and `all`, which named the questions rather than the measures and left nothing
-in the table saying the two were the same run read two ways.
+### Probing and the accuracy bar
 
-The two need different numbers of attempts to be equally settled. One `acc1` reading averages
-seven answers; one `acc2` reading is a single answer. So the combined question has its own
-`--combined-repeats` (3 by default), independent of `--probe-repeats` — which the runs that
-matter set to 1, the per-scope repeat spread having measured 0 to 2 points while the
-between-seed spread ran to 78. Probes are nearly all cache reads, so the two extra attempts
-cost 6-9% of a seed measured against the recorded 60,000/0.86 cell: EUR 0.27-0.36 on a cell
-that cost EUR 4.58. `acc2` is the mean over every combined attempt of every seed, so a file
-merged from runs that asked it once and runs that asked it three times weights each answer
-once rather than each seed once.
+| flag | default | |
+| --- | --- | --- |
+| `--probe-repeats` | 3 | times each per-scope closing question is asked of the same snapshot. The facts and their positions are identical across these, so whatever they disagree about is the model's own willingness to enumerate. This is the `acc1` half |
+| `--combined-repeats` | 5 | times the one combined question — every value at once — is asked, independently of `--probe-repeats`. Its own count because one `acc1` reading averages every scoped question while one `acc2` reading is a single answer |
+| `--min-correctness` | 0.9 | fraction of the control's `acc1` a strategy must retain to be ranked. Under `--from-jsonl` it defaults to whatever the run that wrote the records used, so a rebuilt verdict is the verdict that was measured |
 
-#### Accuracy is a distribution
+The two need different numbers of attempts to be equally settled, which is why the counts are
+separate. Probes are nearly all cache reads, so extra attempts are cheap: measured on the 25
+recorded seeds of the 60,000/0.86 cell, going from one combined attempt to three added 6.6-9.3%
+of a seed's cost and EUR 0.36 to a cell that cost EUR 4.58. `acc2` is the mean over
+every combined attempt of every seed, so a file merged from runs that asked it once and runs that
+asked it three times weights each answer once rather than each seed once.
 
-Three variance sources used to arrive as one number. They are now reported apart:
+### Pricing
 
-- `seed+-` is the spread between seeds — different conversations, so this is compaction's own
-  reliability: whether it cleared a retention boundary this time and not last time.
-- `rep+-` is the spread between `acc1` repeats *within* one seed — identical facts in
-  identical positions, so this is the model's willingness to enumerate and nothing else.
-- `rep2+-` is the same within-seed spread for `acc2`, over its own attempts. At
-  `--probe-repeats 1` it is the only within-seed variance the cell measures, since `rep+-` is
-  then 0 by construction.
-
-Every sample is printed below the table, `acc1` and `acc2` in their own blocks. A strategy
-that scored 52, 52, 52 and 22 while preserving exactly the same 27 facts every time used to
-read the same as one that lost different facts each time.
-
-`--agent harness` swaps the plain agent for `create_harness_agent`, which is what production
-code actually calls. Its optional providers are switched off, because each one adds tools and
-system-prompt text to every measured prompt and would shift the trigger points without saying
-anything about compaction.
-
-#### The table is ranked on both axes, and priced on both
-
-Rows used to be ordered by cost ascending, which puts the strategy that threw the conversation
-away above the one that kept it: the cheapest row of a cell is reliably the one that destroyed
-the most. Rows that retain at least `--min-correctness` of the control's accuracy — the same
-relative test the verdict applies, default 0.9 — now come first, cheapest **total** cost first,
-and the rest follow below a line naming the threshold, in that same order. The count and the
-threshold are printed above the table, so a cell where every row clears reads differently from
-one where none does even though neither draws a line. The control is ordered by the same rule
-as everything else and is marked with a star in the `acc1` column wherever it lands. `acc1` is
-what the ranking, the threshold and the verdict are judged on; `acc2` is reported beside it.
-
-`in$` prices the prompt side alone — uncached plus cached, with output and the summarizer left
-out — beside the total. On a clean five-seed cell the control's total cost varied 38% while its
-input tokens varied 13% and its hit rate 4 points: the whole gap was output, priced at $3.96/M
-against $0.07/M for a cache read. That variance is the model's verbosity rather than anything
-compaction did, and it swamps the axis compaction acts on — three of five rows differed from
-the control by less than the control's own spread. So `in$` is the low-variance view of what a
-strategy changed, and `cost` remains the number that is actually billed and the one the rows
-are ranked on. It is derived from tokens and rates the records already carry, so every results
-file already on disk gains the column.
-
-### The token_budget family
-
-Every other strategy decides *when* to compact from its own trigger, so different strategies
-leave prompts of different sizes and comparing them confounds "trimmed harder" with "trimmed
-smarter". The `token_budget_*` variants all compact to one shared ceiling
-(`--budget-fraction`, default half the input budget) and differ only in the order they delete
-things, which holds size fixed and isolates the choice of what to discard:
-
-| variant | order |
+| flag | |
 | --- | --- |
-| `token_budget_fallback` | nothing — pure oldest-first eviction, the floor the others must beat |
-| `token_budget_tools_first` | tool results, then tool-call groups, then age |
-| `token_budget_truncate_first` | age, then tool results — the mirror, to isolate ordering |
-| `token_budget_window_first` | a hard recency window, then age |
-| `token_budget_summarize` | tool results, then summarize the rest instead of dropping it |
+| `--price-input` | input price per million tokens |
+| `--price-cached` | cached-read price per million tokens |
+| `--price-output` | output price per million tokens |
 
-### Summarization is priced, and its failures are counted
+**Only OpenRouter is auto-discovered; everywhere else these must be passed** or the money columns
+have nothing to work from. Pass the same currency throughout — the tool does no conversion.
 
-`SummarizationStrategy` calls a model of its own, so it needs `--summarizer-provider`. Those
-calls never reach the agent's middleware, and charging them at zero would score the one
-strategy that spends money to preserve information as though preserving it were free. They are
-metered and added to its cost.
+### Provider quirks
 
-Prefer the same model as the one under test: summarizer tokens are priced at the tested model's
-rates, so a cheaper summarizer would be billed at the wrong price.
+| flag | |
+| --- | --- |
+| `--no-force-tool-calls` | let the model choose its own tool calls. Needed for routes that reject a pinned `tool_choice`, and it must then be set for the **whole** run: a run where some rows were pinned and others were not is comparing different conversations |
+| `--server-history` | let the service keep the conversation server-side. Compaction then has nothing to act on, because the agent only sends the new turn. Off by default so that what is measured is actually compaction |
+| `--no-temperature` | omit temperature for models that reject the parameter |
+| `--tokenizer` | `tiktoken` (default) or `estimator`. The estimator is fast and runs about 2x a real BPE count; use `tiktoken` whenever thresholds must land on real token values |
 
-The strategy also catches its own errors, logs a warning and returns `False`. A broken
-summarizer therefore produces a run that never compacted — and so scores *perfect* recall. Its
-failures are counted and flagged in the table (`S<n>`); a row carrying that flag is not
-evidence that summarization preserves anything.
+**Tool pinning matters for comparability.** By default each tool turn forces its own no-argument
+tool and every other turn is closed with `tool_choice="none"`. Without it, models gather different
+numbers of facts between runs, which moves both axes for reasons unrelated to compaction. A row
+whose provider rejected the option carries `NO:temp` or a similar flag and is not comparable with
+one that did not.
 
-### Controlling spend
+### Output, durability and diagnostics
 
-Output is capped at `--response-max-tokens 16` because answers are discarded — you are only
-paying for prompts. Cost scales with `sizes` × `strategies` × `providers` × `repeats`, and
-`--dry-run` reports exactly how many prompt tokens a live run would send. Start there.
+| flag | |
+| --- | --- |
+| `--results-jsonl PATH` | append one JSON record per seed, written and closed the moment that seed is scored |
+| `--from-jsonl PATH [PATH ...]` | render the table and verdict from those files and run nothing. Needs no provider |
+| `--dump-record DIR` | write the full text of every recall record to `DIR/<strategy>-seed<n>.txt` |
+| `--dry-run` | print the plan and its rough size, call nothing |
+| `--show-answers` | print each final answer in full |
 
-`mid` is ~20 turns and ~50 messages; `large` is ~100 turns and ~270 messages, and costs
-roughly 20× more per cell.
+**`--results-jsonl` is not optional in practice.** A cell is every strategy times `--repeats`
+seeds and can run for hours; its table only exists once all of it has finished, so anything that
+stops the process in between discards every seed already completed and already paid for. That
+happened: the 60,000/0.86 cell ran fifteen strategy-seeds over three and a half hours, died before
+printing, and left nothing. Each line carries the cell parameters, the cost and token components,
+what survived and what was lost, every per-probe correctness sample, and any error — everything
+the table reads. The file is appended to, never truncated, so a sweep can point every cell at one
+path and a resumed run extends what is there. Each seed also prints a one-line summary as it
+lands, so a row that has stopped preserving anything shows up hours before the table would.
 
-## Reading the output
+**`--dump-record` is observation only.** The record is read back out of the finished conversation
+after the run is over, so nothing is added to any prompt, no extra call is made, and the tokens,
+the cache hits and the cost are byte for byte what they would have been without it. Only
+`tool_summary_anchored` writes a record at all, and a seed whose model never wrote one produces no
+file rather than an empty one. Use it to read what the model actually preserved, which is the
+question an `UNCOVERED` flag raises and no count can answer.
 
-A real `mid` sweep on `mistral-large-latest`, two repeats, cache reads priced at 10%:
+## Reading the live table
+
+Two real rows from `runs/run-41-luna-share80.txt`, with `summ$`, `nofetch`, `ignored`, `rep+-`
+and `rep2+-` cut out so the rest fits on a page:
 
 ```text
-provider  size  strategy        turns  sent_tok  in_tok  cached  hit%  reuse%  real%  breaks  eff_in@0.1
-mistral   mid   none            20     93,786    48,723  20,512  42.1  91.3    46.1   0       30,262
-mistral   mid   none            20     93,786    48,723  14,112  29.0  91.3    31.7   0       36,022
-mistral   mid   truncation      20     42,106    22,721   7,392  32.5  79.2    41.1   5       16,068
-mistral   mid   truncation      20     42,106    22,721   6,560  28.9  79.2    36.5   5       16,817
-mistral   mid   context_window  20     31,668    17,419   6,720  38.6  78.0    49.5  12       11,371
-mistral   mid   context_window  20     31,668    17,419   5,488  31.5  78.0    40.4  12       12,480
+strategy                 msgs   tok left/peak  snap%  calls        in  hit%     out  seed in$    seed$   probe$     run$ seed$+-  vs none$  facts  lost   acc1  seed+-  acc2  vs none   dq  flags
+tool_summary_anchored   35/40   33,156/35,804    59%     31   742,980   85%  13,601   $0.0171  $0.0240  $0.0275  $0.0515     19%       -3%  53/53     0   100%     0pp   99%     100%   0%  NO:temp,FORCED:1,REC:1,RECFALLBACK:1,RECFORCED:1,RECORDS:1,UNCOVERED:3
+none                    37/37   50,914/50,914    84%     30 1,020,578   94%  13,812   $0.0176  $0.0248  $0.0223  $0.0472     15%         -  53/53     0   100%*    0pp  100%        -   0%  NO:temp
 ```
 
-Two things to read off it. First, `in_tok` is **identical across repeats** for each
-strategy — that is the byte-identical replay working, and it is what makes the varying
-`cached` column attributable to the provider rather than to the harness. Second, on this
-provider compaction wins decisively on cost: `context_window` lands at roughly a third of
-the baseline's effective input despite breaking the prefix 12 times, because Mistral only
-realises 30–50% of the reusable prefix anyway. The lost discount is smaller than the saved
-tokens. On a provider that reliably realises ~100%, that arithmetic can invert — which is
-the whole reason to measure per provider rather than reason about it.
+That is a strategy that kept every fact, removed about a third of the control's snapshot, and came
+in 3% under it on cost — and the run's own verdict line reads `NOT SUPPORTED`, because 3% is
+inside a 19% seed spread. Reading the columns in order is how you arrive at that rather than at
+"-3%".
 
-- `sent_tok` — total prompt tokens the strategy actually sent across the session.
-- `reuse%` — share left byte-identical to the previous prompt. **The cache ceiling.**
-- `hit%` — what the provider actually served from cache.
-- `real%` — `hit%` ÷ `reuse%`, a quotient of two fractions. Below 100% means misses
-  compaction does *not* explain: eviction, TTL expiry, minimum-size floors, intermittent
-  engagement, or (on OpenRouter) upstream re-routing. It is deliberately *not*
-  `cached ÷ reusable_tokens`: those totals use different tokenizers (provider vs. local
-  estimator, which runs ~2× higher), and dividing them directly halves the answer.
-- `breaks` — turns where the prompt was not a pure extension of the previous one. Each one
-  is a forced re-prefill.
-- `no_in` — turns that reported cached tokens but no input count. Some providers drop
-  `input_token_count` on a cache hit; when this is non-zero, `hit%` is suppressed rather
-  than divided by a denominator the provider never sent.
-- `eff_in@0.25` — fresh tokens plus cached tokens priced at `--cache-read-ratio`. Set this
-  to your provider's actual cache-read discount to compare strategies on real cost.
+The tool prints the full legend under every table; this is the short form.
 
-The baseline to compare against is always `none`: it sends the most tokens but breaks the
-prefix zero times.
+| column | what it is |
+| --- | --- |
+| `msgs` | messages in a probe's prompt, out of the most any call carried. Every probe is asked from the same restored snapshot, so this no longer drifts down through the questions |
+| `tok left/peak` | billed tokens in that same prompt, and at the peak. **Watch this rather than `msgs`**: a strategy that rewrites content in place removes tokens without removing messages, and `msgs` cannot see it |
+| `snap%` | the snapshot every question was asked from, as a share of the tried window. How hard compaction acted: the control sits at the fill the cell was sized to, and a strategy below it removed that difference |
+| `calls` | model calls, seeding and probes together |
+| `in` / `out` | input and output tokens billed across the whole run. Output has its own column because a total driven by how much the model *wrote* is a different finding from one driven by how much context it was *sent* |
+| `hit%` | share of input served from the provider's cache. Compaction breaks the cached prefix by construction, so this is what it gives up to save tokens |
+| `seed in$` | the prompt side of `seed$` — uncached and cached together, output and summarizer and probes left out. The low-variance view: on a clean five-seed control the total moved 38% while the input side moved 13%, because output is priced 57x a cache read and the model's verbosity swamps the axis compaction acts on |
+| `seed$` | what the conversation cost: seeding plus the strategy's own summarizer calls, and nothing else. **The ranking, the verdict and `vs none$` are all on this.** The money a deployed agent moves |
+| `probe$` | what the probing cost — the instrument. Every probe re-sends the whole snapshot, so a strategy that compacted hard collects that discount once per probe, on a phase no deployed agent has. Folding it in turned one cell's -14.1% into -3.5% and flipped the sign on two others |
+| `run$` | `seed$` + `probe$`: what was actually billed. Here because it is the number earlier write-ups quote, not because it ranks anything |
+| `seed$+-` | spread between the cheapest and dearest seed, on `seed$`. **A gap smaller than this is not a result.** `0%` with one seed means stability is unknown, not that it is stable |
+| `summ$` | what this strategy's own summarization calls cost, of `seed$` |
+| `vs none$` | `seed$` against the control's. `?` means the comparison is unavailable |
+| `facts` | planted facts surviving compaction into the snapshot: recall's ceiling, scored against exactly the context every probe was answered from |
+| `lost` | compaction removed it, so the model could not use it — **the damage** |
+| `nofetch` | the agent never called that tool, so the fact never entered the history. Not compaction damage; an uncompacted run shows these too |
+| `ignored` | still in the snapshot but unused: the model's failing, not compaction's |
+| `acc1` | the scoped questions — requirements plus one per tool lookup — each reply scored only against the values its own question asked for. A star marks the uncompacted control, which is ordered by the same rule as every other row and can land below the line |
+| `seed+-` | points between the least and most correct seed, on `acc1`. Different conversations, so this is compaction's own reliability |
+| `rep+-` | points between `acc1` repeats *within* one seed. Identical facts in identical positions, so this is the model's willingness to enumerate and nothing else. `0pp` by construction at `--probe-repeats 1` |
+| `acc2` | the one combined question: share of all planted values present in one answer, meaned over every attempt of every seed |
+| `rep2+-` | the same within-seed spread for `acc2`. At `--probe-repeats 1` this is the only within-seed variance the cell measures |
+| `vs none` | `acc1` against the control's. **Read it together with `vs none$` or not at all** — cheaper and less correct is not a saving |
+| `dq` | share of this cell's seeds that sent a prompt larger than the tried limit. A cell that disqualifies at all is excluded from the ranking rather than starred |
 
-## Experimental controls
+**Rows are ranked on both axes.** Rows retaining at least `--min-correctness` of the control's
+`acc1` come first, cheapest `seed$` first; the rest follow below a line naming the threshold. That
+ordering exists because ranking on cost alone puts the strategy that threw the conversation away
+at the top — the cheapest row of a cell is reliably the one that destroyed the most.
 
-These matter, and the tool enforces them:
+Below the table: every per-sample `acc1` and `acc2`, grouped by seed; the achieved fill and tool
+share against target; any throttling, with the seconds spent waiting; and the verdict. A verdict
+whose margin is inside the seed spread is printed with **`NOT SUPPORTED`**, and that line is
+load-bearing — every negative `vs none$` this project has measured carries it.
 
-- **Cache namespace isolation.** Each cell gets a unique salt at the very front of the
-  system message, so cells cannot serve each other cache hits.
-- **Turn 1 is always a cache write, never a read.** It is included in totals because a real
-  session pays for it too.
-- **Sequential execution.** Overlapping cells would contend for the same cache and rate
-  limits.
-- **The system anchor is sized above 1,024 tokens** so that prompts clear the provider
-  minimum from turn 1. Otherwise early turns report zero cached tokens for reasons that
-  have nothing to do with compaction.
-- **Opt-in caching is opted into.** Mistral gets a per-cell `prompt_cache_key` derived from
-  the cell salt — stable across the cell's turns, distinct between cells. Without it the
-  provider simply never caches and the whole row is a false negative.
-- **Cached tokens are clamped to the input count** they are a subset of, and turns that
-  report cache reads without an input count are excluded from `hit%`. Both guard against
-  ratios above 100% that read as a broken benchmark rather than as upstream inconsistency.
-- **Simulated context window.** Budgets default to 60% of a transcript's fully-replayed
-  size rather than the model's real window — a 20-turn transcript never approaches 128k, so
-  a real window would mean no strategy ever fires. Override with `--context-window`.
+### The flags legend
 
-## Compaction can shrink prompts out of cacheable range
+The `flags` column is where a row says it is not measuring what its name claims. Read it before
+the money columns.
 
-The most surprising measured result, on `foundry` / `gpt-5.4-mini`:
+| flag | meaning |
+| --- | --- |
+| `DQ` | this row sent a prompt a model of this size would have refused |
+| `EXCL` | out of the ranking for the other reason: it did not finish its turns |
+| `ERR` | a failed turn |
+| `THROTTLED:<n>` | calls re-sent after the provider refused them for rate reasons. The seconds waited are printed below the table, and they matter: a cached prefix that expired during a wait is a miss the `hit%` column charges to compaction |
+| `RECONNECTED:<n>` | calls re-sent because the request never came back — connection dropped, or a 5xx. Counted apart from throttling because the waits are seconds rather than a quota window, so the prefix is very likely intact |
+| `DRIFT:<n>` | probes whose prompt was not the snapshot verbatim, because the strategy acted again on the restored state. **A row carrying this overstates what reached the model** |
+| `S<n>` | summarizer failures. The strategy catches its own errors and returns `False`, so a broken summarizer produces a run that never compacted and therefore scores *perfect* recall. A row with this flag is not evidence that summarization preserves anything |
+| `<n>/<n>t` | turns completed |
+| `REC:<n>` | whether the model ever wrote a record at all. Saturates at 1 and answers compliance, not quantity |
+| `RECORDS:<n>` | how many records the conversation ended up carrying. Every record is preserved — unshrinkable, undroppable, never merged — so each one raises a floor under the prompt that no later pass can lower, and a row above 1 has money columns that are partly that floor rather than the workload |
+| `FORCED:<n>` | how many times a record was asked for. One record per ask is the mechanism working; more records than asks is a defect, and it was one |
+| `TRUNCATED:<n>` | forced calls the provider cut at `--record-max-tokens`, so that record may cover only part of what it was asked to preserve, and the missing part is scored as compaction damage |
+| `UNCOVERED:<n>` | tool-call groups the record never named, which the strategy therefore refused to delete. **A cost rather than a loss**: those groups are still in the prompt, so the row paid for tokens a complete record would have replaced and lost nothing. A row with `UNCOVERED` is not measuring this strategy working; it is measuring it declining to guess |
+| `FALLBACK:<n>` | times it gave up and compacted another way. **A row with this is measuring that other strategy, not the one named** |
+| `RECFALLBACK:<n>` | passes where a record did exist, was anchored on, and the row still fell back — what the record freed left the prompt over the ceiling. The quieter of the two: the fallback shortens tool results in place, so the row keeps its message count and loses its values |
+| `NOGAIN:<n>` | collapses `anchored_min_gain` declined as below its break-even floor. Distinguishes "never fired" from "fired to no effect" |
+| `NO:<opt>` | the provider rejected that option so it was dropped. A run that dropped `tool_choice` chose its own tool calls and is not comparable with one that did not |
+| `FETCH` | this row gathered a different set of facts than the control |
+| `MSGS:<+-n>` | this row is the control and its conversation was n messages away from the leanest strategy row's. Compaction only adds to the stored history, so the control has to match that row; when it does not, every `vs none$` in the cell compares two different workloads and the control is excluded so that none of them is ranked |
+| `NOSPLIT` | this row cannot say what its probing cost, so its money columns are the invoice rather than the workload |
 
+## Re-rendering and comparing archived results
+
+`--from-jsonl` rebuilds the table and verdict from records and runs nothing, so it needs no
+provider and costs nothing. It is the same aggregation the live path uses over the same records,
+which is what makes a recovered cell *the* cell that was measured rather than a second reading of
+it — and there is a test asserting the two render identically, including where the ranking splits.
+
+```bash
+# one cell
+cachebench_live --from-jsonl runs/run-41-luna-share80.jsonl
+
+# several files, or a directory, read as one body of records
+cachebench_live --from-jsonl runs/run-42-luna-all-strategies-s0.jsonl runs/run-42-luna-all-strategies-s1.jsonl
+cachebench_live --from-jsonl /tmp/sweep/
 ```
+
+Records **group into cells by what they measured**, not by which file they came from. So one file
+can hold a whole sweep and each cell still gets its own table, and several files that measured the
+same thing merge into one cell — which is also the guard: two arms that differ in a workload flag
+or a strategy setting stay apart rather than silently averaging. A cell missing strategies or
+seeds still renders and says which of each it holds against what the run set out to take, because
+nothing in the table itself would otherwise distinguish four strategy-seeds from fifteen.
+
+### The cross-cell settings report
+
+When the records hold **more than one cell**, a comparison section follows the per-cell tables.
+This is the question the per-cell tables cannot answer: two settings are two cells and so two
+tables, leaving the reader to diff them by eye — which is how two arms of one experiment came to
+be merged once already.
+
+```text
+Across cells: the cheapest combination that still answers, per model and per workload.
+
+  Workload: window 60,000  fill 86%  payload 6,714x6 at share 80%  narration neutral  ...
+  2 cell(s), 8 rankable row(s), acc1 bar 90% of each cell's control
+    strategy                        seed$  seed$+-   acc1  vs none  seeds  settings
+    -------------------------------------------------------------------------------
+    tool_summary_anchored         $0.0240     19%   100%     100%      5  repeat_records=off
+    none                          $0.0248     30%    98%*    100%      5  repeat_records=on
+    ...
+    Per strategy, what its own settings did, under the same guard:
+      tool_summary_anchored       [repeat_records=off] 10% cheaper than [repeat_records=on],
+                                  seeds varied by 19%: NOT RESOLVED
+
+    NOT SUPPORTED: seeds of one of these varied by 30%, wider than the 3% gap
+    between the two cheapest rows that clear the bar. Nothing is named best.
+```
+
+A *combination* is a strategy plus the settings it ran under. Rows are ranked on `seed$` behind
+the same accuracy bar each cell's own verdict applied, and only the settings that **differ** are
+shown. Two guards apply, and both fire often:
+
+- **Never ranked across workloads.** A different window, fill, payload, narration or workload flag
+  is a different conversation, so a smaller number under one of them is a smaller job rather than a
+  better strategy. The flags are named on each workload heading, and a cell written before they
+  reached the file reads `flags not recorded` — which is a statement about the record, not about
+  the run. Models are kept apart for the same reason and one more: they are priced differently.
+- **A gap inside the spread is refused.** Both the overall ranking and the per-strategy lines
+  print `NOT RESOLVED` / `NOT SUPPORTED` rather than naming a winner.
+
+## The replay harness: options and output
+
+`cachebench` answers a narrower question — how a *prompt* caches — and is the only mode whose
+numbers compare across providers.
+
+| flag | default | |
+| --- | --- | --- |
+| `--providers` | `azure` | comma-separated, each `provider` or `provider:model` |
+| `--strategies` | `none,context_window,truncation,tool_result` | comma-separated |
+| `--sizes` | `mid` | transcript presets: `small`, `mid`, `large`, `xl`, `xxl`. `mid` is ~20 turns and ~50 messages; `large` is ~100 turns and ~270 messages and costs roughly 20x more per cell |
+| `--repeats` | 1 | independent replays per cell |
+| `--response-max-tokens` | 16 | cap on generated tokens. Answers are discarded, so keep it small — you are only paying for prompts |
+| `--temperature` / `--no-temperature` | 0.0 | sampling temperature, or omit the field entirely |
+| `--context-window` | 60% of the transcript | simulated window driving compaction budgets. A 20-turn transcript never approaches 128k, so a real window would mean no strategy ever fires |
+| `--max-output-tokens` | 512 | subtracted from the window to give the input budget. The model's ceiling, not the reply size you want |
+| `--tokenizer` | `estimator` | `estimator` is fast and runs ~2x a real BPE count; use `tiktoken` whenever thresholds must land on real token values |
+| `--keep-last-groups` | 6 | groups kept by `sliding_window` |
+| `--keep-tool-groups` | 2 | tool-call groups kept verbatim |
+| `--cache-read-ratio` | 0.25 | price of a cached input token relative to a fresh one, for the `eff_in` column |
+| `--no-cost` | off | omit that column |
+| `--prompt-cache-key` | off | send a per-cell key to providers whose caching is automatic |
+| `--request-timeout` | 300 | seconds a single call may take. `0` disables |
+| `--turn-delay` | 0 | seconds between turns, for strict rate limits |
+| `--summarizer-provider` | — | client for the `summarization` strategy |
+| `--out` | `cachebench-results` | output directory: per-turn JSONL plus a summary CSV |
+| `--run-id` | timestamp | run identifier |
+| `--dry-run` | off | run the whole matrix locally with no API calls, reporting prompt sizes and prefix reuse only |
+
+Two independent measurement channels, and the output shows both:
+
+| column | what it is |
+| --- | --- |
+| `sent_tok` | total prompt tokens the strategy sent across the session |
+| `in_tok` / `cached` | provider-reported input and cached tokens — exact |
+| `reuse%` | share left byte-identical to the previous prompt, recomputed locally. **The cache ceiling** — a provider can never serve more than the prefix that survived. Matching is at message granularity, so a message that changed at all contributes zero and the oracle never overstates |
+| `hit%` | what the provider actually served from cache |
+| `real%` | `hit%` ÷ `reuse%`. Below 100% means misses compaction does *not* explain: eviction, TTL expiry, minimum-size floors, intermittent engagement, or upstream re-routing. Deliberately not `cached ÷ reusable_tokens` — those totals use different tokenizers and dividing them halves the answer. Above 1.0 is possible and means partial-message token-level matching |
+| `breaks` | turns where the prompt was not a pure extension of the previous one. Each is a forced re-prefill |
+| `no_in` | turns that reported cached tokens but no input count. Some providers drop `input_token_count` on a hit; when this is non-zero, `hit%` is suppressed rather than divided by a denominator the provider never sent |
+| `eff_in@<r>` | fresh tokens plus cached tokens priced at `--cache-read-ratio`. Set it to your provider's real discount to compare strategies on real cost |
+
+`in_tok` should be **identical across repeats** for a given strategy — that is the byte-identical
+replay working, and it is what makes a varying `cached` column attributable to the provider rather
+than to the harness. The baseline to compare against is always `none`: it sends the most tokens
+and breaks the prefix zero times.
+
+The harness enforces its own controls: a unique cell salt at the front of the system message so
+cells cannot serve each other cache hits, a system anchor sized above 1,024 tokens so prompts
+clear the provider minimum from turn 1, sequential execution so cells do not contend, cached
+tokens clamped to the input count they are a subset of, and turn 1 counted as a write since a real
+session pays for it too.
+
+### One output pattern that is easy to misread
+
+On `foundry` / `gpt-5.4-mini`, at a small transcript:
+
+```text
 strategy         per-turn input tokens        cached
 none             668 → 4,096 (growing)        0 until turn 7, then 1280/1792/2304/…
 truncation       667–1,400 (oscillating)      0 on every turn   (9/20 turns below 1,024)
@@ -544,69 +527,48 @@ context_window   666–850  (pinned)            0 on every turn  (20/20 turns be
 ```
 
 Compaction did not break the cache here — it shrank prompts **below the provider's minimum
-cacheable size**, so caching never engaged at all. The uncompacted control proves the
-mechanism is size and not compaction: with no compaction whatsoever, the same model still
-reported 0 cached at 1,216 / 1,325 / 1,434 tokens, and only began caching at 1,769. Every
-compacted prompt sat below that.
+cacheable size**, so caching never engaged at all. The uncompacted control proves the mechanism is
+size and not compaction: with no compaction whatsoever, the same model reported 0 cached at 1,216
+/ 1,325 / 1,434 tokens and only began caching at 1,769.
 
-The practical consequence: on a provider with a 1,024-token floor, a strategy aggressive
-enough to hold prompts near that floor forfeits caching entirely. Compare `eff_in` rather
-than `hit%` before concluding it was worth it, and consider raising the compaction budget
-so prompts stay comfortably above the floor.
+So a `hit%` of 0 on a heavily compacting row is ambiguous, and the way to resolve it is to read
+`eff_in` rather than `hit%`, and to check the per-turn sizes against the provider's floor before
+concluding the strategy broke anything.
 
-### Scope: stateless routes only
+### Scope
 
-Every provider here is driven statelessly — the full projected message list goes up on each
-turn. `FoundryChatClient` carries no `conversation_id` / `store` / `previous_response_id`,
-so the Foundry rows measure the stateless path.
+Every provider here is driven statelessly — the full projected message list goes up on each turn.
+Routes where the **service** owns the conversation (hosted agent threads, Responses-style stores)
+are a different regime and are out of scope: the client uploads only a delta and the service
+maintains a stable prefix of its own, so local compaction works against it. Applications that let
+the service own context should expect the opposite conclusion from the one this benchmark reaches,
+and the useful comparison there is compaction on versus off, not strategy versus strategy.
+`--server-history` exists to demonstrate that, not to measure it.
 
-Routes where the **service** owns the conversation (Responses-style APIs, hosted agent
-threads) are a different regime and are out of scope. There, the client uploads only a delta
-and the service maintains a stable prefix of its own — so local compaction works against it,
-rewriting history the service was already caching. Applications that let the service own
-context should expect the opposite conclusion from the one this benchmark reaches, and the
-useful comparison there is compaction-on versus compaction-off, not strategy versus strategy.
+## Controlling spend
 
-## Caveats
+Cost scales with `sizes` × `strategies` × `providers` × `repeats` in replay, and with
+`strategies` × `repeats` × probes in live. **`--dry-run` prints the arithmetic before you spend
+anything; start there.** In live mode the probe phase is usually the larger half — every probe
+re-sends the whole snapshot, and there are `scoped questions × --probe-repeats` of them plus
+`--combined-repeats` — so those two counts scale the dominant term.
 
-- Token counts used locally come from `CharacterEstimatorTokenizer` (4 chars/token), so
-  `sent_tok` and `reuse%` are estimates. Provider-reported `in_tok` and `cached` are exact.
-  Ratios between strategies are reliable; absolute local token counts are not.
-- Cache TTLs are minutes. A long sweep may see later cells behave differently from earlier
-  ones purely through cache pressure. Use `--repeats` and compare variance.
-- `real%` above 1.0 is possible and means the provider served cache beyond what the
-  message-granularity oracle predicted — usually partial-message token-level matching.
+Concurrency has to be sized against **strategies per invocation**, not invocations. Five parallel
+runs of four rows each was clean; the same parallelism at eighteen rows each rate-limited 18 of 90
+records, including the control in every seed, and cost that run its entire cost axis.
 
 ## Development
 
 ```bash
-cd python/packages/lab
-poe test-cachebench
+cd python/packages/lab/cachebench
+pytest tests -q
 ```
 
-Tests are offline; the provider call is stubbed.
+Tests are offline; the provider call is stubbed. [`TESTING.md`](TESTING.md) explains what they
+defend and why.
 
-### The strategies are a subpackage, not part of the lab
-
-`agent_framework_lab_cachebench/compaction/` holds the strategies written here — `anchored`,
-`anchored_no_assistant`, `anchored_min_gain` and `tool_summary_anchored`, together with the
-recall tool and the gate that last one cannot work without. They are the thing this benchmark
-measures rather than a part of it, and they are meant to leave for a repository of their own,
-so the subpackage is kept liftable: nothing in it imports from the benchmark, its tests sit
-beside it in `tests/compaction/`, and `tests/compaction/test_boundary.py` walks every module's
-imports and fails if either stops being true.
-
-`_strategies.py` stays in the lab. It is the registry that puts ours and the framework's behind
-one `--strategies` name each and builds them all from one `StrategyOptions`, which is benchmark
-configuration rather than a strategy.
-
-The subpackage depends on `agent_framework._compaction`, which is **private API** and which
-upstream PR [#7912](https://github.com/microsoft/agent-framework/pull/7912) has just rewritten.
-`compaction/__init__.py` says what that means for whoever extracts it, and what has to be
-renamed before anything is published from there.
-
-## The strategies written here
-
-`agent_framework_lab_cachebench/compaction/STRATEGIES.md` explains each one: the
-mechanism, the design constraints behind it, and the short evidence for when it works
-and when it does not. It lives inside the subpackage because it travels with it.
+`agent_framework_lab_cachebench/compaction/` holds the strategies written here and is kept
+liftable: nothing in it imports the benchmark, its tests sit beside it in `tests/compaction/`, and
+`tests/compaction/test_boundary.py` fails if either stops being true. It depends on
+`agent_framework._compaction`, which is **private API**; `compaction/__init__.py` says what that
+means for whoever extracts it.
