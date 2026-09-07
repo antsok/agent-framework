@@ -1533,8 +1533,9 @@ on luna the record is at parity with not compacting and on mini it costs 10-25% 
 the same answer this project has given at every cell it has measured.
 
 **More compaction is not less money, stated as plainly as the data allow.** The repeats arm cuts
-the snapshot 63-66% against the no-repeat arm's 40%, and the cross-cell report puts it **10%
-dearer** on the same workload:
+the snapshot 62-66% against the no-repeat arm's 29-40%, and the cross-cell report puts it **10%
+dearer** on the same workload -- while printing `NOT RESOLVED` on that 10% against a 19% seed
+spread, so read the direction rather than the size:
 
     tool_summary_anchored  $0.0240  repeat_records=off
     tool_summary_anchored  $0.0266  repeat_records=on
@@ -1545,16 +1546,21 @@ gets the sign wrong.
 
 **The coverage threshold sits on a cliff.** `unc` and shrink move together one-for-one, and which
 side a seed lands on flips within an arm: mini at share 0.80 read `unc` of 4, 3, 0, 4, 3 with
-shrink of -2%, 9%, 41%, -1%, 8%. Coverage clears the 0.8 bar in 4 of 5 fixed-payload rows and 2 of
-6 share-0.80 rows, so the margin narrows as results grow, but it is a cliff rather than a
+shrink of -2%, 9%, 41%, -1%, 8%. Coverage clears the 0.8 bar in **15 of the 25 rows**
+-- luna-fixed 5/5, luna-share80-repeats 5/5, mini-fixed 4/5, luna-share80 3/5, mini-share80 1/5 --
+so the margin narrows as results grow and as one record is asked to cover more, but it is a cliff
+rather than a threshold anyone has calibrated.80 rows, so the margin narrows as results grow, but it is a cliff rather than a
 threshold anyone has calibrated. **`--coverage-share` is the sweep worth running next**, and it is
 newly reportable.
 
 **Caveats.** The two share-0.80 cells are not the same workload: matched tool results (41,273
 tokens) but different filler, so luna's tool share is 84% and mini's 94% -- cross-model reading at
-that cell is not like-for-like. `mini-fixed` seeded +5.3% over target and `luna-share80-repeats`
--6.5%, both outside tolerance. Within-arm comparisons, which is where every number above comes
-from, are unaffected.
+that cell is not like-for-like. **One arm seeded outside tolerance: `luna-fixed` at -7.8%**, the
+only arm the instrument flagged. `mini-fixed` came in at +4.2%, `mini-share80` +2.7%, and both
+share-0.80 luna arms at -2.3%, all inside. (An earlier version of this paragraph named
+`mini-fixed` at +5.3% and `luna-share80-repeats` at -6.5%. Neither figure exists: -5.3% is run
+42's fill, transcribed onto the wrong arm with its sign flipped.) Within-arm comparisons, which is
+where every number above comes from, are unaffected.
 
 ### Run 40 -- the repaired check, measured, and the cost axis says no
 

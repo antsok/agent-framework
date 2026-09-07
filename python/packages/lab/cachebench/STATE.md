@@ -775,6 +775,7 @@ run.
 `--coverage-share` is the next sweep and is now reportable.
 
 **Caveats:** the two share-0.80 cells differ in tool share (84% luna, 94% mini) so cross-model
-reading there is not like-for-like; `mini-fixed` +5.3% and `luna-share80-repeats` -6.5% off fill.
-Within-arm comparisons unaffected.
+reading there is not like-for-like; **`luna-fixed` at -7.8% is the only arm off fill** (mini-fixed
++4.2%, mini-share80 +2.7%, both luna share arms -2.3%). The earlier "+5.3% / -6.5%" here was run
+42's fill misattributed with a flipped sign. Within-arm comparisons unaffected.
 

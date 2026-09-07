@@ -1,5 +1,17 @@
 # Compaction on `gpt-5.4-mini`: report
 
+> **SUPERSEDED, 7 September 2026.** The current report is
+> [`REPORT-2026-09-07.md`](REPORT-2026-09-07.md). Two things happened to this document after it was
+> written, and both are structural rather than a matter of emphasis. The adversarial review of
+> 2 September found two instrument defects sitting under **every** `vs none` figure the project had
+> then produced — the control ran a different conversation from every strategy row, and `cost` summed
+> the workload with twelve probe re-reads of the snapshot — so *everything measured before run 32 is
+> withdrawn on cost* ([`REVIEW-2026-09-02.md`](REVIEW-2026-09-02.md), [`STATE.md`](STATE.md) §3e), and
+> every cell here predates run 32. The output reservation was then repaired on 6 September, so no cell
+> here sits on the same instrument as runs 41 and 42 either. Read it for the mechanism, the window
+> series and the design reasoning; do not read it for cost, and do not put its cells in a table with
+> the current ones. Kept unedited so the corrections can be checked against what it said.
+
 **Date:** 1 September 2026
 **Model:** `gpt-5.4-mini`, Azure Foundry (Responses API). The current sweep ran on a second
 deployment of the same model, `gpt-5.4-mini-2`; everything before it on the first.
