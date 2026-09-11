@@ -1468,6 +1468,57 @@ So luna writes at great length about the first two lookups and never reaches the
 is a property of the model's writing, not of a setting, and no bound reachable from the CLI moved
 it.
 
+### Run 44 -- 100,000 at 0.9 fill, and the sizing bug finally diagnosed
+
+Same shape as run 43 at a 100,000-token window: all 18 strategies, five seeds, 90 records, three
+then two invocations at a time. **No throttling, retries or errors.**
+
+**The sizing error is a constant, not a compounding one.** Set against run 43:
+
+| cell | turns | mean shortfall | spread across seeds |
+| --- | ---: | ---: | ---: |
+| 100,000 / 0.9 | 47 | **-8.3%** | 27% of mean |
+| 170,000 / 0.9 | 80 | -7.6% | 22% of mean |
+
+Nearly double the turns, the same shortfall. So run 43's explanation -- reply variance compounding
+across a long conversation -- **is wrong and is withdrawn**. Measuring the seeding replies says
+what is actually happening:
+
+    seed replies, tokens each: 103, 201, 348, 448, 581      assumed: 602
+
+`--assumed-reply-tokens 602` is above **every** seed, so the solver always lays down too few
+filler turns: that is the constant -8%. And luna's reply length varies **5.6x between seeds**,
+which is the 22-27% spread and which no constant can fix. The fix for the mean is to re-measure
+the flag per model; the fix for the spread is for the solver to iterate against observed replies,
+or for the analysis to normalise on achieved fill rather than trusting the label.
+
+**Results.** `VERDICT: none`, as at every cell.
+
+| strategy | snap% | `vs none$` | `seed$+-` | facts | acc1 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `none` | 83% | -- | 54% | 53/53 | 100%* |
+| `tool_summary_anchored` | 64% | **+21%** | 61% | **53/53** | 100% |
+| `selective_tool_call` | 76% | +31% | 30% | 47/53 | 89% |
+| `tool_result` | 80% | +42% | 26% | 48/53 | 91% |
+| `anchored_no_assistant` | 67% | +68% | 50% | 48/53 | 91% |
+| `anchored` | 65% | +92% | 69% | 32/53 | 61% |
+| `token_budget_fallback` | 34% | +162% | 25% | 19/53 | 37% |
+| `sliding_window` | 7% | -17% | 15% | 8/53 | 17% |
+| `token_budget_window_first` | 20% | -38% | 34% | 13/53 | 26% |
+
+**`tool_summary_anchored` is again the only strategy that keeps everything** -- 5 of 5 seeds, where
+the next best manage 48 of 53. Across the three window sizes now measured:
+
+| window | `vs none$` | facts | seeds holding 53/53 |
+| --- | ---: | ---: | --- |
+| 60,000 | -1% to -6% | 53/53 | 25 of 25 rows |
+| 100,000 | +21% | 53/53 | 5 of 5 |
+| 170,000 | +113% | 47/53 | 4 of 5 |
+
+Retention survives to 100,000 and breaks after it; **cost degrades monotonically and steeply**
+the whole way. Whatever case the strategy has, it is a small-window case, and nothing in the 60K
+work suggested where the edge was.
+
 ### Run 43 -- 170,000 tokens at 0.9 fill, where the sizing stops holding
 
 All 18 strategies, `gpt-5.6-luna`, 170,000-token window, 0.9 fill, five seeds, 90 records, run one
@@ -1477,9 +1528,10 @@ worked where run 42's did not.
 
 **The cell's own sizing did not.** The five seeds seeded 124,636 to 155,530 tokens against a
 153,000 target -- **73% to 91% of the window, a 25% range** -- for a mean of -7.6%, flagged
-`FILL OFF TARGET`. Across 80 turns, three times any earlier cell, reply-length variance compounds
-and the solver cannot predict it. These five seeds are not the same operating point, which is the
-first thing to fix before anyone measures here again.
+`FILL OFF TARGET`. (An earlier version of this paragraph blamed 80 turns compounding reply
+variance. Run 44 refutes that: at 47 turns the shortfall is -8.3%, the same. See run 44 for the
+measured cause.) These five seeds are not the same operating point, which is the first thing to
+fix before anyone measures here again.
 
 **No strategy retains reliably at this size.**
 

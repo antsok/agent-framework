@@ -156,6 +156,13 @@ trust.
 
 Runs before 24 predate that format and exist only as captured stdout.
 
+Run 44 is the same shape at a 100,000-token window, five seeds, 90 records, one file per seed,
+no throttling. It is the cell that diagnosed the sizing bug the 170K run only exposed: at 47 turns
+the shortfall is -8.3% against 80 turns' -7.6%, so the error is constant rather than compounding.
+The seeding replies measure 103, 201, 348, 448 and 581 tokens against an assumed 602 -- above
+every seed, and varying 5.6x between them. `--assumed-reply-tokens` wants re-measuring per model
+before any cell is trusted on its label.
+
 Run 43 is all 18 strategies at a 170,000-token window and 0.9 fill -- the largest and fullest
 cell measured -- five seeds, 90 records, one file per seed. Run one or two invocations at a time
 rather than five, because a single one runs near 1.3M tokens a minute; **no throttling, retries or

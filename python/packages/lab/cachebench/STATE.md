@@ -802,3 +802,20 @@ strategy.
 **Next:** re-solve the filler against a measured reply size at 80 turns before any further
 large-window work; `--coverage-share` sweep still outstanding.
 
+## 3n. Run 44: 100K at 0.9 fill, and the sizing bug diagnosed
+
+All 18 strategies, luna, 100,000/0.9, 5 seeds, 90 records, no throttling.
+
+**The sizing error is constant, not compounding.** 47 turns gives -8.3%, 80 turns gives -7.6%.
+**Section 3m's explanation is withdrawn.** Measured seeding replies: 103, 201, 348, 448, 581
+tokens against an assumed 602 -- above every seed, hence the constant shortfall, and a 5.6x spread
+between seeds, hence the 22-27% variance. Fix the mean by re-measuring `--assumed-reply-tokens`
+per model; the spread needs the solver to iterate or the analysis to use achieved fill.
+
+**Results.** VERDICT: none. `tool_summary_anchored` +21% at 53/53 and the only full retainer
+(5/5); next best 48/53. `anchored` +92% at 32/53; `token_budget_fallback` +162%.
+
+**The window series, now three points.** 60K: -1% to -6%, 53/53, 25/25 rows. 100K: +21%, 53/53,
+5/5. 170K: +113%, 47/53, 4/5. Retention survives to 100K and breaks after; cost degrades
+monotonically and steeply. The strategy's case is a small-window case.
+
