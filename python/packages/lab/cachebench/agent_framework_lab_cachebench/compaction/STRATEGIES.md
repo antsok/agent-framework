@@ -184,8 +184,12 @@ one that spends model calls to do so.
    front of it **that the record demonstrably carries**. That last clause is the coverage
    check below, and `groups_kept_uncovered` counts what it refused to delete.
 
-**The two thresholds are one decision.** `trigger_fraction` defaults to **0.8** and
-`fallback_fraction` to **0.95**, and the constructor refuses a fallback at or below the trigger.
+**The two thresholds are one decision.** `trigger_fraction` defaults to **0.6** and
+`fallback_fraction` to **0.9**, and the constructor refuses a fallback at or below the trigger.
+Both were briefly raised to 0.8 and 0.95 on 6 September and reverted the same day: no run had
+ever used them, this project's own data say the record degrades with the bulk it must read -- so
+a later trigger means a bigger ask and a worse record -- and the argument for firing late was
+inverted, since an edit repays over the turns that follow it and firing later leaves fewer.
 0.6 was measured firing at 58% of a 60,000-token window: an agent turn and a broken cached prefix
 spent early in a conversation that may never have needed compacting, when the break-even only
 favours compaction with a long remaining horizon. Raising the trigger forced the give-up line up

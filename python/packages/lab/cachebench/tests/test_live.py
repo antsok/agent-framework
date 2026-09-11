@@ -3532,7 +3532,19 @@ def test_narration_probe_declares_every_flag_it_reads() -> None:
     attribute assumed to exist on LiveOutcome. Both cost a live run to discover. The probe
     is a calibration tool people will point at a new model, so its arguments are pinned.
     """
-    from samples.probe_narration import build_parser as narration_parser
+    # Imported by path rather than by name: `samples` is only importable when pytest runs
+    # from the package directory, so `poe test-cachebench` -- which runs from packages/lab --
+    # failed this test alone while every other check passed.
+    import importlib.util
+    import sys
+
+    probe = Path(__file__).resolve().parent.parent / "samples" / "probe_narration.py"
+    spec = importlib.util.spec_from_file_location("cachebench_probe_narration", probe)
+    assert spec is not None and spec.loader is not None
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    narration_parser = module.build_parser
 
     args = narration_parser().parse_args(["foundry:some-model"])
     for flag in (
