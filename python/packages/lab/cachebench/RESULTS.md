@@ -1468,6 +1468,58 @@ So luna writes at great length about the first two lookups and never reaches the
 is a property of the model's writing, not of a setting, and no bound reachable from the CLI moved
 it.
 
+### Run 43 -- 170,000 tokens at 0.9 fill, where the sizing stops holding
+
+All 18 strategies, `gpt-5.6-luna`, 170,000-token window, 0.9 fill, five seeds, 90 records, run one
+or two at a time rather than five: a single invocation runs near 1.3M tokens a minute, and the
+quota rise to 4M is what allowed even two. **No throttling, no retries, no errors** -- the pacing
+worked where run 42's did not.
+
+**The cell's own sizing did not.** The five seeds seeded 124,636 to 155,530 tokens against a
+153,000 target -- **73% to 91% of the window, a 25% range** -- for a mean of -7.6%, flagged
+`FILL OFF TARGET`. Across 80 turns, three times any earlier cell, reply-length variance compounds
+and the solver cannot predict it. These five seeds are not the same operating point, which is the
+first thing to fix before anyone measures here again.
+
+**No strategy retains reliably at this size.**
+
+| seed | control fill | `tool_result` | `tool_summary_anchored` | `anchored_no_assistant` | `selective_tool_call` |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| s4 | 124,636 (73%) | 53 | 53 | **18** | 53 |
+| s1 | 137,135 (81%) | 47 | 53 | 53 | 45 |
+| s0 | 143,586 (84%) | 53 | 53 | 53 | 53 |
+| s3 | 146,273 (86%) | 53 | 53 | **13** | 53 |
+| s2 | 155,530 (91%) | 53 | **21** | 53 | 39 |
+
+Every one of the four drops at least one seed, and they drop different seeds. **The failures are
+bimodal collapses, not gradual decay** -- a strategy keeps about 53 or falls to 13-21. Fill does
+not explain it: `r = -0.22`, the worst collapse sits at 86% fill and a clean 53 at 91%.
+
+That bounds a claim this project has been making. At 60,000 tokens `tool_summary_anchored` held
+53/53 in **all 25 rows** of run 41 and in run 42. At 170,000 and 0.9 fill it holds 4 of 5 and
+costs **+113%** with a 92% spread, against -1% to -6% in the small cells. **Reliable retention was
+a property of the cells it was measured in, not of the strategy.**
+
+| strategy | snap% | `vs none$` | `seed$+-` | facts | acc1 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| `none` | 83% | -- | 36% | 53/53 | 100%* |
+| `tool_result` | 73% | **+8%** | 43% | 52/53 | 98% |
+| `selective_tool_call` | 82% | +30% | 20% | 49/53 | 91% |
+| `anchored_no_assistant` | 73% | +56% | 16% | 38/53 | 72% |
+| `tool_summary_anchored` | 69% | +113% | 92% | 47/53 | 88% |
+| `anchored_min_gain` | 69% | +131% | 54% | 26/53 | 50% |
+| `anchored` | 70% | +163% | 69% | 26/53 | 50% |
+| `token_budget_fallback` | 35% | +241% | 14% | 20/53 | 39% |
+| `sliding_window` | 4% | -46% | 16% | 8/53 | 17% |
+| `summarization` | 4% | +15% | 6% | 20/53 | 39% |
+
+`VERDICT: none`. Nothing is cheaper except rows that deleted most of the material, which is the
+same answer at every cell this project has measured -- now including the largest and fullest.
+
+**Read the cost column against the fill spread.** Seeds 25% apart in size inflate every `seed$+-`
+here, and the two widest (92% and 69%) are the rows whose retention also collapsed. The ordering
+of the extremes is safe; neighbouring rows are not separated.
+
 ### Run 42 -- every strategy at one high-fill cell, accuracy only
 
 All 18 registered strategies in one cell, `gpt-5.6-luna`, 60,000/0.86, five seeds, 90 records.

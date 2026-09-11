@@ -779,3 +779,26 @@ reading there is not like-for-like; **`luna-fixed` at -7.8% is the only arm off 
 +4.2%, mini-share80 +2.7%, both luna share arms -2.3%). The earlier "+5.3% / -6.5%" here was run
 42's fill misattributed with a flipped sign. Within-arm comparisons unaffected.
 
+## 3m. Run 43: 170K at 0.9 fill -- the sizing breaks and retention stops being reliable
+
+All 18 strategies, luna, 170,000/0.9, 5 seeds, 90 records, no throttling (one or two invocations
+at a time; one alone runs near 1.3M TPM, and the quota rise to 4M allowed two).
+
+**Sizing failure to fix before measuring here again.** Seeds seeded 124,636-155,530 tokens against
+a 153,000 target -- 73% to 91% of the window. 80 turns compounds reply variance and the solver
+cannot predict replies. The seeds are not one operating point.
+
+**No strategy retains reliably.** All four retainers drop at least one seed, on different seeds,
+and the failures are bimodal (53, or 13-21) rather than gradual. Fill does not explain it
+(r = -0.22).
+
+**Bounds an earlier claim.** `tool_summary_anchored` was 53/53 in all 25 rows at 60K; here it is
+4/5 at +113% with a 92% spread. Reliable retention belonged to the small cells, not to the
+strategy.
+
+**Cost.** VERDICT: none. `tool_result` +8% at 52/53 is the closest to parity; `anchored` +163% at
+26/53; `token_budget_fallback` +241%. Cheap rows are cheap by deleting.
+
+**Next:** re-solve the filler against a measured reply size at 80 turns before any further
+large-window work; `--coverage-share` sweep still outstanding.
+

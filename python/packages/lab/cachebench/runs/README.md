@@ -156,6 +156,14 @@ trust.
 
 Runs before 24 predate that format and exist only as captured stdout.
 
+Run 43 is all 18 strategies at a 170,000-token window and 0.9 fill -- the largest and fullest
+cell measured -- five seeds, 90 records, one file per seed. Run one or two invocations at a time
+rather than five, because a single one runs near 1.3M tokens a minute; **no throttling, retries or
+errors**. Its cost axis is sound and its **sizing is not**: the seeds seeded 124,636 to 155,530
+tokens against a 153,000 target, 73% to 91% of the window, because 80 turns compounds reply-length
+variance the solver cannot predict. Read the extremes of the ordering, not neighbouring rows, and
+re-solve the filler before measuring at this size again.
+
 Run 42 is every registered strategy in one cell, `gpt-5.6-luna` at 60,000/0.86, five seeds, 90
 records, split one file per seed because the merged file exceeds the repository's 500 KB limit --
 `--from-jsonl` takes all five paths and reads them as one body. **Its cost axis is void and its
