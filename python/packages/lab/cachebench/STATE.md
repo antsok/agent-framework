@@ -845,3 +845,20 @@ separable by this design.
 **Next:** `--coverage-share` sweep at this cell **with `truncation` included**, which answers the
 gate question and restores the verdict machinery in one run.
 
+## 3p. Turn count drives cost, and bimodal rows defeat the aggregate
+
+**Turn count, not context size.** Runs 45 and 46 seed the same size and differ 72% in cost on the
+uncompacted control alone: 120 filler turns gives 147 calls, 20,220,087 input tokens and $0.5826;
+51 filler turns gives 78 calls, 12,840,933 and $0.3396. Input is size x calls, and this project has
+varied size while treating calls as incidental. Compaction acts only after the growth that was
+already paid for, so a cell labelled by window says little about the bill. Within-arm figures stand;
+cross-cell comparisons at different turn counts compare two things at once.
+
+**Bimodal rows.** Run 46's cell reads 49/53 at acc1 85% with a 55% spread, and **no seed scored 49**
+-- three at 53, two at 44. Control spread 16% against the strategy's 55%, so the variance is the
+coverage gate, not conditions. The instrument cannot detect bimodality; per-seed tables are the
+only honest summary for a row whose behaviour switches.
+
+**Consequence for the next design:** vary turns and window independently, or report cost per turn
+alongside cost per cell. Neither is done today.
+
