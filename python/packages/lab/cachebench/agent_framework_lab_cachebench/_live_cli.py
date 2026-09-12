@@ -79,6 +79,28 @@ _DEFAULT_STRATEGIES = (
 #: is being read as.
 FILL_TOLERANCE: Final[float] = 0.05
 
+#: Share of the fill target that is tool-result text when ``--tool-share`` is not given.
+#:
+#: 0.6 rather than the 0 this CLI shipped with, and that is a deliberate break. 0 selects the
+#: fixed path, where ``--tool-result-tokens`` pins each result at an absolute size and only the
+#: filler grows to reach the target -- so the tool payload stayed near 22,000 tokens whether
+#: the window was 60,000 or 300,000, while the conversation the strategy pays cache costs
+#: across grew without limit. That caps what a strategy that compacts tool results and nothing
+#: else can possibly save, and the cap tightens as the window widens, which reads in a window
+#: sweep as the strategy degrading. Measured on ``tool_summary_anchored`` at a fixed
+#: 3,500-token payload -- 21,967 tokens of tool results at every one of the three windows --
+#: 60,000/0.86 (run 41), 100,000/0.9 (run 44) and 170,000/0.9 (run 43) removed 28.8%, 22.6% and
+#: 17.0% of the control's snapshot while its cache hit rate fell 88% -> 74% -> 66% against a
+#: control climbing 96% -> 97% -> 98%. Deriving the payload from the fill target instead keeps
+#: the workload's proportions as the window moves, so two windows are one cell at two scales.
+#:
+#: 0.6 and 0.8 are the levels this project has treated as realistic payloads; 0.6 is the
+#: conservative one and so the one that becomes the default. The cost is comparability: every
+#: cell measured before this used the fixed path, ``tool_share`` is part of the cell key, and
+#: the two will not pool. That is the intended outcome -- they are different workloads -- but
+#: it means a sweep spanning the change has to state which side each cell came from.
+DEFAULT_TOOL_SHARE: Final[float] = 0.6
+
 
 def build_parser() -> argparse.ArgumentParser:
     """Build the argument parser.
@@ -188,25 +210,35 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_TOOL_RESULT_TOKENS,
         help=(
-            "Approximate size of each tool result, in tokens. Part of the payload, which is a "
-            "run-level parameter: vary it between runs and compare across them, never inside "
-            "one matrix, or the fill fraction stops meaning what it says. Ignored when "
-            "--tool-share is set, which derives this size from the fill target instead."
+            "Absolute size of each tool result, in tokens: the fixed payload. Ignored when "
+            "--tool-share is above 0, which it now is by default, since the two state one "
+            "quantity two ways and --tool-share wins when both are given; --tool-share 0 is "
+            "what selects this path. Fixed is right inside one window and wrong across two: "
+            "the payload stays this size while --context-window grows, so it is a shrinking "
+            "share of the conversation and a window sweep becomes a sweep over two variables. "
+            "Part of the payload either way, which is a run-level parameter: vary it between "
+            "runs and compare across them, never inside one matrix, or the fill fraction stops "
+            "meaning what it says. Default %(default)s."
         ),
     )
     parser.add_argument(
         "--tool-share",
         type=float,
-        default=0.0,
+        default=None,
         help=(
-            "Share of the seeded conversation that is tool-result text. Derives the size of "
-            "each result from the fill target instead of --tool-result-tokens stating it, so "
-            "the workload keeps its proportions as --context-window grows and two window sizes "
-            "are the same cell at two scales. It wins when both are given. Covers every tool "
-            "result including the code-free ones --filler-tool-turns adds, so turning those on "
-            "divides one budget over more results rather than adding to it. Needs --fill, "
-            "since the share is a share of its target. 0 leaves the sizing to "
-            "--tool-result-tokens, the same convention as --fill 0. Default %(default)s."
+            "Share of the seeded conversation that is tool-result text: the scaling payload, "
+            "and the default. Derives the size of each result from the fill target instead of "
+            "--tool-result-tokens stating it, so the workload keeps its proportions as "
+            "--context-window grows and two window sizes are the same cell at two scales. It "
+            "wins when both are given, and --tool-result-tokens is then ignored entirely. 0 "
+            "selects the fixed path and hands the sizing back to --tool-result-tokens, the "
+            "same convention as --fill 0. Covers every tool result including the code-free "
+            "ones --filler-tool-turns adds, so turning those on divides one budget over more "
+            "results rather than adding to it. Needs --fill, since the share is a share of its "
+            "target; under --fill 0 it is refused if asked for and off if it was not. NOTE "
+            "that the default changed from 0.0 on 2026-09-12: cells measured before that date "
+            "carry a fixed payload, this is part of the cell key, and the two do not pool. "
+            "Default 0.6."
         ),
     )
     parser.add_argument(
@@ -1998,6 +2030,30 @@ def _render(
     return "\n".join(lines)
 
 
+def _resolve_tool_share(requested: float | None, *, fill_fraction: float) -> float:
+    """Return the share of the fill target the tool payload is sized to reach.
+
+    The flag parses to None when it was not given, rather than to :data:`DEFAULT_TOOL_SHARE`,
+    for one interaction: manual sizing. ``--fill 0`` sets no target, so there is nothing for a
+    share to be a share of, and a default of 0.6 applied blindly would refuse every ``--fill 0``
+    invocation -- a mode that predates the parameter and has nothing to do with it. Defaulting
+    late separates "asked for a share with no target", which is a contradiction and is refused
+    by the caller, from "did not ask", which falls back to the fixed path exactly as before.
+
+    Args:
+        requested: What ``--tool-share`` parsed to, or None when it was not given.
+
+    Keyword Args:
+        fill_fraction: What ``--fill`` parsed to. 0 means the sizing is manual.
+
+    Returns:
+        The share to size the payload to, 0 to size it from ``--tool-result-tokens`` instead.
+    """
+    if requested is not None:
+        return requested
+    return DEFAULT_TOOL_SHARE if fill_fraction > 0 else 0.0
+
+
 def _plan_or_exit(args: argparse.Namespace, tokenizer: Any, workload: WorkloadSettings) -> FillPlan | None:
     """Solve the fill sizing, or exit explaining why this cell cannot be built.
 
@@ -2015,8 +2071,9 @@ def _plan_or_exit(args: argparse.Namespace, tokenizer: Any, workload: WorkloadSe
         SystemExit: If the payload does not fit inside the target, or if the tool share was
             asked for without a fill target to be a share of.
     """
+    tool_share = _resolve_tool_share(args.tool_share, fill_fraction=args.fill)
     if args.fill <= 0:
-        if args.tool_share > 0:
+        if tool_share > 0:
             raise SystemExit(
                 "--tool-share is a share of the fill target, and --fill 0 sets no target. Either "
                 "give --fill a fraction, or state the payload directly with --tool-result-tokens."
@@ -2031,7 +2088,7 @@ def _plan_or_exit(args: argparse.Namespace, tokenizer: Any, workload: WorkloadSe
             filler_tool_turns=args.filler_tool_turns,
             markers_per_tool=args.markers_per_tool,
             tool_result_tokens=args.tool_result_tokens,
-            tool_share=args.tool_share,
+            tool_share=tool_share,
             narration=args.narration,
             fact_placement=args.fact_placement,
             reply_tokens=args.assumed_reply_tokens,
@@ -2905,6 +2962,12 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
     # is the only place it exists. Reading the flag here would build the conversation the run
     # was not asked for while every printed line described the one it was.
     tool_result_tokens = plan.tool_result_tokens if plan else args.tool_result_tokens
+    # And the plan's share for the same reason, now that the flag parses to None when it was
+    # not given: the resolved share is what sized the payload, it is part of the cell key, and
+    # a cell recording None -- or recording 0 for a run that scaled its payload -- would pool
+    # with cells that are not the same workload. Without a plan there is no share by
+    # construction, since _plan_or_exit refuses one.
+    tool_share = plan.tool_share if plan else 0.0
     probe = build_live_scenario(
         salt="probe",
         filler_turns=filler_turns,
@@ -3065,7 +3128,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
         narration=args.narration,
         fact_placement=args.fact_placement,
         tool_result_tokens=tool_result_tokens,
-        tool_share=args.tool_share,
+        tool_share=tool_share,
         filler_turns=filler_turns,
         filler_tokens=filler_tokens,
         tool_turns=args.tool_turns,
