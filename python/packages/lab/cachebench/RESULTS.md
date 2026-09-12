@@ -1468,6 +1468,62 @@ So luna writes at great length about the first two lookups and never reaches the
 is a property of the model's writing, not of a setting, and no bound reachable from the CLI moved
 it.
 
+### Runs 45 and 46 -- scaling the payload with the window, and the first real win
+
+Two arms at one cell, 300,000 tokens at 0.9 fill, `none` against `tool_summary_anchored`, luna.
+Same window, same fill, same strategies. Run 45 uses the **fixed** payload every earlier cell used;
+run 46 uses the payload **scaled to the window**, which is now the default. Run 45 is one seed, run
+46 five. No throttling, retries or errors in either.
+
+**The fixed arm completes the degradation series and confirms its mechanism.**
+
+| window | tool payload | removed | hit% | `vs none$` |
+| --- | ---: | ---: | ---: | ---: |
+| 60,000 | 21,967 | 28.8% | 88% | -1% to -6% |
+| 100,000 | 21,967 | 22.6% | 74% | +21% |
+| 170,000 | 21,967 | 17.0% | 66% | +113% |
+| 300,000 | 21,967 | **11.7%** | **62%** | **+212%** |
+
+The payload the strategy can act on never grows; the conversation it pays cache costs across does.
+
+**Scaling the payload changes the answer, and the mechanism is the cache.** At 300,000 with tool
+results of ~26,814 tokens instead of ~3,500:
+
+| seed | keeps | hit% | facts | `vs none$` | gate |
+| --- | ---: | ---: | ---: | ---: | --- |
+| s0 | 98% | 96% | 44/53 | +29% | failed, `UNCOVERED:4` |
+| s1 | 61% | 96% | 53/53 | **-21%** | opened |
+| s2 | 64% | 96% | 53/53 | **-23%** | `UNCOVERED:1`, still acted |
+| s3 | 52% | 96% | 53/53 | **-33%** | opened |
+| s4 | 94% | 96% | 44/53 | +19% | failed, `UNCOVERED:4` |
+
+**Three of five seeds are 21-33% cheaper than not compacting while keeping every fact.** That is
+the first resolvable saving with full retention anywhere in this project. The hit rate tells you
+why: **96% against the control's 98%**, a two-point gap, where the fixed payload at the same window
+cost thirty-five. Large contiguous tool results can be replaced without disturbing much of the
+cached prefix; 22,000 tokens scattered through a 270,000-token conversation cannot.
+
+**What decides it is one threshold.** The two failures are the coverage gate shutting:
+`--coverage-share 0.8` asks the record to quote 80% of every digit-bearing token in a group, and a
+26,814-token result holds the same eight planted codes among 7.7x more filler. The gate has no
+notion of result size and was calibrated when results were 3,500 tokens. It is the difference
+between -33% and +29%.
+
+**Two caveats, both mine.**
+
+The cell's cost ranking is **withdrawn by the instrument** -- `CONTROL DIVERGED, MSGS:-2` -- because
+both runs carried only `none` and `tool_summary_anchored`, so the leanest strategy row is the one
+adding the record's own two messages. `STATE.md` section 3h records this trap and says to include a
+message-neutral row such as `truncation`; I did not. It is verifiably a false positive here
+(control peak 133, strategy peak 135, record contributes exactly 2), and the per-seed figures above
+are computed from the records rather than the withdrawn column -- but the spread guard is lost, so
+treat the cell as unranked.
+
+The fixed-and-scaled comparison is **not one variable**. Filling 270,000 tokens with larger results
+needs 51 filler turns instead of 120, so conversation length moves with payload composition. That is
+intrinsic to the change rather than an error, but "scaling helped" and "fewer turns helped" cannot
+be separated by this design.
+
 ### Run 44 -- 100,000 at 0.9 fill, and the sizing bug finally diagnosed
 
 Same shape as run 43 at a 100,000-token window: all 18 strategies, five seeds, 90 records, three
