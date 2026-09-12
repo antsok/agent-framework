@@ -1446,13 +1446,19 @@ def _composed_strategy(options: StrategyOptions) -> Any:
 
 
 def test_the_composed_row_is_built_from_the_same_two_builders_the_single_rows_use() -> None:
-    """Two halves configured apart, from one ``StrategyOptions``, with no shared trigger.
+    """Two halves configured from one ``StrategyOptions``, judged at one of the two triggers.
 
     The composed row is only worth printing beside ``tool_summary_anchored`` and
     ``user_summary_anchored`` if a sweep of either row's flags moves the matching half of this
     one and nothing else. A builder that constructed its parts itself would be a second place
     for a default to live, and the row would drift away from the two it is meant to be read
     against with nothing saying so.
+
+    The trigger is the exception, and it is the composition's decision rather than the builder's:
+    both halves are judged at ``--trigger-fraction``. So what is asserted is that the parts still
+    carry the fractions their own rows are measured at *and* that the line the pass reads is the
+    record half's. ``--user-trigger-fraction`` moving the single row only is the documented cost
+    of that; see ``compaction/_composed``.
     """
     args = build_parser().parse_args(["azure", "--trigger-fraction", "0.5", "--user-trigger-fraction", "0.75"])
     options = _strategy_options(args, TOKENIZER, _StubSummarizer())
@@ -1461,6 +1467,10 @@ def test_the_composed_row_is_built_from_the_same_two_builders_the_single_rows_us
 
     assert strategy.tool_results.trigger_fraction == 0.5
     assert strategy.user_turns.trigger_fraction == 0.75, "--user-trigger-fraction, not --trigger-fraction"
+    assert strategy.user_trigger_fraction == 0.5, (
+        "but the line the composition judges both halves at is the record half's, which is what "
+        "stops the record half's removals holding the prompt below the user half's own"
+    )
     assert strategy.tool_results.max_input_tokens == options.input_budget_tokens
     assert strategy.user_turns.max_input_tokens == options.input_budget_tokens
     assert strategy.user_turns.client is options.summarizer

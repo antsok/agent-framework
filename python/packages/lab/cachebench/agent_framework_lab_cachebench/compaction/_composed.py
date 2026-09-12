@@ -13,86 +13,119 @@ the tool payload it may not touch". ``STRATEGIES.md`` names composing the two as
 next measurement and states that it is not made there.
 
 This is that composition. What it reaches is the question a run of it would answer, and nothing
-in this module is a report of one: no row produced by this class has been measured at the time
-it was written, so every claim below is about mechanism -- which messages each phase selects,
-which number each phase reads -- and not about what the pair removed.
+in this module is a report of one: no row produced by this class has been measured since it was
+given the shared line described below, so every claim here is about mechanism -- which messages
+each phase selects, which number each phase reads -- and not about what the pair removed.
 
-**Order: the record phase first, then the user-turn phase.** Three reasons, the first of which
-is the expensive one to get wrong.
+**One reading of the prompt decides both halves, and one line is what both are judged against.**
+Those are two decisions, forced by the same measurement, so they are stated together.
 
-1. *The record has to be asked for before the bulk degrades it.*
-   :data:`~._toolsummary.DEFAULT_TRIGGER_FRACTION` is 0.6 against
-   :data:`~._usersummary.DEFAULT_USER_TRIGGER_FRACTION`'s 0.8, and the two constants document
-   why they differ: the record strategy asks a *model* to write down what a set of tool results
-   contained, and that record is measured degrading with the bulk it is given to read, so it
-   fires early; the user-turn strategy asks a summarizer for prose whose quality is not what its
-   row measures and pays only in a broken cached prefix, so it fires as late as it can. A
-   composition that let the user phase act first would hand the record phase -- and, worse, the
-   middleware that does the asking -- a conversation already shrunk below the line that is
-   supposed to trigger them. That is not a delay. It is the ask never being made.
-2. *The phase that can remove less goes first.* The record phase is capped at the tool share of
-   the conversation and the user phase at the user share, and on the sizing this package
-   measures those are not close: the user half is most of the prompt and the tool half a
-   seventh of it. A pass ordered the other way would routinely take the prompt from over the
-   user line to under the record phase's lower one in a single step, which silences the record
-   half every pass; ordered this way the removal is small enough that the user line usually
-   survives it, and when it does not, the counter below says so instead of the user half merely
-   looking inert.
-3. *The record phase's fallback decides from group positions.* When a record does not free
-   enough, :class:`~._anchored.AnchoredCompactionStrategy` runs behind it and reads a band
-   defined by counting groups from each end. Running it after the user phase would have it
-   count a band containing this run's summary message rather than the user turns it replaced,
-   so the fallback's geometry -- and therefore what the ``tool_summary_anchored`` row means --
-   would differ between the composed row and the row it is meant to be compared with.
+The row this class first shipped as was structurally tool-only. The record phase fires at
+:data:`~._toolsummary.DEFAULT_TRIGGER_FRACTION`, 0.6, and the user phase at
+:data:`~._usersummary.DEFAULT_USER_TRIGGER_FRACTION`, 0.8; the record phase goes first, removes
+the tool payload while the prompt is still in the 60s of the ceiling, and holds it there for the
+rest of the run. The prompt then never reaches 0.8 at all, so the user half is never consulted:
+gpt-5.6-luna at a 170,000-token window, 0.9 fill, seed 1, reported ``REC:1, RECORDS:1, FORCED:1,
+RECFORCED:1``, a 63% snapshot and no ``USERCOMPACT`` -- a composed row that was
+``tool_summary_anchored`` under a longer name.
+
+*Giving the two halves the same fraction does not on its own fix that*, and this class does not
+pretend it does. With both lines at 0.6 and the phases still judged one after the other, the
+record phase acts first, takes the prompt below the shared line, and the user phase declines on
+its own re-test: the same inertness with a different number on it. What makes a shared line mean
+anything is that **both halves are judged against the size the prompt had when the pass began**.
+:meth:`ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy.__call__` reads
+:func:`~agent_framework._compaction.included_token_count` once, before either phase runs, and
+hands that one number to both: a half that would have fired on the pass-entry size fires,
+whatever the other half has already removed.
+
+**Judging a half against a stale size cannot let it claim the other's material.** The two
+selection rules name disjoint kinds -- ``group_messages`` gives a user message a group of kind
+``user`` and a call-and-result pair a group of kind ``tool_call``, and
+:meth:`~._usersummary.UserTurnAnchoredSummarizationCompactionStrategy._band` takes only the
+first while the record phase takes only the second -- so a phase acting on a number a moment out
+of date still reads its own half of the conversation and nothing else. What the staleness does
+cost is this: the second half may act when the prompt is *already* under the line, freeing
+tokens a strategy reading the live size would have left alone, and spending a summarizer call
+and a rewritten prefix to do it. That is the deliberate choice being made. The alternative is
+the row measured above, where the second half never acts at all, and a pass that removes
+slightly more than it had to is a cheaper defect than a row that silently measures one half.
+
+**The shared line is the record phase's own, and the alignment runs in that direction only.**
+``user_trigger_fraction`` defaults to None, which means the user half is judged at
+``tool_results.trigger_fraction`` -- 0.6 by default, and whatever a sweep of that flag has moved
+it to, so the composed row's two halves cannot drift apart under a sweep of the record row's
+trigger. Aligning the other way, holding the record phase back to 0.8, is the one direction that
+is not safe: the record is written by a *model* asked to read the tool payload, it is measured
+degrading with the bulk it is given, and the middleware that does the asking reads the same
+prompt -- so a record asked for late is a record asked for on more material, and a record asked
+for after the prompt has been cut below the line is a record never asked for. Aligning down
+costs the user half an earlier first compaction than its own row takes; aligning up costs the
+record its quality and possibly its existence. A caller who wants the two apart again passes an
+explicit ``user_trigger_fraction``, which restores the two-line row this class shipped as --
+kept, like every other restored default in this package, so that the two can be run side by side.
+
+Neither sub-strategy's own trigger is touched by any of this. ``tool_summary_anchored`` and
+``user_summary_anchored`` as separate rows read their own ``trigger_fraction`` off the
+conversation in front of them, exactly as they always did; the composition supplies both numbers
+through :meth:`~._usersummary.UserTurnAnchoredSummarizationCompactionStrategy.compact_against`
+rather than by reconfiguring the objects it was handed.
+
+**Order: the record phase first, then the user-turn phase.** Three reasons were given for it.
+Judging both halves at pass entry makes one of them moot, which is said here rather than left
+standing.
+
+1. *The record has to be asked for before the bulk degrades it.* Survives, and it is still the
+   expensive one to get wrong -- but it is about the conversation's size *between* passes rather
+   than within one. Both phases' removals are permanent, so a user phase that ran first would
+   hand the middleware a conversation already shrunk below the line that asks for a record at
+   all, on this call and on every call after it. Pass-entry judging does nothing about that: it
+   governs which phase acts within a pass, not what the next call sees.
+2. *The phase that can remove less goes first.* **Moot as stated, and replaced.** The reason
+   given was that the record phase's smaller removal usually leaves the user line intact for the
+   phase behind it -- which is now true by construction, at either order, because the user half
+   no longer reads a size the record phase has moved. What the order still buys is close to the
+   opposite of that reason: the record phase's removal makes the prompt smaller, so the band the
+   user phase weighs is a *larger* share of it, and
+   :data:`~._usersummary.DEFAULT_MIN_BAND_SHARE` is cleared more easily than it would be the
+   other way round. The hysteresis reads the live prompt on purpose; see
+   :meth:`~._usersummary.UserTurnAnchoredSummarizationCompactionStrategy.compact_against`.
+3. *The record phase's fallback decides from group positions.* Survives untouched, because it is
+   about the conversation's shape rather than its size. When a record does not free enough,
+   :class:`~._anchored.AnchoredCompactionStrategy` runs behind it and reads a band defined by
+   counting groups from each end. Running it after the user phase would have it count a band
+   containing this run's summary message rather than the user turns it replaced, so the
+   fallback's geometry -- and therefore what the ``tool_summary_anchored`` row means -- would
+   differ between the composed row and the row it is meant to be compared with.
 
 **Both phases run on a pass where both want to act.** They are not alternated across turns and
 neither vetoes the other: the pass calls the record phase, re-reads the conversation, and calls
-the user-turn phase, and it reports a change when either reported one. That is safe because
-they select disjoint messages -- ``group_messages`` gives a user message a group of kind
-``user`` and a call-and-result pair a group of kind ``tool_call``, and each phase's selection
-rule names exactly one of those kinds -- so there is no message both could claim and no order in
+the user-turn phase, and it reports a change when either reported one. That is safe because they
+select the two disjoint kinds above, so there is no message both could claim and no order in
 which one could supersede what the other had already superseded.
 
-**The interference is the token accounting, and it is not removed, it is made visible.** Both
-phases begin by reading :func:`~agent_framework._compaction.included_token_count` and comparing
-it with their own trigger, so the second phase sees a number the first phase moved. Three
-things are done about that and a fourth is deliberately not done:
-
-- The conversation is re-annotated between the phases, forced, when the first phase changed
-  anything. Token counts are cached per message inside the group annotations, and the record
-  phase's fallback rewrites tool results *in place*; without the re-read the user phase would
-  threshold against text that no longer exists. This is
-  :meth:`~._anchored.AnchoredCompactionStrategy.__call__`'s own reasoning, one level up.
-- The order above is chosen so the moved number moves as little as it can.
-- :attr:`ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy.user_passes_starved`
-  counts the passes where the record phase's removals are why the prompt is under the user
-  phase's own line. It is the one reading of "the user half did nothing" that is not about the
-  user half at all. It was written as a within-pass transition -- above the line when the pass
-  started, at or below it when the record phase finished -- and that definition could not see
-  the case it was written for: the record phase's trigger is *lower* than the user phase's, so
-  it takes the prompt down before the user line is ever reached and holds it there, and the
-  transition never happens. Measured: seed 1 of the run in ``STATE.md`` reported ``snap 63%``,
-  no ``USERCOMPACT`` and no ``USERSTARVED``. It now counts against what the record phase has
-  removed over the whole run rather than over one pass, which makes the old reading a special
-  case of the new one.
+**The conversation is still re-annotated between the phases, and now for one reason rather than
+two.** It used to be re-read because the user phase thresholded against the result; it no longer
+does. It is re-read because the record phase's fallback rewrites tool results *in place* and
+token counts are cached per message, so the band the user phase weighs -- and the drop this class
+attributes to the record phase -- would otherwise be measured against text that is no longer in
+the conversation. Forced, and skipped when nothing changed, which is the trade
+:meth:`~._anchored.AnchoredCompactionStrategy.__call__` makes one level up.
 
 **The user half is silent for four different reasons, and the flags say which.** This is the
 failure the composition exists to avoid -- a row that is one of its halves under a new name --
 so "did not compact" is not one state here but four, each with its own counter:
 :attr:`~._usersummary.UserTurnAnchoredSummarizationCompactionStrategy.user_passes_below_trigger`
-is never considered, ``user_passes_starved`` is the subset of those the record phase caused,
+is never considered,
+:attr:`ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy.user_passes_starved` is the
+subset of those the record phase caused,
 :attr:`~._usersummary.UserTurnAnchoredSummarizationCompactionStrategy.user_passes_declined` is
 considered and held back by the user phase's own hysteresis, and
 :attr:`~._usersummary.UserTurnAnchoredSummarizationCompactionStrategy.user_summary_failures` is
 a summarizer that did not answer. A reader who has only the flags column can tell the four
-apart, which is the whole point of having them.
-- What is *not* done is overriding either phase's trigger. Both keep their own configuration,
-  including the two thresholds, because the composed row only means anything beside the two
-  single rows if its halves fire where those rows' halves fire. Collapsing them into one shared
-  trigger -- the shape :class:`~agent_framework._compaction.TokenBudgetComposedStrategy` uses,
-  where every variant compacts to one ceiling -- answers a different question: that family holds
-  size fixed to compare orderings of deletion, and here the sizes the two phases reach are the
-  measurement rather than a nuisance to be normalised away.
+apart, which is the whole point of having them. On an aligned row the starvation count is zero
+by construction, so a silent user half there is always the user half's own doing -- which is
+what makes the other three readable as instructions to change something.
 
 **It has no ceiling and no fallback of its own.** Returning False does not mean the prompt now
 fits, exactly as it does not for either part: the record phase carries its own fallback behind
@@ -128,8 +161,9 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
 
     Keyword Args:
         tokenizer: Token counter, and it must be the one both phases were given. This class
-            re-reads the conversation between them, so a count taken here with a different
-            counter would hand the second phase a number its own trigger was not set against.
+            takes the one reading both phases are judged against, so a count taken here with a
+            different counter would judge both halves against a number neither trigger was set
+            against.
         tool_results: The record-then-drop strategy, configured as its own row configures it.
             Its recall middleware is wired by the caller and is not optional: without it the
             model is never pinned to the recall tool, no record is written, and this phase can
@@ -137,14 +171,24 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
             object inside this one for exactly that reason.
         user_turns: The user-band summarising strategy, configured as its own row configures
             it, summarizer client included.
+        user_trigger_fraction: Fraction of the shared ceiling the user half is judged at *inside
+            this composition*. None, the default, means ``tool_results.trigger_fraction``: one
+            line for both halves, moving with whatever the record row's trigger was swept to.
+            An explicit fraction sets the two apart again -- pass ``user_turns.trigger_fraction``
+            to restore the two-line row this class shipped as. The object handed in is not
+            reconfigured either way, so the same instance run as its own row still reads its own
+            trigger. See the module docstring for why the alignment runs downward.
 
     Raises:
-        ValueError: If the two phases measure against different ceilings. Each phase's trigger
-            is a fraction of its own ``max_input_tokens``, and the whole of the order argument
-            in this module is about which of the two fractions is crossed first -- which is a
-            statement about fractions only while they are fractions of one number. Two ceilings
-            would also make ``user_passes_starved`` compare a count against a line taken from
-            somewhere else.
+        ValueError: If the two phases measure against different ceilings, or if an explicit
+            ``user_trigger_fraction`` is outside ``(0.0, 1.0]``. Each phase's trigger is a
+            fraction of its own ``max_input_tokens``, and one shared line is a line only while
+            the two fractions are fractions of one number; two ceilings would also make
+            ``user_passes_starved`` compare a count against a line taken from somewhere else. A
+            fraction of zero would fire the user half on an empty conversation and one above one
+            could never fire it, which are the bounds
+            :class:`~._usersummary.UserTurnAnchoredSummarizationCompactionStrategy` sets on its
+            own trigger for the same two reasons.
     """
 
     def __init__(
@@ -153,6 +197,7 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
         tokenizer: TokenizerProtocol,
         tool_results: ToolResultAnchoredSummarizationCompactionStrategy,
         user_turns: UserTurnAnchoredSummarizationCompactionStrategy,
+        user_trigger_fraction: float | None = None,
     ) -> None:
         """Validate the pair and store it."""
         if tool_results.max_input_tokens != user_turns.max_input_tokens:
@@ -161,12 +206,20 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
                 f"{tool_results.max_input_tokens} and {user_turns.max_input_tokens} are two ceilings, "
                 "and the trigger fractions are then not comparable."
             )
+        if user_trigger_fraction is not None and not 0.0 < user_trigger_fraction <= 1.0:
+            raise ValueError("user_trigger_fraction must be in (0.0, 1.0].")
         self.tokenizer = tokenizer
         self.tool_results = tool_results
         self.user_turns = user_turns
         self.max_input_tokens = tool_results.max_input_tokens
+        #: The line the user half is judged at in this composition, defaulted to the record
+        #: half's so that the two cannot drift apart under a sweep of the record row's trigger.
+        self.user_trigger_fraction = (
+            tool_results.trigger_fraction if user_trigger_fraction is None else user_trigger_fraction
+        )
         self._starved = 0
         self._removed_by_record = 0
+        self._removed_out_of_reach = 0
 
     @property
     def strategies(self) -> tuple[_Phase, ...]:
@@ -226,7 +279,8 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
         On a composed row this is the number :attr:`user_passes_starved` subdivides: of the
         passes where the user phase never reached its line, the starved ones are those the
         record phase's removals account for and the rest are a conversation that was not big
-        enough on its own.
+        enough on its own. On an aligned row the second subset is empty, and this number is
+        then exactly the passes the prompt never reached the shared line on.
         """
         return self.user_turns.user_passes_below_trigger
 
@@ -248,46 +302,51 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
         This one says the user side was never consulted, because the phase in front of it had
         already taken the prompt below the threshold it fires on.
 
-        **It used to be a per-pass transition, and that made it silent exactly where it was
-        needed.** The test was ``before > user_line >= after`` within one pass: the prompt had
-        to be above the user line when the pass started and at or below it when the record phase
-        finished. On the run this counter was written for -- gpt-5.6-luna, a 170,000-token
-        window at 0.9 fill, seed 1 -- the composed row reported ``REC:1, RECORDS:1, FORCED:1,
-        RECFORCED:1``, a 63% snapshot, no ``USERCOMPACT`` and **no ``USERSTARVED``**. The reason
-        is structural rather than incidental: the record phase's trigger is 0.6 and the user
-        phase's is 0.8, so the record phase removes the tool payload while the prompt is still
-        in the 60s and holds it there for the rest of the run. The prompt is then never above
-        the user line at the *start* of a pass, the transition can never be observed, and a row
-        whose user half was starved on every pass reported starvation on none.
+        **Zero by construction on an aligned row, which is the point of aligning.** With one
+        line for both halves the record phase can only act on a pass whose entry size is *above*
+        that line, and a pass above the line is a pass the user half is consulted on -- so
+        nothing the record phase removes is ever removed out of the user half's reach, the
+        quantity below stays at zero, and so does this. A non-zero value on a row built with the
+        default ``user_trigger_fraction`` is therefore a defect report rather than a
+        configuration note, and should be read as one.
 
-        **What is counted now is the counterfactual, and it is carried across passes.** This
-        class accumulates the tokens the record phase has removed over the run and counts a pass
-        as starved when the prompt is at or below the user line *and* would have been above it
-        with those tokens still in the conversation. On the pass where a transition does happen
-        that is the old test -- the removal of that pass is part of the total -- so every pass
-        the old definition counted is still counted, and the passes it could not see are now
-        counted too.
+        **What it counts, on a row whose halves were deliberately set apart.** A pass is starved
+        when the size the pass was judged against is at or below the user line, *and* would have
+        been above it with :attr:`tokens_removed_out_of_user_reach` still in the conversation.
+        The counterfactual it stands for is "the same conversation, compacted by the user phase
+        exactly as it was, with the record phase never run" -- which is the
+        ``user_summary_anchored`` row the composed row is read against, and so the right
+        question to be asking.
 
-        The total is the sum of what each pass's record phase removed, measured as the drop in
-        the included token count across the call and floored at zero: the phase inserts notes of
-        its own when its fallback runs, and a pass whose notes outweighed its removals has
-        removed nothing rather than a negative amount. The counterfactual it stands for is "the
-        same conversation, compacted by the user phase exactly as it was, with the record phase
-        never run" -- which is the ``user_summary_anchored`` row the composed row is read
-        against, and so the right question to be asking.
+        **It is a statement across passes and never within one, which it did not used to be.**
+        A pass is judged by the size it began with, so the record phase cannot take the prompt
+        out from under the user half's decision on the pass it acts on: whatever it removes
+        there, the user half has already been offered the conversation that contained it. Only
+        removals made on *earlier* passes are missing from a later pass's entry reading, and only
+        those are counted here. A row with two lines and a single pass therefore reports nothing,
+        where the shipped row's first version reported a starved half on exactly that case.
+
+        **It has been three definitions, and the first two are why the third is worded as it
+        is.** It began as a within-pass transition -- above the line when the pass started, at or
+        below it when the record phase finished -- and could not see the case it was written
+        for: the record phase's trigger was *lower* than the user phase's, so it took the prompt
+        down before the user line was ever reached and held it there, and the transition never
+        happened. Measured: seed 1 of the run in ``STATE.md`` reported ``snap 63%``, no
+        ``USERCOMPACT`` and no ``USERSTARVED``. It then counted against everything the record
+        phase had removed over the whole run, which saw that case -- and, once the halves shared
+        a line, saw a second case that is not starvation at all: an ordinary quiet pass after a
+        successful compaction, where the prompt is small *because the row worked*. Restricting
+        the total to what was removed while the user half could not be consulted keeps the first
+        reading and drops the second.
 
         Counted per pass rather than as a flag, for the reason
         :attr:`~._toolsummary.ToolResultAnchoredSummarizationCompactionStrategy.fallbacks_after_record`
         is: each pass is its own event, the conversation grows back between them, and one
         starved pass out of one is a different row from one out of twenty.
 
-        It is reported rather than prevented. Preventing it would mean running the user phase
-        against a trigger this class had overridden, and then the composed row's user half would
-        be firing where no ``user_summary_anchored`` row ever fires -- which takes the pair of
-        rows the composition exists to be compared with and makes them incomparable.
-
-        Zero on a row whose user half did compact is the ordinary case and says nothing beyond
-        "the order cost nothing here".
+        Reported rather than prevented, on a row whose halves were set apart deliberately: the
+        prevention is the aligned default, and a caller who has asked for two lines has asked
+        for the row this counts.
         """
         return self._starved
 
@@ -295,26 +354,51 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
     def tokens_removed_by_record_phase(self) -> int:
         """Tokens the record phase has removed from the prompt over this run.
 
-        The quantity :attr:`user_passes_starved` is decided against, exposed because a counter
-        derived from a hidden number is a counter nobody can check. It is a running total of
-        per-pass drops in the included token count, so it describes the conversation as it now
-        stands: the record phase's exclusions are permanent, and nothing here puts them back.
+        A running total of per-pass drops in the included token count, so it describes the
+        conversation as it now stands: the record phase's exclusions are permanent, and nothing
+        here puts them back. Read beside :attr:`user_messages_replaced` it says how the composed
+        row's two halves divided the work.
 
         Not a flag on the row. It is a token count rather than an event count, it moves with the
         workload rather than with the strategy, and the flags column is read for the latter.
         """
         return self._removed_by_record
 
+    @property
+    def tokens_removed_out_of_user_reach(self) -> int:
+        """The part of that total the user half was never in a position to see.
+
+        The quantity :attr:`user_passes_starved` is decided against, exposed because a counter
+        derived from a hidden number is a counter nobody can check. It is the sum of the drops
+        made on passes whose entry size was at or below the user line -- passes where the user
+        half declined at its trigger, so the tokens the record phase took were tokens that could
+        never have carried the prompt over that line.
+
+        Zero on an aligned row, for the reason :attr:`user_passes_starved` is: the record phase
+        acts only above the shared line, and above the line the user half is consulted.
+
+        Floored at zero per pass. The record phase's fallback inserts notes where it shed a
+        group, so a pass can end larger than it started, and a pass that removed nothing has
+        removed nothing rather than a negative amount that would then pay for a later pass's
+        starvation.
+        """
+        return self._removed_out_of_reach
+
     async def __call__(self, messages: list[Message]) -> bool:
-        """Run the record phase, then the user-turn phase.
+        """Run the record phase, then the user-turn phase, both judged at the size on entry.
 
-        Neither phase is called conditionally on the other. Each is trusted to read its own
-        trigger and decline, because that decision is the thing its own row measures and a copy
-        of it here would be a second place for the two to disagree about when a strategy fires.
+        The prompt is measured once, before either phase runs, and that single reading is what
+        each phase's trigger is compared with. Neither phase is called conditionally on the
+        other and neither re-reads the size to decide: the record phase cannot move the number
+        the user phase is judged by, which is the whole of what makes one shared line more than
+        a renamed version of the two-line row. What a phase does *after* it has decided to act
+        is read off the conversation as it now stands -- the band's share of the prompt, the
+        ceiling the record phase's fallback is reached for -- because those are questions about
+        what a pass would cost and what still does not fit.
 
-        What this class does instead of deciding for them is *attribute* a decline. The user
-        phase counts its own three refusals; this counts the one it cannot see, which is the
-        record phase in front of it having taken the prompt below the line the user phase reads.
+        Each phase is still trusted to decide whether to act, because that decision is the thing
+        its own row measures and a copy of it here would be a second place for the two to
+        disagree. What this class supplies is the pair of numbers the decision is taken against.
 
         Args:
             messages: The conversation, mutated in place.
@@ -327,30 +411,42 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
             return False
         annotate_message_groups(messages)
         annotate_token_counts(messages, tokenizer=self.tokenizer)
-        before = included_token_count(messages)
+        entry_tokens = included_token_count(messages)
+        user_line = int(self.max_input_tokens * self.user_trigger_fraction)
 
-        changed = await self.tool_results(messages)
-        after = before
+        # Decided before the record phase runs, and so against what it removed on *earlier*
+        # passes only. This pass's removal comes out of the prompt after the entry reading was
+        # taken, so it cannot be the reason that reading was under the line -- adding it would
+        # report a pass as starved by a removal it had not yet made. Across passes it is a
+        # different statement, and the true one: the record phase's exclusions are permanent, so
+        # what it took while the user half was declining at its trigger is missing from every
+        # entry reading after it.
+        if entry_tokens <= user_line < entry_tokens + self._removed_out_of_reach:
+            self._starved += 1
+
+        changed = await self.tool_results.compact_against(
+            messages,
+            prompt_tokens=entry_tokens,
+            trigger_tokens=int(self.max_input_tokens * self.tool_results.trigger_fraction),
+        )
         if changed:
             # Forced, because the record phase's fallback shortens tool results in place and
             # the counts are cached per message: an incremental re-read would leave the user
-            # phase thresholding against text that is no longer in the conversation. Skipped
-            # when nothing changed, which is the same trade ``_anchored.__call__`` makes.
+            # phase weighing its band against text that is no longer in the conversation, and
+            # would misattribute the drop below. Skipped when nothing changed, which is the same
+            # trade ``_anchored.__call__`` makes.
             annotate_message_groups(messages)
             annotate_token_counts(messages, tokenizer=self.tokenizer, force_retokenize=True)
-            after = included_token_count(messages)
-            # Floored at zero: the fallback inserts notes where it shed a group, so a pass can
-            # end larger than it started, and a pass that removed nothing has removed nothing
-            # rather than a negative amount that would then pay for a later pass's starvation.
-            self._removed_by_record += max(before - after, 0)
+            removed = max(entry_tokens - included_token_count(messages), 0)
+            self._removed_by_record += removed
+            if entry_tokens <= user_line:
+                # The user half declines at its trigger on this pass, so what the record phase
+                # took here is material it will never be offered. Above the line it is offered
+                # everything, whatever the record phase removed first -- which is why an aligned
+                # row can never add to this. See ``user_passes_starved``.
+                self._removed_out_of_reach += removed
 
-        # Read on every pass and not only on one that changed something. The record phase's
-        # exclusions are permanent, so the pass that made them is not the only pass they starve;
-        # on the live row that produced this counter it was never the transition pass at all,
-        # because the record phase acts at 0.6 and the user line is at 0.8. See
-        # ``user_passes_starved``.
-        user_line = int(self.user_turns.max_input_tokens * self.user_turns.trigger_fraction)
-        if after <= user_line < after + self._removed_by_record:
-            self._starved += 1
-
-        return await self.user_turns(messages) or changed
+        compacted = await self.user_turns.compact_against(
+            messages, prompt_tokens=entry_tokens, trigger_tokens=user_line
+        )
+        return compacted or changed

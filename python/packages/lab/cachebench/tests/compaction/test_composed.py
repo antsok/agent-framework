@@ -3,28 +3,42 @@
 """Tests for running the record strategy and the user-turn strategy over one conversation.
 
 The composition owns no selection rule, so almost nothing here is about which messages get
-removed -- that is tested beside each part. What is tested here is the three things composing
+removed -- that is tested beside each part. What is tested here is the four things composing
 adds, each of which fails silently rather than loudly.
 
-**Both halves act.** The point of the row is that the two reach material neither can reach
-alone, and the failure mode is a pass where one half quietly did nothing: the conversation is
-smaller, the row looks like it worked, and it is one of the single rows under a new name. So
-the headline test runs each part alone over the same fixture and pins that each alone moves
-only its own half.
+**Both halves act, on one pass, judged by one number.** The point of the row is that the two
+reach material neither can reach alone, and the failure mode is a pass where one half quietly
+did nothing: the conversation is smaller, the row looks like it worked, and it is one of the
+single rows under a new name. That is not hypothetical -- it is what the row first shipped as,
+because the record phase's removals held the prompt below the line the user phase read. So the
+headline test runs on a ceiling whose shared line sits *between* the size the conversation
+starts at and the size the record phase leaves: both halves fire when both are judged against
+the size the pass began with, and the user half declines the moment anything judges it against
+what the record phase left. Reverting the pass to sequential judging is what that test is
+written to fail on.
 
-**The order is the record phase first, and it is load-bearing rather than arbitrary.** The
-record strategy's trigger is the lower of the two, and the middleware that asks the model for
-a record reads the same size, so a pass that let the user half shrink the prompt first would
-not delay the record -- it would stop it being asked for. The order is therefore asserted
-directly *and* through the consequence, on a ceiling where the two orders give opposite
-answers.
+**One line for both halves, and the single rows keep their own.** The composition judges the
+user half at the record half's trigger, so a test that is about the shipped row builds it with
+that default and a test that is about the row this class used to be passes
+``user_trigger_fraction`` explicitly. Both are here, next to each other, because the pair is
+the argument: the aligned row fires both halves and the split row starves one. And what is
+asserted of the single rows is that neither of them moved -- the same instance, run as its own
+row, still reads its own trigger before and after a composition has run it.
 
-**The token count is what the two phases share, and the starvation counter is what says so.**
-A record phase that removes enough to take the prompt under the user phase's own trigger
-leaves a row reporting no user compactions, which is indistinguishable from a band that held
-nothing. That reading is the counter's whole job, so it is tested at the boundary rather than
-in the middle: one ceiling where it fires, one where the user half would not have fired anyway
-and it must stay silent.
+**The order is the record phase first, and one of its three reasons is now moot.** The record
+strategy's trigger is the lower of the two and the middleware that asks the model for a record
+reads the conversation on the next call, so a pass that let the user half shrink the prompt
+first would not delay the record -- it would stop it being asked for. That reason is asserted
+directly. The reason that is gone is "the phase that removes less goes first, so the user line
+survives it": the user line now survives either order by construction, which is what the
+headline test pins.
+
+**The starvation counter says which silence is the composition's doing.** A record phase that
+removes enough to take the prompt under the user phase's own trigger leaves a row reporting no
+user compactions, which is indistinguishable from a band that held nothing. That reading is the
+counter's whole job. On the aligned row it must read zero -- the record phase never acts below
+the line the user half is consulted at -- and on the split row it must read the run it was
+written for, so both are tested.
 """
 
 from __future__ import annotations
@@ -44,11 +58,13 @@ from agent_framework_lab_cachebench.compaction._composed import (
     ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy,
 )
 from agent_framework_lab_cachebench.compaction._toolsummary import (
+    DEFAULT_TRIGGER_FRACTION,
     RECALL_TOOL_NAME,
     RECORD_MARKER,
     ToolResultAnchoredSummarizationCompactionStrategy,
 )
 from agent_framework_lab_cachebench.compaction._usersummary import (
+    DEFAULT_USER_TRIGGER_FRACTION,
     USER_SUMMARY_MARKER,
     UserTurnAnchoredSummarizationCompactionStrategy,
 )
@@ -66,14 +82,14 @@ _TURN_CHARS = 4_000
 #: rivalled its user text would let the record phase alone look like the composition working.
 _PAYLOAD_CHARS = 2_000
 
-#: A ceiling both triggers are crossed on, and which the record phase's removals leave them
-#: crossed on.
+#: A ceiling every line in play is crossed on, whichever of them a half is judged against.
 #:
 #: The eight-turn fixture measures 18,937 tokens and the record phase takes it to 16,613. The
-#: user line is 0.8 of this, 16,000, so both sizes are above it and the user half fires whether
-#: or not the record phase ran first. The record line is 0.6 of this, 12,000, which both sizes
-#: also clear -- and the ceiling itself is above the post-record size, so the record phase does
-#: not reach for its fallback and no assertion here is about the anchored strategy.
+#: composed row's shared line is 0.6 of this, 12,000, and the ``user_summary_anchored`` row's
+#: own line is 0.8 of it, 16,000: both sizes are above both, so a half that declines here
+#: declined for a reason of its own rather than for want of a trigger. The ceiling itself is
+#: above the post-record size, so the record phase does not reach for its fallback and no
+#: assertion here is about the anchored strategy.
 #:
 #: **Recompute the sizes whenever a default moves, and check the margins rather than the
 #: signs.** A fixture that slips under a trigger does not fail; it asserts against a phase that
@@ -81,15 +97,26 @@ _PAYLOAD_CHARS = 2_000
 #: that loud, and it is the only test here that should ever need these numbers rewritten.
 _COMPACTING_CEILING = 20_000
 
-#: A ceiling whose user line sits *between* the fixture's two sizes.
+#: A ceiling whose *split* user line sits between the fixture's two sizes.
 #:
 #: 0.8 of 22,000 is 17,600: above the 16,613 the record phase leaves and below the 18,937 the
-#: conversation starts at. That is the whole of what this fixture is for, and two tests read it
-#: from opposite ends -- the user half is starved by a record phase that ran first, and the
-#: user half fires normally when the record phase had no record to act on. 0.9 of it is 19,800,
-#: so the record-less case is still waiting rather than falling back, which is what makes the
-#: second reading about the composition and not about the anchored strategy.
+#: conversation starts at. It is the line the record phase's removals used to take the prompt
+#: under within a single pass, and the test on it is that they no longer can -- at either
+#: fraction, because the size that decides is read before the record phase runs. The shared line
+#: here is 0.6 of it, 13,200, which both sizes clear. 0.9 of it is 19,800, so a record-less pass
+#: is still waiting rather than falling back, which is what makes the still-waiting test about
+#: the composition and not about the anchored strategy.
 _NARROW_CEILING = 22_000
+
+#: A ceiling whose *shared* line sits between the fixture's two sizes, which is the headline.
+#:
+#: 0.6 of 28,000 is 16,800: above the 16,613 the record phase leaves and below the 18,937 the
+#: conversation starts at. A user half judged against the size its pass began with fires here
+#: and a user half judged against what the record phase left declines, so this one ceiling is
+#: the difference between the composition and a sequential one wearing a shared fraction. 0.8 of
+#: it is 22,400, above the whole fixture, which is what lets the same number stand for "and the
+#: ``user_summary_anchored`` row, reading its own trigger, does not fire at all".
+_SHARED_LINE_CEILING = 28_000
 
 #: A ceiling neither trigger is anywhere near, so a pass over the fixture must do nothing.
 #:
@@ -100,9 +127,11 @@ _IDLE_CEILING = 100_000
 #: The ceiling the growing fixture is run against, and the one the live composed row had.
 #:
 #: Sized so the record phase's trigger (0.6 of it, 12,000) is crossed part-way through a
-#: twenty-turn run and its removals then hold the prompt below the user phase's line (0.8 of it,
+#: twenty-turn run and its removals then hold the prompt below a *split* user line (0.8 of it,
 #: 16,000) for the whole of the rest. That relationship is what the starvation tests are about,
-#: and they assert it of the fixture before they assert anything of the strategy.
+#: and they assert it of the fixture before they assert anything of the strategy. The same
+#: fixture run at the shared line is the opposite reading: the user half is consulted on every
+#: pass the record phase acts on, and the counter reads zero.
 _GROWING_CEILING = 20_000
 
 
@@ -279,13 +308,32 @@ def _composed(
     *,
     tool_results: ToolResultAnchoredSummarizationCompactionStrategy | None = None,
     user_turns: UserTurnAnchoredSummarizationCompactionStrategy | None = None,
+    user_trigger_fraction: float | None = None,
 ) -> ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
-    """Return both halves composed, each defaulted to its own row's configuration."""
+    """Return both halves composed, each defaulted to its own row's configuration.
+
+    ``user_trigger_fraction`` is left at None by every test that is about the shipped row: the
+    default aligns the user half to the record half's trigger, and that alignment is most of
+    what is under test here. ``_split_composed`` is the other configuration.
+    """
     return ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy(
         tokenizer=TOKENIZER,
         tool_results=tool_results or _record_phase(ceiling),
         user_turns=user_turns or _user_phase(ceiling),
+        user_trigger_fraction=user_trigger_fraction,
     )
+
+
+def _split_composed(
+    ceiling: int = _COMPACTING_CEILING,
+) -> ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
+    """Return the composition with its two halves deliberately set apart, 0.6 against 0.8.
+
+    The row this class shipped as, reachable now only by asking for it. Every test of the
+    starvation counter builds this, because on the aligned row that counter is zero by
+    construction -- and a counter that can only be zero is a counter nothing checks.
+    """
+    return _composed(ceiling, user_trigger_fraction=DEFAULT_USER_TRIGGER_FRACTION)
 
 
 #: Characters of tool payload in the growing fixture, which is where its bulk is.
@@ -401,29 +449,34 @@ async def _grow_composed(
     return passes
 
 
-async def test_the_record_phase_holding_the_prompt_under_the_user_line_is_counted_as_starvation() -> None:
-    """Defect 2, and the reason the counter that existed for it could not see it.
+async def test_two_lines_still_let_the_record_phase_hold_the_prompt_under_the_user_one() -> None:
+    """Defect 2, kept as a test of the configuration it belongs to now that it is opt-in.
 
     Measured live: seed 1 of the composed row reported ``REC:1, RECORDS:1, FORCED:1,
     RECFORCED:1`` with a 63% snapshot, no ``USERCOMPACT`` **and no ``USERSTARVED``**. The user
     half had done nothing and the row's own diagnostic was silent about why.
 
-    The cause is the order of the two triggers rather than anything about the band. The record
-    phase fires at 0.6 and the user phase at 0.8, so on a workload whose bulk is tool payload the
-    record phase removes it while the prompt is still in the 60s and holds it there for the rest
-    of the run. The prompt is then never above the user line when a pass *starts*, which is what
-    the old counter required: it tested ``before > user_line >= after`` within one pass, and that
-    transition never happens.
+    The cause is the two triggers rather than anything about the band. The record phase fires at
+    0.6 and the user phase at 0.8, so on a workload whose bulk is tool payload the record phase
+    removes it while the prompt is still in the 60s and holds it there for the rest of the run.
+    The prompt is then never above the user line when a pass *starts*, which is what the first
+    version of the counter required: it tested ``before > user_line >= after`` within one pass,
+    and that transition never happens.
+
+    The shipped row no longer has two lines, so this builds the split one deliberately -- and
+    that is the point of keeping the test. The fix is not that the counter now reads zero; it is
+    that the configuration which starves a half is the one a caller has to ask for. A run that
+    asks for it still gets the row, and still gets a number saying so.
 
     So the fixture is asserted to be the live case before anything else: no pass over it ever
-    starts above the user line, which is a proof that the old definition could not have counted
-    one -- and the new counter, which asks whether the prompt would be over the line with what
-    the record phase has removed still in it, counts nearly all of them.
+    starts above the user line, which is a proof that the first definition could not have counted
+    one -- and the counter, which asks whether the prompt would be over the line with what the
+    record phase removed out of the user half's reach still in it, counts nearly all of them.
     """
-    strategy = _composed(_GROWING_CEILING)
+    strategy = _split_composed(_GROWING_CEILING)
 
     passes = await _grow_composed(strategy, 20)
-    user_line = int(_GROWING_CEILING * strategy.user_turns.trigger_fraction)
+    user_line = int(_GROWING_CEILING * strategy.user_trigger_fraction)
 
     assert max(before for _, before in passes) <= user_line, (
         "the fixture has to be the live case: no pass starts above the user line, so the "
@@ -435,8 +488,11 @@ async def test_the_record_phase_holding_the_prompt_under_the_user_line_is_counte
         "which is the record phase's doing on most of the run, and has to be said in a number"
     )
     assert strategy.user_passes_below_trigger == len(passes), "every pass ended under the user line"
-    assert strategy.tokens_removed_by_record_phase > user_line - min(before for _, before in passes[-5:]), (
+    assert strategy.tokens_removed_out_of_user_reach > user_line - min(before for _, before in passes[-5:]), (
         "the counterfactual rests on this quantity, so it is checked rather than trusted"
+    )
+    assert strategy.tokens_removed_out_of_user_reach <= strategy.tokens_removed_by_record_phase, (
+        "and it is a part of what the record phase removed rather than a second count beside it"
     )
 
 
@@ -450,11 +506,15 @@ async def test_a_composed_row_whose_user_half_did_nothing_always_says_why() -> N
 
     So what is asserted is the invariant rather than one outcome: over a run of twenty passes,
     every pass in which the user half did not compact is accounted for by exactly one counter,
-    and on this fixture the account is not merely "it was under its line" but *why* it was --
+    and on the split row the account is not merely "it was under its line" but *why* it was --
     the phase in front of it. A composition that reverted to reporting nothing would leave the
     starvation count at zero and fail here, not in a table six weeks later.
+
+    Built split on purpose. The aligned row has no silent user half to account for on this
+    fixture, which is the test one below; this one holds the partition open for the row where
+    the silence is real.
     """
-    strategy = _composed(_GROWING_CEILING)
+    strategy = _split_composed(_GROWING_CEILING)
 
     passes = await _grow_composed(strategy, 20)
 
@@ -478,13 +538,18 @@ async def test_a_composed_row_whose_user_half_did_nothing_always_says_why() -> N
 async def test_the_three_reasons_a_composed_user_half_is_silent_read_differently() -> None:
     """Declined by hysteresis, starved by the record phase, never considered -- from the flags.
 
-    They ask for three different responses: lower ``min_band_share``, reconsider the order or
-    the two triggers, or run a longer conversation. A row that reported one number for all three
-    would send a reader to the wrong knob, and the run that produced this counter reported *no*
-    number for any of them.
+    They ask for three different responses: lower ``min_band_share``, align the two triggers (or
+    accept that a row asked for two lines is a row whose halves fire apart), or run a longer
+    conversation. A row that reported one number for all three would send a reader to the wrong
+    knob, and the run that produced this counter reported *no* number for any of them.
+
+    The three are still three after the alignment, which is what this pins. A reader of the
+    aligned row who sees ``USERHELD`` must not be able to confuse it with the record phase having
+    eaten the prompt, and a reader of a split row who sees ``USERSTARVED`` must not read it as a
+    band that was too small.
     """
     never = _composed(_IDLE_CEILING)
-    starved = _composed(_GROWING_CEILING)
+    starved = _split_composed(_GROWING_CEILING)
     declined = _composed(
         tool_results=_record_phase(_COMPACTING_CEILING),
         user_turns=_user_phase(_COMPACTING_CEILING, keep_head_user_turns=3, keep_tail_user_turns=4),
@@ -502,7 +567,7 @@ async def test_the_three_reasons_a_composed_user_half_is_silent_read_differently
     )
 
 
-async def test_the_fixture_sits_where_the_three_ceilings_assume_it_does() -> None:
+async def test_the_fixture_sits_where_the_four_ceilings_assume_it_does() -> None:
     """A fixture that drifts across a trigger asserts against a phase that did nothing.
 
     Every test here rests on two sizes -- the conversation's, and the conversation's once the
@@ -520,14 +585,253 @@ async def test_the_fixture_sits_where_the_three_ceilings_assume_it_does() -> Non
     assert after > 0.6 * _COMPACTING_CEILING, "the record line stays crossed on the compacting ceiling"
     assert after > 0.8 * _COMPACTING_CEILING, "and so does the user line, which is what lets both halves act"
     assert after <= _COMPACTING_CEILING, "and the record phase never reaches for its fallback there"
-    assert after < 0.8 * _NARROW_CEILING < before, "the narrow ceiling's user line sits between the two sizes"
+    assert after < 0.8 * _NARROW_CEILING < before, "the narrow ceiling's split user line sits between the two sizes"
     assert 0.9 * _NARROW_CEILING > before > 0.6 * _NARROW_CEILING, "where a record-less pass is still waiting"
+    assert after <= 0.6 * _SHARED_LINE_CEILING < before, (
+        "the headline ceiling's *shared* line sits between them, which is the whole of what "
+        "makes that test bite: a user half judged against the size the pass began with fires "
+        "there and one judged against what the record phase left does not"
+    )
+    assert before < 0.8 * _SHARED_LINE_CEILING, (
+        "and the user row's own line is above the fixture entirely, so the same ceiling says "
+        "'the composed row's user half fires where its own row's would not'"
+    )
+    assert after <= _SHARED_LINE_CEILING, "no fallback there either"
     assert before < 0.6 * _IDLE_CEILING, "and neither line is anywhere near on the idle one"
     assert before < 0.95 * _COMPACTING_CEILING, (
-        "the 0.95 trigger one test below sets has to sit above the fixture's *uncompacted* size. "
-        "The starvation counter asks whether the prompt would clear the user line with what the "
-        "record phase removed still in it, and that question is answered by this margin"
+        "the 0.95 line one test below sets has to sit above the fixture's *uncompacted* size, "
+        "because that is the size the user half is judged against: below it the half declines "
+        "at its trigger, which is what that test reads"
     )
+
+
+async def _sizes_at(ceiling: int) -> tuple[int, int, int]:
+    """Return what one pass of the composed row, the record row and the user row each leave.
+
+    Args:
+        ceiling: The shared ceiling all three are built against.
+
+    Returns:
+        Included tokens after the composed pass, after the record pass and after the user pass.
+    """
+    both = _conversation()
+    tool_only = _conversation()
+    user_only = _conversation()
+    await _composed(ceiling)(both)
+    await _record_phase(ceiling)(tool_only)
+    await _user_phase(ceiling)(user_only)
+    return _size(both), _size(tool_only), _size(user_only)
+
+
+async def test_both_halves_act_when_only_the_size_the_pass_began_with_clears_the_shared_line() -> None:
+    """The headline, on the one ceiling where sequential judging and this pass disagree.
+
+    The shared line here is 16,800. The conversation is 18,937 and the record phase leaves
+    16,613, so a user half asked "is the prompt over the line?" *after* the record phase has
+    acted is being asked about 16,613 and answers no -- and the composed row is then the record
+    row with a summarizer attached, which is what it shipped as, first at two fractions and then
+    at one shared fraction judged sequentially. Asked about the size the pass began with it
+    answers yes, and that is this test.
+
+    Written to fail on the regression rather than to describe the feature: hand the user phase a
+    freshly read count in ``__call__`` and this is a row with ``USERCOMPACT`` at zero and
+    ``USERUNDER`` at one, on a conversation whose band is a third of the prompt.
+    """
+    strategy = _composed(_SHARED_LINE_CEILING)
+    messages = _conversation()
+    shared_line = int(_SHARED_LINE_CEILING * strategy.user_trigger_fraction)
+    entry = _size(_conversation())
+    post_record = _conversation()
+    assert await _record_phase(_SHARED_LINE_CEILING)(post_record) is True
+    assert _size(post_record) <= shared_line < entry, (
+        "the fixture has to straddle the line or this proves nothing: the record phase's "
+        "removals must be what would take the prompt under the line the user half reads"
+    )
+
+    assert await strategy(messages) is True
+
+    assert strategy.records_found == 1, "the record phase acted"
+    assert "x" * 100 not in _rendered(messages), "and dropped the tool payload"
+    assert strategy.user_compactions == 1, "and the user half acted on the same pass, not the next one"
+    assert "Turn 4:" not in _rendered(messages), "and replaced the band"
+    assert (strategy.user_passes_below_trigger, strategy.user_passes_declined) == (0, 0), (
+        "neither under its line nor holding back: it was consulted, and it acted"
+    )
+    assert strategy.user_passes_starved == 0, "nothing was taken out of its reach to report"
+    assert _size(messages) < _size(post_record), "and the pass removed what the record phase alone does not"
+
+
+async def test_the_band_is_weighed_against_the_prompt_as_it_now_stands() -> None:
+    """The number the pass-entry reading deliberately does *not* decide, and why it matters.
+
+    One reading of the prompt decides whether each half acts. It does not decide what a pass
+    costs: ``min_band_share`` weighs the band against the prompt the pass would rewrite, and that
+    prompt is the one in front of the user half, after the record phase. Handing the stale entry
+    size to that check as well would make every band look like a smaller share than it is and
+    decline passes worth running -- the same suppression the pass-entry trigger exists to remove,
+    arriving through the hysteresis instead of through the trigger.
+
+    The fixture is sized so the two denominators disagree: the band is 6,174 tokens, which is
+    37.2% of the 16,613 the record phase leaves and 32.6% of the 18,937 the conversation starts
+    at. At a share of 0.35 the composed row's user half fires and the same strategy alone, on the
+    same conversation, declines. That pair is also the replacement for an order argument that
+    went stale -- "the phase that removes less goes first" used to be about protecting the user
+    half's trigger, and what running the record phase first actually buys now is a band that is a
+    larger share of a smaller prompt.
+
+    Self-guarding against fixture drift: a band that fell under 0.35 of the post-record size
+    fails the first half of this, and one that rose over 0.35 of the entry size fails the second.
+    """
+    share = 0.35
+    composed_messages = _conversation()
+    composed = _composed(user_turns=_user_phase(min_band_share=share))
+    alone_messages = _conversation()
+    alone = _user_phase(min_band_share=share)
+
+    assert await composed(composed_messages) is True
+    assert await alone(alone_messages) is False
+
+    assert composed.user_compactions == 1, "the band clears the share against the prompt the pass would rewrite"
+    assert "Turn 4:" not in _rendered(composed_messages)
+    assert (alone.user_compactions, alone.user_passes_declined) == (0, 1), (
+        "and does not clear it against the larger prompt the same conversation starts at, which "
+        "is what the stale reading would have weighed it against"
+    )
+    assert "Turn 4:" in _rendered(alone_messages)
+
+
+async def test_the_composed_row_leaves_less_behind_than_either_half_alone() -> None:
+    """The claim the row exists to make, in tokens, at both ceilings that fire it.
+
+    A composition that quietly ran one half would still return True and still shrink the
+    conversation; what it could not do is beat the row that reaches that half. Asserted at two
+    ceilings because they fail differently: at the compacting one all three rows act and the
+    composed row has to beat two working rows, and at the headline one the user row does not act
+    at all -- which is the cost of aligning downward, stated in tokens rather than in prose.
+    """
+    composed_low, tool_low, user_low = await _sizes_at(_COMPACTING_CEILING)
+    composed_high, tool_high, user_high = await _sizes_at(_SHARED_LINE_CEILING)
+    entry = _size(_conversation())
+
+    assert tool_low < entry and user_low < entry, "both single rows act at the compacting ceiling"
+    assert composed_low < min(tool_low, user_low), (
+        "so the composed row there is beating two rows that each did their own half's work"
+    )
+
+    assert tool_high < entry, "the record row acts at the headline ceiling"
+    assert user_high == entry, (
+        "and the user row does not: its own 0.8 line is above the whole fixture. That is the "
+        "price of aligning down -- the composed row's user half fires where its own row's does "
+        "not, and the two rows are that much less alike"
+    )
+    assert composed_high < min(tool_high, user_high)
+
+
+async def test_the_aligned_row_reports_no_starvation_on_the_run_that_starves_the_split_one() -> None:
+    """``USERSTARVED`` reads zero when both halves fire, and it reads zero for a reason.
+
+    The same twenty-pass fixture under both configurations. The split row is the measured defect:
+    the record phase acts at 0.6, the prompt never reaches 0.8, and the user half is never
+    consulted. The aligned row consults it on every pass the record phase acts on, because that
+    is what one line means -- so there is no pass on which the record phase removes anything the
+    user half was not offered, the quantity the counter is decided against stays at zero, and so
+    does the counter.
+
+    The zero is asserted together with the quantity underneath it on purpose. A counter that
+    reads zero because the row worked and a counter that reads zero because it stopped counting
+    are the same number, and this package has shipped the second one twice.
+    """
+    aligned = _composed(_GROWING_CEILING)
+    split = _split_composed(_GROWING_CEILING)
+
+    passes = await _grow_composed(aligned, 20)
+    await _grow_composed(split, 20)
+
+    assert aligned.records_found == 1, "the record phase acted on the aligned row"
+    assert aligned.user_compactions > 0, "and so did the user half, which is the whole claim"
+    assert aligned.tokens_removed_by_record_phase > 0, (
+        "the record phase removed something, or the zero below is vacuous"
+    )
+    assert aligned.tokens_removed_out_of_user_reach == 0, (
+        "and none of it on a pass the user half was not consulted on, which is why the zero is "
+        "structural rather than a property of this fixture"
+    )
+    assert aligned.user_passes_starved == 0
+    assert len(passes) == 20
+
+    assert (split.user_compactions, split.records_found) == (0, 1), "the same run with two lines is the old row"
+    assert split.user_passes_starved > 0, "and it still says so"
+
+
+async def test_a_half_run_as_its_own_row_reads_its_own_trigger_before_and_after_composing() -> None:
+    """The alignment is a reading the composition takes, not a setting it writes.
+
+    ``tool_summary_anchored`` and ``user_summary_anchored`` are rows in the same table as the
+    composed one, and every archived number for them was produced by a strategy reading its own
+    ``trigger_fraction`` off the conversation in front of it. A composition that reconfigured the
+    objects it was handed -- or a shared line implemented by assigning one -- would change those
+    rows too, silently, and only in runs that happened to select all three.
+
+    So the same instance is run as its own row, then as a phase, then as its own row again. The
+    ceiling is the headline one, where its own line is above the fixture and the shared line is
+    below it, so the two readings give opposite answers and a leak would be loud.
+    """
+    user_phase = _user_phase(_SHARED_LINE_CEILING)
+    record_phase = _record_phase(_SHARED_LINE_CEILING)
+    standalone_first = _conversation()
+
+    assert await user_phase(standalone_first) is False, "0.8 of this ceiling is above the fixture"
+    assert user_phase.user_passes_below_trigger == 1
+    assert "Turn 4:" in _rendered(standalone_first), "so the band is untouched"
+
+    composed_messages = _conversation()
+    assert await _composed(tool_results=record_phase, user_turns=user_phase)(composed_messages) is True
+    assert user_phase.user_compactions == 1, "the same object, judged at the record half's line, fires"
+
+    standalone_again = _conversation()
+    assert await user_phase(standalone_again) is False, "and is unchanged as its own row afterwards"
+    assert user_phase.user_passes_below_trigger == 2
+    assert "Turn 4:" in _rendered(standalone_again)
+    assert user_phase.trigger_fraction == DEFAULT_USER_TRIGGER_FRACTION, "nothing wrote to the object"
+
+    standalone_record = _conversation()
+    assert await record_phase(standalone_record) is True, "and the row the line was borrowed from is itself"
+    assert record_phase.trigger_fraction == DEFAULT_TRIGGER_FRACTION
+
+
+def test_the_composed_row_takes_its_one_line_from_the_record_half() -> None:
+    """Which of the two fractions is shared, and what a sweep of it moves.
+
+    Aligning to the record half rather than to the user half is the direction that keeps the
+    record askable: the model writes it, it degrades with the bulk it is given, and the
+    middleware that asks reads the same prompt -- so the alignment can only go down. Reading it
+    off the record half rather than storing a constant is what keeps a ``--trigger-fraction``
+    sweep moving both halves of this row together instead of splitting them apart again at every
+    value but the default.
+    """
+    default = _composed()
+    swept = _composed(tool_results=_record_phase(trigger_fraction=0.35), user_turns=_user_phase())
+
+    assert default.tool_results.trigger_fraction == DEFAULT_TRIGGER_FRACTION
+    assert default.user_trigger_fraction == DEFAULT_TRIGGER_FRACTION, "one line, and it is the record half's"
+    assert default.user_turns.trigger_fraction == DEFAULT_USER_TRIGGER_FRACTION, (
+        "while the object keeps the fraction its own row is measured at"
+    )
+    assert swept.user_trigger_fraction == 0.35, "a sweep of the record row's trigger moves both halves of this one"
+
+
+def test_a_user_trigger_fraction_outside_the_unit_interval_is_refused() -> None:
+    """The bounds the user half sets on its own trigger, kept where the line is overridden.
+
+    Zero would judge the user half over on an empty conversation, where the band is empty and
+    the only thing a pass can produce is a summarizer call; above one it can never fire, which is
+    a composed row whose user half is off with nothing saying so. Refused here for the same two
+    reasons the strategy refuses them, because a line supplied from outside is still that line.
+    """
+    with pytest.raises(ValueError, match="user_trigger_fraction"):
+        _composed(user_trigger_fraction=0.0)
+    with pytest.raises(ValueError, match="user_trigger_fraction"):
+        _composed(user_trigger_fraction=1.5)
 
 
 async def test_the_two_halves_compact_two_halves_of_one_conversation() -> None:
@@ -565,23 +869,28 @@ async def test_the_two_halves_compact_two_halves_of_one_conversation() -> None:
 async def test_the_record_phase_runs_before_the_user_phase() -> None:
     """The order, asserted where it is decided rather than inferred from an outcome.
 
-    It is not arbitrary. The record phase's trigger is the lower of the two and the middleware
-    that asks the model for a record reads the same size, so a user phase that ran first and
-    removed the majority share of the prompt would not delay the record -- it would take the
-    conversation below the line that asks for one at all, and the row's tool half would report
-    a model that never complied.
+    It is not arbitrary, and the reason that survives the shared line is the one about the next
+    call rather than this one. Both phases' removals are permanent, so a user phase that ran
+    first and removed the majority share of the prompt would hand the middleware -- which reads
+    the conversation on the next call, not this pass's entry size -- a prompt already below the
+    line that asks for a record at all, and the row's tool half would report a model that never
+    complied.
+
+    Spied on ``compact_against`` rather than on ``__call__``, because that is what a pass calls
+    now: the composition reads the size and the line once and hands both to each half, and a spy
+    on the entry point a *row* uses would record nothing at all.
     """
     order: list[str] = []
 
     class _RecordSpy(ToolResultAnchoredSummarizationCompactionStrategy):
-        async def __call__(self, messages: list[Message]) -> bool:
+        async def compact_against(self, messages: list[Message], *, prompt_tokens: int, trigger_tokens: int) -> bool:
             order.append("record")
-            return await super().__call__(messages)
+            return await super().compact_against(messages, prompt_tokens=prompt_tokens, trigger_tokens=trigger_tokens)
 
     class _UserSpy(UserTurnAnchoredSummarizationCompactionStrategy):
-        async def __call__(self, messages: list[Message]) -> bool:
+        async def compact_against(self, messages: list[Message], *, prompt_tokens: int, trigger_tokens: int) -> bool:
             order.append("user")
-            return await super().__call__(messages)
+            return await super().compact_against(messages, prompt_tokens=prompt_tokens, trigger_tokens=trigger_tokens)
 
     strategy = _composed(
         tool_results=_RecordSpy(max_input_tokens=_COMPACTING_CEILING, tokenizer=TOKENIZER),
@@ -596,25 +905,46 @@ async def test_the_record_phase_runs_before_the_user_phase() -> None:
     )
 
 
-async def test_the_order_is_what_decides_which_half_acts_on_a_narrow_ceiling() -> None:
-    """The consequence of the order, on the ceiling where the two orders disagree.
+async def test_even_two_lines_do_not_starve_a_half_within_one_pass() -> None:
+    """The ceiling the old order argument was made on, where the argument has stopped applying.
 
-    The user line sits between the conversation's size and its size once the record phase has
-    acted, so exactly one half can fire. Running the record phase first spends the pass on the
-    tool half and reports the user half as starved; running it the other way round would spend
-    the pass on the user half -- and would then leave the prompt below the record phase's own
-    trigger, which is the outcome the order exists to prevent.
+    0.8 of this ceiling, 17,600, sits between the conversation's 18,937 and the 16,613 the record
+    phase leaves. On the row this class shipped as that was the whole story: the record phase
+    spent the pass, the prompt dropped under 17,600, the user half re-read the size and declined,
+    and the pass was reported starved. It is what "the order decides which half acts" meant.
+
+    Pass-entry judging removes that from the split row as well as from the aligned one, and that
+    is worth a test of its own rather than a line in a docstring: 18,937 is over both lines when
+    the pass begins, so both halves act at either fraction. What is left of starvation is a
+    statement across passes -- a record phase whose earlier removals are missing from a later
+    pass's entry reading -- and the growing fixture is where that is tested.
+
+    The two rows are asserted to reach the same place here, which is the point: the fraction a
+    half is read at stops mattering once every half is read at the same size.
     """
-    strategy = _composed(_NARROW_CEILING)
-    messages = _conversation()
+    split = _split_composed(_NARROW_CEILING)
+    split_messages = _conversation()
+    aligned = _composed(_NARROW_CEILING)
+    aligned_messages = _conversation()
 
-    assert await strategy(messages) is True
+    assert await split(split_messages) is True
+    assert await aligned(aligned_messages) is True
 
-    assert strategy.groups_kept_uncovered == 0, "the record phase acted"
-    assert "x" * 100 not in _rendered(messages)
-    assert strategy.user_compactions == 0, "and left no room for the user phase's own trigger"
-    assert strategy.user_passes_starved == 1
-    assert "Turn 4:" in _rendered(messages), "so the user band is exactly as it was found"
+    assert (split.groups_kept_uncovered, aligned.groups_kept_uncovered) == (0, 0), "the record phase acted on both"
+    assert "x" * 100 not in _rendered(split_messages)
+    assert "x" * 100 not in _rendered(aligned_messages)
+
+    assert split.user_compactions == 1, "the higher line was over the prompt when the pass began"
+    assert aligned.user_compactions == 1
+    assert (split.user_passes_starved, aligned.user_passes_starved) == (0, 0), (
+        "and nothing was taken out from under either, because the size that decided was read first"
+    )
+    assert "Turn 4:" not in _rendered(split_messages)
+    assert "Turn 4:" not in _rendered(aligned_messages)
+    assert _size(split_messages) == _size(aligned_messages), (
+        "same conversation, same two halves, same result: the fraction each half was read at "
+        "stopped deciding anything the moment both were read at one size"
+    )
 
 
 async def test_a_user_half_that_would_not_have_fired_anyway_is_not_counted_as_starved() -> None:
@@ -652,13 +982,15 @@ async def test_the_user_half_still_fires_while_the_record_half_is_waiting_for_a_
 
 
 async def test_configuration_reaches_each_half_without_reaching_the_other() -> None:
-    """Two rows' worth of knobs on one object, and no shared trigger between them.
+    """Two rows' worth of knobs on one object, and the trigger is the only one they share.
 
     The composed row is only readable beside the two single rows if a sweep of either row's
-    flags moves this row's matching half and nothing else. The two settings chosen here are the
-    ones that would be most tempting to unify -- a coverage share and a pair of user anchors --
-    and they are asserted on behaviour rather than on attributes, because a constructor that
-    stored them and a pass that read one number for both would pass an attribute check.
+    flags moves this row's matching half and nothing else. The trigger is the documented
+    exception and is tested as such elsewhere; everything else has to stay separate. The two
+    settings chosen here are the ones that would be most tempting to unify with it -- a coverage
+    share and a pair of user anchors -- and they are asserted on behaviour rather than on
+    attributes, because a constructor that stored them and a pass that read one number for both
+    would pass an attribute check.
     """
     # A record naming three of the four tool groups, so the fourth is covered at a share of 0
     # and not at the default -- which is what makes the coverage assertion below about the
@@ -690,21 +1022,24 @@ async def test_configuration_reaches_each_half_without_reaching_the_other() -> N
     )
 
 
-async def test_the_two_halves_keep_their_own_triggers() -> None:
-    """No shared threshold, which is the one thing composing here deliberately does not do.
+async def test_a_caller_can_set_the_two_halves_apart_again_and_then_they_fire_apart() -> None:
+    """The escape hatch, and the behaviour it restores.
 
-    ``TokenBudgetComposedStrategy`` gives its parts one ceiling because its family holds size
-    fixed to compare orderings of deletion. Here the sizes the two phases reach are the
-    measurement, and a shared trigger would fire both halves at one line that neither single
-    row is measured at -- so the composed row would stop being comparable with either.
+    One line is the default rather than the only option. A caller sweeping the two triggers
+    against each other -- which is what produced the finding this class was rewritten for -- has
+    to be able to ask for two, and what they then get is a row whose halves fire at their own
+    lines. Asserted on behaviour rather than on attributes, because a constructor that stored the
+    fraction and a pass that ignored it would satisfy an attribute check.
     """
     strategy = _composed(
         tool_results=_record_phase(trigger_fraction=0.2, fallback_fraction=0.99),
         user_turns=_user_phase(trigger_fraction=0.95),
+        user_trigger_fraction=0.95,
     )
 
     assert strategy.tool_results.trigger_fraction == 0.2
     assert strategy.user_turns.trigger_fraction == 0.95
+    assert strategy.user_trigger_fraction == 0.95, "the composition was told to read the higher line"
 
     messages = _conversation()
     assert await strategy(messages) is True

@@ -30,10 +30,15 @@ What is here:
   once per turn. It touches nothing the other three touch, so the rows stay comparable.
 - :class:`ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy` runs those last two
   over one conversation, the record phase first. It is the only entry here that composes
-  rather than compacts: it owns no selection rule and removes nothing itself, and what it adds
-  is an order, one re-read of the conversation between the phases, and the attribution of a
-  silent second phase: which passes the first phase's removals kept under the second's trigger,
-  as against the passes the second phase declined for its own reasons.
+  rather than compacts: it owns no selection rule and removes nothing itself. What it adds is
+  an order; one line for both halves, taken from the record phase's trigger; one reading of the
+  prompt, taken before either phase acts, which is what makes that line more than a shared
+  number -- a half that would have fired on the size the pass began with fires whatever the
+  other half has already removed; one re-read of the conversation between the phases, for the
+  in-place rewrites the record phase's fallback makes; and the attribution of a silent second
+  phase, which on a row whose halves have been set apart again says which passes the first
+  phase's removals kept under the second's trigger, as against the passes the second phase
+  declined for its own reasons.
 - :func:`set_preserved` and :func:`is_preserved` carry one annotation between the two: a
   message no strategy may shorten, drop or shed. It exists because the record is a tool
   result, the anchored strategy trims tool results, and for a while it trimmed the record --

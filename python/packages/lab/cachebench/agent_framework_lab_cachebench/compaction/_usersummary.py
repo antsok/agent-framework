@@ -182,6 +182,13 @@ logger = logging.getLogger(__name__)
 #: asks a summarizer for prose whose quality is not what the row measures, and pays instead in
 #: a broken cached prefix, so it wants to fire as late as it can while still leaving the
 #: conversation room to continue.
+#:
+#: **This is the single row's line, and the composed row does not use it.**
+#: :class:`~._composed.ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy` judges this
+#: strategy at the record strategy's fraction instead, because the two being apart there is the
+#: record phase removing the tool payload at 0.6 and holding the prompt under 0.8 for the rest
+#: of the run -- a composed row whose user half never fires. Nothing about this constant or the
+#: strategy that reads it changes; the composition supplies the line rather than the object.
 DEFAULT_USER_TRIGGER_FRACTION: Final[float] = 0.8
 
 #: Share of the included prompt the band must be worth before a pass may run.
@@ -502,7 +509,8 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
         On a composed row this number is the one
         :attr:`~._composed.ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy.user_passes_starved`
         subdivides: of the passes counted here, the starved ones are those the phase in front
-        took below the line.
+        took below the line. That subset is empty on a composed row judging both halves at one
+        line, where every pass counted here is a conversation that had not grown yet.
         """
         return self._below_trigger
 
@@ -547,6 +555,15 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
         do for its projection, on the ground that a rollback missing one field is a silent
         wrong answer rather than a loud one.
 
+        **The two numbers a pass is judged by are read here, and a composition reads them for
+        it.** The size and the line this method compares are both taken off the conversation in
+        front of it, which is what a row does and what every number archived against this row
+        was produced by. :meth:`compact_against` is the same pass with that pair supplied, and
+        is how
+        :class:`~._composed.ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy` judges
+        this half against the size its pass began with rather than against whatever the half in
+        front of it has already removed.
+
         Args:
             messages: The conversation, mutated in place.
 
@@ -560,13 +577,43 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
             return False
         annotate_message_groups(messages)
         annotate_token_counts(messages, tokenizer=self.tokenizer)
-        prompt_tokens = included_token_count(messages)
-        if prompt_tokens <= int(self.max_input_tokens * self.trigger_fraction):
+        return await self.compact_against(
+            messages,
+            prompt_tokens=included_token_count(messages),
+            trigger_tokens=int(self.max_input_tokens * self.trigger_fraction),
+        )
+
+    async def compact_against(self, messages: list[Message], *, prompt_tokens: int, trigger_tokens: int) -> bool:
+        """Run one pass, judged against a size and a line the caller read rather than this pass.
+
+        The seam a composition needs and a row does not, and the whole of what it changes is
+        *whether* the pass runs -- everything a running pass then does is read off the
+        conversation as it now stands. :meth:`__call__` supplies the pair it read itself, so a
+        row's behaviour is exactly what it was.
+
+        **The hysteresis is deliberately not judged against ``prompt_tokens``.** The share
+        :meth:`_worth_compacting` takes is a share of what a pass would *cost*, which is the
+        prompt behind the edit as it now stands, so it is taken against a fresh count. Judging
+        it against a larger stale number would make every band look like a smaller share of the
+        prompt than it is and decline passes that are worth running -- which is the same
+        suppression the pass-entry trigger exists to remove, arriving by the other route. The
+        two counts are equal when :meth:`__call__` is the caller.
+
+        Args:
+            messages: The conversation, mutated in place. Already grouped and token-annotated
+                by the caller, which is what lets the two readings differ at all.
+            prompt_tokens: Included tokens the trigger is judged against.
+            trigger_tokens: Included tokens the prompt must exceed for a pass to run.
+
+        Returns:
+            True if the outgoing messages changed.
+        """
+        if prompt_tokens <= trigger_tokens:
             self._below_trigger += 1
             return False
 
         band = self._band(messages)
-        if not self._worth_compacting(messages, band, prompt_tokens):
+        if not self._worth_compacting(messages, band, included_token_count(messages)):
             self._declined += 1
             return False
 
