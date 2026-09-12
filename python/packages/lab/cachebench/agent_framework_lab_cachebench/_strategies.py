@@ -24,6 +24,14 @@ delete things, which holds size fixed and isolates the choice of what to discard
 ``token_budget_fallback`` composes nothing at all, so its removals are pure oldest-first
 eviction: the floor any ordering has to beat to be worth its complexity.
 
+``tool_and_user_summary_anchored`` is a composition of a third kind, and deliberately not a
+member of that family. It runs ``tool_summary_anchored`` and then ``user_summary_anchored``
+over one conversation, each keeping its own trigger, so the two do *not* meet at a shared
+ceiling: what the row is for is how far the two halves reach together, and normalising their
+sizes away is exactly what the ``token_budget_*`` family does. Its parts are built by the same
+two builders the single rows use, so a sweep of any of their flags moves this row's half the
+way it moves theirs.
+
 Budgets are sized relative to the transcript rather than to a model's real context window.
 A 20-turn transcript never approaches a 128k window, so a real window would mean no
 strategy ever fires and the benchmark would measure nothing.
@@ -59,6 +67,7 @@ from .compaction import (
     AnchoredCompactionStrategy,
     MinimumGainAnchoredCompactionStrategy,
     ToolResultAnchoredSummarizationCompactionStrategy,
+    ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy,
     UserTurnAnchoredSummarizationCompactionStrategy,
 )
 
@@ -311,7 +320,7 @@ def _build_anchored_min_gain(options: StrategyOptions) -> CompactionStrategy:
     )
 
 
-def _build_tool_summary_anchored(options: StrategyOptions) -> CompactionStrategy:
+def _build_tool_summary_anchored(options: StrategyOptions) -> ToolResultAnchoredSummarizationCompactionStrategy:
     """Return the record-then-drop strategy.
 
     Needs no summarizer client of its own: the recording is done by the agent's own model
@@ -336,7 +345,7 @@ def _build_tool_summary_anchored(options: StrategyOptions) -> CompactionStrategy
     )
 
 
-def _build_user_summary_anchored(options: StrategyOptions) -> CompactionStrategy:
+def _build_user_summary_anchored(options: StrategyOptions) -> UserTurnAnchoredSummarizationCompactionStrategy:
     """Return the strategy that compacts the user's own turns.
 
     The mirror of ``tool_summary_anchored`` on the other half of the conversation, and the pair
@@ -365,6 +374,32 @@ def _build_user_summary_anchored(options: StrategyOptions) -> CompactionStrategy
         keep_head_user_turns=options.keep_head_user_turns,
         keep_tail_user_turns=options.keep_tail_user_turns,
         trigger_fraction=options.user_trigger_fraction,
+    )
+
+
+def _build_tool_and_user_summary_anchored(options: StrategyOptions) -> CompactionStrategy:
+    """Return both summarising strategies over one conversation, the record one first.
+
+    Built from the same two builders the single rows use rather than from two fresh
+    constructor calls, which is what makes the comparison the row exists for legitimate: a
+    sweep moving ``--coverage-share`` or ``--user-trigger-fraction`` moves this row's half in
+    exactly the way it moves the corresponding single row, and neither half can drift into a
+    configuration no other row was measured at. It is also the whole of how the two keep their
+    own settings -- there is no shared trigger here, and ``compaction/_composed`` says why one
+    would answer a different question.
+
+    Selecting this is selecting both halves' costs together. The record half spends an agent
+    turn writing its record and the user half spends a summarizer call, so a cell running this
+    beside ``none`` is comparing a row with two extra call types against a row with none.
+
+    Raises:
+        ValueError: If no summarizer client was configured, from the user-band half. The
+            record half needs none: its record is written by the agent's own model.
+    """
+    return ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy(
+        tokenizer=options.tokenizer,
+        tool_results=_build_tool_summary_anchored(options),
+        user_turns=_build_user_summary_anchored(options),
     )
 
 
@@ -516,6 +551,7 @@ STRATEGY_BUILDERS: Final[dict[str, Callable[[StrategyOptions], CompactionStrateg
     "anchored": _build_anchored,
     "tool_summary_anchored": _build_tool_summary_anchored,
     "user_summary_anchored": _build_user_summary_anchored,
+    "tool_and_user_summary_anchored": _build_tool_and_user_summary_anchored,
     "anchored_no_assistant": _build_anchored_no_assistant,
     "anchored_min_gain": _build_anchored_min_gain,
     "sliding_window": _build_sliding_window,
@@ -539,11 +575,54 @@ STRATEGY_BUILDERS: Final[dict[str, Callable[[StrategyOptions], CompactionStrateg
 #: point of naming them: the two read as a pair but only one of them calls a summarizer. The
 #: other has the agent's own model write its record through a tool call, so it needs no client
 #: at all, and a rule matching on "summary" would have demanded one from it.
+#:
+#: ``tool_and_user_summary_anchored`` is here because it *contains* the one that needs a
+#: client, and that is the cost of naming rather than deriving: a composed strategy's needs
+#: are its parts' needs unioned, and nothing computes that union for a set written out by
+#: hand. Both readers of this set break when a composed name is left out of it, and neither
+#: breaks loudly. The run's pre-flight would not demand ``--summarizer-provider`` for a cell
+#: that cannot run without one, and ``_build_or_exit`` -- which skips the names in this set
+#: precisely so a missing client is not reported as a bad value -- would build the row with
+#: ``summarizer=None`` and exit saying the *configuration* was rejected, about a flag that
+#: was simply not passed.
 STRATEGIES_NEEDING_SUMMARIZER: Final[frozenset[str]] = frozenset({
     "summarization",
     "token_budget_summarize",
+    "tool_and_user_summary_anchored",
     "user_summary_anchored",
 })
+
+
+#: Strategies whose run installs the recall middleware, and so forces a recall call.
+#:
+#: Named for the reason :data:`STRATEGIES_NEEDING_SUMMARIZER` is named, and it is the same
+#: hazard one category along: ``--record-max-tokens`` and ``--record-target-tokens`` are
+#: settings of a call that only these rows make, and the warning about the first being above
+#: the run's output reservation is printed from a name test. A composed row that runs the
+#: record strategy as a phase makes that call and inherits that hazard, so leaving it out of
+#: this set would silence a warning about a configuration the run is genuinely in.
+#:
+#: What actually installs the middleware is ``_live.run_live``, which finds the record
+#: strategy inside whatever was built rather than matching a name -- see
+#: ``find_nested_strategy``. This set exists only for the checks that run before anything is
+#: built, and a name added to :data:`STRATEGY_BUILDERS` that composes the record strategy
+#: belongs in both places.
+STRATEGIES_FORCING_RECORDS: Final[frozenset[str]] = frozenset({
+    "tool_and_user_summary_anchored",
+    "tool_summary_anchored",
+})
+
+
+def forces_records(names: Iterable[str]) -> bool:
+    """Return whether any of ``names`` has the middleware force a recall call.
+
+    Args:
+        names: Strategy names selected for a run.
+
+    Returns:
+        True when at least one writes a record.
+    """
+    return any(name in STRATEGIES_FORCING_RECORDS for name in names)
 
 
 def needs_summarizer(names: Iterable[str]) -> bool:

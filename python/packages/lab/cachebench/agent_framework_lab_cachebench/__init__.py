@@ -31,6 +31,7 @@ from ._live import (
     UsageRecorder,
     build_live_agent,
     build_live_scenario,
+    find_nested_strategy,
     make_lookup_tool,
     probe_count,
     restore_state,
@@ -77,10 +78,12 @@ from ._records import (
 from ._report import render_summary_table, write_records_jsonl, write_summary_csv
 from ._runner import CallOutcome, ProviderCaller, TurnCaller, run_cell, unsupported_option
 from ._strategies import (
+    STRATEGIES_FORCING_RECORDS,
     STRATEGIES_NEEDING_SUMMARIZER,
     STRATEGY_BUILDERS,
     StrategyOptions,
     build_strategy,
+    forces_records,
     resolve_context_window,
     strategy_names,
 )
@@ -102,6 +105,7 @@ __all__ = [
     "DEFAULT_SYSTEM_TOKENS",
     "PROVIDER_SPECS",
     "SCHEMA_VERSION",
+    "STRATEGIES_FORCING_RECORDS",
     "STRATEGIES_NEEDING_SUMMARIZER",
     "STRATEGY_BUILDERS",
     "TOKENIZER_NAMES",
@@ -155,6 +159,8 @@ __all__ = [
     "common_message_prefix",
     "cost_of",
     "fetch_openrouter_pricing",
+    "find_nested_strategy",
+    "forces_records",
     "group_by_cell",
     "live_main",
     "main",

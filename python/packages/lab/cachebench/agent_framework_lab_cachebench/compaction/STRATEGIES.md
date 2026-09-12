@@ -1,9 +1,10 @@
 # The strategies in this package
 
-Four compaction strategies and one supporting middleware, written against what the
-`cachebench` benchmark measured rather than against intuition. This file says what each one
-does, why it is shaped that way, and the short version of when it earns its keep. Full numbers
-live in the benchmark's `RESULTS.md`; only enough appears here to make each claim checkable.
+Five compaction strategies and one supporting middleware, the fifth of them a composition of two
+of the others, written against what the `cachebench` benchmark measured rather than against
+intuition. This file says what each one does, why it is shaped that way, and the short version of
+when it earns its keep. Full numbers live in the benchmark's `RESULTS.md`; only enough appears
+here to make each claim checkable.
 
 ## The problem all of them are shaped by
 
@@ -392,8 +393,9 @@ results, the run's own assumed 602-token replies, and a stub summarizer, so no m
 The size of the summary barely matters: 500, 1,000 and 2,000 tokens move the result by 0.6
 points, because what it replaces is around 75,000. And the floor at 41% is not this strategy
 failing — it is the two halves it may not touch, the assistant's replies (~43,000 tokens) plus
-the tool payload (~22,000). Reaching below it needs this row *composed with* a tool-side one,
-which is the obvious next measurement and is not made here.
+the tool payload (~22,000). Reaching below it needs this row *composed with* a tool-side one.
+That composition now exists — `ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy`,
+below — and has not been run, so this floor is still the last thing measured on the question.
 
 **When it does not work.** On a conversation whose bulk is tool output rather than user text,
 which is the shape `tool_summary_anchored` was built for; on short conversations, where the band
@@ -408,6 +410,86 @@ answers and its accuracy columns say only that it did not disturb the other half
 permanent conversation history; here that output stands in for *the user's own turns*, which is
 the half a model treats as instructions. Point it only at a service trusted as much as the
 primary model.
+
+---
+
+## `ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy`
+
+The two strategies above, over one conversation. It is the only entry here that composes rather
+than compacts: it owns no selection rule and removes nothing itself.
+
+**Why it exists.** Each of its parts is capped by the share of the conversation it is allowed to
+touch, and both say so. The record strategy works on the tool half — a seventh of run 43's
+prompt — and the user-turn strategy's offline replay bottomed out at 41% of the window, a floor
+that is exactly "the assistant replies and the tool payload it may not touch". The section above
+names composing the two as the obvious next measurement and does not make it. **That measurement
+has still not been made.** Nothing below is a result; it is what the mechanism does, and what a
+run of it would be answering.
+
+**Mechanism.** One pass runs the record strategy, re-reads the conversation, and runs the
+user-turn strategy. It returns True when either did. The two select disjoint messages —
+`group_messages` gives a user message a group of kind `user` and a call-and-result pair a group of
+kind `tool_call`, and each part's rule names exactly one kind — so there is no message both could
+claim and nothing either could supersede twice.
+
+**Order: the record strategy first.** Three reasons, the first of which is the expensive one.
+
+- *The record has to be asked for early.* Its trigger is 0.6 against the user band's 0.8, and the
+  two constants document why they differ: the record degrades with the bulk it is given to read,
+  so it fires early, while the user band pays only in a broken cached prefix and fires as late as
+  it can. `ToolResultRecallMiddleware` reads the same size the strategy does. A user phase running
+  first would shrink the prompt below the line that asks for a record at all, so the row would not
+  have a late record — it would have none, and would report a model that never complied.
+- *The phase that can remove less goes first.* The record phase is capped at the tool share and
+  the user phase at the user share, and on this benchmark's sizing those are a seventh and most of
+  the prompt. The other order takes the prompt from above the user line to below the record line
+  in one step, every pass.
+- *The record strategy's fallback counts group positions.* Running it behind the user phase would
+  have it count a band containing this pass's summary message rather than the turns it replaced,
+  so the fallback's geometry — and what the `tool_summary_anchored` row means — would differ
+  between the composed row and the row it is meant to be read against.
+
+**The two triggers stay separate, which is the opposite of what `TokenBudgetComposedStrategy`
+does.** That family gives every variant one ceiling precisely so that size is held fixed and only
+the ordering of deletion varies. Here the sizes the two phases reach *are* the measurement, and a
+shared trigger would fire both halves at a line neither single row was ever measured at.
+
+**The interference is the token count, and it is made visible rather than removed.** Both parts
+begin by reading the included token count and comparing it with their own trigger, so the second
+sees a number the first moved. The conversation is re-annotated between the phases — forced, when
+the first changed anything, because the record strategy's fallback rewrites tool results in place
+and the counts are cached per message. The order above is chosen so the number moves as little as
+it can. And `user_passes_starved` — the `USERSTARVED:<n>` flag — counts the passes where the
+record phase's own removals took the prompt from above the user phase's line to at or below it.
+That is the one reading of `USERCOMPACT:0` that is not about the user half at all, and without it
+it is indistinguishable from a band that held nothing.
+
+It is reported rather than prevented. Preventing it means overriding a part's trigger, and then
+the composed row's user half fires where no `user_summary_anchored` row fires, which takes the two
+rows the composition exists to be compared with and makes them incomparable.
+
+**It has no ceiling and no fallback of its own,** and returning False does not mean the prompt
+fits — the same as for both its parts. A third shed step here would put a removal in the composed
+row that neither single row can make.
+
+**Counters.** Both parts' counters are readable off the composed object, so one row's flags say
+which half did what: `REC`, `RECORDS`, `FALLBACK`, `RECFALLBACK` and `UNCOVERED` are the record
+half, `USERCOMPACT`, `USERREPLACED` and `USERSUMMFAIL` the user half, and `USERSTARVED` is the
+composition's own.
+
+**The wiring the row needs, and the one that was missing.** The record half is a strategy *and* a
+middleware, and the benchmark installs that middleware for the strategy it finds inside whatever
+it built rather than for an object of that class. A composition is not an instance of its parts,
+so an `isinstance` there leaves a composed row with no middleware and no recall tool: no call is
+pinned, no record is written, the strategy waits and falls back, and the row prints `FALLBACK` —
+which is what a model that refused to comply looks like. Anything embedding these strategies owes
+the same check.
+
+**When it will not help.** Wherever either part is already inert: a conversation with no tool work
+for a record to carry, or one short enough that the band between the user anchors is a turn or
+two. It also spends both parts' costs — an agent turn for the record and a summarizer call for the
+summary — so a cell running it beside the uncompacted control is comparing a row with two extra
+call types against a row with none.
 
 ---
 

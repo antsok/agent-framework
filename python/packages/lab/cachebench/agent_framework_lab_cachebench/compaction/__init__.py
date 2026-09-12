@@ -27,6 +27,11 @@ What is here:
   tail, and it recompacts its own earlier summary when the threshold is crossed again --
   deliberately the opposite of ``_anchored``'s refusal to re-trim, for the reason its module
   docstring gives. It touches nothing the other three touch, so the rows stay comparable.
+- :class:`ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy` runs those last two
+  over one conversation, the record phase first. It is the only entry here that composes
+  rather than compacts: it owns no selection rule and removes nothing itself, and what it adds
+  is an order, one re-read of the conversation between the phases, and a count of the passes
+  where the first phase's removals took the prompt under the second phase's trigger.
 - :func:`set_preserved` and :func:`is_preserved` carry one annotation between the two: a
   message no strategy may shorten, drop or shed. It exists because the record is a tool
   result, the anchored strategy trims tool results, and for a while it trimmed the record --
@@ -59,6 +64,7 @@ from ._anchored import (
     AnchoredCompactionStrategy,
     MinimumGainAnchoredCompactionStrategy,
 )
+from ._composed import ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy
 from ._preserve import (
     PRESERVE_REASON_KEY,
     PRESERVED_KEY,
@@ -113,6 +119,7 @@ __all__ = [
     "MinimumGainAnchoredCompactionStrategy",
     "RecallGate",
     "ToolResultAnchoredSummarizationCompactionStrategy",
+    "ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy",
     "ToolResultRecallMiddleware",
     "UserTurnAnchoredSummarizationCompactionStrategy",
     "any_preserved",

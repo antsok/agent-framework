@@ -34,7 +34,7 @@ import random
 from collections.abc import Awaitable, Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, TypeVar
 
 from agent_framework import (
     Agent,
@@ -109,6 +109,7 @@ __all__ = [
     "UsageRecorder",
     "build_live_agent",
     "build_live_scenario",
+    "find_nested_strategy",
     "make_lookup_tool",
     "make_scope_tools",
     "probe_count",
@@ -123,6 +124,9 @@ __all__ = [
     "unretrieved_facts",
     "wants_client_side_history",
 ]
+
+#: The strategy class :func:`find_nested_strategy` was asked for, so it hands that class back.
+_StrategyT = TypeVar("_StrategyT")
 
 #: How the agent under test is assembled.
 #:
@@ -553,7 +557,8 @@ class LiveOutcome:
     because a flag is read and a column is measured. Non-zero says a row's cost is the price
     of a partial record rather than of the design working, and a mean over seeds cannot be
     taken on a string. Zero on every strategy that keeps no such count, which is all of them
-    but ``tool_summary_anchored``.
+    but ``tool_summary_anchored`` and the composed ``tool_and_user_summary_anchored`` that
+    runs it as a phase -- the count is read off whichever of the two the row installed.
     """
     fallbacks_after_record: int = 0
     """Compaction passes where a record existed and the strategy fell back regardless.
@@ -566,7 +571,7 @@ class LiveOutcome:
     record left behind. Non-zero says part of this row measures the fallback strategy.
 
     Zero on every strategy that keeps no such count, which is all of them but
-    ``tool_summary_anchored``.
+    ``tool_summary_anchored`` and the composed row that runs it as a phase.
     """
     records_in_conversation: int = 0
     """Records the conversation ended up carrying, at the most the strategy saw it hold.
@@ -584,7 +589,7 @@ class LiveOutcome:
     archived flags is what it looks like.
 
     Zero on every strategy that keeps no such count, which is all of them but
-    ``tool_summary_anchored``.
+    ``tool_summary_anchored`` and the composed row that runs it as a phase.
     """
     user_compactions: int = 0
     """Passes where ``user_summary_anchored`` replaced a band of user turns with a summary.
@@ -595,7 +600,7 @@ class LiveOutcome:
     the provider re-reads everything behind it, so two passes are two of those.
 
     Zero on every strategy that keeps no such count, which is all of them but
-    ``user_summary_anchored``.
+    ``user_summary_anchored`` and the composed row that runs it as a phase.
     """
     user_messages_replaced: int = 0
     """User turns the most recent such compaction superseded.
@@ -606,7 +611,7 @@ class LiveOutcome:
     finding from one that compacted seven times and replaced ten.
 
     Zero on every strategy that keeps no such count, which is all of them but
-    ``user_summary_anchored``.
+    ``user_summary_anchored`` and the composed row that runs it as a phase.
     """
     record_text: str = ""
     """The recall record the run produced, exactly as the model wrote it.
@@ -614,7 +619,8 @@ class LiveOutcome:
     Read back out of the finished conversation rather than captured while it was made, so
     nothing about the prompts, the token accounting or the cost depends on whether anyone
     wants to look at it. Empty when the run took no record, which is every strategy but
-    ``tool_summary_anchored`` and any run of that one where the model never complied.
+    ``tool_summary_anchored`` and the composed row that runs it, and any run of either where
+    the model never complied.
 
     Here because the counter above says only *how many* groups a record failed to cover, and
     the question that follows is always what the record actually said. Nothing reads this by
@@ -819,6 +825,52 @@ class LiveOutcome:
         return tuple(probe.scope for probe in chosen), tuple(probe.answer for probe in chosen)
 
 
+def find_nested_strategy(strategy: Any, kind: type[_StrategyT]) -> _StrategyT | None:
+    """Return ``strategy`` or the first part of it that is an instance of ``kind``.
+
+    **A plain ``isinstance`` here is a silent misconfiguration, not a missing diagnostic.**
+    ``run_live`` installs :class:`~.compaction.ToolResultRecallMiddleware` for the row that
+    records, and that middleware is the half of the design which *asks*: without it no call is
+    ever pinned to the recall tool, so no record is written, so the strategy waits, falls back,
+    and produces a row that looks like a different strategy wearing the selected name. The test
+    used to be ``isinstance``, and a composed strategy is not an instance of its parts -- so
+    from the moment one existed that test answered "is this object of that class" where the
+    wiring needs "does this row run that strategy".
+
+    The walk is over ``strategies``, which is the attribute
+    :class:`~agent_framework._compaction.TokenBudgetComposedStrategy` uses for its parts and
+    which ``compaction/_composed`` adopted for that reason: one name to follow rather than one
+    per composing class. Breadth-first, so the answer is the outermost match rather than one
+    buried inside another composition, and cycle-guarded, because a composition holding itself
+    is a configuration error rather than something to hang on.
+
+    Nothing else is followed. In particular a record strategy's own ``fallback`` is not, and
+    that is the point: the fallback is a strategy this row *degrades into*, not a phase it
+    runs, and treating it as a part would let a search find counters belonging to a strategy
+    the row is only measuring by accident.
+
+    Args:
+        strategy: What the run built, or None for the uncompacted control.
+        kind: The class wanted.
+
+    Returns:
+        The first match in run order, or None when the row has no such part.
+    """
+    seen: set[int] = set()
+    pending: list[Any] = [strategy]
+    while pending:
+        candidate = pending.pop(0)
+        if candidate is None or id(candidate) in seen:
+            continue
+        seen.add(id(candidate))
+        if isinstance(candidate, kind):
+            return candidate
+        parts = getattr(candidate, "strategies", None)
+        if isinstance(parts, Sequence) and not isinstance(parts, (str, bytes)):
+            pending.extend(parts)
+    return None
+
+
 def _strategy_notes(strategy: Any) -> tuple[str, ...]:
     """Return what a strategy reports about its own run, if it reports anything.
 
@@ -847,6 +899,7 @@ def _strategy_notes(strategy: Any) -> tuple[str, ...]:
         ("user_compactions", "USERCOMPACT"),
         ("user_messages_replaced", "USERREPLACED"),
         ("user_summary_failures", "USERSUMMFAIL"),
+        ("user_passes_starved", "USERSTARVED"),
     ):
         value = getattr(strategy, attribute, None)
         if isinstance(value, int) and value:
@@ -1630,13 +1683,20 @@ async def run_live(
     recall_middleware: ToolResultRecallMiddleware | None = None
     # Kept as a narrowed reference rather than re-tested at the end of the run. The counters
     # this outcome reports are read off the strategy object once the conversation is over, and
-    # a second isinstance down there is a second place to keep in step with this one.
-    recording = strategy if isinstance(strategy, ToolResultAnchoredSummarizationCompactionStrategy) else None
-    # The same narrowing for the other summarising strategy, and kept apart from the one above
+    # a second test down there is a second place to keep in step with this one.
+    #
+    # Found rather than isinstance-tested, and that is the whole of what arms a composed row.
+    # A composition is not an instance of its parts, so the plain test this used to be left the
+    # middleware uninstalled for any strategy that merely *contains* the record one: no call
+    # pinned, no record written, the strategy waiting and then falling back, and a row carrying
+    # the composed name while measuring only the half of it that needs no middleware. Nothing
+    # in the table would have said so, because FALLBACK is also what a model that never
+    # complied looks like. See ``find_nested_strategy``.
+    recording = find_nested_strategy(strategy, ToolResultAnchoredSummarizationCompactionStrategy)
+    # The same discovery for the other summarising strategy, and kept apart from the one above
     # rather than folded into a single "does it have counters" test: the two report different
-    # numbers, and a row is only ever one of them, so a shared reference would have to be
-    # re-tested at every use anyway.
-    user_compacting = strategy if isinstance(strategy, UserTurnAnchoredSummarizationCompactionStrategy) else None
+    # numbers, and a composed row is both, so one shared reference could not answer for either.
+    user_compacting = find_nested_strategy(strategy, UserTurnAnchoredSummarizationCompactionStrategy)
     if recording is not None:
         gate = RecallGate()
         # Registered like any other tool, because the harness must know it to run it, and

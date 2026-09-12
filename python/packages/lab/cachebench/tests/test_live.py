@@ -56,6 +56,7 @@ from agent_framework_lab_cachebench import (
     build_live_scenario,
     build_recall_scenario,
     build_strategy,
+    find_nested_strategy,
     make_lookup_tool,
     recommend,
     run_live,
@@ -132,6 +133,7 @@ from agent_framework_lab_cachebench.compaction import (
     AnchoredCompactionStrategy,
     MinimumGainAnchoredCompactionStrategy,
     ToolResultAnchoredSummarizationCompactionStrategy,
+    ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy,
     ToolResultRecallMiddleware,
     UserTurnAnchoredSummarizationCompactionStrategy,
     make_recall_tool,
@@ -1425,6 +1427,305 @@ async def test_a_user_band_summarizer_failure_is_flagged_rather_than_silent() ->
     assert strategy.user_summary_failures == 1
     assert "USERSUMMFAIL:1" in _strategy_notes(strategy)
     assert not [note for note in _strategy_notes(strategy) if note.startswith("USERCOMPACT")]
+
+
+def _composed_strategy(options: StrategyOptions) -> Any:
+    """Return the built ``tool_and_user_summary_anchored`` strategy, for the wiring tests."""
+    strategy = build_strategy("tool_and_user_summary_anchored", options)
+    assert isinstance(strategy, ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy)
+    return strategy
+
+
+def test_the_composed_row_is_built_from_the_same_two_builders_the_single_rows_use() -> None:
+    """Two halves configured apart, from one ``StrategyOptions``, with no shared trigger.
+
+    The composed row is only worth printing beside ``tool_summary_anchored`` and
+    ``user_summary_anchored`` if a sweep of either row's flags moves the matching half of this
+    one and nothing else. A builder that constructed its parts itself would be a second place
+    for a default to live, and the row would drift away from the two it is meant to be read
+    against with nothing saying so.
+    """
+    args = build_parser().parse_args(["azure", "--trigger-fraction", "0.5", "--user-trigger-fraction", "0.75"])
+    options = _strategy_options(args, TOKENIZER, _StubSummarizer())
+
+    strategy = _composed_strategy(options)
+
+    assert strategy.tool_results.trigger_fraction == 0.5
+    assert strategy.user_turns.trigger_fraction == 0.75, "--user-trigger-fraction, not --trigger-fraction"
+    assert strategy.tool_results.max_input_tokens == options.input_budget_tokens
+    assert strategy.user_turns.max_input_tokens == options.input_budget_tokens
+    assert strategy.user_turns.client is options.summarizer
+
+
+def test_the_composed_row_declares_the_summarizer_half_of_it_needs() -> None:
+    """A composed strategy's needs are its parts' needs, and nothing computes that union.
+
+    ``STRATEGIES_NEEDING_SUMMARIZER`` is written out by hand precisely so that "summary" in a
+    name does not decide it, and the cost of that is a composed name having to be added. Left
+    out, a run selecting this would not be told to pass ``--summarizer-provider``; it would
+    reach the pre-flight, build with no client, and exit reporting that the *configuration* was
+    rejected -- about a flag nobody passed.
+    """
+    assert needs_summarizer(["tool_and_user_summary_anchored"]) is True
+
+    with pytest.raises(ValueError, match="summarizer client"):
+        build_strategy(
+            "tool_and_user_summary_anchored", _strategy_options(build_parser().parse_args(["azure"]), TOKENIZER)
+        )
+
+
+def test_the_record_strategy_is_found_inside_whatever_the_run_built() -> None:
+    """The search the middleware wiring rests on, checked on its own cases.
+
+    An ``isinstance`` answers "is this object that class"; the wiring needs "does this row run
+    that strategy", and those stopped being the same question the moment a composition existed.
+    A fallback is deliberately not a part: it is what a row degrades *into*, so finding counters
+    there would attribute another strategy's numbers to this one.
+    """
+    options = _strategy_options(build_parser().parse_args(["azure"]), TOKENIZER, _StubSummarizer())
+    composed = _composed_strategy(options)
+    single = build_strategy("tool_summary_anchored", options)
+    anchored = build_strategy("anchored", options)
+
+    assert find_nested_strategy(composed, ToolResultAnchoredSummarizationCompactionStrategy) is composed.tool_results
+    assert find_nested_strategy(composed, UserTurnAnchoredSummarizationCompactionStrategy) is composed.user_turns
+    assert find_nested_strategy(single, ToolResultAnchoredSummarizationCompactionStrategy) is single
+    assert find_nested_strategy(single, UserTurnAnchoredSummarizationCompactionStrategy) is None
+    assert find_nested_strategy(anchored, ToolResultAnchoredSummarizationCompactionStrategy) is None
+    assert find_nested_strategy(None, ToolResultAnchoredSummarizationCompactionStrategy) is None
+    assert find_nested_strategy(single, AnchoredCompactionStrategy) is None, (
+        "the fallback a row degrades into is not a phase the row runs"
+    )
+
+
+async def test_the_recall_middleware_is_wired_for_the_composed_strategy(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The headline, and the one failure in this change that would have been silent.
+
+    The record half of this row is two things: a strategy that waits for a record, and a
+    middleware that makes the model write one. The middleware used to be installed only when
+    the built strategy *was* the record strategy, and a composition is not an instance of its
+    parts -- so a composed row would have been assembled with no middleware and no recall tool.
+    Nothing in the table says that: no call is pinned, no record is ever written, the strategy
+    waits and then falls back, and the row prints ``FALLBACK`` -- which is exactly what a model
+    that refused to comply looks like. The row would have been a ``user_summary_anchored`` run
+    wearing a composed name, and every conclusion drawn from it would have been about the wrong
+    strategy.
+
+    Asserted on what reaches ``build_live_agent``, because that is the wiring: the middleware
+    object, the recall tool beside the lookup tools, and the middleware's thresholds taken from
+    the *nested* record strategy rather than from a second copy of the flags.
+    """
+    built: list[dict[str, Any]] = []
+    real = build_live_agent
+
+    def capture(*args: Any, **kwargs: Any) -> Any:
+        built.append(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr("agent_framework_lab_cachebench._live.build_live_agent", capture)
+    scenario = build_live_scenario(salt="composed", filler_turns=2, filler_tokens=50, tool_turns=2)
+
+    await run_live(
+        ProviderRuntime(client=StubChatClient(), model="stub"),
+        strategy_name="tool_and_user_summary_anchored",
+        options=_options(summarizer=_StubSummarizer()),
+        scenario=scenario,
+    )
+
+    assert len(built) == 1
+    middleware = [item for item in built[0]["extra_middleware"] if isinstance(item, ToolResultRecallMiddleware)]
+    assert middleware, "the composed row was assembled with no recall middleware, so no record can ever be written"
+    assert [tool.__name__ for tool in built[0]["tools"] if tool.__name__ == RECALL_TOOL_NAME] == [RECALL_TOOL_NAME], (
+        "the tool the middleware pins has to be registered, or the model's forced call goes unanswered"
+    )
+    nested = find_nested_strategy(built[0]["strategy"], ToolResultAnchoredSummarizationCompactionStrategy)
+    assert nested is not None
+    assert middleware[0].trigger_fraction == nested.trigger_fraction, (
+        "the ask and the wait are one setting, and a composed row must not split them"
+    )
+    assert middleware[0].max_input_tokens == nested.max_input_tokens
+
+
+async def test_a_row_with_no_record_strategy_in_it_still_gets_no_middleware(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The other half of the wiring test, without which it passes on a run that wires always.
+
+    Registering the recall tool on every row would put an extra tool in every prompt and give
+    unrelated strategies something new to call, which is a difference between rows that has
+    nothing to do with compaction.
+    """
+    built: list[dict[str, Any]] = []
+    real = build_live_agent
+
+    def capture(*args: Any, **kwargs: Any) -> Any:
+        built.append(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr("agent_framework_lab_cachebench._live.build_live_agent", capture)
+    scenario = build_live_scenario(salt="userband", filler_turns=2, filler_tokens=50, tool_turns=2)
+
+    await run_live(
+        ProviderRuntime(client=StubChatClient(), model="stub"),
+        strategy_name="user_summary_anchored",
+        options=_options(summarizer=_StubSummarizer()),
+        scenario=scenario,
+    )
+
+    assert built[0]["extra_middleware"] == []
+    assert not [tool for tool in built[0]["tools"] if tool.__name__ == RECALL_TOOL_NAME]
+
+
+async def test_both_halves_counters_are_read_off_the_composed_rows_own_parts(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The five columns a composed row owes the file, taken from two objects rather than one.
+
+    ``run_live`` reads them off a narrowed reference it resolves once, and that reference used
+    to be an ``isinstance`` test -- which a composition fails, so every one of these columns
+    would have been written as nought while the flags column, built by duck typing, showed the
+    same run's counts. A file disagreeing with its own table is worse than one saying nothing.
+
+    The counts are pinned on the parts rather than produced by compacting, deliberately: a
+    fixture that happened to slip under a trigger would assert zero against zero and pass,
+    which is the failure this whole family of tests exists to avoid.
+    """
+
+    class _CountedRecordPhase(ToolResultAnchoredSummarizationCompactionStrategy):
+        @property
+        def records_in_conversation(self) -> int:
+            return 2
+
+        @property
+        def groups_kept_uncovered(self) -> int:
+            return 3
+
+        @property
+        def fallbacks_after_record(self) -> int:
+            return 1
+
+    class _CountedUserPhase(UserTurnAnchoredSummarizationCompactionStrategy):
+        @property
+        def user_compactions(self) -> int:
+            return 4
+
+        @property
+        def user_messages_replaced(self) -> int:
+            return 11
+
+    composed = ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy(
+        tokenizer=TOKENIZER,
+        tool_results=_CountedRecordPhase(max_input_tokens=29_952, tokenizer=TOKENIZER),
+        user_turns=_CountedUserPhase(max_input_tokens=29_952, tokenizer=TOKENIZER, client=_StubSummarizer()),
+    )
+    monkeypatch.setattr("agent_framework_lab_cachebench._live.build_strategy", lambda name, options: composed)
+    scenario = build_live_scenario(salt="counters", filler_turns=2, filler_tokens=50, tool_turns=2)
+
+    outcome = await run_live(
+        ProviderRuntime(client=StubChatClient(), model="stub"),
+        strategy_name="tool_and_user_summary_anchored",
+        options=_options(summarizer=_StubSummarizer()),
+        scenario=scenario,
+    )
+
+    assert (outcome.records_in_conversation, outcome.groups_kept_uncovered) == (2, 3), "the record half"
+    assert outcome.fallbacks_after_record == 1
+    assert (outcome.user_compactions, outcome.user_messages_replaced) == (4, 11), "and the user half"
+
+
+def _composed_over(ceiling: int = 12_000) -> ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
+    """Return the composed strategy at the ceiling ``_user_band_conversation`` is sized for."""
+    return ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy(
+        tokenizer=TOKENIZER,
+        tool_results=ToolResultAnchoredSummarizationCompactionStrategy(max_input_tokens=ceiling, tokenizer=TOKENIZER),
+        user_turns=UserTurnAnchoredSummarizationCompactionStrategy(
+            max_input_tokens=ceiling, tokenizer=TOKENIZER, client=_StubSummarizer()
+        ),
+    )
+
+
+async def test_both_halves_counters_reach_the_seed_record_and_the_flags_column() -> None:
+    """A composed row that reports one half's counters cannot be attributed to either half.
+
+    The whole reading of this row is which of the two halves moved ``snap%`` and what each
+    cost, and the counters are the only thing that says so: ``RECORDS`` and ``UNCOVERED`` are
+    the tool half, ``USERCOMPACT`` and ``USERREPLACED`` the user half. Four of them also have
+    columns of their own on the seed record, because a flag is read and a column is meaned, and
+    every one of those is a handoff at which a composed row could have been left at zero.
+    """
+    strategy = _composed_over()
+
+    assert await strategy(_user_band_conversation(8)) is True
+
+    notes = _strategy_notes(strategy)
+    assert "USERCOMPACT:1" in notes
+    assert "USERREPLACED:6" in notes
+    assert not [note for note in notes if note.startswith("REC")], "no tool work, so the record half says nothing"
+
+    outcome, scenario = await _probed(StubChatClient(usage=UsageDetails(input_token_count=1_000)), repeats=1)
+    record = _record(
+        replace(
+            outcome,
+            strategy_notes=(*notes, "RECORDS:1", "UNCOVERED:2"),
+            user_compactions=strategy.user_compactions,
+            user_messages_replaced=strategy.user_messages_replaced,
+            records_in_conversation=1,
+            groups_kept_uncovered=2,
+        ),
+        scenario,
+        strategy="tool_and_user_summary_anchored",
+    )
+
+    assert (record.user_compactions, record.user_messages_replaced) == (1, 6)
+    assert (record.records_in_conversation, record.groups_kept_uncovered) == (1, 2)
+    cell = _aggregate("tool_and_user_summary_anchored", [record])
+    flags = _flags(cell, None)
+
+    assert "USERCOMPACT:1" in flags and "USERREPLACED:6" in flags, "the user half"
+    assert "RECORDS:1" in flags and "UNCOVERED:2" in flags, "and the tool half, on one row"
+    assert "USERCOMPACT:1" in _render(None, [cell], set(), show_answers=False)
+
+
+async def test_a_starved_user_half_reaches_the_flags_column() -> None:
+    """The one counter composing adds, and the only thing that reads USERCOMPACT:0 correctly.
+
+    Without it, a pass whose record half took the prompt under the user half's own trigger is
+    indistinguishable from a band that held nothing worth summarising -- and the two ask for
+    opposite responses, since the first is an argument for moving a threshold and the second is
+    not. It travels by the same duck-typed route every other strategy counter does, which is
+    the route a new one is most easily left off.
+    """
+    strategy = _composed_over(ceiling=100_000)
+
+    assert await strategy(_user_band_conversation(8)) is False, "neither trigger is near this ceiling"
+    assert not _strategy_notes(strategy), "an idle pass adds nothing to the flags column"
+
+    starved = _composed_over()
+    starved._starved = 2
+
+    assert "USERSTARVED:2" in _strategy_notes(starved)
+
+
+async def test_a_record_cap_above_the_reservation_is_named_for_the_composed_row_too(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The same name test, one composed strategy along, and the same silent failure.
+
+    ``--record-max-tokens`` is a setting of a call only the rows forcing a record make, and the
+    warning about it exceeding the run's own output reservation was printed from a literal
+    strategy name. A composed row makes that call and carries that cost -- the record is
+    preserved and re-sent on every later turn -- so it would have been the one row configured
+    wrongly with nothing printed.
+    """
+    capsys.readouterr()
+
+    await run_live_comparison(
+        build_parser().parse_args(
+            _live_argv(
+                "--strategies", "none,tool_and_user_summary_anchored", "--record-max-tokens", "4000", "--dry-run"
+            )
+        )
+    )
+
+    assert "--record-max-tokens 4,000 is above the --max-output-tokens 2,048" in capsys.readouterr().out
 
 
 async def test_records_written_before_the_user_band_counters_read_back_as_zero() -> None:
