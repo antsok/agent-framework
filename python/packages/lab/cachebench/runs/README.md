@@ -156,6 +156,30 @@ trust.
 
 Runs before 24 predate that format and exist only as captured stdout.
 
+Run 47a is the **aborted** first attempt at run 47, kept as evidence rather than as data. All
+twenty strategies at a 170,000-token window and 0.9 fill with the scaled payload, stopped after
+two of five seeds because both new rows were misbehaving: seed 0 holds 19 rows, seed 1 all 20,
+seed 3 only the control. It is the only place two figures quoted in the source have a record
+behind them, which is why it is here at all.
+
+What it shows, and what it is void for:
+
+- `user_summary_anchored` ran **unbounded**, at `USERCOMPACT:31` (seed 1, 53.4% hit rate) and
+  `USERCOMPACT:30` (seed 2, 61.3%), `USERREPLACED:2` on both, 53 of 53 facts on both. That is
+  the pass-per-turn behaviour `--user-min-band-share` was written to stop, and these records
+  predate it: their `user_min_band_share` is absent and reads as `0.0`, which is what those runs
+  did rather than what this version defaults to. The row as it now stands has no archived run.
+- `tool_and_user_summary_anchored` (seed 2) reads `USERCOMPACT:0`, `RECORDS:1`, a 94.6% hit rate
+  and `snap 63%` — the composed row acting as `tool_summary_anchored` under a longer name, with
+  its own starvation counter reporting nothing. **This is the defect record**, and the reason the
+  two halves now share one trigger judged at the size the pass began with. Every number on that
+  row is void for the row as it stands.
+- The eighteen older rows ran unchanged code and are ordinary records of that cell, on two seeds
+  rather than five.
+
+No `.sh` is kept: the script that produced it is the same one run 47 uses, and re-running it
+against this tree produces the repaired rows rather than these.
+
 Runs 45 and 46 are one cell in two arms: 300,000 tokens at 0.9 fill, `none` against
 `tool_summary_anchored`, with run 45 on the **fixed** payload every earlier cell used and run 46 on
 the payload **scaled to the window**, which is now the default. Run 45 is one seed, run 46 five, no
