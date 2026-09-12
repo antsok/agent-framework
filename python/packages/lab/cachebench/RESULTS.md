@@ -1610,6 +1610,19 @@ with -- sits at 18/53, level with blind truncation.
 not invocations. Run 41's five-way parallelism was clean at four rows each; the same parallelism
 at eighteen rows each was not.
 
+> **2026-09-12 -- the payload default changed, and every run in this file predates it.**
+> `--tool-share` now defaults to 0.6 instead of 0.0, so the tool payload is derived from the fill
+> target and scales with `--context-window`. Every run recorded here, and every large-window cell
+> this project has measured, used the fixed path: `--tool-result-tokens 3500` recorded a tool payload
+> of **21,967 tokens at all three of 60,000, 100,000 and 170,000**, while only the filler grew. That caps
+> what a strategy compacting tool results and nothing else can save, and tightens the cap as the
+> window widens. Across 60,000/0.86 (run 41), 100,000/0.9 (run 44) and 170,000/0.9 (run 43),
+> `tool_summary_anchored` removed **28.8% -> 22.6% -> 17.0%** of the control's snapshot while its cache
+> hit rate fell **88% -> 74% -> 66%** against a control climbing **96% -> 97% -> 98%** -- read
+> here as a property of the strategy, and substantially a property of the workload. `tool_share`
+> is part of the cell key, so cells from either side of this date do not pool; re-running any
+> command line in `runs/` needs `--tool-share 0` to reproduce what it measured.
+
 ### Run 41 -- the clean baseline
 
 The first measurement on code with the coverage check repaired, the record protected, one record

@@ -163,8 +163,8 @@ want to vary is a flag, because a knob that is only a default cannot be measured
 | `--fill` | 0.7 | share of that limit the seeded conversation is sized to reach, solved analytically from the payload and filler sizes. Pass 0 to size manually from `--filler-turns` and `--filler-tokens` |
 | `--filler-turns` | 6 | padding turns between planted facts. Ignored unless `--fill` is 0 |
 | `--filler-tokens` | 2,000 | size of each filler turn; under `--fill`, the size the solver keeps them near while it picks how many |
-| `--tool-result-tokens` | 4,000 | approximate size of each tool result. **Ignored when `--tool-share` is set** |
-| `--tool-share` | 0.0 | share of the seeded conversation that is tool-result text, deriving the result size from the fill target instead. **Wins when both are given**, and needs `--fill` |
+| `--tool-result-tokens` | 4,000 | absolute size of each tool result: the fixed payload. **Read only under `--tool-share 0`**, since `--tool-share` wins when both are given |
+| `--tool-share` | 0.6 | share of the seeded conversation that is tool-result text, deriving the result size from the fill target so the payload scales with the window. **Wins when both are given**; `0` selects the fixed path above. Needs `--fill`: under `--fill 0` it is refused if asked for and off if it was not. **The default changed from 0.0 on 2026-09-12** — see below |
 | `--assumed-reply-tokens` | 150 | how large the model's own replies are assumed to be when solving for the fill. The one term the solver cannot compute, and it is per model: ~150 on `gpt-5.4-mini`, ~602 on `gpt-5.6-luna`. Measure it from a one-seed probe before sizing a matrix on a new model |
 | `--tool-turns` | 6 | tool-call groups to plant. Must exceed `--keep-last-tool-groups` or tool-oriented compaction never fires |
 | `--filler-tool-turns` | 0 | extra tool calls whose results carry no codes: bulk without anything to remember |
@@ -176,6 +176,25 @@ want to vary is a flag, because a knob that is only a default cannot be measured
 family shortens each banded result to a share of the *ceiling*, so its allowance grew from ~2,900
 to ~5,900 tokens while the results stayed at 3,500, and at 120,000 it planned nothing while its
 rows were read as measurements. `--tool-share` holds the proportions.
+
+**The scaling payload became the default on 2026-09-12, and that breaks comparability with every
+cell measured before it.** `--tool-share` was 0.0, so every large-window cell this project has
+measured used the fixed path: the tool payload was **21,967 tokens at a 60,000-token window, at
+100,000 and at 170,000 alike**, and only the filler grew to reach the target. That systematically
+penalises a strategy that compacts tool results and nothing else — its largest possible saving is
+capped at the payload while the conversation it pays cache costs across grows without limit, so
+the cap tightens as the window widens. Measured on `tool_summary_anchored` at a fixed 3,500-token
+payload, across 60,000/0.86 (run 41), 100,000/0.9 (run 44) and 170,000/0.9 (run 43): removed share
+fell **28.8% → 22.6% → 17.0%** while its cache hit rate fell **88% → 74% → 66%** against a control
+climbing **96% → 97% → 98%**. That reads as a property of the strategy and is substantially a
+property of the workload.
+
+What the change costs is stated plainly: `tool_share` is part of the cell key, so cells from
+either side of the change do not pool into one row — which is correct, because they are different
+workloads, but it means **a sweep spanning 2026-09-12 has to say which side each cell came from**.
+To reproduce an archived cell exactly, pass `--tool-share 0` alongside the `--tool-result-tokens`
+its command line already states; the fixed path is unchanged, it is only no longer the default.
+0.6 and 0.8 are the levels this project has treated as realistic, and 0.6 is the conservative one.
 
 The achieved fill and the achieved share are both measured on the uncompacted run and flagged if
 they land more than 5% from target. A payload that will not fit inside the smallest cell is

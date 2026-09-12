@@ -85,6 +85,7 @@ from agent_framework_lab_cachebench._live import (
     snapshot_state,
 )
 from agent_framework_lab_cachebench._live_cli import (
+    DEFAULT_TOOL_SHARE,
     CellStats,
     _accuracy_note,
     _aggregate,
@@ -828,6 +829,28 @@ def test_the_help_says_which_of_the_two_payload_flags_wins() -> None:
     assert "Ignored when" in help_text, "--tool-result-tokens must say it loses"
 
 
+def test_the_help_states_the_scaling_default_and_what_each_payload_flag_does_across_windows() -> None:
+    """The default changed under readers who had already measured cells with the old one.
+
+    --help is the one place every caller looks, and two things have to be there or a window
+    sweep is misread: that the payload now scales by default, so a cell measured today is not
+    the cell the same command line measured before 2026-09-12; and that --tool-result-tokens
+    holds an absolute size while --tool-share holds a proportion, which is the whole difference
+    between a sweep over one variable and a sweep over two.
+
+    Whitespace is normalised because argparse rewraps help text to the terminal width, so a
+    phrase asserted verbatim would pass or fail on the width of whoever ran the tests.
+    """
+    help_text = " ".join(build_parser().format_help().split())
+
+    assert "Default 0.6." in help_text, "the help must print the new default, since %(default)s cannot"
+    assert "the default changed from 0.0 on 2026-09-12" in help_text, "the break in comparability must be stated"
+    assert "keeps its proportions as --context-window grows" in help_text, "--tool-share must say what it holds"
+    assert "the payload stays this size while --context-window grows" in help_text, (
+        "--tool-result-tokens must say what a window sweep does to it"
+    )
+
+
 def _dry_argv(*extra: str) -> list[str]:
     """Return a command line for a dry run at the cell the payload flags were written for.
 
@@ -878,9 +901,17 @@ async def test_the_dry_run_states_the_size_it_derived_and_the_share_it_reached(
     assert re.search(r"6 tool results of ~[\d,]+ tokens", printed), "the derived size must be printed"
 
 
-async def test_a_dry_run_without_a_share_says_nothing_about_one(capsys: pytest.CaptureFixture[str]) -> None:
-    """A line reporting a share of 0 would read as a payload that vanished."""
-    await run_live_comparison(build_parser().parse_args(_dry_argv("--tool-result-tokens", "3500")))
+async def test_an_explicit_tool_share_of_zero_selects_the_fixed_payload_path(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """0 has to keep selecting the fixed path now that the default no longer does.
+
+    Two claims in one run, because they are the same claim from both ends. --tool-share 0 must
+    size every result from --tool-result-tokens verbatim, which is what makes the cells already
+    on disk re-runnable at all; and the share line must stay off, because a line reporting a
+    share of 0 reads as a payload that vanished.
+    """
+    await run_live_comparison(build_parser().parse_args(_dry_argv("--tool-share", "0", "--tool-result-tokens", "3500")))
     printed = capsys.readouterr().out
 
     assert "tool share:" not in printed
@@ -911,6 +942,94 @@ async def test_a_tool_share_without_a_fill_target_is_refused() -> None:
         await run_live_comparison(build_parser().parse_args(argv))
 
     assert "--tool-share is a share of the fill target" in str(error.value)
+
+
+def _derived_result_tokens(printed: str) -> int:
+    """Return the per-result size a dry run's sizing line says it will build with.
+
+    Read off the printed line rather than off the plan, because the line is what a caller
+    checks before spending anything and the two have disagreed: the sizing print read the flag
+    while the run built from the plan.
+
+    Args:
+        printed: Everything the dry run wrote to stdout.
+
+    Returns:
+        The size in tokens.
+    """
+    match = re.search(r"tool results of ~([\d,]+) tokens", printed)
+    assert match is not None, f"no sizing line was printed:\n{printed}"
+    return int(match.group(1).replace(",", ""))
+
+
+async def test_the_default_tool_share_scales_the_payload_with_the_context_window(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """The default has to be the scaling one, or every window sweep measures two variables.
+
+    This is the regression that made the default worth changing. On the fixed path the payload
+    is an absolute size, so it stays put while --context-window grows and only the filler
+    stretches to reach the target -- which caps what a strategy that compacts tool results and
+    nothing else can save, and tightens the cap the wider the window. Measured on
+    ``tool_summary_anchored`` at a fixed 3,500-token payload across 60,000, 100,000 and
+    170,000 -- 21,967 tokens of tool results at all three -- removed share fell 28.8% -> 22.6%
+    -> 17.0% while its cache hit rate fell 88% -> 74% -> 66% against a control climbing 96% ->
+    97% -> 98%, which reads as a property of the strategy and is substantially a property of the
+    workload.
+
+    Five times the window with nothing else touched, so the derived size has to move with it.
+    Four times is asserted rather than five to leave room for the solver's rounding; the
+    measured ratio is a little above five, because the non-tool floor it works around is a
+    constant that does not grow with the window.
+    """
+    await run_live_comparison(build_parser().parse_args(_dry_argv("--context-window", "60000")))
+    small = capsys.readouterr().out
+    await run_live_comparison(build_parser().parse_args(_dry_argv("--context-window", "300000")))
+    large = capsys.readouterr().out
+
+    assert "tool share: 60.0% predicted against 60% requested" in small
+    assert "tool share: 60.0% predicted against 60% requested" in large
+    assert _derived_result_tokens(large) > 4 * _derived_result_tokens(small), (
+        f"a payload of {_derived_result_tokens(small):,} tokens at 60,000 and "
+        f"{_derived_result_tokens(large):,} at 300,000 is not a payload that scales"
+    )
+
+
+async def test_a_stated_result_size_alone_no_longer_governs_the_payload(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--tool-result-tokens without --tool-share 0 is now ignored, and must be seen to be.
+
+    The trap the changed default sets. Every archived run states a result size and nothing
+    else, so re-running one of those command lines today derives a different payload from the
+    fill target instead of honouring the number typed. It has to be loud in the sizing line --
+    which is printed before anything is spent -- rather than discovered in the recorded cell
+    afterwards.
+    """
+    await run_live_comparison(build_parser().parse_args(_dry_argv("--tool-result-tokens", "3500")))
+    printed = capsys.readouterr().out
+
+    assert "6 tool results of ~3,500 tokens" not in printed, "the stated size must lose to the default share"
+    assert "tool share: 60.0% predicted against 60% requested" in printed
+
+
+async def test_manual_sizing_does_not_have_to_switch_the_default_share_off_by_hand(
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    """--fill 0 predates the share and must keep working without mentioning it.
+
+    The interaction the other way round from the refusal above, and the one a default of 0.6
+    would break if it were applied before the fill was looked at: a share is a share of the
+    fill target, --fill 0 sets no target, so a blindly-defaulted share would turn every manual
+    invocation into a SystemExit about a flag the caller never typed.
+    """
+    argv = _dry_argv("--fill", "0", "--filler-turns", "3", "--filler-tokens", "50")
+
+    await run_live_comparison(build_parser().parse_args(argv))
+    printed = capsys.readouterr().out
+
+    assert "fill: manual, 3 filler turns" in printed
+    assert "tool share:" not in printed, "manual sizing has no target for a share to be a share of"
 
 
 # endregion
@@ -4934,6 +5053,47 @@ async def test_two_tool_shares_are_two_cells(
     sizes = {params.tool_result_tokens for params, _ in cells}
     assert len(sizes) == 2, "the derived size must reach the record, or --from-jsonl rebuilds the wrong payload"
     assert 50 not in sizes, "the record kept the --tool-result-tokens the share was supposed to override"
+
+
+async def test_a_defaulted_share_and_the_fixed_path_are_two_cells(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The share a run resolved to has to reach the record even when nobody typed it.
+
+    The flag parses to None when it is not given, so the resolved value -- not the raw argument
+    -- is what the cell has to carry. Recording the raw one would write None, or 0, onto a run
+    whose payload scaled with the window, and cells from either side of the 2026-09-12 default
+    change would then pool into one row: a fixed 4,000-token payload averaged with a derived
+    one, under a label saying both were the same workload.
+    """
+    _stub_provider(monkeypatch)
+    path = tmp_path / "defaulted.jsonl"
+    # A smaller window than _live_argv's, because the defaulted share sizes the payload from
+    # the target and the stub then has to carry every token of it through a whole seeded run.
+    argv = _live_argv(
+        "--results-jsonl",
+        str(path),
+        "--fill",
+        "0.5",
+        "--context-window",
+        "30000",
+        "--repeats",
+        "1",
+        "--strategies",
+        "none",
+    )
+    await run_live_comparison(build_parser().parse_args(argv))
+    await run_live_comparison(build_parser().parse_args([*argv, "--tool-share", "0"]))
+    capsys.readouterr()
+
+    cells = group_by_cell(read_seed_records(path))
+
+    assert len(cells) == 2, "a scaled payload and a fixed one are two workloads and cannot aggregate into one row"
+    assert {params.tool_share for params, _ in cells} == {DEFAULT_TOOL_SHARE, 0.0}
+    fixed = next(params for params, _ in cells if params.tool_share == 0.0)
+    scaled = next(params for params, _ in cells if params.tool_share == DEFAULT_TOOL_SHARE)
+    assert fixed.tool_result_tokens == 50, "--tool-share 0 must hand the sizing back to --tool-result-tokens"
+    assert scaled.tool_result_tokens != 50, "the defaulted share must derive the size instead"
 
 
 async def test_a_complete_cell_is_not_marked_partial(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> None:

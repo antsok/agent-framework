@@ -305,7 +305,10 @@ def plan_fill(
         tool_result_tokens: Requested size of each tool result. Ignored when ``tool_share``
             derives one, since the two state the same quantity two ways.
         tool_share: Share of the target that should be tool-result text, 0 to size each result
-            from ``tool_result_tokens`` instead. See :func:`_solve_tool_result_tokens`.
+            from ``tool_result_tokens`` instead. See :func:`_solve_tool_result_tokens`. Defaulted
+            to 0 here and to 0.6 by ``cachebench_live``, deliberately: a caller reaching this
+            function directly states the sizing it wants, while the CLI has a matrix to keep
+            comparable across windows and picks the proportional payload for it.
         narration: How hard the scenario pushes the model to restate tool values.
         fact_placement: Where the codes sit inside each result.
         retrieval_guidance: Whether the instructions carry the retrieval clause, which is part
