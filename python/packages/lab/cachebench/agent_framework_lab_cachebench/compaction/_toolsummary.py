@@ -892,6 +892,12 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
     async def __call__(self, messages: list[Message]) -> bool:
         """Request a record, or drop what an existing record covers.
 
+        The size and the line this pass is judged by are read off the conversation in front of
+        it, which is what a row does. :meth:`compact_against` is the same pass with that pair
+        supplied by the caller, and is how
+        :class:`~._composed.ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy` gives
+        every half of one pass the same reading.
+
         Returns:
             True if the outgoing messages changed.
         """
@@ -899,8 +905,32 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
             return False
         annotate_message_groups(messages)
         annotate_token_counts(messages, tokenizer=self.tokenizer)
-        used = included_token_count(messages)
-        if used <= int(self.max_input_tokens * self.trigger_fraction):
+        return await self.compact_against(
+            messages,
+            prompt_tokens=included_token_count(messages),
+            trigger_tokens=int(self.max_input_tokens * self.trigger_fraction),
+        )
+
+    async def compact_against(self, messages: list[Message], *, prompt_tokens: int, trigger_tokens: int) -> bool:
+        """Run one pass, judged against a size and a line the caller read rather than this pass.
+
+        The seam a composition needs and a row does not. What it moves is the *trigger* only:
+        the give-up line below is still this strategy's own ``fallback_fraction`` of its own
+        ceiling, because that line is not a question about when to start compacting but about
+        how long a record may be waited for, and nothing a composition does changes how long
+        that is. The ceiling the fallback is reached for is likewise read live, since it is a
+        statement about whether the prompt now fits.
+
+        Args:
+            messages: The conversation, mutated in place. Already grouped and token-annotated
+                by the caller.
+            prompt_tokens: Included tokens the trigger and the give-up line are judged against.
+            trigger_tokens: Included tokens the prompt must exceed for a pass to run.
+
+        Returns:
+            True if the outgoing messages changed.
+        """
+        if prompt_tokens <= trigger_tokens:
             return False
 
         anchor = find_record_index(messages)
@@ -935,7 +965,7 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
                 changed = shortened or changed
             return changed
 
-        if used < int(self.max_input_tokens * self.fallback_fraction):
+        if prompt_tokens < int(self.max_input_tokens * self.fallback_fraction):
             # Still waiting for the middleware's forced call to come back. Nothing may be
             # dropped yet: the record is the only thing that would replace it.
             return False

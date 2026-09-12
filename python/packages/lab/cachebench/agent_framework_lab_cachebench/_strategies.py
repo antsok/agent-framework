@@ -26,11 +26,18 @@ eviction: the floor any ordering has to beat to be worth its complexity.
 
 ``tool_and_user_summary_anchored`` is a composition of a third kind, and deliberately not a
 member of that family. It runs ``tool_summary_anchored`` and then ``user_summary_anchored``
-over one conversation, each keeping its own trigger, so the two do *not* meet at a shared
-ceiling: what the row is for is how far the two halves reach together, and normalising their
-sizes away is exactly what the ``token_budget_*`` family does. Its parts are built by the same
-two builders the single rows use, so a sweep of any of their flags moves this row's half the
-way it moves theirs.
+over one conversation and the two do *not* meet at a shared ceiling: what the row is for is how
+far the two halves reach together, and normalising their sizes away is exactly what the
+``token_budget_*`` family does. Its parts are built by the same two builders the single rows
+use, so a sweep of any of their flags moves this row's half the way it moves theirs.
+
+What it does share is one *trigger*. The two halves are judged at ``--trigger-fraction``,
+against one reading of the prompt taken before either acts, because the alternative was measured
+and it was a row that could not work: the record half fires at the lower of the two fractions,
+its removals hold the prompt below the higher one, and the user half is never consulted. That is
+a property of the composition and not of either part, so it is fixed there; ``compaction/_composed``
+carries the argument, including why the alignment runs down to the record half's line rather than
+up to the user half's, and how a caller asks for the two-line row back.
 
 Budgets are sized relative to the transcript rather than to a model's real context window.
 A 20-turn transcript never approaches a 128k window, so a real window would mean no
@@ -394,11 +401,18 @@ def _build_tool_and_user_summary_anchored(options: StrategyOptions) -> Compactio
 
     Built from the same two builders the single rows use rather than from two fresh
     constructor calls, which is what makes the comparison the row exists for legitimate: a
-    sweep moving ``--coverage-share`` or ``--user-trigger-fraction`` moves this row's half in
+    sweep moving ``--coverage-share`` or ``--keep-head-user-turns`` moves this row's half in
     exactly the way it moves the corresponding single row, and neither half can drift into a
-    configuration no other row was measured at. It is also the whole of how the two keep their
-    own settings -- there is no shared trigger here, and ``compaction/_composed`` says why one
-    would answer a different question.
+    configuration no other row was measured at.
+
+    The one setting that does not reach this row is ``--user-trigger-fraction``. The composition
+    judges both halves at ``--trigger-fraction``, taking that line from the record half it was
+    handed, so a sweep of the record row's trigger moves both halves of this row together and a
+    sweep of the user row's trigger moves the single row only. That is the composed row's whole
+    subject: with two lines the record half's removals hold the prompt below the user half's and
+    the row is ``tool_summary_anchored`` under a longer name. ``compaction/_composed`` carries
+    the argument and the escape hatch -- its ``user_trigger_fraction`` restores the two-line row
+    for a caller assembling the parts by hand.
 
     Selecting this is selecting both halves' costs together. The record half spends an agent
     turn writing its record and the user half spends a summarizer call, so a cell running this

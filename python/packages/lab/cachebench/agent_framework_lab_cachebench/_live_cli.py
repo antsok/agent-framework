@@ -489,13 +489,17 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Share of the input budget at which user_summary_anchored summarises the user's "
             "own turns. Its own flag rather than --trigger-fraction, which belongs to "
-            "tool_summary_anchored: the two thresholds answer different questions and sharing "
-            "one would make a sweep of either a sweep of both. It sits higher than that one's "
-            "0.6 because this strategy pays only in a broken cached prefix, so it can wait. It "
-            "decides when the first compaction happens and not how many there are -- that is "
-            "--user-min-band-share, and firing late was measured not to bound the count at "
-            "all. Read USERCOMPACT in the flags column for how often it fired and USERHELD for "
-            "how often the band was not worth a pass. Default %(default)s."
+            "tool_summary_anchored: the two thresholds answer different questions for the two "
+            "single rows, and sharing one flag would make a sweep of either a sweep of both. It "
+            "sits higher than that one's 0.6 because this strategy pays only in a broken cached "
+            "prefix, so it can wait. It decides when the first compaction happens and not how "
+            "many there are -- that is --user-min-band-share, and firing late was measured not "
+            "to bound the count at all. It moves the single row only: "
+            "tool_and_user_summary_anchored judges both of its halves at --trigger-fraction, "
+            "because two lines there is the record half holding the prompt below the user "
+            "half's for the whole of a run. Read USERCOMPACT in the flags column for how often "
+            "it fired and USERHELD for how often the band was not worth a pass. "
+            "Default %(default)s."
         ),
     )
     parser.add_argument(
@@ -1894,14 +1898,16 @@ _LEGEND: Final[tuple[str, ...]] = (
     "            consulted. It is the subset of USERUNDER the composition caused rather",
     "            than the conversation, and the only reading of USERCOMPACT:0 that is not",
     "            about the user half at all. It counts a pass whenever the prompt would",
-    "            have been over that trigger with everything the record half has removed",
-    "            still in it -- not only on the one pass that crossed the line, which was",
-    "            the earlier definition and could not see this case at all: the record",
-    "            half fires at the lower trigger and holds the prompt below the user one",
-    "            from before it is ever reached.",
-    "            It is reported rather than prevented: overriding the user half's trigger",
-    "            would have the composed row fire where no user_summary_anchored row does,",
-    "            and the pair would stop being comparable.",
+    "            have been over that trigger with what the record half removed on earlier",
+    "            passes, while the user half was declining at its own line, still in it.",
+    "            Zero is the ordinary reading now, and zero is what the default produces:",
+    "            both halves of that row are judged at --trigger-fraction, against one",
+    "            reading of the prompt taken before either acts, so the record half never",
+    "            removes anything on a pass the user half was not offered. Non-zero on a",
+    "            default row is a defect report. It was the row's ordinary state while the",
+    "            two halves had two lines -- the record half fires at the lower one and",
+    "            holds the prompt below the higher one from before it is ever reached --",
+    "            and a caller who sets them apart again is asking for that row back.",
     "            FALLBACK:<n> times it gave up",
     "            and compacted another way. A row with",
     "            FALLBACK is measuring that other strategy, not the one named.",
