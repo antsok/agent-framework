@@ -909,3 +909,85 @@ never sent.
 collapse note, had we gone that way, costs 14 BPE tokens -- about 830 tokens for a 60-turn band at
 the 170K cell, ~0.5% of the window.
 
+## 3r. The composed row was structurally tool-only, and the fix is one reading of the prompt
+
+**The defect.** `tool_and_user_summary_anchored` ran the record half at `--trigger-fraction`
+0.6 and the user half at `--user-trigger-fraction` 0.8, record half first. On a workload whose
+bulk is tool payload the record half removes that payload while the prompt is still in the 60s
+of the ceiling and holds it there for the rest of the run, so the prompt never reaches 0.8 and
+the user half is never consulted. At a 170,000-token window the arithmetic is flat:
+
+    ceiling            167,952
+    user trigger 0.8   134,362
+    record trigger 0.6 100,771   <- below the user line
+
+Measured, run 47a seed 2: `snap 63%`, `REC:1 RECORDS:1 FORCED:1 RECFORCED:1`, 94.6% hit rate,
+`USERCOMPACT:0`. The row was `tool_summary_anchored` under a longer name, and its own starvation
+counter -- then a within-pass transition test -- reported nothing, because the transition it
+looked for never happened: the prompt was under the user line before the run began rather than
+taken under it during a pass.
+
+**The fix that does not work, written down because it is the obvious one.** Giving both halves
+the same fraction changes nothing while the phases are still judged one after the other: the
+record half acts first, takes the prompt below the shared line, and the user half declines on
+its own re-test. Same inertness, different number.
+
+**The fix.** `__call__` reads `included_token_count` once, before either phase runs, and hands
+that one number to both through a new `compact_against(messages, *, prompt_tokens,
+trigger_tokens)` seam on each part. Both halves are judged against the size the prompt had when
+the pass began, so a half that would have fired on the entry size fires whatever the other
+removed first. The shared line is the record half's own (`tool_results.trigger_fraction`), so a
+sweep of `--trigger-fraction` moves both halves together; aligning the other way is the unsafe
+direction, because the record is written by a model that degrades with the bulk it reads and the
+middleware that asks reads the same prompt. `--user-trigger-fraction` therefore moves the single
+row only, which is now stated in the flag's help, in the record schema, and in three documents.
+
+Judging a half against a slightly stale size cannot let it claim the other's material -- the two
+selection rules name disjoint group kinds. What it costs is that the second half may act when
+the prompt is already under the line. That is the deliberate trade.
+
+**`USERSTARVED` had to be redefined, not retargeted.** With pass-entry judging, within-pass
+starvation is impossible in any configuration, and the old cumulative counterfactual then fires
+on every quiet pass after a successful compaction -- the prompt is small *because the row
+worked*. It now accumulates only what the record half removed on passes whose entry size was at
+or below the user line, exposed as `tokens_removed_out_of_user_reach` so it can be checked, and
+the test runs before the record phase so this pass's removal cannot explain this pass's reading.
+**On a default row it is zero by construction**: the record half acts only above the shared line,
+and above the line the user half is consulted. Verified from the operators rather than from the
+tests -- both parts return early on `prompt_tokens <= trigger_tokens`, and the accumulator is
+guarded by `entry_tokens <= user_line`, which cannot both hold, including at exact equality where
+neither phase acts. A non-zero value there is a defect report.
+
+**Smoke, 170,000/0.9 scaled payload, one seed, probes cut to 1** (mechanism only -- `seed+- 0%`
+means unknown, not stable):
+
+| row | msgs | tok left | snap% | hit% | seed$ | vs none$ | facts | acc1 | flags |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `none` | 85/85 | 137,225 | 81% | 97% | $0.0955 | — | 53/53 | 100% | — |
+| `tool_summary_anchored` | 79/87 | 91,811 | 54% | 94% | $0.1019 | +7% | 53/53 | 100% | REC:1 RECORDS:1 |
+| `user_summary_anchored` | 62/86 | 125,380 | 73% | 92% | $0.1561 | +63% | 53/53 | 100% | USERCOMPACT:2 USERHELD:30 USERREPLACED:24 USERUNDER:63 |
+| `tool_and_user_summary_anchored` | 51/90 | 73,830 | 43% | 86% | $0.1576 | +65% | 53/53 | 89% | REC:1 RECORDS:1 UNCOVERED:1 USERCOMPACT:5 USERHELD:22 USERREPLACED:12 USERUNDER:69 |
+| `truncation` | 60/85 | 83,659 | 49% | 92% | $0.1268 | +33% | 29/53 | 56% | — |
+
+The mechanism is confirmed: both halves fire, no `USERSTARVED`, and the composition reaches
+further than either half alone -- 73,830 tokens left against 91,811 and 125,380, `snap%` 43
+against 54 and 73. **Nothing here is a cost result.** One seed, and both user-half rows sit at
++63% and +65% on a single sample.
+
+**The user half's hysteresis bites hard at this sizing.** `USERHELD:30` against `USERCOMPACT:2`
+on the single row, and `USERHELD:22` against `USERCOMPACT:5` composed. That is
+`--user-min-band-share` 0.1 doing what it was written to do on a workload where the band is the
+minority of the prompt -- which is the other finding here.
+
+**The payload scaling inverted the half each strategy may touch, and two documents still said
+otherwise.** Run 43 held the tool payload at a fixed 3,500 tokens per result: 57% user text
+against 14% tool results, so the user band was most of the prompt. With scaling now the default
+(`--tool-share` 0.6) the same 170,000/0.9 cell seeds 91,791 tokens of tool results against about
+38,664 of user-side filler. The record strategy now works on the bulk and the user strategy on
+the minority -- the opposite of the regime both strategies' rationales were written against.
+Corrected in `STRATEGIES.md` and `compaction/STRATEGIES.md`.
+
+**Run 47 relaunched** with all twenty strategies, five seeds, two streams. Run 47a -- the aborted
+attempt -- is archived under `runs/` as evidence, because it is the only record behind figures
+the source quotes.
+
