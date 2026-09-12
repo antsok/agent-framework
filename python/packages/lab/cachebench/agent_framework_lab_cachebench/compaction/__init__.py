@@ -24,14 +24,16 @@ What is here:
   :class:`ToolResultRecallMiddleware` is what asks.
 - :class:`UserTurnAnchoredSummarizationCompactionStrategy` is the mirror of that one on the
   other half of the conversation: it summarises the *user's* turns between a fixed head and
-  tail, and it recompacts its own earlier summary when the threshold is crossed again --
+  tail, and it recompacts its own earlier summary once the band is worth a pass again --
   deliberately the opposite of ``_anchored``'s refusal to re-trim, for the reason its module
-  docstring gives. It touches nothing the other three touch, so the rows stay comparable.
+  docstring gives, and bounded by a minimum band share because the threshold alone let it fire
+  once per turn. It touches nothing the other three touch, so the rows stay comparable.
 - :class:`ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy` runs those last two
   over one conversation, the record phase first. It is the only entry here that composes
   rather than compacts: it owns no selection rule and removes nothing itself, and what it adds
-  is an order, one re-read of the conversation between the phases, and a count of the passes
-  where the first phase's removals took the prompt under the second phase's trigger.
+  is an order, one re-read of the conversation between the phases, and the attribution of a
+  silent second phase: which passes the first phase's removals kept under the second's trigger,
+  as against the passes the second phase declined for its own reasons.
 - :func:`set_preserved` and :func:`is_preserved` carry one annotation between the two: a
   message no strategy may shorten, drop or shed. It exists because the record is a tool
   result, the anchored strategy trims tool results, and for a while it trimmed the record --
@@ -89,6 +91,7 @@ from ._toolsummary import (
 from ._usersummary import (
     DEFAULT_KEEP_HEAD_USER_TURNS,
     DEFAULT_KEEP_TAIL_USER_TURNS,
+    DEFAULT_MIN_BAND_SHARE,
     DEFAULT_USER_SUMMARY_PROMPT,
     DEFAULT_USER_TRIGGER_FRACTION,
     USER_SUMMARY_MARKER,
@@ -102,6 +105,7 @@ __all__ = [
     "DEFAULT_KEEP_HEAD_USER_TURNS",
     "DEFAULT_KEEP_TAIL_USER_TURNS",
     "DEFAULT_KEEP_TOKENS",
+    "DEFAULT_MIN_BAND_SHARE",
     "DEFAULT_MIN_GAIN_FRACTION",
     "DEFAULT_RECORD_MAX_TOKENS",
     "DEFAULT_RECORD_TARGET_TOKENS",

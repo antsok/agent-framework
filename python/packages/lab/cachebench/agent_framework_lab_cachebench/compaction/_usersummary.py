@@ -35,15 +35,52 @@ that strategy*, because its trigger is the band's geometry: a result sits in the
 turn it ages out of the tail until the end of the run, so "trim whatever is in the band" is an
 instruction that fires on every single pass.
 
-Here the trigger is a threshold that the compaction itself moves away from. A pass only runs
-when the prompt is past ``trigger_fraction`` of the ceiling, and a pass that runs removes
-tens of thousands of tokens, so the next pass cannot happen until the conversation has grown
-all of that back. Between two compactions the prefix is therefore byte-identical on every
-turn, which is the property the anchored design is built around; what changes is how often the
-prefix is rewritten at all, and at the default trigger on a conversation of this shape that is
-once or twice in a run rather than once per turn. So the same argument that makes re-trimming
-wrong in ``_shorten`` makes re-summarising affordable here, and the two were decided
-differently on purpose rather than by one of them forgetting the other.
+**The threshold was argued to be self-limiting. Measurement says it is not, and this module
+used to say the opposite.** The argument that stood here was that the trigger is a threshold
+the compaction itself moves away from: a pass only runs past ``trigger_fraction`` of the
+ceiling, a pass removes tens of thousands of tokens, so the next pass cannot happen until the
+conversation has grown all of that back -- once or twice in a run rather than once per turn.
+Measured on gpt-5.6-luna at a 170,000-token window, 0.9 fill, scaled payload, this row
+reported ``USERCOMPACT:31 USERREPLACED:2`` on one seed and ``USERCOMPACT:30 USERREPLACED:2``
+on another: about one pass per turn, each replacing the previous summary and one new turn,
+with the cache hit rate down to 53% and 61% against the uncompacted control's 95%.
+
+The argument has two holes and either one is enough on its own.
+
+- **The band is not the prompt.** It is the user turns between the anchors, and the assistant
+  replies and tool results around them are not this strategy's to touch. On the run above the
+  band was about 28% of the prompt, so a pass that removed *all* of it need not take the
+  prompt back under the line -- and on a workload whose bulk is tool output it certainly does
+  not. "A compaction moves away from its own trigger" is true only while the band is most of
+  what there is to remove, which is not the ordinary case.
+- **After the first pass the band is not even that.** What is left between the anchors is this
+  strategy's own summary plus whatever turns arrived since, a fraction of a percent of the
+  prompt. Every later pass then rewrites the prefix at the summary's position to free almost
+  nothing, which is exactly the thrash ``_shorten`` refuses.
+
+The size that fired the trigger does not go away by itself -- the sentence
+:meth:`~._toolsummary.ToolResultRecallMiddleware._record_due` is built around -- and the
+"something in the band is not my own summary" rule below is satisfied by every new user turn,
+so above the trigger the condition stays true for the rest of the run.
+
+**Hysteresis, and it is one rule: a pass has to be worth what a pass costs.** The band must be
+worth at least ``min_band_share`` of the included prompt before anything is summarised: see
+:data:`DEFAULT_MIN_BAND_SHARE` for the number, and
+:meth:`UserTurnAnchoredSummarizationCompactionStrategy._worth_compacting` for the rule and for
+the two shapes of hysteresis it was chosen over. That is what bounds the firing count, and the
+bound is geometric rather than a cap: the band can only regrow from user turns added since the
+last pass, so for the band to be worth a share ``f`` of the prompt again the prompt itself must
+have grown by a factor of at least ``1 / (1 - f)``. A conversation that grows from the size of
+its first compaction to ``k`` times that size therefore compacts at most
+``ceil(log(k) / log(1 / (1 - f)))`` times -- one pass per 11% of prompt growth at the default,
+so seven over a conversation that doubles, against one per turn before. What it costs is stated
+with the constant: a band that never clears the share is a band never compacted at all, and
+:attr:`UserTurnAnchoredSummarizationCompactionStrategy.user_passes_declined` is what says so
+rather than leaving the row looking like the uncompacted control.
+
+So the same argument that makes re-trimming wrong in ``_shorten`` makes re-summarising
+affordable here only once a pass is required to be worth something, and the two are now
+decided by one rule read from opposite ends rather than by one of them forgetting the other.
 
 Refusing to recompact is not a neutral alternative either. The summary is a user message, so a
 strategy that would not re-read its own output would have to keep every earlier summary
@@ -53,12 +90,13 @@ exists to report, where each preserved record raises a floor under the prompt th
 pass can lower. Recompaction is what stops the floor rising.
 
 **It will not run on nothing new.** A pass whose band holds only this strategy's own earlier
-summary would rewrite one message at one position and free almost nothing, which is precisely
+summary would rewrite one message at one position and free exactly nothing, which is precisely
 the thrash ``_shorten`` refuses. So the band has to contain at least one turn that is not a
 summary -- the same shape as
 :meth:`~._toolsummary.ToolResultRecallMiddleware._record_due`, which re-arms its trigger on new
-material rather than on size, and for the same reason: the size that fired the trigger does not
-go away by itself.
+material rather than on size. That rule is necessary and, as the measurement above shows, not
+sufficient: one new turn satisfies it, so it is the ``f = 0`` corner of the share rule and both
+are checked in the one place.
 
 **The replacement is a user message, where the framework's own summarizer writes an assistant
 one.** ``SummarizationStrategy`` summarises whole groups of every kind, so its output belongs to
@@ -114,6 +152,7 @@ if TYPE_CHECKING:
 __all__ = [
     "DEFAULT_KEEP_HEAD_USER_TURNS",
     "DEFAULT_KEEP_TAIL_USER_TURNS",
+    "DEFAULT_MIN_BAND_SHARE",
     "DEFAULT_USER_SUMMARY_PROMPT",
     "DEFAULT_USER_TRIGGER_FRACTION",
     "EXCLUDE_REASON",
@@ -126,13 +165,16 @@ logger = logging.getLogger(__name__)
 
 #: Fraction of the ceiling at which the user band is summarised.
 #:
-#: **0.8, and the number is the whole of what makes recompaction affordable.** This strategy
-#: rewrites the prefix at one position and is willing to rewrite it again later, which is the
-#: behaviour :meth:`~._anchored.AnchoredCompactionStrategy._shorten` refuses; what buys it is
-#: that a pass cannot follow another pass until the conversation has grown back everything the
-#: first one removed. A trigger low enough to fire on a conversation that has barely grown
-#: would collapse that argument and produce exactly the per-turn mutation the anchored design
-#: exists to avoid.
+#: **0.8, and it decides when compaction starts, not how often it happens.** This constant used
+#: to be described as the whole of what makes recompaction affordable, on the argument that a
+#: pass cannot follow another pass until the conversation has grown back everything the first
+#: one removed. That argument is wrong whenever the band is a minority of the prompt, which is
+#: the ordinary case, and the row measured 30 passes in a run because of it -- see the module
+#: docstring. What bounds the passes is :data:`DEFAULT_MIN_BAND_SHARE`; this number only decides
+#: how large the prompt is before the first one.
+#:
+#: Lowering it does not now produce per-turn mutation, because the share rule is what refuses
+#: that; it produces a first compaction on a smaller prompt, which is the thing the flag is for.
 #:
 #: It sits above :data:`~._toolsummary.DEFAULT_TRIGGER_FRACTION`, which is 0.6, and the two are
 #: different decisions rather than an inconsistency. That one asks a *model* for a record and
@@ -141,6 +183,50 @@ logger = logging.getLogger(__name__)
 #: a broken cached prefix, so it wants to fire as late as it can while still leaving the
 #: conversation room to continue.
 DEFAULT_USER_TRIGGER_FRACTION: Final[float] = 0.8
+
+#: Share of the included prompt the band must be worth before a pass may run.
+#:
+#: **0.1, and it is the hysteresis.** Without it the strategy fires once per turn for the rest
+#: of a run that stays above the trigger, because the band it reads after its first pass is its
+#: own summary plus the turns arrived since -- 0.4% to 0.9% of the prompt on the fixture in
+#: ``tests``, and ``USERREPLACED:2`` on the live run in the module docstring. Each of those
+#: passes spends a summarizer call and re-bills the prompt from the summary's position to the
+#: end of the conversation in order to free a few hundred tokens.
+#:
+#: **Where 0.1 comes from: this package's own break-even, at this benchmark's own length.**
+#: :data:`~._anchored.DEFAULT_MIN_GAIN_FRACTION` derives when an edit repays the prefix it
+#: breaks -- ``R > B * (p - c) / (p + T * c)`` for ``R`` tokens removed, ``B`` tokens behind the
+#: edit, ``T`` turns still to come and the measured prices ``p = 0.66`` and ``c = 0.07`` per
+#: million. This strategy's edit sits at the band's first position, just behind the head turn,
+#: so ``B`` is very nearly the whole prompt and the share is a share of the prompt. Solved for
+#: ``T`` instead of for ``R``, a band worth ``f`` of the prompt repays itself within
+#: ``((p - c) / f - p) / c`` turns: **75 turns at 0.1**, which is the length of the
+#: conversations this benchmark seeds (72 filler turns at the 170,000-token cell). So a pass
+#: this rule permits can repay inside the run it is part of, and the 0.9% passes measured above
+#: would have needed about 900 turns to.
+#:
+#: **Why not 0.29, which is the same formula.** That is the twenty-turns-remaining figure, and
+#: at this row's geometry it refuses the 28% band the live run had -- the row would then be the
+#: uncompacted control, which is not a fix for a strategy that fires too often. It is also a
+#: floor this package deliberately did *not* make a default: it ships as
+#: :class:`~._anchored.MinimumGainAnchoredCompactionStrategy`, a separate row measured against
+#: its own parent, because a break-even floor changes what a strategy measures rather than only
+#: how often it fires. This constant is sized to remove passes that cannot repay under any
+#: conversation length anyone here runs, and to leave the rest to that row.
+#:
+#: **What it bounds.** A band regrows only from user turns added since the last pass, so for the
+#: band to be worth ``f`` of the prompt again the prompt must have grown by a factor of at least
+#: ``1 / (1 - f)`` -- 1.111 here. Compactions over a conversation growing from ``P`` to ``kP``
+#: are therefore at most ``ceil(log(k) / log(1.111))``: seven on a conversation that doubles
+#: after its first compaction, three on one that grows by a third, against one per turn before.
+#:
+#: **What it costs.** A band that never reaches a tenth of the prompt is never compacted, and on
+#: a workload whose bulk is tool output that can be every band in a run. The row is then the
+#: uncompacted control on its user half -- but it says so, in
+#: :attr:`UserTurnAnchoredSummarizationCompactionStrategy.user_passes_declined`, which is the
+#: difference between this and the silent degradation the counters in this package exist to
+#: rule out. ``0.0`` restores the old behaviour exactly, so the two can be run side by side.
+DEFAULT_MIN_BAND_SHARE: Final[float] = 0.1
 
 #: User turns kept verbatim at the start.
 #:
@@ -290,6 +376,10 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
             anything happens. Below it the strategy returns without reading the conversation's
             shape at all: a compaction that was not needed spends a summarizer call and breaks
             a cached prefix for nothing. See :data:`DEFAULT_USER_TRIGGER_FRACTION`.
+        min_band_share: Share of the included prompt the band must be worth before a pass may
+            run. This is the hysteresis: without it the strategy fires once per turn for the
+            rest of a run that stays above the trigger. ``0.0`` restores that behaviour, which
+            is what every run before this one measured. See :data:`DEFAULT_MIN_BAND_SHARE`.
         prompt: What the summarizer is asked for. See :data:`DEFAULT_USER_SUMMARY_PROMPT`.
     """
 
@@ -302,16 +392,21 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
         keep_head_user_turns: int = DEFAULT_KEEP_HEAD_USER_TURNS,
         keep_tail_user_turns: int = DEFAULT_KEEP_TAIL_USER_TURNS,
         trigger_fraction: float = DEFAULT_USER_TRIGGER_FRACTION,
+        min_band_share: float = DEFAULT_MIN_BAND_SHARE,
         prompt: str | None = None,
     ) -> None:
         """Validate and store the configuration.
 
         Raises:
-            ValueError: If the ceiling is not positive, either anchor is negative, or the
-                trigger is outside ``(0.0, 1.0]``. A trigger of zero would fire on an empty
-                conversation, where the band is empty and the only thing a pass can produce is
-                a summarizer call; above one it can never fire, which is a row that silently
-                measures the uncompacted control under another name.
+            ValueError: If the ceiling is not positive, either anchor is negative, the trigger
+                is outside ``(0.0, 1.0]``, or the band share is outside ``[0.0, 1.0)``. A
+                trigger of zero would fire on an empty conversation, where the band is empty
+                and the only thing a pass can produce is a summarizer call; above one it can
+                never fire, which is a row that silently measures the uncompacted control under
+                another name. A band share of one demands a band that is the whole prompt, which
+                is the same never-fires row by the other route; zero is legal and is the
+                behaviour this class had before the share existed, kept so the two can be run
+                side by side.
         """
         if max_input_tokens <= 0:
             raise ValueError("max_input_tokens must be positive.")
@@ -319,25 +414,31 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
             raise ValueError("keep_head_user_turns and keep_tail_user_turns must be >= 0.")
         if not 0.0 < trigger_fraction <= 1.0:
             raise ValueError("trigger_fraction must be in (0.0, 1.0].")
+        if not 0.0 <= min_band_share < 1.0:
+            raise ValueError("min_band_share must be in [0.0, 1.0).")
         self.max_input_tokens = max_input_tokens
         self.tokenizer = tokenizer
         self.client = client
         self.keep_head_user_turns = keep_head_user_turns
         self.keep_tail_user_turns = keep_tail_user_turns
         self.trigger_fraction = trigger_fraction
+        self.min_band_share = min_band_share
         self.prompt = prompt or DEFAULT_USER_SUMMARY_PROMPT
         self._compactions = 0
         self._replaced = 0
         self._failures = 0
+        self._below_trigger = 0
+        self._declined = 0
 
     @property
     def user_compactions(self) -> int:
         """Passes that replaced a band of user turns with a summary.
 
-        The count that says whether this row is measuring the design at all. Zero means the
-        conversation never passed ``trigger_fraction``, or passed it with nothing between the
-        anchors, and either way the row is the uncompacted control wearing another name --
-        which is the reading this package has twice had to add a counter to rule out.
+        The count that says whether this row is measuring the design at all. Zero means the row
+        is the uncompacted control wearing another name -- which is the reading this package has
+        twice had to add a counter to rule out -- and which of the three ways it got there is
+        said by :attr:`user_passes_below_trigger`, :attr:`user_passes_declined` and
+        :attr:`user_summary_failures`, exactly one of which is non-zero on such a row.
 
         Read it against :attr:`user_messages_replaced` rather than alone. One compaction that
         replaced seventy turns and seven that replaced ten each cost very different amounts of
@@ -385,8 +486,57 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
         """
         return self._failures
 
+    @property
+    def user_passes_below_trigger(self) -> int:
+        """Passes that returned at the trigger check, having read nothing but the prompt's size.
+
+        The ordinary state of a conversation that has not grown yet, and the reason it is
+        counted at all is that ``user_compactions == 0`` has several causes and a reader needs
+        to tell them apart from the numbers rather than from a story. This one says the
+        conversation never reached the line; :attr:`user_passes_declined` says it did and the
+        band was not worth a pass; :attr:`user_summary_failures` says the band was and the
+        summarizer was not. Together with :attr:`user_compactions` the four partition every
+        pass over a non-empty conversation, so a row where the user half did nothing always has
+        exactly one non-zero number saying why.
+
+        On a composed row this number is the one
+        :attr:`~._composed.ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy.user_passes_starved`
+        subdivides: of the passes counted here, the starved ones are those the phase in front
+        took below the line.
+        """
+        return self._below_trigger
+
+    @property
+    def user_passes_declined(self) -> int:
+        """Passes over the trigger where the band was not worth what a pass costs.
+
+        The hysteresis counter, and the price of having one. Every pass counted here is a pass
+        the old behaviour would have spent: a summarizer call, a rewritten prefix billed from
+        the summary's position to the end of the conversation, and a few hundred tokens freed.
+        Thirty of them is what the live run in the module docstring measured.
+
+        It is one number for three refusals, because they are one statement -- there was not
+        enough here to be worth a pass. The band was empty (the anchors cover the conversation),
+        or it held only this strategy's own earlier summary (nothing new has been said), or it
+        was worth less than ``min_band_share`` of the prompt (something new has been said and it
+        is not enough). :meth:`_worth_compacting` is where all three are written down.
+
+        **Read it as a ratio against :attr:`user_compactions`, not alone.** Non-zero beside a
+        non-zero compaction count is the mechanism working. Non-zero beside *zero* compactions
+        is a row whose user half never acted, and the share is then too high for that workload's
+        band -- which is a configuration to change, not a strategy that failed, and it is
+        visible here rather than looking like a conversation that never grew.
+        """
+        return self._declined
+
     async def __call__(self, messages: list[Message]) -> bool:
-        """Summarise the user band when the prompt is over the trigger.
+        """Summarise the user band when the prompt is over the trigger and the band is worth it.
+
+        Two conditions, and the second one is why this is not once per turn: the trigger says
+        the prompt is large enough to act on, and :meth:`_worth_compacting` says this band is
+        worth the pass. Each refusal increments the counter that names it, so the four outcomes
+        -- under the line, declined, summarizer failed, compacted -- partition the passes and a
+        row that did nothing says which.
 
         Nothing is mutated until the summary is in hand. That ordering is the whole of the
         "degrade safely" contract: exclusion flags and the summary's back-references are
@@ -410,11 +560,14 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
             return False
         annotate_message_groups(messages)
         annotate_token_counts(messages, tokenizer=self.tokenizer)
-        if included_token_count(messages) <= int(self.max_input_tokens * self.trigger_fraction):
+        prompt_tokens = included_token_count(messages)
+        if prompt_tokens <= int(self.max_input_tokens * self.trigger_fraction):
+            self._below_trigger += 1
             return False
 
         band = self._band(messages)
-        if not band:
+        if not self._worth_compacting(messages, band, prompt_tokens):
+            self._declined += 1
             return False
 
         summary = await self._summarize([messages[span["start_index"]] for span in band])
@@ -445,19 +598,17 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
         subtler bug: a preserved last turn would otherwise take the tail's place and let the
         live request be summarised.
 
-        **At least one candidate must not be this strategy's own summary.** A band holding only
-        the previous summary is a band whose replacement frees nothing, and rewriting one
-        message at one position for nothing is exactly the thrash
-        :meth:`~._anchored.AnchoredCompactionStrategy._shorten` refuses to do. This is the same
-        shape as :meth:`~._toolsummary.ToolResultRecallMiddleware._record_due`, which re-arms on
-        new material rather than on size, and for the same reason: the size that fired the
-        trigger does not go away when the compaction that answered it is already in the prompt.
+        **Whether the band is worth replacing is not decided here.** This returns what a pass
+        *may* touch; :meth:`_worth_compacting` decides whether a pass runs at all. The two were
+        one method until the band's own size had to be weighed, and separating them is what
+        keeps the selection rule readable as a selection rule -- and puts all three reasons a
+        pass declines in one place, behind one counter.
 
         Args:
             messages: The conversation, already grouped.
 
         Returns:
-            The spans to replace, empty when this pass must do nothing.
+            The spans this pass may replace, empty when the anchors leave nothing between them.
         """
         turns = [
             span
@@ -469,10 +620,55 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
         last = len(turns) - self.keep_tail_user_turns
         if last <= self.keep_head_user_turns:
             return []
-        band = turns[self.keep_head_user_turns : last]
-        if all(_is_summary(messages[span["start_index"]]) for span in band):
-            return []
-        return band
+        return turns[self.keep_head_user_turns : last]
+
+    def _worth_compacting(self, messages: list[Message], band: list[dict[str, Any]], prompt_tokens: int) -> bool:
+        """Return whether this band is worth what a pass costs.
+
+        **The hysteresis, in the one place it is written down.** A pass spends a summarizer call
+        and rewrites the prompt at the band's first position, which re-bills everything from
+        there to the end of the conversation at the uncached rate. Three refusals, which are one
+        statement -- there is not enough here to pay for that:
+
+        - **An empty band.** The anchors cover the whole conversation, so there is nothing
+          between them to stand for.
+        - **A band holding only this strategy's own earlier summary.** Replacing it frees
+          exactly nothing: one message is rewritten at one position and the prompt is the size
+          it was. This is :meth:`~._toolsummary.ToolResultRecallMiddleware._record_due`'s rule,
+          re-arming on new material rather than on size.
+        - **A band worth less than ``min_band_share`` of the included prompt.** The rule the
+          other two are corners of, and the one the measurement forced. The condition that fires
+          a pass is the prompt's size, and the prompt does not shrink to the size of the band --
+          so once the band is down to the previous summary plus a turn or two, every new turn
+          makes the second rule true again while freeing a fraction of a percent. Thirty passes
+          in a run, measured; see the module docstring and :data:`DEFAULT_MIN_BAND_SHARE`.
+
+        **The band is measured, not counted.** A minimum number of new *turns* since the last
+        pass would bound nothing: it divides the firing count by a constant and leaves it
+        growing with the conversation. A minimum *growth of the prompt* would bound it, but on
+        growth this strategy may not touch -- a run whose bulk is tool output would re-arm the
+        band without adding anything to it. Tokens in the band against tokens in the prompt is
+        the one measure that is both what a pass would free and what it would cost.
+
+        The share is taken against the prompt as the trigger read it, before anything was
+        removed, and the summary's own size is not deducted from the band: it is not known until
+        the summarizer has answered, and it is one message against a band that has to clear a
+        fifth of the prompt to get here.
+
+        Args:
+            messages: The conversation, already grouped and token-annotated.
+            band: The spans :meth:`_band` selected.
+            prompt_tokens: Included tokens, as the trigger check read them.
+
+        Returns:
+            True when the pass may go on to spend a summarizer call.
+        """
+        if not band:
+            return False
+        replaced = [messages[span["start_index"]] for span in band]
+        if all(_is_summary(message) for message in replaced):
+            return False
+        return included_token_count(replaced) >= prompt_tokens * self.min_band_share
 
     async def _summarize(self, turns: list[Message]) -> str | None:
         """Return the summary of ``turns``, or None when the summarizer did not produce one.

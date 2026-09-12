@@ -355,12 +355,44 @@ different question. The turn before that has already been answered and has no su
 method refuses to touch a result already carrying `REMOVAL_MARKER`, because its trigger is the
 band's geometry: a result sits in the band from the turn it ages out of the tail until the end
 of the run, so "trim what is in the band" fires every single pass and re-trimming would be a
-fresh mutation at one position on every turn. Here the trigger is a threshold that the
-compaction moves away from — a pass removes tens of thousands of tokens, and the next one cannot
-happen until the conversation has grown all of that back — so between two compactions the prefix
-is byte-identical on every turn. Measured on the replay below, the default 0.8 fires **once** on
-a 72-turn conversation. The two decisions are opposite and neither was taken in ignorance of the
-other.
+fresh mutation at one position on every turn. The two decisions are opposite and neither was
+taken in ignorance of the other — but the argument that made this one safe was wrong, and the
+correction is below.
+
+**The threshold alone does not bound the passes. Measured: 31 of them.** This section used to
+say that the trigger is a threshold the compaction moves away from — a pass removes tens of
+thousands of tokens, the next one cannot happen until the conversation has grown all of that
+back — and the offline replay below, where the default fires once on a 72-turn conversation,
+was read as confirming it. It does not generalise past that replay's shape. On gpt-5.6-luna at
+a 170,000-token window, 0.9 fill and a **scaled** payload, the row reported `USERCOMPACT:31`
+and `USERCOMPACT:30` on two seeds, `USERREPLACED:2` on both, snapshots of 82% and 76%, and
+cache hit rates of 53% and 61% against the uncompacted control's 95%.
+
+Two things are wrong with the old argument. The band is not the prompt: on that run it was 28%
+of it, and the rest is assistant replies and tool payload this strategy may not touch, so
+removing *all* of the band need not take the prompt under the line. And after the first pass
+the band is not even that — it is the previous summary plus the turns since, a fraction of a
+percent — so every later pass rewrites the prefix at one position to free almost nothing. That
+is the thrash `_shorten` refuses, arrived at from the other direction, and the replay agreed all
+along: its own table shows 9 passes at a 0.4 trigger.
+
+**The bound is `min_band_share` (`--user-min-band-share`), default 0.1.** A pass runs only when
+the band is worth at least that share of the included prompt. Derived from this package's own
+break-even — `R > B * (p - c) / (p + T * c)` at the measured prices, the same arithmetic behind
+`MinimumGainAnchoredCompactionStrategy` — solved for turns rather than for tokens: a band worth
+a tenth of the prompt repays the prefix it breaks within about 75 turns, which is this
+benchmark's own conversation length, and the 0.9% bands measured above would need about 900.
+It is not that strategy's 0.29, which is the twenty-turn figure and would refuse the 28% band
+this row exists to measure.
+
+What it bounds, and how: a band regrows only from user turns added since the last pass, so to be
+worth `f` of the prompt again the prompt must have grown by `1 / (1 - f)`. The firing count over
+a conversation growing from `P` to `kP` is therefore at most `ceil(log(k) / log(1 / (1 - f)))` —
+one pass per 11% of prompt growth at the default. On the package's own 40-turn growing fixture
+that is **3 passes against 33** with the share switched off. What it costs is a band that never
+reaches a tenth of the prompt never being compacted at all; `USERHELD:<n>`
+(`user_passes_declined`) is what says so, and a row with `USERHELD` and no `USERCOMPACT` is a
+share set too high for that workload rather than a strategy that failed.
 
 Refusing to recompact is not the neutral option either: the summary is a user message, so a
 strategy that would not re-read its own output would have to keep every earlier summary beside
@@ -371,13 +403,18 @@ A pass whose band holds **only** the previous summary does nothing, because rewr
 message at one position for no reduction is the thrash `_shorten` refuses. The band must contain
 at least one turn that is not a summary, which is the same rule `_record_due` applies to the
 recall middleware and for the same reason: the size that fired the trigger does not go away when
-the compaction that answered it is already in the prompt.
+the compaction that answered it is already in the prompt. That rule is necessary and was not
+sufficient — one new turn satisfies it — so it now sits in `_worth_compacting` beside the share,
+as its `f = 0` corner.
 
 **The trigger is 0.8 where the record strategy's is 0.6,** and they are separate settings
 (`--user-trigger-fraction` against `--trigger-fraction`). The record has to be asked for before
 the bulk it must read degrades it — 53 of 53 facts at 8,000-token results, 18 of 53 at 25,200 —
 so it wants to fire early. This one asks for prose whose quality is not what the row measures and
-pays only in a broken cached prefix, so it wants to fire as late as it still can.
+pays only in a broken cached prefix, so it wants to fire as late as it still can. It decides
+*when the first compaction happens*, and nothing else: how many there are is the band share
+above. That the two thresholds are ordered this way is also what starves the user half of the
+composed row — see below.
 
 **Expected effect, from an offline replay of run 43's conversation** — the real turns and tool
 results, the run's own assumed 602-token replies, and a stub summarizer, so no model was called:
@@ -389,6 +426,12 @@ results, the run's own assumed 602-token replies, and a stub summarizer, so no m
 | `user_summary_anchored`, trigger 0.8 | 83,761 | 49% | 1, replacing 60 turns |
 | `user_summary_anchored`, trigger 0.6 | 69,635 | 41% | 2 |
 | `user_summary_anchored`, trigger 0.4 | 69,635 | 41% | 9 |
+
+**Read that table as a statement about run 43's shape and not about the strategy.** Its
+conversation is 57% user text, so the band is most of the prompt and one pass clears the
+trigger. The live scaled-payload run above has the band at 28%, where the same code fired 31
+times — and the 9 passes at a 0.4 trigger in the last row are that same behaviour visible in the
+replay. The pass counts here predate `min_band_share` and are the `0.0` arm of it.
 
 The size of the summary barely matters: 500, 1,000 and 2,000 tokens move the result by 0.6
 points, because what it replaces is around 75,000. And the floor at 41% is not this strategy
@@ -460,9 +503,26 @@ sees a number the first moved. The conversation is re-annotated between the phas
 the first changed anything, because the record strategy's fallback rewrites tool results in place
 and the counts are cached per message. The order above is chosen so the number moves as little as
 it can. And `user_passes_starved` — the `USERSTARVED:<n>` flag — counts the passes where the
-record phase's own removals took the prompt from above the user phase's line to at or below it.
-That is the one reading of `USERCOMPACT:0` that is not about the user half at all, and without it
-it is indistinguishable from a band that held nothing.
+record phase's removals are why the prompt is under the user phase's line. That is the one
+reading of `USERCOMPACT:0` that is not about the user half at all.
+
+**It was written as a within-pass transition and could not see the case it was written for.**
+The test was "above the line when the pass started, at or below it when the record phase
+finished". Measured: seed 1 of the composed row reported `snap 63%`, `REC:1, RECORDS:1,
+FORCED:1, RECFORCED:1`, no `USERCOMPACT` — and no `USERSTARVED`. The cause is structural rather
+than incidental. The record phase's trigger is *lower* than the user phase's, so on a workload
+whose bulk is tool payload it removes that payload while the prompt is still in the 60s and
+holds it there for the rest of the run; the prompt is then never above the user line when a pass
+begins, and the transition never happens. The composed row had silently become
+`tool_summary_anchored` with extra machinery, which is exactly the failure the composition
+exists to avoid, and its own diagnostic said nothing.
+
+It now counts against what the record phase has removed **over the run** rather than over one
+pass: a pass is starved when the prompt is at or below the user line and would have been above
+it with those tokens still in the conversation. Every pass the old definition counted is still
+counted — that pass's own removal is part of the total — and the ones it could not see are
+counted too. On the package's growing fixture that is 15 starved passes out of 20 where the old
+definition reported 0.
 
 It is reported rather than prevented. Preventing it means overriding a part's trigger, and then
 the composed row's user half fires where no `user_summary_anchored` row fires, which takes the two
@@ -474,8 +534,17 @@ row that neither single row can make.
 
 **Counters.** Both parts' counters are readable off the composed object, so one row's flags say
 which half did what: `REC`, `RECORDS`, `FALLBACK`, `RECFALLBACK` and `UNCOVERED` are the record
-half, `USERCOMPACT`, `USERREPLACED` and `USERSUMMFAIL` the user half, and `USERSTARVED` is the
-composition's own.
+half, `USERCOMPACT`, `USERREPLACED`, `USERUNDER`, `USERHELD` and `USERSUMMFAIL` the user half,
+and `USERSTARVED` is the composition's own.
+
+**A silent user half has four readings and the flags separate all four,** which is the whole
+point of the row being readable at all: `USERUNDER` is never considered, `USERSTARVED` is the
+subset of those the record phase caused, `USERHELD` is considered and held back by the band
+share, and `USERSUMMFAIL` is a summarizer that did not answer. They partition the passes — over
+a non-empty conversation every pass lands in exactly one of those four or in `USERCOMPACT` — so
+a reader with only the flags column can tell "the order of the phases is wrong" from "the share
+is set too high for this workload" from "the conversation never got big enough", and those ask
+for three different changes.
 
 **The wiring the row needs, and the one that was missing.** The record half is a strategy *and* a
 middleware, and the benchmark installs that middleware for the strategy it finds inside whatever

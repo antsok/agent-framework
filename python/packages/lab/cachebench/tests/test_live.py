@@ -1138,6 +1138,8 @@ _TUNED_ARGV = (
     "3",
     "--user-trigger-fraction",
     "0.31",
+    "--user-min-band-share",
+    "0.37",
     "--budget-fraction",
     "0.29",
 )
@@ -1286,12 +1288,16 @@ def _user_band_conversation(turns: int) -> list[Message]:
 
 
 def test_the_user_band_flags_reach_the_strategy_that_consumes_them() -> None:
-    """Three more knobs that parse and could go nowhere, checked the way the others are.
+    """Four more knobs that parse and could go nowhere, checked the way the others are.
 
     Its own test rather than a block inside the tuning test above, because this strategy cannot
     be built without a summarizer client and that helper deliberately builds with none: the
     pre-flight skips summarizer-needing strategies when there is no client, so a run without
     one would never have exercised these at all.
+
+    ``--user-min-band-share`` is the one that decides how many times the row compacts rather
+    than when it starts, so a flag that parsed and reached nothing would leave a sweep of it
+    producing identical rows and no way to tell that from a null result.
     """
     summarizer = _StubSummarizer()
     options = _strategy_options(build_parser().parse_args(["azure", *_TUNED_ARGV]), TOKENIZER, summarizer)
@@ -1301,6 +1307,7 @@ def test_the_user_band_flags_reach_the_strategy_that_consumes_them() -> None:
     assert isinstance(strategy, UserTurnAnchoredSummarizationCompactionStrategy)
     assert (strategy.keep_head_user_turns, strategy.keep_tail_user_turns) == (2, 3)
     assert strategy.trigger_fraction == 0.31, "--user-trigger-fraction, not --trigger-fraction"
+    assert strategy.min_band_share == 0.37, "--user-min-band-share, which bounds how often it fires"
     assert strategy.max_input_tokens == options.input_budget_tokens
     assert strategy.client is summarizer
 
@@ -1333,6 +1340,8 @@ def test_the_two_trigger_flags_stay_apart() -> None:
         pytest.param(["--user-trigger-fraction", "1.5"], "trigger_fraction", id="trigger-above-one"),
         pytest.param(["--keep-head-user-turns", "-1"], "keep_head_user_turns", id="head"),
         pytest.param(["--keep-tail-user-turns", "-1"], "keep_tail_user_turns", id="tail"),
+        pytest.param(["--user-min-band-share", "-0.1"], "min_band_share", id="share-negative"),
+        pytest.param(["--user-min-band-share", "1.0"], "min_band_share", id="share-one"),
     ],
 )
 def test_a_user_band_value_outside_its_range_is_refused_before_anything_is_spent(argv: list[str], match: str) -> None:
@@ -1684,24 +1693,37 @@ async def test_both_halves_counters_reach_the_seed_record_and_the_flags_column()
     assert "USERCOMPACT:1" in _render(None, [cell], set(), show_answers=False)
 
 
-async def test_a_starved_user_half_reaches_the_flags_column() -> None:
-    """The one counter composing adds, and the only thing that reads USERCOMPACT:0 correctly.
+async def test_every_reason_the_user_half_did_nothing_reaches_the_flags_column() -> None:
+    """USERCOMPACT:0 has four readings, and the flags column has to carry all four.
 
-    Without it, a pass whose record half took the prompt under the user half's own trigger is
-    indistinguishable from a band that held nothing worth summarising -- and the two ask for
-    opposite responses, since the first is an argument for moving a threshold and the second is
-    not. It travels by the same duck-typed route every other strategy counter does, which is
-    the route a new one is most easily left off.
+    A pass whose record half took the prompt under the user half's own trigger, a pass whose
+    band was not worth compacting, a pass that never reached the trigger at all and a summarizer
+    that did not answer are four different findings: the first is an argument about the order of
+    the phases, the second about ``--user-min-band-share``, the third about the workload and the
+    fourth about the summarizer. A column that shows only some of them sends a reader to the
+    wrong knob. They travel by the same duck-typed route every other strategy counter does,
+    which is the route a new one is most easily left off.
+
+    An idle pass is no longer silent, and that is the change: it reports ``USERUNDER``, because
+    "the user half was never consulted" is the reading that most needs a number beside it -- it
+    is what ``USERSTARVED`` is a subset of, and without the total there is nothing to read that
+    subset against.
     """
     strategy = _composed_over(ceiling=100_000)
 
     assert await strategy(_user_band_conversation(8)) is False, "neither trigger is near this ceiling"
-    assert not _strategy_notes(strategy), "an idle pass adds nothing to the flags column"
+    assert _strategy_notes(strategy) == ("USERUNDER:1",), "an idle pass reports being idle and nothing else"
 
     starved = _composed_over()
     starved._starved = 2
+    starved.user_turns._declined = 3
+    starved.user_turns._below_trigger = 7
 
-    assert "USERSTARVED:2" in _strategy_notes(starved)
+    notes = _strategy_notes(starved)
+
+    assert "USERSTARVED:2" in notes
+    assert "USERHELD:3" in notes, "held back by the band share, which is not the same as starved"
+    assert "USERUNDER:7" in notes, "and the passes it was never consulted on at all"
 
 
 async def test_a_record_cap_above_the_reservation_is_named_for_the_composed_row_too(
@@ -1751,7 +1773,7 @@ async def test_records_written_before_the_user_band_counters_read_back_as_zero()
 
 
 def test_a_settings_block_written_before_the_user_band_knobs_still_loads() -> None:
-    """The three new settings are read leniently, and the licence for that is narrow.
+    """The three schema 9 settings are read leniently, and the licence for that is narrow.
 
     Version 7's rule is that an unrecorded setting reads back as ``None``, because filling it in
     would credit an archived cell with a configuration it may never have run. These three are
@@ -1771,6 +1793,29 @@ def test_a_settings_block_written_before_the_user_band_knobs_still_loads() -> No
     assert settings.user_trigger_fraction == 0.8
 
 
+def test_a_settings_block_written_before_the_band_share_reads_it_as_zero_and_not_as_the_default() -> None:
+    """The fourth user-band setting is read on a different licence from the other three.
+
+    A schema 9 record *could* select ``user_summary_anchored``, so unlike the schema 8 case this
+    is not an inapplicable knob -- those runs compacted user turns, and they did it with no
+    minimum band share at all, which is the same thing as a share of zero. So zero is what those
+    runs demonstrably did, and filling in today's default would credit them with a bound they
+    ran without and let an archived cell pool with a rerun that behaves differently. The
+    strategy's own tests pin that ``0.0`` really is the old behaviour, which is what makes this
+    reading true rather than merely convenient.
+    """
+    written = _cell_params(settings=_settings()).to_dict()
+    del written["settings"]["user_min_band_share"]
+
+    settings = CellParams.from_dict(written).settings
+
+    assert settings is not None
+    assert settings.user_min_band_share == 0.0, "what those runs did, not what this version defaults to"
+    assert _cell_params(settings=settings).key != _cell_params(settings=_settings()).key, (
+        "so an archived cell and a rerun of it under the default do not merge into one row"
+    )
+
+
 def test_two_cells_differing_only_in_a_user_band_setting_do_not_merge() -> None:
     """The reason the settings block exists, on the knobs this change adds.
 
@@ -1784,6 +1829,10 @@ def test_two_cells_differing_only_in_a_user_band_setting_do_not_merge() -> None:
 
     assert early.key != late.key
     assert _cell_params(settings=_settings(keep_tail_user_turns=4)).key != _cell_params(settings=_settings()).key
+    assert _cell_params(settings=_settings(user_min_band_share=0.0)).key != _cell_params(settings=_settings()).key, (
+        "and the band share hardest of all: it decides whether the row compacts once or once "
+        "per turn, which is the whole money side of it"
+    )
 
 
 async def test_the_dry_run_checks_the_configuration_it_is_printing_a_plan_for(
@@ -5722,6 +5771,7 @@ def _settings(**overrides: Any) -> StrategySettings:
         "keep_head_user_turns": 1,
         "keep_tail_user_turns": 1,
         "user_trigger_fraction": 0.8,
+        "user_min_band_share": 0.1,
         "token_budget_fraction": 0.5,
         "max_output_tokens": 2_048,
         "answer_max_tokens": 12_000,
