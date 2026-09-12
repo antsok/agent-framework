@@ -457,6 +457,14 @@ class StrategySettings:
     Its own field rather than ``trigger_fraction`` above, which belongs to
     ``tool_summary_anchored``. Recording one number for both would key two runs as one cell
     whenever a sweep moved either, which is the whole defect this block exists to stop.
+
+    **It describes the single row only, and a reader of a composed row must not take it from
+    here.** ``tool_and_user_summary_anchored`` judges both of its halves at
+    ``trigger_fraction`` above, against one reading of the prompt taken before either acts, so a
+    record whose row is that one is a record whose user half fired at ``trigger_fraction`` while
+    this field says something else about a row that was not being run. Two lines there was
+    measured to be the record half holding the prompt below the user half's for a whole run;
+    ``compaction/_composed`` carries the argument.
     """
     user_min_band_share: float
     """Share of the prompt the band had to be worth before ``user_summary_anchored`` acted.
