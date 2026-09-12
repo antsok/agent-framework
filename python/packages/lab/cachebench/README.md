@@ -9,7 +9,7 @@ The other four documents answer different questions:
 
 | | |
 | --- | --- |
-| [`STRATEGIES.md`](STRATEGIES.md) | what each of the eighteen strategies does, and what it retained |
+| [`STRATEGIES.md`](STRATEGIES.md) | what each of the twenty strategies does, and what it retained |
 | [`REPORT-2026-09-07.md`](REPORT-2026-09-07.md) | what the measurements mean, and what has been withdrawn |
 | [`RESULTS.md`](RESULTS.md) | every run, with its own caveats |
 | [`TESTING.md`](TESTING.md) | how the package is tested and why |
@@ -150,7 +150,7 @@ want to vary is a flag, because a knob that is only a default cannot be measured
 | flag | default | |
 | --- | --- | --- |
 | `provider` (positional) | — | `provider` or `provider:model`. Omitted only with `--from-jsonl` |
-| `--strategies` | 11 of the 18 | comma-separated; see [`STRATEGIES.md`](STRATEGIES.md) |
+| `--strategies` | 11 of the 20 | comma-separated; see [`STRATEGIES.md`](STRATEGIES.md) |
 | `--agent` | `plain` | `harness` swaps in `create_harness_agent`, which is what production code calls. Its optional providers are switched off, because each adds tools and system-prompt text to every measured prompt |
 | `--repeats` | 1 | seeds per strategy — whole conversations driven from scratch. This is the axis that measures compaction's own reliability. 3 or more is what makes a ranking defensible |
 | `--seed-offset` | 0 | number the seeds from here. The seed number goes into the scenario salt, so two invocations that both start at seed 1 build byte-identical conversations; offsetting is what makes several single-seed invocations into different seeds rather than one seed measured repeatedly |
@@ -215,7 +215,7 @@ refused with an error rather than quietly overshooting.
 | --- | --- | --- | --- |
 | `--max-output-tokens` | 2,048 | subtracted from `--context-window` to give the input budget every threshold is a fraction of | every seeding call |
 | `--answer-max-tokens` | 4,000 | checked against the fill target before the run spends anything | the closing questions, and nothing else |
-| `--record-max-tokens` | 4,000 | the seeding reservation | the one call `tool_summary_anchored` forces. `0` leaves the run's own cap in place |
+| `--record-max-tokens` | 4,000 | the seeding reservation | the one call `tool_summary_anchored` forces, and the composed row's record half with it. `0` leaves the run's own cap in place |
 
 These are separate because a seeding reply is appended to the history and re-sent on every later
 turn, while nothing follows a closing answer — the snapshot is restored before the next probe, so
@@ -262,6 +262,21 @@ a measured cost. What is measured points the other way: the record degrades with
 read, 53/53 facts at 8,000-token results against 18/53 at 25,200, so a later ask is a bigger ask
 and a worse record, and it leaves fewer turns for the edit to repay itself over.
 
+**The user-turn strategy** — `user_summary_anchored`, and the user half of
+`tool_and_user_summary_anchored`. Both rows need `--summarizer-provider`:
+
+| flag | default | |
+| --- | --- | --- |
+| `--user-trigger-fraction` | 0.8 | share of the input budget at which `user_summary_anchored` summarises the user's own turns. Its own flag rather than `--trigger-fraction`, which belongs to `tool_summary_anchored`: the two thresholds answer different questions for the two single rows, and one flag would make a sweep of either a sweep of both. Higher than that one's 0.6 because this strategy pays only in a broken cached prefix, so it can wait. It decides when the *first* compaction happens and not how many there are — that is `--user-min-band-share`, and firing late was found not to bound the count at all. **Moves the single row only**: `tool_and_user_summary_anchored` judges both halves at `--trigger-fraction`, because two lines there is the record half holding the prompt below the user half's for the whole of a run |
+| `--user-min-band-share` | 0.1 | share of the included prompt the user band must be worth before `user_summary_anchored` will compact it. The hysteresis, and what bounds the passes: at `0` the strategy fires once per turn for the rest of a run that stays above the trigger, because after its first pass the band is its own summary plus the turns since, and each pass is a summarizer call and a rewritten prefix to free a few hundred tokens. 0.1 is the break-even share for a conversation of this benchmark's own length at the measured cached and uncached prices; raise it for shorter runs. `0` restores the unbounded behaviour so the two can be run side by side, and `USERHELD` in the flags column says how many passes it refused |
+| `--keep-head-user-turns` | 1 | user turns at the start of the conversation never summarised. Counted in user turns, not message groups, so it is not `--keep-head-groups`, which protects a prefix of groups of every kind and is read by four other strategies. One because one is what carries the task and its requirements, which every deleting strategy measured here throws away first |
+| `--keep-tail-user-turns` | 1 | user turns at the end never summarised. One because the last user turn is the live request, and a model answering a summary of the question it was just asked answers the wrong question; the turn before it has already been answered and has no such claim, so raising this buys nothing and costs the band its newest material. Separate from the head so the two ends can be moved apart, which is the only way to measure the opening statement against the recent turns |
+
+Neither row has a measured run behind it; [`STRATEGIES.md`](STRATEGIES.md) says what a run would
+answer. The composed row reads `--trigger-fraction`, `--fallback-fraction`, `--coverage-share` and
+the record flags above for its record half and the four flags here for its user half, so a sweep
+of any of them moves that half of it exactly as it moves the single row.
+
 **Everything else:**
 
 | flag | default | |
@@ -269,7 +284,7 @@ and a worse record, and it leaves fewer turns for the edit to repay itself over.
 | `--keep-last-groups` | 6 | groups `sliding_window` keeps, and the target `summarization` compacts to. Unreachable before this flag existed, which fixed the worst-performing row in the table at one setting |
 | `--keep-last-tool-groups` | 4 | tool-call groups the tool-oriented strategies retain verbatim. The framework's own default; with fewer groups than this in the scenario they collapse nothing at all |
 | `--budget-fraction` | 0.5 | fraction of the input budget the `token_budget_*` family compacts down to |
-| `--summarizer-provider` | — | required by `summarization` and `token_budget_summarize`. Prefer the same model as the one under test: summarizer tokens are priced at the tested model's rates, so a cheaper summarizer is billed at the wrong price. Those calls never reach the agent's middleware, and charging them at zero would score the one strategy that spends money to preserve information as though preserving it were free |
+| `--summarizer-provider` | — | required by `summarization`, `token_budget_summarize`, `user_summary_anchored` and `tool_and_user_summary_anchored`. Prefer the same model as the one under test: summarizer tokens are priced at the tested model's rates, so a cheaper summarizer is billed at the wrong price. Those calls never reach the agent's middleware, and charging them at zero would score the one strategy that spends money to preserve information as though preserving it were free |
 
 ### Probing and the accuracy bar
 
@@ -335,9 +350,10 @@ lands, so a row that has stopped preserving anything shows up hours before the t
 **`--dump-record` is observation only.** The record is read back out of the finished conversation
 after the run is over, so nothing is added to any prompt, no extra call is made, and the tokens,
 the cache hits and the cost are byte for byte what they would have been without it. Only
-`tool_summary_anchored` writes a record at all, and a seed whose model never wrote one produces no
-file rather than an empty one. Use it to read what the model actually preserved, which is the
-question an `UNCOVERED` flag raises and no count can answer.
+`tool_summary_anchored` — and `tool_and_user_summary_anchored`, which runs it as a phase — writes
+a record at all, and a seed whose model never wrote one produces no file rather than an empty
+one. Use it to read what the model actually preserved, which is the question an `UNCOVERED` flag
+raises and no count can answer.
 
 ## Reading the live table
 
@@ -417,6 +433,12 @@ the money columns.
 | `FALLBACK:<n>` | times it gave up and compacted another way. **A row with this is measuring that other strategy, not the one named** |
 | `RECFALLBACK:<n>` | passes where a record did exist, was anchored on, and the row still fell back — what the record freed left the prompt over the ceiling. The quieter of the two: the fallback shortens tool results in place, so the row keeps its message count and loses its values |
 | `NOGAIN:<n>` | collapses `anchored_min_gain` declined as below its break-even floor. Distinguishes "never fired" from "fired to no effect" |
+| `USERCOMPACT:<n>` | passes where `user_summary_anchored` replaced a band of the user's own turns with one summary of them. Above 1 is the strategy recompacting its own earlier summary, and every pass re-bills the prompt from its edit to the end. `USERCOMPACT:0` is the uncompacted control under another name, and exactly one of the next three says why |
+| `USERREPLACED:<n>` | turns the most recent of those passes stands in for — how much of the conversation the row carries as a summary rather than verbatim, which is what moved `snap%` |
+| `USERUNDER:<n>` | passes where the prompt never reached the user trigger, so the band was not even read |
+| `USERHELD:<n>` | passes where it did and the band was not worth a pass under `--user-min-band-share`: empty, holding only the strategy's own earlier summary, or too small a share of the prompt to pay for the prefix a pass rewrites. The hysteresis working; `USERHELD` with no `USERCOMPACT` is a share set too high for the workload, not a strategy that failed |
+| `USERSUMMFAIL:<n>` | passes where the summarizer raised or returned nothing, so the band was left exactly as found and those passes are the control too |
+| `USERSTARVED:<n>` | passes of `tool_and_user_summary_anchored` where the record half's removals on earlier passes are why the prompt was under the user half's line, so the user half was never consulted — the subset of `USERUNDER` the composition caused rather than the conversation. **Zero by construction on the row the CLI builds**, whose halves share `--trigger-fraction` against one reading taken before either acts; non-zero there is a defect report |
 | `NO:<opt>` | the provider rejected that option so it was dropped. A run that dropped `tool_choice` chose its own tool calls and is not comparable with one that did not |
 | `FETCH` | this row gathered a different set of facts than the control |
 | `MSGS:<+-n>` | this row is the control and its conversation was n messages away from the leanest strategy row's. Compaction only adds to the stored history, so the control has to match that row; when it does not, every `vs none$` in the cell compares two different workloads and the control is excluded so that none of them is ranked |

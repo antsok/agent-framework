@@ -791,6 +791,7 @@ def test_every_argument_the_runner_reads_is_defined() -> None:
         "keep_head_user_turns",
         "keep_tail_user_turns",
         "user_trigger_fraction",
+        "user_min_band_share",
         "record_repeats",
         "min_correctness",
         "summarizer_provider",

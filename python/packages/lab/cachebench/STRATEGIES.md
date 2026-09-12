@@ -1,7 +1,10 @@
-# The eighteen strategies this benchmark selects between
+# The twenty strategies this benchmark selects between
 
 Every name `--strategies` accepts, what it removes, when it fires, what it protects, and what
-it retained the one time all eighteen were measured in a single cell.
+it retained the one time every strategy then in existence — eighteen of the twenty — was
+measured in a single cell. The two that did not yet exist, `user_summary_anchored` and
+`tool_and_user_summary_anchored`, have no measured row anywhere in this package, and their
+sections below say so.
 
 The registry is [`_strategies.py`](agent_framework_lab_cachebench/_strategies.py). It stays in
 the lab rather than in the strategy subpackage because it is benchmark configuration: its job
@@ -11,9 +14,11 @@ each, built from one `StrategyOptions`, so that a row is a row on equal terms.
 Related documents:
 
 - [`agent_framework_lab_cachebench/compaction/STRATEGIES.md`](agent_framework_lab_cachebench/compaction/STRATEGIES.md)
-  — the three strategies written here, in depth. **Read that for `anchored`,
-  `anchored_min_gain` and `tool_summary_anchored`;** this file gives only their place in the
-  set. It is separate because the subpackage is meant to be lifted out whole into a repository
+  — the five strategies written here, in depth. **Read that for `anchored`,
+  `anchored_min_gain`, `tool_summary_anchored`, `user_summary_anchored` and
+  `tool_and_user_summary_anchored`;** this file gives only their place in the set. Its account
+  of the composed row is behind the code — see the caveats at the end. It is separate because
+  the subpackage is meant to be lifted out whole into a repository
   of its own, and the design notes travel with the code rather than with the instrument that
   measured it. `tests/compaction/test_boundary.py` enforces the same boundary on the imports.
 - [`REPORT-2026-09-07.md`](REPORT-2026-09-07.md) — what the measurements mean.
@@ -34,11 +39,13 @@ strategies believed 57,952 tokens were available when 48,000 were. **Runs 26 to 
 arithmetic; runs 41 and 42 do not, and the two sets are different instruments.**
 
 **Compaction excludes, it does not delete.** The framework marks a message
-`additional_properties["_excluded"] = True` and projects the included ones at send time. Two
+`additional_properties["_excluded"] = True` and projects the included ones at send time. Three
 strategies also *insert*: `ToolResultCompactionStrategy` and `SummarizationStrategy` replace
-what they exclude with a new assistant message carrying trace links back to the originals. The
-anchored family is the third case — it rewrites tool-result *text* in place, which removes
-tokens without removing messages, and is why `msgs` alone cannot see what it did.
+what they exclude with a new assistant message carrying trace links back to the originals, and
+`user_summary_anchored` replaces the user turns it excludes with a new *user* message carrying
+the same links. The anchored family is the remaining case — it rewrites tool-result *text* in
+place, which removes tokens without removing messages, and is why `msgs` alone cannot see what
+it did.
 
 **A group is the unit.** `group_messages()` spans a system message, a user message, an
 assistant text message, or a whole tool-call group — the assistant call, any reasoning
@@ -66,6 +73,11 @@ sweep moving either would move every anchored row except the one hiding inside t
 that fell back is partly measuring `anchored`; `RECFALLBACK:<n>` in the flags column says so,
 and it counts effects rather than attempts.
 
+**`tool_and_user_summary_anchored` has one line for two halves, and it is the record half's.**
+Both halves are judged at `--trigger-fraction` against a single reading of the prompt taken
+before either acts, and `--user-trigger-fraction` does not reach the row. The section on it
+says why the two obvious alternatives are one defect under two numbers.
+
 **Exclusion order versus size.** Every strategy outside the `token_budget_*` family decides
 *when* to compact from its own trigger, so different strategies leave prompts of different
 sizes and a comparison between them confounds "trimmed harder" with "trimmed smarter". The
@@ -74,12 +86,17 @@ the input budget) and differ only in the order they delete, which holds size fix
 
 ---
 
-## What they retained, all eighteen in one cell
+## What they retained — eighteen of the twenty, in one cell
 
 Run 42: `gpt-5.6-luna` through the MAF harness, 60,000-token window, 0.86 fill, 3,500-token
 tool results, 5 seeds, 90 records, 53 planted facts. `facts` is the mean over seeds and `acc1`
 the mean share of scoped questions answered; `snap%` is the snapshot every question was asked
 from, as a share of the window, and the uncompacted control sits at 81%.
+
+The table is eighteen rows because eighteen is what the registry held when the run was taken.
+`user_summary_anchored` and `tool_and_user_summary_anchored` were written afterwards and have
+not been run at this cell or at any other; they are absent here rather than at zero, and
+nothing below is a ranking of twenty.
 
 **The cost column of this run is not usable** — 18 of 90 records were rate-limited, including
 the control in all five seeds, which is the baseline every `vs none$` is taken against. It is
@@ -267,6 +284,195 @@ compacting and the instrument printed `NOT SUPPORTED` on both; three arms named 
 `gpt-5.4-mini` it cost 10% to 25% more. Its coverage check also sits on a cliff rather than a
 calibrated threshold: `unc` and shrink move one-for-one and flip seed to seed within one arm.
 
+## The user-turn strategy — `user_summary_anchored`
+
+`UserTurnAnchoredSummarizationCompactionStrategy`, written here in `compaction/_usersummary.py`,
+and the only row in the set that touches the user's own turns. Full account in
+[`compaction/STRATEGIES.md`](agent_framework_lab_cachebench/compaction/STRATEGIES.md).
+
+**What it removes.** Past `--user-trigger-fraction` (0.8) of the input budget it takes every
+user turn between a fixed head (`--keep-head-user-turns`, 1) and a fixed tail
+(`--keep-tail-user-turns`, 1), sends them to the `--summarizer-provider` client, and puts the
+summary back in their place as a single *user* message. It never reads a tool group: tool
+calls, tool results and assistant narration are not annotated, not excluded and not counted.
+That is the point rather than a limitation. In this benchmark the planted facts live in tool
+results, so this row's `facts` and `acc1` are not where its risk is — they should read as the
+control's, and a row where they do not has disturbed something it may not touch. What the row
+measures is `snap%`: how much of a conversation is user-side, and so how much a strategy
+confined to that side can remove. Its band is exactly the part of the conversation the record
+strategy is structurally forbidden to touch, and how much of the prompt that is depends entirely
+on how the cell was sized — a fact about the workload rather than about this row, and one the
+package's own default has since inverted. Run 43 held the tool payload at a fixed 3,500 tokens
+per result whatever the window, and its 170,000-token cell at 0.9 fill divided as 57% user-turn
+text against 14% tool results: the band was most of the prompt and one pass could clear the
+trigger. Scaling the payload with the window is now the default (`--tool-share`, 0.6), which
+holds tool results at 60% of the payload by construction: the same cell sized today seeds 60%
+tool results against about 25% user-side filler. The band this row may touch is then the
+minority of the prompt, which is the regime `--user-min-band-share` holds it back in. Read
+`USERHELD` before reading `snap%`.
+
+**Head and tail are two numbers, and both are one.** The first user turn carries the task and
+its requirements, the labelling every deleting strategy throws away first and the reason
+`truncation` could leave 29 of 53 facts in a prompt the model used none of. The last is the
+live request: a model answering a summary of the question it was just asked answers a different
+question, and the turn before it has already been answered, so a larger tail buys nothing and
+costs the band its newest material. They are separate flags because moving the two ends apart
+is the only way to measure what the opening statement is worth against what the recent turns
+are worth. Both count user turns rather than groups, so `--keep-head-groups` does not reach
+them.
+
+**When it fires: 0.8, above the record strategy's 0.6, and the two are different decisions
+rather than an inconsistency.** The record strategy asks a *model* to write a record and has to
+ask early, because the record degrades with the bulk it is given to read. This strategy asks a
+summarizer for prose whose quality is not what the row measures, and pays instead in a broken
+cached prefix, so it wants to fire as late as it can while still leaving the conversation room
+to continue. The trigger decides when the *first* compaction happens and nothing else.
+
+**How often it fires is `--user-min-band-share` (0.1), and that is the hysteresis.** A pass
+runs only when the band is worth at least that share of the included prompt. At 0.0 the
+strategy fires on every pass past the trigger for the rest of the run: after its first pass the
+band is its own summary plus the turns arrived since, every new turn satisfies "something here
+is not my own summary", and the prompt does not shrink to the size of the band, so the trigger
+stays true. Each of those passes is one summarizer call and one rewritten prefix, re-billed
+from the summary's position to the end of the conversation, to free a few hundred tokens. 0.1 is
+this package's own break-even — the anchored family's `R > B(p−c)/(p+T·c)` — solved for turns
+rather than tokens: a band worth a tenth of the prompt repays the prefix it breaks within about
+75 turns, which is the length of conversation this benchmark seeds. The bound it gives is
+geometric: the band regrows only from user turns added since the last pass, so the prompt has
+to grow by `1/(1−f)`, about 11%, between one compaction and the next. What it costs is stated
+with it — a band that never reaches a tenth of the prompt is never compacted, and on a workload
+whose bulk is tool output that can be every band in a run; `USERHELD` is what says so. `0`
+restores the unbounded behaviour, so the two can be run side by side.
+
+On the package's own forty-turn growing fixture — synthetic, under the character-estimator
+tokenizer, with a stub summarizer, so a statement about mechanism and not a measurement — the
+tests hold the unbounded arm to at least 25 passes and the default to between two and eight.
+
+**It drops what it replaces.** Exclusion plus one replacement message, which is the framework's
+own mechanism: the summary carries the ids of the messages and groups it stands for, each
+superseded turn carries the summary's id back, and the originals are excluded with the reason
+`user_turn_summarized`. This was a deliberate reversal. Whether to keep the message count
+instead — collapsing each turn in place, as the anchored family does to tool results — was
+asked while the strategy was being designed, on the ground that some providers track the
+sequence statefully. The audit in `STATE.md` §3q found that exclusion already removes messages
+from the wire on every route this benchmark runs, that ten strategies — six of the framework's
+and four here — already drop, and that on a stateful route the framework skips compaction
+entirely, so a preserved count would protect nothing. The in-place mechanism exists to keep a
+tool call paired with its result; a user turn has no pairing to protect.
+
+**It recompacts its own output, so compaction stacks over compaction.** The replacement is a
+*user* message so that the next pass can read it as a turn: a later pass summarises the
+summary together with whatever has arrived since, and one message stands for everything behind
+it. Refusing to re-read its own output is not the neutral option — the strategy would then keep
+every earlier summary beside every new one, which is the accumulation `RECORDS:<n>` reports on
+the record row, a floor under the prompt that no later pass can lower. It is the opposite of the
+anchored family's refusal to re-trim a result it has already shortened, and the two are one
+rule read from opposite ends: a pass has to be worth what a pass costs.
+
+**What the counters say.** `USERCOMPACT:<n>` is the passes that replaced a band, read together
+with `USERREPLACED:<n>`, the turns the most recent of them stands for. `USERCOMPACT:0` is the
+uncompacted control under another name, and exactly one of three flags says why:
+`USERUNDER:<n>` — the prompt never reached the trigger, so the band was not read;
+`USERHELD:<n>` — it did, and the band was not worth a pass under the share; `USERSUMMFAIL:<n>`
+— the summarizer raised or returned nothing, and the band was left exactly as found. The four
+partition every pass over a non-empty conversation, so a row whose user half did nothing always
+says which, and the three silences ask for three different changes.
+
+**It is unmeasured.** No archived run carries this row. The one live attempt that included it
+was aborted and predates the band share; the pass-per-turn behaviour it showed is what the share
+was written to stop, and the figures the source quotes from that attempt are not a measurement
+of the row as it now stands. A run of it would answer four things: how far a strategy confined
+to the user half moves `snap%` on a real conversation; whether `facts` and `acc1` stay at the
+control's, as the mechanism says they must; what the rewritten prefix costs in `hit%` against
+the control; and how many passes the share permits over a run of this benchmark's length.
+
+**When it will not help.** On a conversation whose bulk is tool output, which is the shape the
+record strategy was built for; on a short one, where the band is a turn or two and the
+summarizer call costs more than it frees; and wherever the exact wording of an earlier turn
+matters, since what replaces it is a paraphrase written by another model. That summarizer is a
+trust boundary sharper than the framework's own: its output stands in for the user's turns,
+which is the half a model treats as instructions.
+
+## The composition — `tool_and_user_summary_anchored`
+
+`ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy`, in `compaction/_composed.py`:
+the record strategy and then the user-turn strategy, over one conversation, in that order. It
+owns no selection rule and removes nothing itself. Its two halves are built by the same two
+builders the single rows use, so a sweep of any single-row flag moves this row's half exactly
+as it moves that row, and neither half can drift into a configuration no other row was measured
+at. It is deliberately not a `token_budget_*` variant: the halves do not meet at a shared
+ceiling, because how far the two reach together is what the row is for, and normalising their
+sizes away is what that family does.
+
+**What it composes.** Each half is capped at the share of the conversation it may touch — the
+record strategy at the tool payload, the user-turn strategy at the user turns — and the two
+select **disjoint** group kinds, `tool_call` and `user`, so neither can claim the other's
+material, nothing can be superseded twice, and both run on any pass where both want to act.
+Selecting it is selecting both halves' costs: an agent turn for the record and a summarizer
+call for the summary, so a cell running it beside `none` compares a row with two extra call
+types against one with none. It needs `--summarizer-provider`, for the user half; the record
+half needs none.
+
+**The shared line.** Both halves are judged at `--trigger-fraction` (0.6), against one reading
+of the prompt taken *before either phase acts*. The obvious version of this does not work. Give
+each half its own line — 0.6 for the record, 0.8 for the user turns — and the record half
+fires first, removes the tool payload while the prompt is still in the 60s of the budget, and
+holds it there; the prompt never reaches 0.8, the user half is never consulted, and the row is
+`tool_summary_anchored` under a longer name. Giving both halves the same fraction and judging
+them one after the other is the same defect with a different number on it: the record half
+still acts first, still takes the prompt below the shared line, and the user half still
+declines on its own re-test of what is left. What makes one line mean anything is that both
+halves are compared with the size the pass *began* with, so a half that would have fired on the
+entry size fires, whatever the other has already removed. What that costs is stated: the user
+half may act when the prompt is already under the line, spending a summarizer call to free
+tokens a live reading would have left alone. A pass that removes slightly more than it had to
+is a cheaper defect than a row that silently measures one half.
+
+**Why the alignment runs down to 0.6 and not up to 0.8.** The record is written by a model
+reading the tool payload, and it is measured degrading with the bulk it is given, so a record
+asked for at 0.8 is a bigger ask and a worse record. The middleware that does the asking reads
+the same prompt, so a record asked for after the prompt has been cut below its line is a record
+never asked for at all. Aligning down costs the user half an earlier first compaction than its
+own row takes; aligning up costs the record its quality and possibly its existence.
+
+**So `--user-trigger-fraction` does not reach this row.** It moves `user_summary_anchored`
+only; `--trigger-fraction` moves both halves of this row together. A caller assembling the parts
+by hand can pass the class an explicit `user_trigger_fraction` and get the two-line row back,
+kept so that the two can be run side by side; the CLI does not expose it.
+
+**Order: the record half first.** The record has to be asked for before the user half shrinks
+the prompt below the line that asks for one — removals are permanent, so this is about the size
+the *next* call sees rather than which half acts within a pass. The record half's removal also
+makes the band a larger share of what is left, so the user half clears its share more easily
+this way round. And the record half's fallback counts groups from each end; run after the user
+half it would count a band containing this pass's summary rather than the turns it replaced,
+and the `tool_summary_anchored` row would mean something different inside the composition than
+beside it. The conversation is re-annotated between the phases because that fallback rewrites
+tool results in place and token counts are cached per message.
+
+**`USERSTARVED:<n>` is zero by construction on this row.** It is the one counter the
+composition adds: passes where the record half's removals on *earlier* passes are why the prompt
+was under the user half's line, so the user half was never consulted. With one line the record
+half can only act on a pass whose entry size is above it, and that is a pass the user half is
+offered, so nothing is ever removed out of its reach. A non-zero value on a row built by the CLI
+is a defect report, not a configuration note. A silent user half here therefore has the same
+three readings as on the single row — `USERUNDER`, `USERHELD`, `USERSUMMFAIL` — and the record
+half's `REC`, `RECORDS`, `FORCED`, `UNCOVERED`, `FALLBACK` and `RECFALLBACK` read off the
+composed row unchanged.
+
+**It is unmeasured.** No archived run carries this row. The one live attempt measured the
+two-line row the class first shipped as, was aborted, and is void for the row as it now stands:
+what it showed — the record half holding the prompt under the user half's line, no
+`USERCOMPACT`, and a starvation counter that could not see it — is the defect the shared line
+replaced, and the counter has been redefined since. On the package's eight-turn fixture —
+synthetic, character-estimator tokenizer, stub summarizer, not a measurement — the composed row
+leaves less behind than either half alone at both ceilings that fire it, and at the headline
+ceiling its user half fires where the `user_summary_anchored` row, reading its own 0.8, does
+not act at all; that is the price of aligning down, in tokens. A run of it would answer whether
+the two halves reach below either alone on a real conversation, what `facts` survive with an
+agent turn and a summarizer both in the loop, and whether two edit positions' worth of broken
+prefix is repaid by what they remove.
+
 ## Summarization — `summarization`
 
 `SummarizationStrategy`, the ladder the framework leads with, and the only registry entry
@@ -324,10 +530,21 @@ conversation looks like, and is why the table is ranked on correctness first.
   model is sent or writes, so `facts`, `acc1` and `snap%` stand; `vs none$` does not.
 - **One cell, one model.** Everything in the run-42 table is `gpt-5.6-luna` at 60,000/0.86 with
   3,500-token results, and that cell seeded 5.3% under its fill target. `gpt-5.4-mini` behaves
-  differently on the record row and has never been measured across all eighteen.
+  differently on the record row and has never been measured across the eighteen of run 42, let
+  alone the twenty.
 - **Accuracy is a distribution.** Several rows above have `seed+-` of 20 to 60 points. A gap
   smaller than a row's own spread is not a ranking, and this file quotes means.
-- **`compaction/STRATEGIES.md` is behind on two numbers.** It documents `trigger_fraction` 0.8
-  and `fallback_fraction` 0.95; both were reverted to 0.6 and 0.9 on 6 September 2026, which is
-  what the code, the CLI and every archived run use. Its mechanism and design reasoning are
-  current; those two defaults are not.
+- **Two rows have no measurement at all.** `user_summary_anchored` and
+  `tool_and_user_summary_anchored` appear in no archived run. The one live attempt that included
+  them was aborted, predates `--user-min-band-share`, and ran the composed row with the two-line
+  design its shared line has since replaced, so nothing it showed describes either row as it now
+  stands. Their sections above state mechanism only, and say what a run would answer.
+- **`compaction/STRATEGIES.md` is behind on two numbers and one design.** It documents
+  `trigger_fraction` 0.8 and `fallback_fraction` 0.95; both were reverted to 0.6 and 0.9 on
+  6 September 2026, which is what the code, the CLI and every archived run use. Its section on
+  `ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy` describes the two-line row that
+  class first shipped as — separate triggers, starvation reported rather than prevented, and a
+  `USERSTARVED` counted against everything the record phase removed over a run — all of which
+  `_composed.py` has replaced with the shared line described above. Its mechanism and design
+  reasoning for the other four strategies are current; those two defaults and that section are
+  not.

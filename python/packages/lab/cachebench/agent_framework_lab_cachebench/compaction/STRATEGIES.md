@@ -329,12 +329,23 @@ that rewrites the same position twice on purpose.
 
 **Why there is a second half at all.** Everything above acts on tool output, and both of them
 say in as many words that user turns are what give surviving values their meaning. That is true
-of the first user turn and of the last. It is not true of the seventy in between, and on this
-benchmark's own sizing those seventy are most of the prompt. Run 43 — a 170,000-token cell
-filled to 90% — divides as **57% user-turn text, 28% assistant replies, 14% tool results**:
-87,551 tokens of user turns against 21,978 of tool payload over 72 seeded turns. A strategy
-confined to the tool half is working on a seventh of the conversation, which is why the anchored
-rows in that run sit at 72% of the window where the uncompacted control sits at 85%.
+of the first user turn and of the last. It is not true of the seventy in between, and how much
+of the prompt those seventy are is a property of the sizing rather than of the conversation.
+Run 43 — a 170,000-token cell filled to 90%, with the tool payload held at a fixed 3,500 tokens
+per result whatever the window — divides as **57% user-turn text, 28% assistant replies, 14%
+tool results**: 87,551 tokens of user turns against 21,978 of tool payload over 72 seeded turns.
+A strategy confined to the tool half is working on a seventh of that conversation, which is why
+the anchored rows in that run sit at 72% of the window where the uncompacted control sits at
+85%.
+
+**That ratio is no longer the default, and it inverts.** Scaling the tool payload with the
+window is now what the runner does (`--tool-share`, 0.6), so tool results are 60% of the payload
+by construction at every window: the same 170,000-token cell at 0.9 fill seeds 91,791 tokens of
+tool results against about 38,664 of user-side filler. The half each strategy may touch is
+therefore the opposite size from the one these paragraphs were written against — the record
+strategy now works on the bulk and this one on the minority — and the argument for having a
+second half survives the inversion only as "neither half can reach the other's", which is what
+the composed row exists to test.
 
 **Mechanism.** Past `trigger_fraction` of the ceiling it takes the user turns between a fixed
 head and a fixed tail, sends them to a summarizer client, and puts the result back in their
@@ -413,8 +424,8 @@ the bulk it must read degrades it — 53 of 53 facts at 8,000-token results, 18 
 so it wants to fire early. This one asks for prose whose quality is not what the row measures and
 pays only in a broken cached prefix, so it wants to fire as late as it still can. It decides
 *when the first compaction happens*, and nothing else: how many there are is the band share
-above. That the two thresholds are ordered this way is also what starves the user half of the
-composed row — see below.
+above. Ordering the two thresholds this way is also what made the composed row inert, and that
+row now takes one line for both of its halves rather than these two — see below.
 
 **Expected effect, from an offline replay of run 43's conversation** — the real turns and tool
 results, the run's own assumed 602-token replies, and a stub summarizer, so no model was called:
@@ -428,7 +439,9 @@ results, the run's own assumed 602-token replies, and a stub summarizer, so no m
 | `user_summary_anchored`, trigger 0.4 | 69,635 | 41% | 9 |
 
 **Read that table as a statement about run 43's shape and not about the strategy.** Its
-conversation is 57% user text, so the band is most of the prompt and one pass clears the
+conversation is 57% user text — run 43's fixed payload, not what `--tool-share` 0.6 now seeds,
+where the same cell is 60% tool results against about 25% user-side filler and the band is the
+minority of the prompt — so there the band is most of the prompt and one pass clears the
 trigger. The live scaled-payload run above has the band at 28%, where the same code fired 31
 times — and the 9 passes at a 0.4 trigger in the last row are that same behaviour visible in the
 replay. The pass counts here predate `min_band_share` and are the `0.0` arm of it.
@@ -492,41 +505,69 @@ claim and nothing either could supersede twice.
   so the fallback's geometry — and what the `tool_summary_anchored` row means — would differ
   between the composed row and the row it is meant to be read against.
 
-**The two triggers stay separate, which is the opposite of what `TokenBudgetComposedStrategy`
-does.** That family gives every variant one ceiling precisely so that size is held fixed and only
-the ordering of deletion varies. Here the sizes the two phases reach *are* the measurement, and a
-shared trigger would fire both halves at a line neither single row was ever measured at.
+**The two ceilings stay separate; the trigger does not.** `TokenBudgetComposedStrategy` gives
+every variant one ceiling precisely so that size is held fixed and only the ordering of deletion
+varies, and this row deliberately does the opposite: the sizes the two phases reach *are* the
+measurement. But the two *triggers* are now one, taken from the record half
+(`--trigger-fraction`), because the alternative was measured and it was not a row at all.
 
-**The interference is the token count, and it is made visible rather than removed.** Both parts
-begin by reading the included token count and comparing it with their own trigger, so the second
-sees a number the first moved. The conversation is re-annotated between the phases — forced, when
-the first changed anything, because the record strategy's fallback rewrites tool results in place
-and the counts are cached per message. The order above is chosen so the number moves as little as
-it can. And `user_passes_starved` — the `USERSTARVED:<n>` flag — counts the passes where the
-record phase's removals are why the prompt is under the user phase's line. That is the one
-reading of `USERCOMPACT:0` that is not about the user half at all.
+**Two lines made the row inert, and it said nothing.** The record phase fires at 0.6 and the user
+phase at 0.8, the record phase goes first, and on a workload whose bulk is tool payload it removes
+that payload while the prompt is still in the 60s of the ceiling and holds it there for the rest
+of the run. The prompt then never reaches 0.8, so the user half is never consulted. Measured:
+gpt-5.6-luna at a 170,000-token window, 0.9 fill, seed 2 reported `snap 63%`, `REC:1, RECORDS:1,
+FORCED:1, RECFORCED:1`, a 94.6% cache hit rate and `USERCOMPACT:0` — `tool_summary_anchored`
+under a longer name, which is exactly the failure this composition exists to avoid. Its own
+starvation diagnostic, then a within-pass transition test, reported zero: the transition it looked
+for never happened, because the prompt was under the user line before the run began rather than
+taken under it during a pass.
 
-**It was written as a within-pass transition and could not see the case it was written for.**
-The test was "above the line when the pass started, at or below it when the record phase
-finished". Measured: seed 1 of the composed row reported `snap 63%`, `REC:1, RECORDS:1,
-FORCED:1, RECFORCED:1`, no `USERCOMPACT` — and no `USERSTARVED`. The cause is structural rather
-than incidental. The record phase's trigger is *lower* than the user phase's, so on a workload
-whose bulk is tool payload it removes that payload while the prompt is still in the 60s and
-holds it there for the rest of the run; the prompt is then never above the user line when a pass
-begins, and the transition never happens. The composed row had silently become
-`tool_summary_anchored` with extra machinery, which is exactly the failure the composition
-exists to avoid, and its own diagnostic said nothing.
+**Giving both halves the same fraction does not on its own fix it.** With the phases still judged
+one after the other, the record phase acts first, takes the prompt below the shared line, and the
+user phase declines on its own re-test — the same inertness with a different number on it. What
+makes a shared line mean anything is that **both halves are judged against the size the prompt had
+when the pass began**: `__call__` reads the included token count once, before either phase runs,
+and hands that one number to both through each part's `compact_against`. A half that would have
+fired on the pass-entry size fires, whatever the other half has already removed.
 
-It now counts against what the record phase has removed **over the run** rather than over one
-pass: a pass is starved when the prompt is at or below the user line and would have been above
-it with those tokens still in the conversation. Every pass the old definition counted is still
-counted — that pass's own removal is part of the total — and the ones it could not see are
-counted too. On the package's growing fixture that is 15 starved passes out of 20 where the old
-definition reported 0.
+That is safe because the two selection rules name disjoint group kinds, so a phase acting on a
+number a moment out of date still reads its own half of the conversation and nothing else. What it
+costs is that the second half may act when the prompt is already under the line, spending a
+summarizer call and a rewritten prefix to free tokens a strategy reading the live size would have
+left alone. A pass that removes slightly more than it had to is the cheaper defect.
 
-It is reported rather than prevented. Preventing it means overriding a part's trigger, and then
-the composed row's user half fires where no `user_summary_anchored` row fires, which takes the two
-rows the composition exists to be compared with and makes them incomparable.
+**The alignment runs down to the record half's line, never up.** The record is written by a
+*model* asked to read the tool payload, it is measured degrading with the bulk it is given, and
+the middleware that does the asking reads the same prompt — so a record asked for late is asked
+for on more material, and one asked for after the prompt has been cut is never asked for. Aligning
+down costs the user half an earlier first compaction than its own row takes. The honest price of
+this is that the composed row's user half fires at a line no `user_summary_anchored` row was
+measured at, so on that axis the two are not the same configuration; a row that is measurably one
+of its halves is the worse of the two failures, and a caller who wants the two lines back passes
+an explicit `user_trigger_fraction`.
+
+**The conversation is still re-annotated between the phases, and now for one reason rather than
+two.** It used to be re-read because the user phase thresholded against the result; it no longer
+does. It is re-read because the record strategy's fallback rewrites tool results in place and the
+counts are cached per message, so the band the user phase weighs would otherwise be measured
+against text no longer in the conversation. The band's share, unlike the trigger, is deliberately
+weighed against the prompt as it now stands: feeding it the stale entry size would shrink every
+band's apparent share and decline worthwhile passes by the other route.
+
+**`USERSTARVED` is now zero by construction on a default row, and that is the point.** The record
+phase can only act on a pass whose entry size is above the shared line, and a pass above the line
+is a pass the user half is consulted on, so nothing the record phase removes is ever removed out
+of the user half's reach. A non-zero value on a default row is a defect report rather than a
+configuration note. On a row whose halves were deliberately set apart it still counts what it was
+written for: a pass is starved when the size it was judged against is at or below the user line
+and would have been above it with the record phase's earlier out-of-reach removals still in the
+conversation. It is a statement across passes and never within one — a pass is judged by the size
+it began with, so this pass's removal cannot explain this pass's reading — and the quantity it is
+decided against is exposed as `tokens_removed_out_of_user_reach` so the counter can be checked.
+On the package's growing fixture the aligned row reports `USERCOMPACT:4, USERHELD:1,
+USERSTARVED:0` and ends at 9,235 tokens; the split row reports `USERCOMPACT:0, USERSTARVED:15`
+and ends at 11,961 — exactly the size `tool_summary_anchored` alone reaches, which is the defect
+in one number.
 
 **It has no ceiling and no fallback of its own,** and returning False does not mean the prompt
 fits — the same as for both its parts. A third shed step here would put a removal in the composed

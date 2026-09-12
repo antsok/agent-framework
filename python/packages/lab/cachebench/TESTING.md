@@ -1,7 +1,7 @@
 # How this package is tested
 
-385 test functions, 486 cases after parametrisation, about 10,100 lines of test against 13,900
-lines of source. Everything runs offline in under thirty seconds. This file says what is being
+452 test functions, 566 cases after parametrisation, about 12,800 lines of test against 15,800
+lines of source. Everything runs offline in under a minute. This file says what is being
 defended and why the tests are shaped the way they are, because most of them exist to prevent a
 specific failure that already happened and cost either a paid-for run or a wrong number in a
 write-up.
@@ -11,14 +11,15 @@ cd python/packages/lab/cachebench
 pytest tests -q
 ```
 
-> Run it from **this directory**, not from `python/packages/lab`. The declared task there,
-> `poe test-cachebench`, runs `pytest cachebench/tests` and one test fails under it:
-> `test_narration_probe_declares_every_flag_it_reads` imports `samples.probe_narration`, and
-> `samples` only resolves when the package directory is on the path. From here, 486 pass.
+> `poe test-cachebench`, declared in `python/packages/lab`, runs the same suite from that
+> directory with coverage on, and all 566 pass there too. One did not until
+> `test_narration_probe_declares_every_flag_it_reads` was changed to load
+> `samples/probe_narration.py` by file path: `samples` only resolves by name when the package
+> directory is on the path, which it is from here and was not from there.
 
 | file | tests | what it defends |
 | --- | ---: | --- |
-| `tests/test_live.py` | 186 | the live runner: the agent pipeline, retries, probing, scoring, the table, the records file |
+| `tests/test_live.py` | 210 | the live runner: the agent pipeline, retries, probing, scoring, the table, the records file |
 | `tests/test_cachebench.py` | 51 | the replay harness, the prefix oracle, providers, cost |
 | `tests/test_recall.py` | 23 | the recall scenario and the scorer |
 | `tests/test_fill.py` | 14 | the fill solver and the payload sizing |
@@ -26,11 +27,13 @@ pytest tests -q
 | `tests/test_summary.py` | 7 | the summary CLI |
 | `tests/compaction/test_toolsummary.py` | 60 | the record strategy, its tool and its middleware |
 | `tests/compaction/test_anchored.py` | 28 | the anchored family |
+| `tests/compaction/test_composed.py` | 22 | the composed row: one line for both halves, the order, and what the starvation counter may and may not count |
+| `tests/compaction/test_usersummary.py` | 21 | the user-turn strategy: the band, the hysteresis that bounds its passes, and recompaction of its own output |
 | `tests/compaction/test_boundary.py` | 4 | that `compaction/` never imports the lab |
 
 ## The split, and why `tests/compaction/` is separate
 
-`agent_framework_lab_cachebench/compaction/` holds the three strategies written here, the recall
+`agent_framework_lab_cachebench/compaction/` holds the five strategies written here, the recall
 tool and the gate that keeps it inert when unasked. It is meant to be **lifted out whole** into a
 repository of its own, so nothing in it may import from the benchmark that measures it, and its
 tests travel with it.
@@ -102,7 +105,7 @@ line rather than on a paid call. Each was written after the category bit.
 
 **Every argument the runner reads must be declared.**
 `test_every_argument_the_runner_reads_is_defined` parses a minimal command line and asserts the
-namespace carries all thirty-six attributes the run function reads. A flag referenced but never
+namespace carries all thirty-nine attributes the run function reads. A flag referenced but never
 declared raises `AttributeError` only once a live run is under way; that happened twice, on an
 `add_argument` edit that silently failed to apply while the code using it did not.
 
