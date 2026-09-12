@@ -54,10 +54,13 @@ from .compaction import (
     DEFAULT_BAND_SHARE,
     DEFAULT_COVERAGE_SHARE,
     DEFAULT_FALLBACK_FRACTION,
+    DEFAULT_KEEP_HEAD_USER_TURNS,
+    DEFAULT_KEEP_TAIL_USER_TURNS,
     DEFAULT_MIN_GAIN_FRACTION,
     DEFAULT_RECORD_MAX_TOKENS,
     DEFAULT_RECORD_TARGET_TOKENS,
     DEFAULT_TRIGGER_FRACTION,
+    DEFAULT_USER_TRIGGER_FRACTION,
 )
 
 if TYPE_CHECKING:
@@ -478,6 +481,48 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--user-trigger-fraction",
+        type=float,
+        default=DEFAULT_USER_TRIGGER_FRACTION,
+        help=(
+            "Share of the input budget at which user_summary_anchored summarises the user's "
+            "own turns. Its own flag rather than --trigger-fraction, which belongs to "
+            "tool_summary_anchored: the two thresholds answer different questions and sharing "
+            "one would make a sweep of either a sweep of both. It sits higher than that one's "
+            "0.6 because this strategy is willing to compact more than once and each pass "
+            "re-bills the prompt from its edit to the end -- firing late is what keeps the "
+            "number of passes near one on a conversation of this length. Lower it to make the "
+            "repeat behaviour happen, and read USERCOMPACT in the flags column to see how "
+            "often it did. Default %(default)s."
+        ),
+    )
+    parser.add_argument(
+        "--keep-head-user-turns",
+        type=int,
+        default=DEFAULT_KEEP_HEAD_USER_TURNS,
+        help=(
+            "User turns at the start of the conversation user_summary_anchored never "
+            "summarises. Counted in user turns, not in message groups, so it is not "
+            "--keep-head-groups: that flag protects a prefix of groups of every kind and is "
+            "read by four other strategies. One is the default because one is what carries "
+            "the task and its requirements, which every deleting strategy measured here "
+            "throws away first. Default %(default)s."
+        ),
+    )
+    parser.add_argument(
+        "--keep-tail-user-turns",
+        type=int,
+        default=DEFAULT_KEEP_TAIL_USER_TURNS,
+        help=(
+            "User turns at the end of the conversation user_summary_anchored never "
+            "summarises. One is the default because the last user turn is the live request, "
+            "and a model answering a summary of the question it was just asked answers the "
+            "wrong question; the turn before it has already been answered and has no such "
+            "claim, so raising this buys nothing and costs the band its newest material. "
+            "Default %(default)s."
+        ),
+    )
+    parser.add_argument(
         "--assumed-reply-tokens",
         type=int,
         default=ASSUMED_REPLY_TOKENS,
@@ -839,6 +884,8 @@ def _seed_record(
         groups_kept_uncovered=outcome.groups_kept_uncovered,
         fallbacks_after_record=outcome.fallbacks_after_record,
         records_in_conversation=outcome.records_in_conversation,
+        user_compactions=outcome.user_compactions,
+        user_messages_replaced=outcome.user_messages_replaced,
         strategy_notes=outcome.strategy_notes,
         dropped_options=outcome.dropped_options,
         answer=outcome.answer,
@@ -1797,6 +1844,19 @@ _LEGEND: Final[tuple[str, ...]] = (
     "            deleted anyway and the facts in them arrived in acc1 as compaction damage,",
     "            with nothing in any column saying where they went. A row with UNCOVERED is",
     "            not measuring this strategy working; it is measuring it declining to guess.",
+    "            USERCOMPACT:<n> passes where user_summary_anchored replaced a band of the",
+    "            user's own turns with one summary of them, and USERREPLACED:<n> how many",
+    "            turns the most recent of those passes stood in for. Read them together: the",
+    "            second is how much of the conversation that row is carrying as a summary",
+    "            instead of verbatim, which is what moved snap%, and the first is what it cost",
+    "            to get there, because every pass re-bills the prompt from its own edit to the",
+    "            end. That strategy is deliberately willing to recompact its own earlier",
+    "            summary, which is the opposite of the anchored family's refusal to re-trim a",
+    "            result it has already shortened, and USERCOMPACT above 1 is that happening.",
+    "            A row with USERCOMPACT:0 never fired and is the uncompacted control under",
+    "            another name. USERSUMMFAIL:<n> passes where the summarizer raised or returned",
+    "            nothing, so the band was left exactly as it was found and those passes are",
+    "            the control too.",
     "            FALLBACK:<n> times it gave up",
     "            and compacted another way. A row with",
     "            FALLBACK is measuring that other strategy, not the one named.",
@@ -2134,6 +2194,9 @@ def _strategy_options(args: argparse.Namespace, tokenizer: Any, summarizer: Any 
         trigger_fraction=args.trigger_fraction,
         fallback_fraction=args.fallback_fraction,
         coverage_share=args.coverage_share,
+        keep_head_user_turns=args.keep_head_user_turns,
+        keep_tail_user_turns=args.keep_tail_user_turns,
+        user_trigger_fraction=args.user_trigger_fraction,
         token_budget_fraction=args.budget_fraction,
         summarizer=summarizer,
     )
@@ -2178,6 +2241,9 @@ def _strategy_settings(
         trigger_fraction=options.trigger_fraction,
         fallback_fraction=options.fallback_fraction,
         coverage_share=options.coverage_share,
+        keep_head_user_turns=options.keep_head_user_turns,
+        keep_tail_user_turns=options.keep_tail_user_turns,
+        user_trigger_fraction=options.user_trigger_fraction,
         token_budget_fraction=options.token_budget_fraction,
         max_output_tokens=options.max_output_tokens,
         answer_max_tokens=args.answer_max_tokens,

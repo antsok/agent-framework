@@ -1,6 +1,6 @@
 # The strategies in this package
 
-Three compaction strategies and one supporting middleware, written against what the
+Four compaction strategies and one supporting middleware, written against what the
 `cachebench` benchmark measured rather than against intuition. This file says what each one
 does, why it is shaped that way, and the short version of when it earns its keep. Full numbers
 live in the benchmark's `RESULTS.md`; only enough appears here to make each claim checkable.
@@ -318,6 +318,96 @@ not under pressure that is pure overhead.
 all of them in one call. That bounds both quantities the record degrades with — the text one
 call must read, and the values it must extract — at the price of more calls. Every measurement
 above points at it.
+
+---
+
+## `UserTurnAnchoredSummarizationCompactionStrategy`
+
+The mirror of the strategy above on the other half of the conversation, and the only one here
+that rewrites the same position twice on purpose.
+
+**Why there is a second half at all.** Everything above acts on tool output, and both of them
+say in as many words that user turns are what give surviving values their meaning. That is true
+of the first user turn and of the last. It is not true of the seventy in between, and on this
+benchmark's own sizing those seventy are most of the prompt. Run 43 — a 170,000-token cell
+filled to 90% — divides as **57% user-turn text, 28% assistant replies, 14% tool results**:
+87,551 tokens of user turns against 21,978 of tool payload over 72 seeded turns. A strategy
+confined to the tool half is working on a seventh of the conversation, which is why the anchored
+rows in that run sit at 72% of the window where the uncompacted control sits at 85%.
+
+**Mechanism.** Past `trigger_fraction` of the ceiling it takes the user turns between a fixed
+head and a fixed tail, sends them to a summarizer client, and puts the result back in their
+place as a single **user** message — the framework's own replace-and-link mechanism, so the
+summary carries `_summary_of_message_ids` and `_summary_of_group_ids`, each superseded turn
+carries `_summarized_by_summary_id` back, and the originals are excluded with a reason. It reads
+nothing but user groups: tool calls, tool results and assistant narration are never annotated and
+never excluded, so this row and the tool-side rows measure independent things and can be put in
+one table.
+
+The defaults are **1 and 1**, and one at each end is what is load-bearing rather than a round
+number. The first turn carries the task and its requirements, which is the labelling truncation
+was measured losing — 29 of 53 facts left in a prompt the model could not use. The last is the
+live request, and a model answering a summary of the question it was just asked answers a
+different question. The turn before that has already been answered and has no such claim.
+
+**It recompacts its own output, and `_anchored.py::_shorten` deliberately does not.** That
+method refuses to touch a result already carrying `REMOVAL_MARKER`, because its trigger is the
+band's geometry: a result sits in the band from the turn it ages out of the tail until the end
+of the run, so "trim what is in the band" fires every single pass and re-trimming would be a
+fresh mutation at one position on every turn. Here the trigger is a threshold that the
+compaction moves away from — a pass removes tens of thousands of tokens, and the next one cannot
+happen until the conversation has grown all of that back — so between two compactions the prefix
+is byte-identical on every turn. Measured on the replay below, the default 0.8 fires **once** on
+a 72-turn conversation. The two decisions are opposite and neither was taken in ignorance of the
+other.
+
+Refusing to recompact is not the neutral option either: the summary is a user message, so a
+strategy that would not re-read its own output would have to keep every earlier summary beside
+every new one. That is `records_in_conversation`'s accumulation problem exactly — a floor under
+the prompt that no later pass can lower — and recompaction is what stops it rising.
+
+A pass whose band holds **only** the previous summary does nothing, because rewriting one
+message at one position for no reduction is the thrash `_shorten` refuses. The band must contain
+at least one turn that is not a summary, which is the same rule `_record_due` applies to the
+recall middleware and for the same reason: the size that fired the trigger does not go away when
+the compaction that answered it is already in the prompt.
+
+**The trigger is 0.8 where the record strategy's is 0.6,** and they are separate settings
+(`--user-trigger-fraction` against `--trigger-fraction`). The record has to be asked for before
+the bulk it must read degrades it — 53 of 53 facts at 8,000-token results, 18 of 53 at 25,200 —
+so it wants to fire early. This one asks for prose whose quality is not what the row measures and
+pays only in a broken cached prefix, so it wants to fire as late as it still can.
+
+**Expected effect, from an offline replay of run 43's conversation** — the real turns and tool
+results, the run's own assumed 602-token replies, and a stub summarizer, so no model was called:
+
+| row | snapshot | `snap%` | passes |
+| --- | ---: | ---: | ---: |
+| uncompacted control | 158,301 | 93% | — |
+| `anchored` (default band share) | 158,301 | 93% | inert at 3,500-token results |
+| `user_summary_anchored`, trigger 0.8 | 83,761 | 49% | 1, replacing 60 turns |
+| `user_summary_anchored`, trigger 0.6 | 69,635 | 41% | 2 |
+| `user_summary_anchored`, trigger 0.4 | 69,635 | 41% | 9 |
+
+The size of the summary barely matters: 500, 1,000 and 2,000 tokens move the result by 0.6
+points, because what it replaces is around 75,000. And the floor at 41% is not this strategy
+failing — it is the two halves it may not touch, the assistant's replies (~43,000 tokens) plus
+the tool payload (~22,000). Reaching below it needs this row *composed with* a tool-side one,
+which is the obvious next measurement and is not made here.
+
+**When it does not work.** On a conversation whose bulk is tool output rather than user text,
+which is the shape `tool_summary_anchored` was built for; on short conversations, where the band
+between the anchors is a turn or two and the summarizer call costs more than it saves; and
+wherever the exact wording of an earlier turn matters, since what replaces it is a paraphrase
+written by a different model. Fact retention across the band is deliberately not measured — the
+planted facts live in tool results, which this never touches — so a row's `snap%` is what it
+answers and its accuracy columns say only that it did not disturb the other half.
+
+**The summarizer is a trust boundary, and a sharper one than the framework's.**
+`SummarizationStrategy` carries an indirect-prompt-injection caveat because its output becomes
+permanent conversation history; here that output stands in for *the user's own turns*, which is
+the half a model treats as instructions. Point it only at a service trusted as much as the
+primary model.
 
 ---
 

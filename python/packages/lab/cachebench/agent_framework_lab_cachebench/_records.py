@@ -25,6 +25,11 @@ from typing import TYPE_CHECKING, Any, Final
 from ._advisor import ModelPricing
 from ._fill import FillPlan
 from ._summary import DEFAULT_MIN_CORRECTNESS
+from .compaction import (
+    DEFAULT_KEEP_HEAD_USER_TURNS,
+    DEFAULT_KEEP_TAIL_USER_TURNS,
+    DEFAULT_USER_TRIGGER_FRACTION,
+)
 
 if TYPE_CHECKING:
     from collections.abc import Mapping, Sequence
@@ -140,7 +145,20 @@ __all__ = [
 #: and ``--no-retrieval-guidance``. A default here would therefore not be a stale value but a
 #: guess about a command line nobody wrote down, and it would key an archived cell as having
 #: held the same conversation as one run today. ``None`` equals only ``None``.
-SCHEMA_VERSION: Final[int] = 8
+#:
+#: 9 adds ``user_compactions`` and ``user_messages_replaced``, and the bump is the version 5
+#: argument rather than the version 4 one. Before it no strategy in this package was allowed to
+#: touch a user turn at all -- the anchored family shortens tool results, the record-then-drop
+#: strategy drops tool groups, and both keep the user side verbatim by construction -- so zero
+#: user turns replaced is what every archived run did, and the number is knowable rather than
+#: unknowable. The version is what lets a reader tell that zero from the zero a row of
+#: ``user_summary_anchored`` shows when its trigger never fired.
+#:
+#: The three settings the same change adds to :class:`StrategySettings` are read leniently
+#: rather than forcing the whole settings block to ``None``, and :func:`_settings_from_dict`
+#: says why: they are consulted by one strategy no older record can carry a row for, so on an
+#: older record they describe an inapplicable knob rather than an unrecorded measurement.
+SCHEMA_VERSION: Final[int] = 9
 
 #: Versions this reader accepts, which is not only the current one.
 #:
@@ -180,7 +198,11 @@ SCHEMA_VERSION: Final[int] = 8
 #: Everything it measured this version still measures; what it cannot say is which of the five
 #: workload flags its run set, and it says so by carrying no workload block rather than one
 #: filled in from today's defaults.
-_READABLE_SCHEMAS: Final[frozenset[int]] = frozenset({2, 3, 4, 5, 6, 7, SCHEMA_VERSION})
+#:
+#: Version 8 joins on the version 4 argument -- what its runs did about user turns is not in
+#: doubt, because no strategy they could select was allowed to touch one -- and refusing it
+#: would discard every cell on disk over two columns none of them could have written.
+_READABLE_SCHEMAS: Final[frozenset[int]] = frozenset({2, 3, 4, 5, 6, 7, 8, SCHEMA_VERSION})
 
 #: The parameters that make two records the same cell, and so aggregable into one row.
 #:
@@ -413,6 +435,22 @@ class StrategySettings:
     trigger_fraction: float
     fallback_fraction: float
     coverage_share: float
+    keep_head_user_turns: int
+    """User turns ``user_summary_anchored`` left verbatim at the start of the conversation."""
+    keep_tail_user_turns: int
+    """User turns it left verbatim at the end: the live request, and whatever else is asked for.
+
+    Beside the head rather than folded into one number, because the two ends are not
+    interchangeable and a cell that moved only one of them is a different measurement from one
+    that moved both.
+    """
+    user_trigger_fraction: float
+    """Share of the input budget at which ``user_summary_anchored`` summarises the user band.
+
+    Its own field rather than ``trigger_fraction`` above, which belongs to
+    ``tool_summary_anchored``. Recording one number for both would key two runs as one cell
+    whenever a sweep moved either, which is the whole defect this block exists to stop.
+    """
     token_budget_fraction: float
     max_output_tokens: int
     """The output reservation, which every anchored and composed ceiling is the window less.
@@ -484,6 +522,17 @@ def _settings_from_dict(data: Mapping[str, Any]) -> StrategySettings:
         trigger_fraction=float(data["trigger_fraction"]),
         fallback_fraction=float(data["fallback_fraction"]),
         coverage_share=float(data["coverage_share"]),
+        # The three user-band settings are read leniently where every other field here is not,
+        # and the licence is narrow: they are consulted by exactly one strategy, and no record
+        # written before schema 9 can carry a row for it, because it did not exist. So the
+        # value on an older record is not an unrecorded measurement -- the version 7 case, where
+        # ``None`` is the only honest answer -- but an inapplicable knob, and filling it in with
+        # the defaults keys an archived cell as poolable with a rerun of the same cell instead
+        # of splitting it over a setting that could not have applied to it. This is
+        # ``_plan_from_dict``'s reasoning about its two sizing fields, one block along.
+        keep_head_user_turns=int(data.get("keep_head_user_turns", DEFAULT_KEEP_HEAD_USER_TURNS)),
+        keep_tail_user_turns=int(data.get("keep_tail_user_turns", DEFAULT_KEEP_TAIL_USER_TURNS)),
+        user_trigger_fraction=float(data.get("user_trigger_fraction", DEFAULT_USER_TRIGGER_FRACTION)),
         token_budget_fraction=float(data["token_budget_fraction"]),
         max_output_tokens=int(data["max_output_tokens"]),
         answer_max_tokens=int(data["answer_max_tokens"]),
@@ -891,6 +940,34 @@ class SeedRecord:
     stored the answer as a number -- see :data:`SCHEMA_VERSION`. Zero from a live run means what
     it says, including on the four strategies that take no record at all.
     """
+    user_compactions: int
+    """Passes where ``user_summary_anchored`` replaced a band of user turns with a summary.
+
+    The count that says whether that row measured its own design or the uncompacted control
+    under another name: zero means the trigger never fired, or fired with nothing between the
+    anchors. It is also how the cost of the design is read, because each pass re-bills the
+    prompt from its own edit to the end -- one pass and seven passes over the same band are the
+    same reduction bought at very different prices, and no other column separates them.
+
+    Stored beside the ``USERCOMPACT:<n>`` flag on ``strategy_notes`` for the reason
+    ``groups_kept_uncovered`` is: the flag says a row is affected, the number can be meaned
+    across a cell's seeds.
+
+    Zero for every strategy that keeps no such count, and zero on a record written before
+    schema 9 -- see :data:`SCHEMA_VERSION` for why that zero is a measurement and not a gap.
+    """
+    user_messages_replaced: int
+    """User turns the most recent such compaction superseded.
+
+    The state as it stands rather than a running total, which is the rule
+    ``groups_kept_uncovered`` follows and for the same reason: the strategy recompacts its own
+    earlier summary, so a total would count a turn once when it was first replaced and again
+    inside every summary of the summary. What this answers is how much of the conversation the
+    one surviving summary is standing in for, which is what the prompt's size is made of.
+
+    Zero for every strategy that keeps no such count, and zero on a record written before
+    schema 9, on the same reading as the field above.
+    """
     strategy_notes: tuple[str, ...]
     dropped_options: tuple[str, ...]
     answer: str
@@ -1037,6 +1114,13 @@ class SeedRecord:
         # conversation, so it took one record or none -- but which of the two is on the record
         # only as a flag, and a count inferred from a flag string is not a count anybody took.
         values.setdefault("records_in_conversation", None)
+        # Zero, and for the ``groups_kept_uncovered`` reason rather than the probe-token one. No
+        # strategy a record written before schema 9 could select was allowed to touch a user
+        # turn, so no run of that era replaced one: zero is what those runs did, not a number
+        # this reader could not find. Required with no default on the class, so a live run
+        # cannot inherit the same zero by forgetting to record it.
+        values.setdefault("user_compactions", 0)
+        values.setdefault("user_messages_replaced", 0)
         try:
             return cls(cell=CellParams.from_dict(data["cell"]), **values)
         except (KeyError, TypeError) as error:

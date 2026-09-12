@@ -123,6 +123,7 @@ from agent_framework_lab_cachebench._records import (
     group_by_cell,
     read_seed_records,
 )
+from agent_framework_lab_cachebench._strategies import needs_summarizer
 from agent_framework_lab_cachebench.compaction import (
     DEFAULT_RECORD_MAX_TOKENS,
     DEFAULT_RECORD_TARGET_TOKENS,
@@ -132,6 +133,7 @@ from agent_framework_lab_cachebench.compaction import (
     MinimumGainAnchoredCompactionStrategy,
     ToolResultAnchoredSummarizationCompactionStrategy,
     ToolResultRecallMiddleware,
+    UserTurnAnchoredSummarizationCompactionStrategy,
     make_recall_tool,
 )
 
@@ -784,6 +786,9 @@ def test_every_argument_the_runner_reads_is_defined() -> None:
         "trigger_fraction",
         "fallback_fraction",
         "coverage_share",
+        "keep_head_user_turns",
+        "keep_tail_user_turns",
+        "user_trigger_fraction",
         "record_repeats",
         "min_correctness",
         "summarizer_provider",
@@ -1125,6 +1130,12 @@ _TUNED_ARGV = (
     "0.19",
     "--coverage-share",
     "0.23",
+    "--keep-head-user-turns",
+    "2",
+    "--keep-tail-user-turns",
+    "3",
+    "--user-trigger-fraction",
+    "0.31",
     "--budget-fraction",
     "0.29",
 )
@@ -1241,6 +1252,237 @@ def test_a_value_outside_a_strategys_range_is_refused_before_anything_is_spent(a
         _build_or_exit(strategies, options)
 
     assert match in str(error.value)
+
+
+class _StubSummarizer:
+    """The smallest thing ``user_summary_anchored`` will accept as a summarizer.
+
+    A real client is not needed to check that a flag reaches a constructor, and using one would
+    put the strategy's behaviour inside a test about wiring. What it must do is answer, because
+    the strategy counts a summarizer that does not as a failure and leaves the band alone --
+    which would make a wiring test pass for the wrong reason.
+    """
+
+    def __init__(self, text: str = "The user asked for several things, in order.") -> None:
+        self.calls = 0
+        self.text = text
+
+    async def get_response(self, messages: Any, *, stream: bool = False, **kwargs: Any) -> Any:
+        self.calls += 1
+        return ChatResponse(messages=[Message(role="assistant", contents=[self.text])])
+
+
+def _user_band_conversation(turns: int) -> list[Message]:
+    """Return a conversation whose user turns are large enough to be worth summarising."""
+    messages: list[Message] = [Message(role="system", contents=["You are an assistant."], message_id="sys")]
+    for index in range(turns):
+        messages += [
+            Message(role="user", contents=[f"Turn {index}: " + "u" * 4_000], message_id=f"u{index}"),
+            Message(role="assistant", contents=[f"Reply {index}: " + "a" * 4_000], message_id=f"a{index}"),
+        ]
+    return messages
+
+
+def test_the_user_band_flags_reach_the_strategy_that_consumes_them() -> None:
+    """Three more knobs that parse and could go nowhere, checked the way the others are.
+
+    Its own test rather than a block inside the tuning test above, because this strategy cannot
+    be built without a summarizer client and that helper deliberately builds with none: the
+    pre-flight skips summarizer-needing strategies when there is no client, so a run without
+    one would never have exercised these at all.
+    """
+    summarizer = _StubSummarizer()
+    options = _strategy_options(build_parser().parse_args(["azure", *_TUNED_ARGV]), TOKENIZER, summarizer)
+
+    strategy = build_strategy("user_summary_anchored", options)
+
+    assert isinstance(strategy, UserTurnAnchoredSummarizationCompactionStrategy)
+    assert (strategy.keep_head_user_turns, strategy.keep_tail_user_turns) == (2, 3)
+    assert strategy.trigger_fraction == 0.31, "--user-trigger-fraction, not --trigger-fraction"
+    assert strategy.max_input_tokens == options.input_budget_tokens
+    assert strategy.client is summarizer
+
+
+def test_the_two_trigger_flags_stay_apart() -> None:
+    """One threshold belongs to the record strategy and one to the user-band strategy.
+
+    They default differently -- 0.6 against 0.8 -- because the decisions differ: the record has
+    to be asked for before the bulk it must read degrades it, while the user band pays only in
+    a broken cached prefix and wants to fire as late as it can. Reading one flag for both would
+    make every sweep of either a sweep of both, and the rows would move together for a reason
+    no column records.
+    """
+    args = build_parser().parse_args(["azure", "--trigger-fraction", "0.5"])
+    options = _strategy_options(args, TOKENIZER, _StubSummarizer())
+
+    user_band = build_strategy("user_summary_anchored", options)
+    record = build_strategy("tool_summary_anchored", options)
+
+    assert isinstance(user_band, UserTurnAnchoredSummarizationCompactionStrategy)
+    assert isinstance(record, ToolResultAnchoredSummarizationCompactionStrategy)
+    assert record.trigger_fraction == 0.5
+    assert user_band.trigger_fraction == 0.8, "the user band keeps its own default"
+
+
+@pytest.mark.parametrize(
+    ("argv", "match"),
+    [
+        pytest.param(["--user-trigger-fraction", "0"], "trigger_fraction", id="trigger-zero"),
+        pytest.param(["--user-trigger-fraction", "1.5"], "trigger_fraction", id="trigger-above-one"),
+        pytest.param(["--keep-head-user-turns", "-1"], "keep_head_user_turns", id="head"),
+        pytest.param(["--keep-tail-user-turns", "-1"], "keep_tail_user_turns", id="tail"),
+    ],
+)
+def test_a_user_band_value_outside_its_range_is_refused_before_anything_is_spent(argv: list[str], match: str) -> None:
+    """The same "fail at the command line" contract, on the strategy that needs a client.
+
+    Worth its own test because the pre-flight skips a summarizer-needing strategy when the run
+    configured no client, so these ranges are only checked for a run that actually selected a
+    summarizer -- a real gap, and one a reader of the other parametrized test would not guess.
+    """
+    options = _strategy_options(build_parser().parse_args(["azure", *argv]), TOKENIZER, _StubSummarizer())
+
+    with pytest.raises(SystemExit) as error:
+        _build_or_exit(["user_summary_anchored"], options)
+
+    assert match in str(error.value)
+
+
+def test_the_user_band_strategy_says_it_needs_a_summarizer() -> None:
+    """It calls a model, so a run that selected it and no client has to be told which to fix.
+
+    The list of strategies needing one is named rather than matched on "summar" in the name,
+    and this is the pair that makes that matter: ``tool_summary_anchored`` reads as a
+    summarizing strategy and needs no client at all, because its record is written by the
+    agent's own model through a tool call.
+    """
+    assert needs_summarizer(["user_summary_anchored"]) is True
+    assert needs_summarizer(["tool_summary_anchored"]) is False
+
+    with pytest.raises(ValueError, match="summarizer client"):
+        build_strategy("user_summary_anchored", _strategy_options(build_parser().parse_args(["azure"]), TOKENIZER))
+
+
+async def test_user_band_compactions_reach_the_seed_record_and_the_flags_column() -> None:
+    """A strategy whose whole subject is how much it removed has to say how it removed it.
+
+    ``snap%`` shows the size of the snapshot and nothing else, so a row that compacted once and
+    stood in for seventy turns and a row that compacted seven times and stood in for ten read
+    identically there -- while the second paid seven times over for a broken cached prefix.
+    Both numbers therefore have to travel from the strategy through the outcome and the seed
+    record to the column somebody actually reads, which is four handoffs and four places to
+    drop one.
+    """
+    strategy = UserTurnAnchoredSummarizationCompactionStrategy(
+        max_input_tokens=12_000, tokenizer=TOKENIZER, client=_StubSummarizer()
+    )
+
+    assert await strategy(_user_band_conversation(8)) is True
+    assert (strategy.user_compactions, strategy.user_messages_replaced) == (1, 6)
+
+    notes = _strategy_notes(strategy)
+    assert "USERCOMPACT:1" in notes
+    assert "USERREPLACED:6" in notes
+
+    outcome, scenario = await _probed(StubChatClient(usage=UsageDetails(input_token_count=1_000)), repeats=1)
+    record = _record(
+        replace(
+            outcome,
+            strategy_notes=notes,
+            user_compactions=strategy.user_compactions,
+            user_messages_replaced=strategy.user_messages_replaced,
+        ),
+        scenario,
+        strategy="user_summary_anchored",
+    )
+
+    assert (record.user_compactions, record.user_messages_replaced) == (1, 6), (
+        "the counts must survive scoring, not only the flag string"
+    )
+    cell = _aggregate("user_summary_anchored", [record])
+
+    assert "USERCOMPACT:1" in _flags(cell, None)
+    assert "USERREPLACED:6" in _render(None, [cell], set(), show_answers=False)
+
+
+async def test_a_user_band_summarizer_failure_is_flagged_rather_than_silent() -> None:
+    """A pass that lost its summarizer is a pass that measured the uncompacted control.
+
+    Nothing else in the table would say so: the conversation is exactly as it was, so the row
+    reads as a strategy that found nothing worth compacting rather than as one that could not
+    ask.
+    """
+
+    class _Broken:
+        async def get_response(self, messages: Any, *, stream: bool = False, **kwargs: Any) -> Any:
+            raise RuntimeError("no summarizer today")
+
+    strategy = UserTurnAnchoredSummarizationCompactionStrategy(
+        max_input_tokens=12_000, tokenizer=TOKENIZER, client=_Broken()
+    )
+
+    assert await strategy(_user_band_conversation(8)) is False
+    assert strategy.user_summary_failures == 1
+    assert "USERSUMMFAIL:1" in _strategy_notes(strategy)
+    assert not [note for note in _strategy_notes(strategy) if note.startswith("USERCOMPACT")]
+
+
+async def test_records_written_before_the_user_band_counters_read_back_as_zero() -> None:
+    """Zero is what those runs did, and the schema is what says which zero a reader is seeing.
+
+    No strategy a schema 8 record could select was allowed to touch a user turn: the anchored
+    family shortens tool results and the record strategy drops tool groups. So this is the
+    ``groups_kept_uncovered`` case rather than the probe-token one -- the number is knowable and
+    it is nought -- and refusing those records over two columns none of them could have written
+    would discard every cell on disk.
+    """
+    outcome, scenario = await _probed(StubChatClient(usage=UsageDetails(input_token_count=1_000)), repeats=1)
+    record = _record(replace(outcome, user_compactions=3, user_messages_replaced=9), scenario)
+
+    assert (record.user_compactions, record.user_messages_replaced) == (3, 9)
+
+    dropped = {"user_compactions", "user_messages_replaced"}
+    older = {key: value for key, value in record.to_dict().items() if key not in dropped}
+    older["schema"] = SCHEMA_VERSION - 1
+    read_back = SeedRecord.from_dict(older)
+
+    assert (read_back.user_compactions, read_back.user_messages_replaced) == (0, 0)
+
+
+def test_a_settings_block_written_before_the_user_band_knobs_still_loads() -> None:
+    """The three new settings are read leniently, and the licence for that is narrow.
+
+    Version 7's rule is that an unrecorded setting reads back as ``None``, because filling it in
+    would credit an archived cell with a configuration it may never have run. These three are
+    the exception and it is a small one: they are consulted by a single strategy, and no record
+    written before schema 9 can carry a row for it, so on an older record they describe an
+    inapplicable knob rather than an unrecorded measurement. Refusing the block outright would
+    throw away everything else it does say.
+    """
+    written = _cell_params(settings=_settings()).to_dict()
+    for name in ("keep_head_user_turns", "keep_tail_user_turns", "user_trigger_fraction"):
+        del written["settings"][name]
+
+    settings = CellParams.from_dict(written).settings
+
+    assert settings is not None, "the rest of the block is still a measurement"
+    assert (settings.keep_head_user_turns, settings.keep_tail_user_turns) == (1, 1)
+    assert settings.user_trigger_fraction == 0.8
+
+
+def test_two_cells_differing_only_in_a_user_band_setting_do_not_merge() -> None:
+    """The reason the settings block exists, on the knobs this change adds.
+
+    Run 40's two ``repeat_records`` arms pooled into one row at +1% out of arms that had
+    measured -7% and +9%, because the setting was on no key. A user-band trigger moved between
+    two runs changes how often the band is rewritten and therefore the whole money side of the
+    row, so it has to key them apart for the same reason.
+    """
+    early = _cell_params(settings=_settings(user_trigger_fraction=0.5))
+    late = _cell_params(settings=_settings(user_trigger_fraction=0.9))
+
+    assert early.key != late.key
+    assert _cell_params(settings=_settings(keep_tail_user_turns=4)).key != _cell_params(settings=_settings()).key
 
 
 async def test_the_dry_run_checks_the_configuration_it_is_printing_a_plan_for(
@@ -3384,6 +3626,8 @@ def test_the_two_accuracy_measures_are_named_acc1_and_acc2() -> None:
         groups_kept_uncovered=0,
         fallbacks_after_record=0,
         records_in_conversation=0,
+        user_compactions=0,
+        user_messages_replaced=0,
         strategy_notes=(),
         dropped_options=(),
         answer="",
@@ -3585,6 +3829,8 @@ def _control_cell(seeded: int) -> dict[str, CellStats]:
         groups_kept_uncovered=0,
         fallbacks_after_record=0,
         records_in_conversation=0,
+        user_compactions=0,
+        user_messages_replaced=0,
         strategy_notes=(),
         dropped_options=(),
         answer="",
@@ -4882,6 +5128,8 @@ def test_a_progress_line_shows_what_a_watcher_needs() -> None:
         groups_kept_uncovered=0,
         fallbacks_after_record=0,
         records_in_conversation=0,
+        user_compactions=0,
+        user_messages_replaced=0,
         strategy_notes=(),
         dropped_options=(),
         answer="",
@@ -5170,6 +5418,9 @@ def _settings(**overrides: Any) -> StrategySettings:
         "trigger_fraction": 0.6,
         "fallback_fraction": 0.9,
         "coverage_share": 0.8,
+        "keep_head_user_turns": 1,
+        "keep_tail_user_turns": 1,
+        "user_trigger_fraction": 0.8,
         "token_budget_fraction": 0.5,
         "max_output_tokens": 2_048,
         "answer_max_tokens": 12_000,
