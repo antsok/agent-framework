@@ -65,10 +65,27 @@ things are done about that and a fourth is deliberately not done:
   :meth:`~._anchored.AnchoredCompactionStrategy.__call__`'s own reasoning, one level up.
 - The order above is chosen so the moved number moves as little as it can.
 - :attr:`ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy.user_passes_starved`
-  counts the passes where the record phase's removals took the prompt from above the user
-  phase's own line to at or below it. Zero is the ordinary case and the counter is then silent;
-  non-zero is the one reading of "the user half did nothing" that is not about the user half at
-  all, and it would otherwise be indistinguishable from a conversation with nothing in its band.
+  counts the passes where the record phase's removals are why the prompt is under the user
+  phase's own line. It is the one reading of "the user half did nothing" that is not about the
+  user half at all. It was written as a within-pass transition -- above the line when the pass
+  started, at or below it when the record phase finished -- and that definition could not see
+  the case it was written for: the record phase's trigger is *lower* than the user phase's, so
+  it takes the prompt down before the user line is ever reached and holds it there, and the
+  transition never happens. Measured: seed 1 of the run in ``STATE.md`` reported ``snap 63%``,
+  no ``USERCOMPACT`` and no ``USERSTARVED``. It now counts against what the record phase has
+  removed over the whole run rather than over one pass, which makes the old reading a special
+  case of the new one.
+
+**The user half is silent for four different reasons, and the flags say which.** This is the
+failure the composition exists to avoid -- a row that is one of its halves under a new name --
+so "did not compact" is not one state here but four, each with its own counter:
+:attr:`~._usersummary.UserTurnAnchoredSummarizationCompactionStrategy.user_passes_below_trigger`
+is never considered, ``user_passes_starved`` is the subset of those the record phase caused,
+:attr:`~._usersummary.UserTurnAnchoredSummarizationCompactionStrategy.user_passes_declined` is
+considered and held back by the user phase's own hysteresis, and
+:attr:`~._usersummary.UserTurnAnchoredSummarizationCompactionStrategy.user_summary_failures` is
+a summarizer that did not answer. A reader who has only the flags column can tell the four
+apart, which is the whole point of having them.
 - What is *not* done is overriding either phase's trigger. Both keep their own configuration,
   including the two thresholds, because the composed row only means anything beside the two
   single rows if its halves fire where those rows' halves fire. Collapsing them into one shared
@@ -149,6 +166,7 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
         self.user_turns = user_turns
         self.max_input_tokens = tool_results.max_input_tokens
         self._starved = 0
+        self._removed_by_record = 0
 
     @property
     def strategies(self) -> tuple[_Phase, ...]:
@@ -202,16 +220,61 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
         return self.user_turns.user_summary_failures
 
     @property
+    def user_passes_below_trigger(self) -> int:
+        """:attr:`~._usersummary.UserTurnAnchoredSummarizationCompactionStrategy.user_passes_below_trigger`.
+
+        On a composed row this is the number :attr:`user_passes_starved` subdivides: of the
+        passes where the user phase never reached its line, the starved ones are those the
+        record phase's removals account for and the rest are a conversation that was not big
+        enough on its own.
+        """
+        return self.user_turns.user_passes_below_trigger
+
+    @property
+    def user_passes_declined(self) -> int:
+        """:attr:`~._usersummary.UserTurnAnchoredSummarizationCompactionStrategy.user_passes_declined`."""
+        return self.user_turns.user_passes_declined
+
+    @property
     def user_passes_starved(self) -> int:
-        """Passes where the record phase's removals dropped the prompt under the user phase's line.
+        """Passes where the record phase's removals are why the user phase never reached its line.
 
         The one number composing produces that neither part can report, and the only reading of
         a silent user half that is not about the user half. Every other explanation for
-        ``user_compactions == 0`` is visible elsewhere -- a conversation that never grew past
-        the trigger, a band holding nothing but an earlier summary, a summarizer that raised
+        ``user_compactions == 0`` is visible on the user phase itself -- a conversation that
+        never grew past the trigger (:attr:`user_passes_below_trigger`), a band not worth a pass
+        (:attr:`user_passes_declined`), a summarizer that raised
         (:attr:`user_summary_failures`) -- and all of them are statements about the user side.
         This one says the user side was never consulted, because the phase in front of it had
         already taken the prompt below the threshold it fires on.
+
+        **It used to be a per-pass transition, and that made it silent exactly where it was
+        needed.** The test was ``before > user_line >= after`` within one pass: the prompt had
+        to be above the user line when the pass started and at or below it when the record phase
+        finished. On the run this counter was written for -- gpt-5.6-luna, a 170,000-token
+        window at 0.9 fill, seed 1 -- the composed row reported ``REC:1, RECORDS:1, FORCED:1,
+        RECFORCED:1``, a 63% snapshot, no ``USERCOMPACT`` and **no ``USERSTARVED``**. The reason
+        is structural rather than incidental: the record phase's trigger is 0.6 and the user
+        phase's is 0.8, so the record phase removes the tool payload while the prompt is still
+        in the 60s and holds it there for the rest of the run. The prompt is then never above
+        the user line at the *start* of a pass, the transition can never be observed, and a row
+        whose user half was starved on every pass reported starvation on none.
+
+        **What is counted now is the counterfactual, and it is carried across passes.** This
+        class accumulates the tokens the record phase has removed over the run and counts a pass
+        as starved when the prompt is at or below the user line *and* would have been above it
+        with those tokens still in the conversation. On the pass where a transition does happen
+        that is the old test -- the removal of that pass is part of the total -- so every pass
+        the old definition counted is still counted, and the passes it could not see are now
+        counted too.
+
+        The total is the sum of what each pass's record phase removed, measured as the drop in
+        the included token count across the call and floored at zero: the phase inserts notes of
+        its own when its fallback runs, and a pass whose notes outweighed its removals has
+        removed nothing rather than a negative amount. The counterfactual it stands for is "the
+        same conversation, compacted by the user phase exactly as it was, with the record phase
+        never run" -- which is the ``user_summary_anchored`` row the composed row is read
+        against, and so the right question to be asking.
 
         Counted per pass rather than as a flag, for the reason
         :attr:`~._toolsummary.ToolResultAnchoredSummarizationCompactionStrategy.fallbacks_after_record`
@@ -228,12 +291,30 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
         """
         return self._starved
 
+    @property
+    def tokens_removed_by_record_phase(self) -> int:
+        """Tokens the record phase has removed from the prompt over this run.
+
+        The quantity :attr:`user_passes_starved` is decided against, exposed because a counter
+        derived from a hidden number is a counter nobody can check. It is a running total of
+        per-pass drops in the included token count, so it describes the conversation as it now
+        stands: the record phase's exclusions are permanent, and nothing here puts them back.
+
+        Not a flag on the row. It is a token count rather than an event count, it moves with the
+        workload rather than with the strategy, and the flags column is read for the latter.
+        """
+        return self._removed_by_record
+
     async def __call__(self, messages: list[Message]) -> bool:
         """Run the record phase, then the user-turn phase.
 
         Neither phase is called conditionally on the other. Each is trusted to read its own
         trigger and decline, because that decision is the thing its own row measures and a copy
         of it here would be a second place for the two to disagree about when a strategy fires.
+
+        What this class does instead of deciding for them is *attribute* a decline. The user
+        phase counts its own three refusals; this counts the one it cannot see, which is the
+        record phase in front of it having taken the prompt below the line the user phase reads.
 
         Args:
             messages: The conversation, mutated in place.
@@ -249,6 +330,7 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
         before = included_token_count(messages)
 
         changed = await self.tool_results(messages)
+        after = before
         if changed:
             # Forced, because the record phase's fallback shortens tool results in place and
             # the counts are cached per message: an incremental re-read would leave the user
@@ -256,8 +338,19 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
             # when nothing changed, which is the same trade ``_anchored.__call__`` makes.
             annotate_message_groups(messages)
             annotate_token_counts(messages, tokenizer=self.tokenizer, force_retokenize=True)
-            user_line = int(self.user_turns.max_input_tokens * self.user_turns.trigger_fraction)
-            if before > user_line >= included_token_count(messages):
-                self._starved += 1
+            after = included_token_count(messages)
+            # Floored at zero: the fallback inserts notes where it shed a group, so a pass can
+            # end larger than it started, and a pass that removed nothing has removed nothing
+            # rather than a negative amount that would then pay for a later pass's starvation.
+            self._removed_by_record += max(before - after, 0)
+
+        # Read on every pass and not only on one that changed something. The record phase's
+        # exclusions are permanent, so the pass that made them is not the only pass they starve;
+        # on the live row that produced this counter it was never the transition pass at all,
+        # because the record phase acts at 0.6 and the user line is at 0.8. See
+        # ``user_passes_starved``.
+        user_line = int(self.user_turns.max_input_tokens * self.user_turns.trigger_fraction)
+        if after <= user_line < after + self._removed_by_record:
+            self._starved += 1
 
         return await self.user_turns(messages) or changed

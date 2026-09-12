@@ -41,6 +41,7 @@ from agent_framework_lab_cachebench.compaction._preserve import set_preserved
 from agent_framework_lab_cachebench.compaction._usersummary import (
     DEFAULT_KEEP_HEAD_USER_TURNS,
     DEFAULT_KEEP_TAIL_USER_TURNS,
+    DEFAULT_MIN_BAND_SHARE,
     DEFAULT_USER_TRIGGER_FRACTION,
     EXCLUDE_REASON,
     SUMMARY_ID_PREFIX,
@@ -237,14 +238,17 @@ def test_the_fixture_sits_where_the_two_ceilings_assume_it_does() -> None:
     assert size < _IDLE_CEILING * DEFAULT_USER_TRIGGER_FRACTION * 0.5, "and must be nowhere near the idle one"
 
 
-def test_the_defaults_are_one_turn_at_each_end_and_a_late_trigger() -> None:
-    """The three numbers a caller inherits, pinned where a reader of the table can find them.
+def test_the_defaults_are_one_turn_at_each_end_a_late_trigger_and_a_tenth_of_the_prompt() -> None:
+    """The four numbers a caller inherits, pinned where a reader of the table can find them.
 
     They are defaults rather than derivations, and a change to any of them changes what every
-    archived row means, so moving one should have to move this line too.
+    archived row means, so moving one should have to move this line too. The band share is the
+    one that changes how *often* the strategy acts rather than when, and the one whose absence
+    was measured as thirty passes in a run where the design expected one or two.
     """
     assert (DEFAULT_KEEP_HEAD_USER_TURNS, DEFAULT_KEEP_TAIL_USER_TURNS) == (1, 1)
     assert DEFAULT_USER_TRIGGER_FRACTION == 0.8
+    assert DEFAULT_MIN_BAND_SHARE == 0.1
 
 
 async def test_it_compacts_user_turns_and_leaves_tool_results_and_assistant_messages_alone() -> None:
@@ -544,6 +548,8 @@ async def test_a_preserved_user_turn_is_never_summarised() -> None:
         pytest.param({"keep_tail_user_turns": -1}, "keep_tail_user_turns", id="tail"),
         pytest.param({"trigger_fraction": 0.0}, "trigger_fraction", id="trigger-zero"),
         pytest.param({"trigger_fraction": 1.5}, "trigger_fraction", id="trigger-above-one"),
+        pytest.param({"min_band_share": -0.1}, "min_band_share", id="share-negative"),
+        pytest.param({"min_band_share": 1.0}, "min_band_share", id="share-one"),
     ],
 )
 def test_a_configuration_outside_its_range_is_refused_by_the_constructor(kwargs: dict[str, Any], match: str) -> None:
@@ -556,6 +562,223 @@ def test_a_configuration_outside_its_range_is_refused_by_the_constructor(kwargs:
     """
     with pytest.raises(ValueError, match=match):
         _strategy(**kwargs)
+
+
+#: Characters in a user turn of the lopsided fixture, against ``_FAT_REPLY_CHARS`` in its reply.
+#:
+#: 1,000 against 4,000, so the user half is a fifth of the conversation and the band between the
+#: anchors about a fifth of the prompt. That ratio is the whole point of the fixture: the
+#: even-sized conversation above hands this strategy half the prompt, where one pass takes the
+#: prompt so far under the trigger that nothing else can be measured, while the live run that
+#: produced the defect had its band at 28% of the prompt and the rest in assistant replies and
+#: tool payload the strategy may not touch.
+_THIN_USER_CHARS = 1_000
+
+#: Characters in an assistant reply of the lopsided fixture. See ``_THIN_USER_CHARS``.
+_FAT_REPLY_CHARS = 4_000
+
+
+def _lopsided_turn(index: int) -> list[Message]:
+    """Return one user turn and a reply four times its size.
+
+    Args:
+        index: Numbers the pair.
+
+    Returns:
+        The two messages.
+    """
+    return [
+        Message(role="user", contents=[f"Turn {index}: " + "u" * _THIN_USER_CHARS], message_id=f"u{index}"),
+        Message(role="assistant", contents=[f"Reply {index}: " + "a" * _FAT_REPLY_CHARS], message_id=f"a{index}"),
+    ]
+
+
+async def _grow_and_compact(
+    strategy: UserTurnAnchoredSummarizationCompactionStrategy, turns: int
+) -> list[tuple[int, int, bool]]:
+    """Run one pass per turn over a conversation that never stops growing.
+
+    This is the shape a live run has and the shape no test here had: the strategy is called once
+    per agent turn on a conversation one turn longer each time, rather than once on a
+    conversation that is already long. Both defects this module has had were differences between
+    those two -- a rule that is right for one pass and wrong for the hundredth -- so the driver
+    is written out once and shared.
+
+    Args:
+        strategy: The strategy under test, called once per turn.
+        turns: How many turns to seed.
+
+    Returns:
+        One ``(turn, prompt tokens before the pass, whether it compacted)`` per turn.
+    """
+    messages = [Message(role="system", contents=["You are an assistant."], message_id="sys")]
+    passes: list[tuple[int, int, bool]] = []
+    for index in range(turns):
+        messages += _lopsided_turn(index)
+        before = _included(messages)
+        passes.append((index, before, await strategy(messages)))
+    return passes
+
+
+async def test_a_conversation_that_keeps_growing_compacts_a_bounded_number_of_times() -> None:
+    """The defect this module was measured with, and the test that has to fail if it comes back.
+
+    Live, at a 170,000-token window on gpt-5.6-luna, this strategy reported ``USERCOMPACT:31``
+    with ``USERREPLACED:2`` and took the cache hit rate from the control's 95% down to 53%. It
+    had compacted on every turn: past the trigger the prompt does not shrink to the size of the
+    band, so the condition stays true, and every new turn satisfies the "something here is not
+    my own summary" rule that was supposed to re-arm it on new material only.
+
+    Both arms below run the same forty-turn conversation one turn at a time, and differ in one
+    number. The bounded arm is asserted against the unbounded one rather than against a
+    constant, because the constant is what a future change would quietly re-tune.
+    """
+    hysteretic = _strategy()
+    unbounded = _strategy(min_band_share=0.0)
+
+    bounded_passes = await _grow_and_compact(hysteretic, 40)
+    await _grow_and_compact(unbounded, 40)
+
+    line = _COMPACTING_CEILING * DEFAULT_USER_TRIGGER_FRACTION
+    over_the_line = [index for index, before, _ in bounded_passes if before > line]
+    assert len(over_the_line) > 20, "the fixture has to spend most of the run over the trigger or this measures nothing"
+    assert unbounded.user_compactions >= 25, (
+        "without the share the strategy fires on very nearly every pass over the trigger, which "
+        "is the behaviour measured live and the thing this test exists to keep out"
+    )
+    assert 2 <= hysteretic.user_compactions <= 8, (
+        f"bounded and small, and neither once per turn nor never: {hysteretic.user_compactions} "
+        f"against {unbounded.user_compactions} without the share"
+    )
+    assert hysteretic.user_passes_declined >= 15, "and every pass it did not spend is counted rather than silent"
+
+
+async def test_the_prompt_has_to_grow_between_two_compactions_by_the_factor_the_bound_claims() -> None:
+    """The bound itself, rather than the small number it produces on one fixture.
+
+    ``DEFAULT_MIN_BAND_SHARE`` claims a geometric bound: a band regrows only from the user turns
+    added since the last pass, so for the band to be worth ``f`` of the prompt again the prompt
+    must have grown by at least ``1 / (1 - f)``. That is what makes the firing count logarithmic
+    in the length of the conversation rather than linear, and it is the claim a reader of the
+    module has to be able to trust -- a test pinning only "eight or fewer on this fixture" would
+    still pass if the mechanism became a per-turn counter that happened to divide by eight.
+    """
+    strategy = _strategy()
+
+    passes = await _grow_and_compact(strategy, 40)
+    fired_at = [before for _, before, fired in passes if fired]
+
+    assert len(fired_at) >= 2, "one compaction cannot show a ratio between two"
+    ratios = [later / earlier for earlier, later in zip(fired_at, fired_at[1:], strict=False)]
+    assert all(ratio >= 1 / (1 - DEFAULT_MIN_BAND_SHARE) for ratio in ratios), (
+        f"consecutive compactions must be a factor 1/(1-f) apart in prompt size, and these are {ratios}"
+    )
+
+
+async def test_a_share_of_zero_is_the_behaviour_every_archived_row_was_measured_with() -> None:
+    """The old code path stays reachable, because the comparison needs it.
+
+    Every ``user_summary_anchored`` row on disk was produced without a band share, and a record
+    written before this reads the setting back as ``0.0`` for exactly that reason. If zero did
+    not reproduce the old behaviour that reading would be a lie, and the A/B that justifies the
+    default could not be run at all.
+    """
+    strategy = _strategy(min_band_share=0.0)
+    messages = _conversation(8)
+
+    assert await strategy(messages) is True
+    assert strategy.user_compactions == 1
+
+    messages += _conversation(1, first_turn=8)
+
+    assert await strategy(messages) is True, "one new turn is enough to recompact when nothing bounds it"
+    assert (strategy.user_compactions, strategy.user_messages_replaced) == (2, 2), (
+        "the summary and the one turn after it, which is USERREPLACED:2 -- the live signature"
+    )
+    assert strategy.user_passes_declined == 0
+
+
+async def test_a_band_worth_less_than_the_share_is_declined_before_the_summarizer_is_called() -> None:
+    """The rule at its own boundary, on a band that is new material rather than an old summary.
+
+    The "nothing but my own summary" rule cannot catch this: everything in this band is a turn
+    the strategy has never seen. What makes the pass not worth making is size alone -- one turn
+    against a prompt made of assistant replies -- and before the share existed this was a
+    summarizer call and a rewritten prefix spent to remove a fraction of a percent of the prompt.
+    """
+    summarizer = _Summarizer()
+    strategy = _strategy(summarizer, keep_head_user_turns=3, keep_tail_user_turns=4)
+    messages = _conversation(8)
+
+    assert await strategy(messages) is False, "one turn between the anchors is not worth a pass"
+    assert (strategy.user_compactions, strategy.user_passes_declined) == (0, 1)
+    assert summarizer.requests == [], "declined before the call, which is where the saving is"
+
+    generous = _strategy(_Summarizer(), keep_head_user_turns=3, keep_tail_user_turns=4, min_band_share=0.0)
+
+    assert await generous(_conversation(8)) is True, "and the same band is compacted when nothing bounds it"
+
+
+async def test_the_share_is_measured_against_the_prompt_and_not_against_the_ceiling() -> None:
+    """Which denominator it is decides whether the bound is geometric or linear.
+
+    Against the ceiling the bar would be a fixed number of tokens, the band would clear it again
+    after a fixed amount of growth, and the firing count would rise linearly with the length of
+    the conversation -- the same defect one order of magnitude quieter. Against the prompt the
+    bar rises as the prompt does, which is what makes each pass need proportionally more
+    material than the last.
+
+    Asserted by holding the band fixed and moving everything else: the same eight user turns are
+    worth a pass in a conversation of their own size and not worth one in a conversation several
+    times the size, on one ceiling and with one band.
+    """
+    small = _strategy()
+    large = _strategy()
+    thin: list[Message] = [Message(role="system", contents=["You are an assistant."], message_id="sys")]
+    fat: list[Message] = [Message(role="system", contents=["You are an assistant."], message_id="sys")]
+    for index in range(8):
+        thin += _turn(index)
+        fat += [
+            Message(role="user", contents=[f"Turn {index}: " + "u" * _TURN_CHARS], message_id=f"u{index}"),
+            Message(role="assistant", contents=[f"Reply {index}: " + "a" * _TURN_CHARS * 9], message_id=f"a{index}"),
+        ]
+
+    assert _user_tokens(fat) == _user_tokens(thin), "one band, so the only thing moving is the prompt around it"
+    assert _included(fat) > _included(thin) * 4
+
+    assert await small(thin) is True
+    assert await large(fat) is False
+    assert (large.user_compactions, large.user_passes_declined) == (0, 1)
+
+
+async def test_the_four_outcomes_of_a_pass_partition_the_passes() -> None:
+    """A row that did nothing has exactly one number saying why, and the numbers add up.
+
+    Four counters is two more than this class had, and the reason for each is that
+    ``user_compactions == 0`` had four readings and no way to tell them apart: the conversation
+    never grew, the band was not worth a pass, the summarizer failed, or -- on a composed row --
+    the phase in front took the prompt below the line. A partition is the strongest form of that
+    claim: every pass over a non-empty conversation lands in exactly one of the four, so an
+    outcome added later without a counter makes this fail.
+    """
+    strategy = _strategy()
+    passes = await _grow_and_compact(strategy, 40)
+    failing = _strategy(_FailingSummarizer())
+    failing_passes = await _grow_and_compact(failing, 40)
+
+    for name, subject, count in (("clean", strategy, len(passes)), ("failing", failing, len(failing_passes))):
+        assert (
+            subject.user_compactions
+            + subject.user_passes_declined
+            + subject.user_passes_below_trigger
+            + subject.user_summary_failures
+            == count
+        ), f"the {name} run's counters have to account for every pass, and account for it once"
+
+    assert strategy.user_passes_below_trigger > 0, "the early turns are under the trigger"
+    assert strategy.user_summary_failures == 0
+    assert failing.user_compactions == 0, "the failing arm never replaced anything"
+    assert failing.user_summary_failures > 0, "and says so rather than reading as a band nobody wanted"
 
 
 def _is_summary(message: Message) -> bool:

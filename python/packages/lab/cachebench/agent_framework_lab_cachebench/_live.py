@@ -898,6 +898,8 @@ def _strategy_notes(strategy: Any) -> tuple[str, ...]:
         ("declined_collapses", "NOGAIN"),
         ("user_compactions", "USERCOMPACT"),
         ("user_messages_replaced", "USERREPLACED"),
+        ("user_passes_below_trigger", "USERUNDER"),
+        ("user_passes_declined", "USERHELD"),
         ("user_summary_failures", "USERSUMMFAIL"),
         ("user_passes_starved", "USERSTARVED"),
     ):

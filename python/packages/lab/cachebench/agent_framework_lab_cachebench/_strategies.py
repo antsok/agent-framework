@@ -61,6 +61,7 @@ from .compaction import (
     DEFAULT_FALLBACK_FRACTION,
     DEFAULT_KEEP_HEAD_USER_TURNS,
     DEFAULT_KEEP_TAIL_USER_TURNS,
+    DEFAULT_MIN_BAND_SHARE,
     DEFAULT_MIN_GAIN_FRACTION,
     DEFAULT_TRIGGER_FRACTION,
     DEFAULT_USER_TRIGGER_FRACTION,
@@ -177,6 +178,16 @@ class StrategyOptions:
     the decisions are different: one asks a model for a record and must ask before the bulk
     degrades it, this one pays only in a broken cached prefix and wants to fire as late as it
     still can. Sharing a field would have made a sweep of either one a sweep of both.
+    """
+    user_min_band_share: float = DEFAULT_MIN_BAND_SHARE
+    """Share of the prompt the user band must be worth before ``user_summary_anchored`` acts.
+
+    The hysteresis, and the field that says what a row of that strategy means. Without it the
+    trigger alone fires the strategy once per turn for the rest of a run that stays above it --
+    30 passes in a measured run where the design expects one or two -- because the band it reads
+    after its first pass is its own summary plus the turns since. Sweepable because the right
+    value is a property of the workload's user share rather than of the strategy: 0.0 is the
+    behaviour every run before this measured, and every archived row is one.
     """
     token_budget_fraction: float = 0.5
     summarizer: SupportsChatGetResponse[Any] | None = None
@@ -374,6 +385,7 @@ def _build_user_summary_anchored(options: StrategyOptions) -> UserTurnAnchoredSu
         keep_head_user_turns=options.keep_head_user_turns,
         keep_tail_user_turns=options.keep_tail_user_turns,
         trigger_fraction=options.user_trigger_fraction,
+        min_band_share=options.user_min_band_share,
     )
 
 

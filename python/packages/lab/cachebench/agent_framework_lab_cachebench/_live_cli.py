@@ -57,6 +57,7 @@ from .compaction import (
     DEFAULT_FALLBACK_FRACTION,
     DEFAULT_KEEP_HEAD_USER_TURNS,
     DEFAULT_KEEP_TAIL_USER_TURNS,
+    DEFAULT_MIN_BAND_SHARE,
     DEFAULT_MIN_GAIN_FRACTION,
     DEFAULT_RECORD_MAX_TOKENS,
     DEFAULT_RECORD_TARGET_TOKENS,
@@ -490,11 +491,29 @@ def build_parser() -> argparse.ArgumentParser:
             "own turns. Its own flag rather than --trigger-fraction, which belongs to "
             "tool_summary_anchored: the two thresholds answer different questions and sharing "
             "one would make a sweep of either a sweep of both. It sits higher than that one's "
-            "0.6 because this strategy is willing to compact more than once and each pass "
-            "re-bills the prompt from its edit to the end -- firing late is what keeps the "
-            "number of passes near one on a conversation of this length. Lower it to make the "
-            "repeat behaviour happen, and read USERCOMPACT in the flags column to see how "
-            "often it did. Default %(default)s."
+            "0.6 because this strategy pays only in a broken cached prefix, so it can wait. It "
+            "decides when the first compaction happens and not how many there are -- that is "
+            "--user-min-band-share, and firing late was measured not to bound the count at "
+            "all. Read USERCOMPACT in the flags column for how often it fired and USERHELD for "
+            "how often the band was not worth a pass. Default %(default)s."
+        ),
+    )
+    parser.add_argument(
+        "--user-min-band-share",
+        type=float,
+        default=DEFAULT_MIN_BAND_SHARE,
+        help=(
+            "Share of the included prompt the user band must be worth before "
+            "user_summary_anchored will compact it. This is the hysteresis, and it is what "
+            "bounds the number of passes: without it the strategy fires once per turn for the "
+            "rest of a run that stays above --user-trigger-fraction, because after its first "
+            "pass the band is its own summary plus the turns since -- measured at "
+            "USERCOMPACT:31 with USERREPLACED:2 and a 53%% cache hit rate against the "
+            "control's 95%%. The default is the break-even share for a conversation of this "
+            "benchmark's own length at the measured cached and uncached prices; raise it for "
+            "shorter runs. 0 restores the unbounded behaviour every archived row was measured "
+            "with, so the two can be run side by side, and USERHELD in the flags column says "
+            "how many passes it refused. Default %(default)s."
         ),
     )
     parser.add_argument(
@@ -1855,14 +1874,31 @@ _LEGEND: Final[tuple[str, ...]] = (
     "            end. That strategy is deliberately willing to recompact its own earlier",
     "            summary, which is the opposite of the anchored family's refusal to re-trim a",
     "            result it has already shortened, and USERCOMPACT above 1 is that happening.",
-    "            A row with USERCOMPACT:0 never fired and is the uncompacted control under",
-    "            another name. USERSUMMFAIL:<n> passes where the summarizer raised or returned",
-    "            nothing, so the band was left exactly as it was found and those passes are",
-    "            the control too. USERSTARVED:<n> passes of tool_and_user_summary_anchored",
-    "            where the record half's own removals took the prompt from above the user",
-    "            half's trigger to at or below it, so the user half was never consulted. It",
-    "            is the only reading of USERCOMPACT:0 that is not about the user half at all,",
-    "            and without it that row is indistinguishable from one whose band was empty.",
+    "            A row with USERCOMPACT:0 never fired and is the uncompacted control",
+    "            under another name -- and exactly one of the next three flags says why.",
+    "            USERUNDER:<n> passes where the prompt never reached",
+    "            --user-trigger-fraction, so the band was not even read. USERHELD:<n>",
+    "            passes where it did and the band was not worth a pass under",
+    "            --user-min-band-share: empty, holding nothing but the strategy's own",
+    "            earlier summary, or too small a share of the prompt to pay for the",
+    "            prefix a pass rewrites. That flag is the hysteresis working, and a row",
+    "            with USERHELD and no USERCOMPACT is one whose band never cleared the",
+    "            share -- a setting to change, not a strategy that failed. Before the",
+    "            share existed this row fired once per turn: USERCOMPACT:31 with",
+    "            USERREPLACED:2 and a 53% cache hit rate where the control held 95%.",
+    "            USERSUMMFAIL:<n> passes where the summarizer raised or returned",
+    "            nothing, so the band was left exactly as it was found and those passes",
+    "            are the control too. USERSTARVED:<n> passes of",
+    "            tool_and_user_summary_anchored where the record half's removals are why",
+    "            the prompt was under the user half's trigger, so the user half was never",
+    "            consulted. It is the subset of USERUNDER the composition caused rather",
+    "            than the conversation, and the only reading of USERCOMPACT:0 that is not",
+    "            about the user half at all. It counts a pass whenever the prompt would",
+    "            have been over that trigger with everything the record half has removed",
+    "            still in it -- not only on the one pass that crossed the line, which was",
+    "            the earlier definition and could not see this case at all: the record",
+    "            half fires at the lower trigger and holds the prompt below the user one",
+    "            from before it is ever reached.",
     "            It is reported rather than prevented: overriding the user half's trigger",
     "            would have the composed row fire where no user_summary_anchored row does,",
     "            and the pair would stop being comparable.",
@@ -2206,6 +2242,7 @@ def _strategy_options(args: argparse.Namespace, tokenizer: Any, summarizer: Any 
         keep_head_user_turns=args.keep_head_user_turns,
         keep_tail_user_turns=args.keep_tail_user_turns,
         user_trigger_fraction=args.user_trigger_fraction,
+        user_min_band_share=args.user_min_band_share,
         token_budget_fraction=args.budget_fraction,
         summarizer=summarizer,
     )
@@ -2253,6 +2290,7 @@ def _strategy_settings(
         keep_head_user_turns=options.keep_head_user_turns,
         keep_tail_user_turns=options.keep_tail_user_turns,
         user_trigger_fraction=options.user_trigger_fraction,
+        user_min_band_share=options.user_min_band_share,
         token_budget_fraction=options.token_budget_fraction,
         max_output_tokens=options.max_output_tokens,
         answer_max_tokens=args.answer_max_tokens,

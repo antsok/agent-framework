@@ -97,6 +97,14 @@ _NARROW_CEILING = 22_000
 #: two lines rather than a value sitting near it.
 _IDLE_CEILING = 100_000
 
+#: The ceiling the growing fixture is run against, and the one the live composed row had.
+#:
+#: Sized so the record phase's trigger (0.6 of it, 12,000) is crossed part-way through a
+#: twenty-turn run and its removals then hold the prompt below the user phase's line (0.8 of it,
+#: 16,000) for the whole of the rest. That relationship is what the starvation tests are about,
+#: and they assert it of the fixture before they assert anything of the strategy.
+_GROWING_CEILING = 20_000
+
 
 class _Summarizer:
     """A summarizer that answers from a script and counts what it was asked."""
@@ -280,6 +288,220 @@ def _composed(
     )
 
 
+#: Characters of tool payload in the growing fixture, which is where its bulk is.
+#:
+#: Nine times a user turn, so the record phase's removals are large enough to hold the prompt
+#: under the user phase's line for the whole run. That is not an extreme: the live run this
+#: fixture stands in for used ``--scale-payload``, and its composed row settled at 63% of the
+#: window with the user line at 80% of it.
+_GROWING_PAYLOAD_CHARS = 9_000
+
+#: Characters in a user turn of the growing fixture.
+_GROWING_USER_CHARS = 500
+
+#: Characters in an assistant reply of the growing fixture.
+_GROWING_REPLY_CHARS = 1_000
+
+
+def _growing_turn(index: int) -> list[Message]:
+    """Return one turn of the growing fixture: a user turn, a reply, and a tool call with it.
+
+    Args:
+        index: Numbers the turn and the call it carries.
+
+    Returns:
+        The four messages.
+    """
+    call_id = f"call_{index}"
+    return [
+        Message(role="user", contents=[f"Turn {index}: " + "u" * _GROWING_USER_CHARS], message_id=f"u{index}"),
+        Message(role="assistant", contents=[f"Reply {index}: " + "a" * _GROWING_REPLY_CHARS], message_id=f"a{index}"),
+        Message(
+            role="assistant",
+            contents=[{"type": "function_call", "call_id": call_id, "name": f"lookup_{index}", "arguments": "{}"}],
+            message_id=f"c{index}",
+        ),
+        Message(
+            role="tool",
+            contents=[
+                {
+                    "type": "function_result",
+                    "call_id": call_id,
+                    "result": f"code_1=CODE-{index} " + "x" * _GROWING_PAYLOAD_CHARS,
+                }
+            ],
+            message_id=f"r{index}",
+        ),
+    ]
+
+
+def _numbered_record(indices: list[int], serial: int) -> list[Message]:
+    """Return a record covering ``indices``, with ids of its own so several can coexist.
+
+    ``_record_messages`` writes one fixed pair of ids, which is right for a conversation handed
+    to one pass and wrong for a run where the model writes a record more than once.
+
+    Args:
+        indices: The tool groups the record accounts for.
+        serial: Numbers this record's call and result.
+
+    Returns:
+        The two messages.
+    """
+    values = " ".join(f"lookup_{index}: CODE-{index}." for index in indices)
+    return [
+        Message(
+            role="assistant",
+            contents=[
+                {"type": "function_call", "call_id": f"rec{serial}", "name": RECALL_TOOL_NAME, "arguments": "{}"}
+            ],
+            message_id=f"rec_call{serial}",
+        ),
+        Message(
+            role="tool",
+            contents=[{"type": "function_result", "call_id": f"rec{serial}", "result": f"{RECORD_MARKER} {values}"}],
+            message_id=f"rec_res{serial}",
+        ),
+    ]
+
+
+async def _grow_composed(
+    strategy: ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy, turns: int
+) -> list[tuple[int, int]]:
+    """Run one composed pass per turn over a conversation that never stops growing.
+
+    The recall middleware is stood in for rather than wired: once the prompt is past the record
+    phase's trigger and there is tool work no record accounts for, a record covering all of it is
+    appended, which is what the middleware's forced call produces one turn later. Nothing here
+    depends on the timing of that, and the phase under test reads only whether a record is
+    present.
+
+    Args:
+        strategy: The composed strategy, called once per turn.
+        turns: How many turns to seed.
+
+    Returns:
+        One ``(turn, prompt tokens before the pass)`` per turn.
+    """
+    messages = [Message(role="system", contents=["You are an assistant."], message_id="sys")]
+    covered: set[int] = set()
+    seen: list[int] = []
+    passes: list[tuple[int, int]] = []
+    for index in range(turns):
+        messages += _growing_turn(index)
+        seen.append(index)
+        if _size(messages) > strategy.tool_results.max_input_tokens * strategy.tool_results.trigger_fraction and (
+            set(seen) - covered
+        ):
+            messages += _numbered_record(seen, len(covered))
+            covered = set(seen)
+        before = _size(messages)
+        await strategy(messages)
+        passes.append((index, before))
+    return passes
+
+
+async def test_the_record_phase_holding_the_prompt_under_the_user_line_is_counted_as_starvation() -> None:
+    """Defect 2, and the reason the counter that existed for it could not see it.
+
+    Measured live: seed 1 of the composed row reported ``REC:1, RECORDS:1, FORCED:1,
+    RECFORCED:1`` with a 63% snapshot, no ``USERCOMPACT`` **and no ``USERSTARVED``**. The user
+    half had done nothing and the row's own diagnostic was silent about why.
+
+    The cause is the order of the two triggers rather than anything about the band. The record
+    phase fires at 0.6 and the user phase at 0.8, so on a workload whose bulk is tool payload the
+    record phase removes it while the prompt is still in the 60s and holds it there for the rest
+    of the run. The prompt is then never above the user line when a pass *starts*, which is what
+    the old counter required: it tested ``before > user_line >= after`` within one pass, and that
+    transition never happens.
+
+    So the fixture is asserted to be the live case before anything else: no pass over it ever
+    starts above the user line, which is a proof that the old definition could not have counted
+    one -- and the new counter, which asks whether the prompt would be over the line with what
+    the record phase has removed still in it, counts nearly all of them.
+    """
+    strategy = _composed(_GROWING_CEILING)
+
+    passes = await _grow_composed(strategy, 20)
+    user_line = int(_GROWING_CEILING * strategy.user_turns.trigger_fraction)
+
+    assert max(before for _, before in passes) <= user_line, (
+        "the fixture has to be the live case: no pass starts above the user line, so the "
+        "within-pass transition the counter used to test for cannot happen on any of them"
+    )
+    assert strategy.records_found == 1, "the record phase is acting, which is what does the holding"
+    assert strategy.user_compactions == 0, "and the user half never gets a turn"
+    assert strategy.user_passes_starved >= 10, (
+        "which is the record phase's doing on most of the run, and has to be said in a number"
+    )
+    assert strategy.user_passes_below_trigger == len(passes), "every pass ended under the user line"
+    assert strategy.tokens_removed_by_record_phase > user_line - min(before for _, before in passes[-5:]), (
+        "the counterfactual rests on this quantity, so it is checked rather than trusted"
+    )
+
+
+async def test_a_composed_row_whose_user_half_did_nothing_always_says_why() -> None:
+    """The failure the composition exists to avoid, asserted as a property of every pass.
+
+    A composed row that silently degrades to one half is worse than either single row: it is
+    smaller than the control, returns True, and reads as a working measurement. The wiring test
+    beside this one cannot catch it -- it checks the middleware is attached, and it passed
+    throughout the run where this happened.
+
+    So what is asserted is the invariant rather than one outcome: over a run of twenty passes,
+    every pass in which the user half did not compact is accounted for by exactly one counter,
+    and on this fixture the account is not merely "it was under its line" but *why* it was --
+    the phase in front of it. A composition that reverted to reporting nothing would leave the
+    starvation count at zero and fail here, not in a table six weeks later.
+    """
+    strategy = _composed(_GROWING_CEILING)
+
+    passes = await _grow_composed(strategy, 20)
+
+    accounted = (
+        strategy.user_compactions
+        + strategy.user_passes_declined
+        + strategy.user_passes_below_trigger
+        + strategy.user_summary_failures
+    )
+    assert accounted == len(passes), "every pass lands in exactly one of the user half's four outcomes"
+    assert strategy.user_compactions == 0, "the user half did nothing on this fixture"
+    assert strategy.user_passes_starved > 0, (
+        "so something other than 'the conversation was small' has to be saying why, and the "
+        "only candidate is the phase in front of it"
+    )
+    assert strategy.user_passes_starved <= strategy.user_passes_below_trigger, (
+        "starvation is a subset of the passes the user half was never consulted on, not a second count beside them"
+    )
+
+
+async def test_the_three_reasons_a_composed_user_half_is_silent_read_differently() -> None:
+    """Declined by hysteresis, starved by the record phase, never considered -- from the flags.
+
+    They ask for three different responses: lower ``min_band_share``, reconsider the order or
+    the two triggers, or run a longer conversation. A row that reported one number for all three
+    would send a reader to the wrong knob, and the run that produced this counter reported *no*
+    number for any of them.
+    """
+    never = _composed(_IDLE_CEILING)
+    starved = _composed(_GROWING_CEILING)
+    declined = _composed(
+        tool_results=_record_phase(_COMPACTING_CEILING),
+        user_turns=_user_phase(_COMPACTING_CEILING, keep_head_user_turns=3, keep_tail_user_turns=4),
+    )
+
+    assert await never(_conversation()) is False
+    await _grow_composed(starved, 20)
+    assert await declined(_conversation()) is True, "the record phase acted; the user half is what did not"
+
+    assert (never.user_passes_below_trigger, never.user_passes_starved, never.user_passes_declined) == (1, 0, 0)
+    assert starved.user_passes_starved > 0 and starved.user_passes_declined == 0
+    assert declined.user_passes_declined == 1, "over its line, and the band between those anchors is one turn"
+    assert (declined.user_passes_starved, declined.user_passes_below_trigger) == (0, 0), (
+        "which is not starvation: the prompt was over the user line when the user half read it"
+    )
+
+
 async def test_the_fixture_sits_where_the_three_ceilings_assume_it_does() -> None:
     """A fixture that drifts across a trigger asserts against a phase that did nothing.
 
@@ -301,6 +523,11 @@ async def test_the_fixture_sits_where_the_three_ceilings_assume_it_does() -> Non
     assert after < 0.8 * _NARROW_CEILING < before, "the narrow ceiling's user line sits between the two sizes"
     assert 0.9 * _NARROW_CEILING > before > 0.6 * _NARROW_CEILING, "where a record-less pass is still waiting"
     assert before < 0.6 * _IDLE_CEILING, "and neither line is anywhere near on the idle one"
+    assert before < 0.95 * _COMPACTING_CEILING, (
+        "the 0.95 trigger one test below sets has to sit above the fixture's *uncompacted* size. "
+        "The starvation counter asks whether the prompt would clear the user line with what the "
+        "record phase removed still in it, and that question is answered by this margin"
+    )
 
 
 async def test_the_two_halves_compact_two_halves_of_one_conversation() -> None:

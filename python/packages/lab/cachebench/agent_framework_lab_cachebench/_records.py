@@ -158,7 +158,7 @@ __all__ = [
 #: rather than forcing the whole settings block to ``None``, and :func:`_settings_from_dict`
 #: says why: they are consulted by one strategy no older record can carry a row for, so on an
 #: older record they describe an inapplicable knob rather than an unrecorded measurement.
-SCHEMA_VERSION: Final[int] = 9
+SCHEMA_VERSION: Final[int] = 10
 
 #: Versions this reader accepts, which is not only the current one.
 #:
@@ -202,7 +202,14 @@ SCHEMA_VERSION: Final[int] = 9
 #: Version 8 joins on the version 4 argument -- what its runs did about user turns is not in
 #: doubt, because no strategy they could select was allowed to touch one -- and refusing it
 #: would discard every cell on disk over two columns none of them could have written.
-_READABLE_SCHEMAS: Final[frozenset[int]] = frozenset({2, 3, 4, 5, 6, 7, 8, SCHEMA_VERSION})
+#:
+#: Version 9 joins on that argument too, for the setting version 10 adds. A version 9 run could
+#: select ``user_summary_anchored``, so unlike version 8 it may have compacted user turns -- but
+#: the minimum band share did not exist, and a strategy with no such floor is exactly a strategy
+#: whose floor is zero. So ``user_min_band_share`` reads back as ``0.0`` on those records: not a
+#: default filled in for an unrecorded setting, which version 7's rule forbids, but the value
+#: they demonstrably ran, and the value that keys them apart from anything measured since.
+_READABLE_SCHEMAS: Final[frozenset[int]] = frozenset({2, 3, 4, 5, 6, 7, 8, 9, SCHEMA_VERSION})
 
 #: The parameters that make two records the same cell, and so aggregable into one row.
 #:
@@ -451,6 +458,19 @@ class StrategySettings:
     ``tool_summary_anchored``. Recording one number for both would key two runs as one cell
     whenever a sweep moved either, which is the whole defect this block exists to stop.
     """
+    user_min_band_share: float
+    """Share of the prompt the band had to be worth before ``user_summary_anchored`` acted.
+
+    The hysteresis, and the field that decides what a row of that strategy means. At ``0.0`` the
+    strategy compacts on every pass past its trigger -- one summarizer call and one rewritten
+    prefix per turn, measured at ``USERCOMPACT:31`` with a 53% cache hit rate -- and above it
+    the passes are bounded by how fast the band regrows. Two runs either side of that are not
+    one cell, which is why it is here and not only in the strategy.
+
+    ``0.0`` on a record written before schema 10, and that is a measurement rather than a
+    default: those runs had no such floor, which is the same thing as a floor of zero. See
+    :data:`SCHEMA_VERSION`.
+    """
     token_budget_fraction: float
     max_output_tokens: int
     """The output reservation, which every anchored and composed ceiling is the window less.
@@ -533,6 +553,11 @@ def _settings_from_dict(data: Mapping[str, Any]) -> StrategySettings:
         keep_head_user_turns=int(data.get("keep_head_user_turns", DEFAULT_KEEP_HEAD_USER_TURNS)),
         keep_tail_user_turns=int(data.get("keep_tail_user_turns", DEFAULT_KEEP_TAIL_USER_TURNS)),
         user_trigger_fraction=float(data.get("user_trigger_fraction", DEFAULT_USER_TRIGGER_FRACTION)),
+        # Read leniently on a different licence from the three above, and the number is not this
+        # version's default. A record written before schema 10 ran a strategy that had no
+        # minimum band share, which is a minimum band share of zero -- so 0.0 here is what that
+        # run did, and keying it apart from a run that set the default is the point.
+        user_min_band_share=float(data.get("user_min_band_share", 0.0)),
         token_budget_fraction=float(data["token_budget_fraction"]),
         max_output_tokens=int(data["max_output_tokens"]),
         answer_max_tokens=int(data["answer_max_tokens"]),
