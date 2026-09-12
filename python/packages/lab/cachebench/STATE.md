@@ -862,3 +862,50 @@ only honest summary for a row whose behaviour switches.
 **Consequence for the next design:** vary turns and window independently, or report cost per turn
 alongside cost per cell. Neither is done today.
 
+## 3q. What exclusion does, and what a stateful provider actually breaks
+
+Asked while designing `user_summary_anchored`: should it preserve the message count, since some
+providers track the sequence statefully? Audited, and the answer reversed the design back to the
+committed one.
+
+**Exclusion removes messages from the wire, not just marks them.** `set_excluded` writes
+`EXCLUDED_KEY`; `included_messages` filters on it; `apply_compaction` returns
+`project_included_messages(messages)` rather than the mutated list;
+`BaseChatClient._prepare_messages_for_model_call` returns exactly that, and it becomes the request
+payload. `CompactionProvider.before_run` additionally rewrites the context by object identity. The
+one place exclusion is only a mark is **storage** -- `after_run` keeps excluded messages in session
+state so annotations survive, and `ChatMessageStore.skip_excluded` (default `False`) decides
+whether they reload.
+
+**Ten strategies drop messages.** Framework: `TruncationStrategy`, `SlidingWindowStrategy`,
+`SelectiveToolCallCompactionStrategy`, `ToolResultCompactionStrategy`, `SummarizationStrategy`,
+`TokenBudgetComposedStrategy` (whose strict pass excludes **system** groups). Lab:
+`AnchoredCompactionStrategy._shed` and its min-gain subclass, `_drop_before` in the record
+strategy, `_replace` in the user-turn strategy.
+
+**Correction to something I asserted:** "every other strategy drops messages" is wrong for
+`_anchored`. Its *primary* phase, `_collapse_tool_results`, rewrites `content.result` in place and
+drops nothing -- count and order unchanged -- and says why: "the tool-call structure stays intact".
+It only excludes in the secondary `_shed` phase. **An in-place mechanism already exists in this
+package**, confined to tool-result text, where a result can be shortened without breaking the
+call/result pairing. A user turn has no such pairing to protect, which is why the same trick was
+not already applied there.
+
+**The exposure is inertness, not desynchronisation.** On a stateless route (chat completions,
+Responses with `store=False`) the client sends the whole projected list and there is no server
+sequence to diverge from -- this is every cachebench run. On a stateful route the framework skips
+`HistoryProvider.before_run` entirely because the service owns the conversation, so the agent sends
+only the new turn and **compaction has nothing to compact**. Preserving the message count would not
+have helped: on that route the client's list is not what the server reads. Where inline items *are*
+re-sent beside a continuation marker, the risk is duplication, which the OpenAI client already
+strips identities to avoid (microsoft/agent-framework#3295).
+
+This package already forces the issue: `_live.py::wants_client_side_history` sets `store=False` for
+any client that stores by default, with a measured reason -- a 16-turn conversation reported a
+one-message prompt on every row while the service billed 82,708 input tokens for history the client
+never sent.
+
+**Incidental:** `exclude_group_ids` is exported from the framework and has zero callers. And a
+collapse note, had we gone that way, costs 14 BPE tokens -- about 830 tokens for a 60-turn band at
+the 170K cell, ~0.5% of the window.
+
