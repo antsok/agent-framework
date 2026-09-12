@@ -51,11 +51,15 @@ from .compaction import (
     DEFAULT_BAND_SHARE,
     DEFAULT_COVERAGE_SHARE,
     DEFAULT_FALLBACK_FRACTION,
+    DEFAULT_KEEP_HEAD_USER_TURNS,
+    DEFAULT_KEEP_TAIL_USER_TURNS,
     DEFAULT_MIN_GAIN_FRACTION,
     DEFAULT_TRIGGER_FRACTION,
+    DEFAULT_USER_TRIGGER_FRACTION,
     AnchoredCompactionStrategy,
     MinimumGainAnchoredCompactionStrategy,
     ToolResultAnchoredSummarizationCompactionStrategy,
+    UserTurnAnchoredSummarizationCompactionStrategy,
 )
 
 if TYPE_CHECKING:
@@ -140,6 +144,30 @@ class StrategyOptions:
 
     The dial on the coverage check, whose default is a threshold rather than a derivation and
     whose right value depends on how many values a workload's results carry.
+    """
+    keep_head_user_turns: int = DEFAULT_KEEP_HEAD_USER_TURNS
+    """User turns ``user_summary_anchored`` never summarises at the start of the conversation.
+
+    Counted in user turns rather than in message groups, which is why it is not
+    ``keep_head_groups``: that number protects a prefix of every kind of group and is read by
+    four strategies, and pointing this at it would make a change intended for the tool band
+    silently move which user turns survive.
+    """
+    keep_tail_user_turns: int = DEFAULT_KEEP_TAIL_USER_TURNS
+    """User turns ``user_summary_anchored`` never summarises at the end of the conversation.
+
+    One by default because the last user turn is the live request. Separate from
+    ``keep_head_user_turns`` so the two ends can be moved apart, which is the only way to
+    measure what the opening task statement is worth against what the recent turns are worth.
+    """
+    user_trigger_fraction: float = DEFAULT_USER_TRIGGER_FRACTION
+    """Share of the input budget at which ``user_summary_anchored`` summarises the user band.
+
+    Its own field rather than a second reading of ``trigger_fraction``, which belongs to
+    ``tool_summary_anchored``. The two defaults differ -- 0.8 here against 0.6 there -- because
+    the decisions are different: one asks a model for a record and must ask before the bulk
+    degrades it, this one pays only in a broken cached prefix and wants to fire as late as it
+    still can. Sharing a field would have made a sweep of either one a sweep of both.
     """
     token_budget_fraction: float = 0.5
     summarizer: SupportsChatGetResponse[Any] | None = None
@@ -308,6 +336,38 @@ def _build_tool_summary_anchored(options: StrategyOptions) -> CompactionStrategy
     )
 
 
+def _build_user_summary_anchored(options: StrategyOptions) -> CompactionStrategy:
+    """Return the strategy that compacts the user's own turns.
+
+    The mirror of ``tool_summary_anchored`` on the other half of the conversation, and the pair
+    is the reason both exist: each touches only its own half, so the two rows measure what a
+    strategy can remove from the user side and from the tool side independently rather than
+    reporting one number for both. On this benchmark's sizing that is not a small difference --
+    run 43's seeded conversation is 57% user-turn text against 14% tool results.
+
+    Its ceiling is the full input budget, like the anchored family's and unlike the
+    threshold-driven framework strategies: the trigger is a fraction of that ceiling and is
+    configured separately, so subtracting a second margin here would make the flag mean
+    something other than what it says.
+
+    Raises:
+        ValueError: If no summarizer client was configured.
+    """
+    if options.summarizer is None:
+        raise ValueError(
+            "The 'user_summary_anchored' strategy needs a summarizer client. "
+            "Pass --summarizer-provider to select one, or drop this strategy from the run."
+        )
+    return UserTurnAnchoredSummarizationCompactionStrategy(
+        max_input_tokens=options.input_budget_tokens,
+        tokenizer=options.tokenizer,
+        client=options.summarizer,
+        keep_head_user_turns=options.keep_head_user_turns,
+        keep_tail_user_turns=options.keep_tail_user_turns,
+        trigger_fraction=options.user_trigger_fraction,
+    )
+
+
 def _build_truncation(options: StrategyOptions) -> CompactionStrategy:
     """Return oldest-first truncation triggering at 80% of the input budget."""
     budget = options.input_budget_tokens
@@ -455,6 +515,7 @@ STRATEGY_BUILDERS: Final[dict[str, Callable[[StrategyOptions], CompactionStrateg
     "truncation": _build_truncation,
     "anchored": _build_anchored,
     "tool_summary_anchored": _build_tool_summary_anchored,
+    "user_summary_anchored": _build_user_summary_anchored,
     "anchored_no_assistant": _build_anchored_no_assistant,
     "anchored_min_gain": _build_anchored_min_gain,
     "sliding_window": _build_sliding_window,
@@ -473,7 +534,16 @@ STRATEGY_BUILDERS: Final[dict[str, Callable[[StrategyOptions], CompactionStrateg
 #: detected by looking for "summar" in the name: that convention silently required a client
 #: for a strategy that does its recording through the agent's own tool loop, and would just as
 #: silently fail to require one for a summarizing strategy named otherwise.
-STRATEGIES_NEEDING_SUMMARIZER: Final[frozenset[str]] = frozenset({"summarization", "token_budget_summarize"})
+#:
+#: ``user_summary_anchored`` is here and ``tool_summary_anchored`` is not, which is the whole
+#: point of naming them: the two read as a pair but only one of them calls a summarizer. The
+#: other has the agent's own model write its record through a tool call, so it needs no client
+#: at all, and a rule matching on "summary" would have demanded one from it.
+STRATEGIES_NEEDING_SUMMARIZER: Final[frozenset[str]] = frozenset({
+    "summarization",
+    "token_budget_summarize",
+    "user_summary_anchored",
+})
 
 
 def needs_summarizer(names: Iterable[str]) -> bool:

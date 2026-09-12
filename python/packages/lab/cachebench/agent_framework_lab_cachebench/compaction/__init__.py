@@ -22,6 +22,11 @@ What is here:
   three names to work: :func:`make_recall_tool` is the tool the model calls,
   :class:`RecallGate` keeps that tool inert until it is asked for, and
   :class:`ToolResultRecallMiddleware` is what asks.
+- :class:`UserTurnAnchoredSummarizationCompactionStrategy` is the mirror of that one on the
+  other half of the conversation: it summarises the *user's* turns between a fixed head and
+  tail, and it recompacts its own earlier summary when the threshold is crossed again --
+  deliberately the opposite of ``_anchored``'s refusal to re-trim, for the reason its module
+  docstring gives. It touches nothing the other three touch, so the rows stay comparable.
 - :func:`set_preserved` and :func:`is_preserved` carry one annotation between the two: a
   message no strategy may shorten, drop or shed. It exists because the record is a tool
   result, the anchored strategy trims tool results, and for a while it trimmed the record --
@@ -75,27 +80,41 @@ from ._toolsummary import (
     find_record_index,
     make_recall_tool,
 )
+from ._usersummary import (
+    DEFAULT_KEEP_HEAD_USER_TURNS,
+    DEFAULT_KEEP_TAIL_USER_TURNS,
+    DEFAULT_USER_SUMMARY_PROMPT,
+    DEFAULT_USER_TRIGGER_FRACTION,
+    USER_SUMMARY_MARKER,
+    UserTurnAnchoredSummarizationCompactionStrategy,
+)
 
 __all__ = [
     "DEFAULT_BAND_SHARE",
     "DEFAULT_COVERAGE_SHARE",
     "DEFAULT_FALLBACK_FRACTION",
+    "DEFAULT_KEEP_HEAD_USER_TURNS",
+    "DEFAULT_KEEP_TAIL_USER_TURNS",
     "DEFAULT_KEEP_TOKENS",
     "DEFAULT_MIN_GAIN_FRACTION",
     "DEFAULT_RECORD_MAX_TOKENS",
     "DEFAULT_RECORD_TARGET_TOKENS",
     "DEFAULT_TRIGGER_FRACTION",
+    "DEFAULT_USER_SUMMARY_PROMPT",
+    "DEFAULT_USER_TRIGGER_FRACTION",
     "MARKER_ID_PREFIX",
     "PRESERVED_KEY",
     "PRESERVE_REASON_KEY",
     "RECALL_TOOL_NAME",
     "RECORD_MARKER",
     "REMOVAL_MARKER",
+    "USER_SUMMARY_MARKER",
     "AnchoredCompactionStrategy",
     "MinimumGainAnchoredCompactionStrategy",
     "RecallGate",
     "ToolResultAnchoredSummarizationCompactionStrategy",
     "ToolResultRecallMiddleware",
+    "UserTurnAnchoredSummarizationCompactionStrategy",
     "any_preserved",
     "find_record_index",
     "is_preserved",

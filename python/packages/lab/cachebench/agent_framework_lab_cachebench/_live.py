@@ -73,6 +73,7 @@ from .compaction import (
     RecallGate,
     ToolResultAnchoredSummarizationCompactionStrategy,
     ToolResultRecallMiddleware,
+    UserTurnAnchoredSummarizationCompactionStrategy,
     find_record_index,
     make_recall_tool,
 )
@@ -585,6 +586,28 @@ class LiveOutcome:
     Zero on every strategy that keeps no such count, which is all of them but
     ``tool_summary_anchored``.
     """
+    user_compactions: int = 0
+    """Passes where ``user_summary_anchored`` replaced a band of user turns with a summary.
+
+    Zero says that row never acted, which for a strategy whose whole subject is how much of a
+    conversation is user-side is the difference between a measurement and the control under
+    another name. Non-zero is also the price: every pass rewrites the prefix at its own edit and
+    the provider re-reads everything behind it, so two passes are two of those.
+
+    Zero on every strategy that keeps no such count, which is all of them but
+    ``user_summary_anchored``.
+    """
+    user_messages_replaced: int = 0
+    """User turns the most recent such compaction superseded.
+
+    Beside the count above for the reason ``groups_kept_uncovered`` sits beside its flag: this
+    is the size of what the surviving summary stands for, and it is what makes the ``snap%``
+    column attributable -- a row that compacted once and replaced seventy turns is a different
+    finding from one that compacted seven times and replaced ten.
+
+    Zero on every strategy that keeps no such count, which is all of them but
+    ``user_summary_anchored``.
+    """
     record_text: str = ""
     """The recall record the run produced, exactly as the model wrote it.
 
@@ -821,6 +844,9 @@ def _strategy_notes(strategy: Any) -> tuple[str, ...]:
         ("records_truncated", "TRUNCATED"),
         ("groups_kept_uncovered", "UNCOVERED"),
         ("declined_collapses", "NOGAIN"),
+        ("user_compactions", "USERCOMPACT"),
+        ("user_messages_replaced", "USERREPLACED"),
+        ("user_summary_failures", "USERSUMMFAIL"),
     ):
         value = getattr(strategy, attribute, None)
         if isinstance(value, int) and value:
@@ -1606,6 +1632,11 @@ async def run_live(
     # this outcome reports are read off the strategy object once the conversation is over, and
     # a second isinstance down there is a second place to keep in step with this one.
     recording = strategy if isinstance(strategy, ToolResultAnchoredSummarizationCompactionStrategy) else None
+    # The same narrowing for the other summarising strategy, and kept apart from the one above
+    # rather than folded into a single "does it have counters" test: the two report different
+    # numbers, and a row is only ever one of them, so a shared reference would have to be
+    # re-tested at every use anyway.
+    user_compacting = strategy if isinstance(strategy, UserTurnAnchoredSummarizationCompactionStrategy) else None
     if recording is not None:
         gate = RecallGate()
         # Registered like any other tool, because the harness must know it to run it, and
@@ -1887,6 +1918,8 @@ async def run_live(
         groups_kept_uncovered=recording.groups_kept_uncovered if recording is not None else 0,
         fallbacks_after_record=recording.fallbacks_after_record if recording is not None else 0,
         records_in_conversation=recording.records_in_conversation if recording is not None else 0,
+        user_compactions=user_compacting.user_compactions if user_compacting is not None else 0,
+        user_messages_replaced=user_compacting.user_messages_replaced if user_compacting is not None else 0,
         # Taken from the snapshot rather than from the live session, so it is the record the
         # probes were answered from and not one a probe's own compaction pass moved.
         record_text=recall_record_text(agent, snapshot),
