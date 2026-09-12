@@ -45,6 +45,7 @@ from ._strategies import (
     STRATEGIES_NEEDING_SUMMARIZER,
     StrategyOptions,
     build_strategy,
+    forces_records,
     needs_summarizer,
     strategy_names,
 )
@@ -904,7 +905,8 @@ def _dump_record(directory: Path, strategy: str, seed: int, text: str) -> Path |
 
     Writes nothing when there is no record, rather than an empty file. An empty file and a
     record the model wrote as an empty string would be indistinguishable, and the first is the
-    ordinary case: every strategy but ``tool_summary_anchored`` takes no record at all.
+    ordinary case: every strategy but ``tool_summary_anchored``, and the composed row that
+    runs it as a phase, takes no record at all.
 
     Args:
         directory: Where to write, created if it does not exist. One run's worth: the name
@@ -1856,7 +1858,14 @@ _LEGEND: Final[tuple[str, ...]] = (
     "            A row with USERCOMPACT:0 never fired and is the uncompacted control under",
     "            another name. USERSUMMFAIL:<n> passes where the summarizer raised or returned",
     "            nothing, so the band was left exactly as it was found and those passes are",
-    "            the control too.",
+    "            the control too. USERSTARVED:<n> passes of tool_and_user_summary_anchored",
+    "            where the record half's own removals took the prompt from above the user",
+    "            half's trigger to at or below it, so the user half was never consulted. It",
+    "            is the only reading of USERCOMPACT:0 that is not about the user half at all,",
+    "            and without it that row is indistinguishable from one whose band was empty.",
+    "            It is reported rather than prevented: overriding the user half's trigger",
+    "            would have the composed row fire where no user_summary_anchored row does,",
+    "            and the pair would stop being comparable.",
     "            FALLBACK:<n> times it gave up",
     "            and compacted another way. A row with",
     "            FALLBACK is measuring that other strategy, not the one named.",
@@ -3012,7 +3021,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
     # as a seeding reply is -- which makes --max-output-tokens its reservation too, and makes
     # --record-max-tokens a tightening of the run's cap for one call rather than a cap of its
     # own. The shipped defaults have it the other way round: 4,000 against a 2,048 reservation.
-    if "tool_summary_anchored" in strategies and args.record_max_tokens > args.max_output_tokens:
+    if forces_records(strategies) and args.record_max_tokens > args.max_output_tokens:
         print(
             f"WARNING: --record-max-tokens {args.record_max_tokens:,} is above the "
             f"--max-output-tokens {args.max_output_tokens:,} the input budget reserves. The "
