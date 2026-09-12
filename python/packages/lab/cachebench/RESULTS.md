@@ -1468,6 +1468,33 @@ So luna writes at great length about the first two lookups and never reaches the
 is a property of the model's writing, not of a setting, and no bound reachable from the CLI moved
 it.
 
+### What runs 45 and 46 say about the benchmark itself
+
+**Turn count drives cost, not context size.** The two arms seed the same conversation size and cost
+utterly different amounts, and this is the *uncompacted control* in both, with no strategy involved:
+
+| arm | filler turns | seeded | calls | input tokens | control cost |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| fixed payload | 120 | 256,776 | 147 | 20,220,087 | $0.5826 |
+| scaled payload | 51 | 255,897 | 78 | 12,840,933 | **$0.3396** |
+
+Same destination, **72% apart**, because one conversation re-sends its prefix over 147 calls and
+the other over 78. Input tokens are the product of size and calls, and this project has been
+varying size while treating calls as incidental.
+
+That reframes the central question. Compaction reduces size, but it can only act **after** the
+conversation has grown -- by which time most of the re-sending has already been paid for. A cell
+labelled by its window says little about the bill; a cell labelled by its turn count says a lot.
+Every "vs none$" figure in this document is measured within one arm, so none of them is wrong, but
+comparisons *across* cells with different turn counts have been comparing two things at once.
+
+**And an aggregate row can hide two behaviours rather than average one.** Run 46's cell reads
+`49/53` facts at `acc1 85%` with a 55% spread. **No seed scored 49.** Three scored 53 and two
+scored 44, and the cell mean is a number the experiment never produced. The control's own spread is
+16% against the strategy's 55%, so seed conditions were comparable and the variance belongs to the
+coverage gate flipping. Read the per-seed table above; the aggregate is the wrong summary for a
+bimodal row, and the instrument has no way to know a distribution is bimodal.
+
 ### Runs 45 and 46 -- scaling the payload with the window, and the first real win
 
 Two arms at one cell, 300,000 tokens at 0.9 fill, `none` against `tool_summary_anchored`, luna.
