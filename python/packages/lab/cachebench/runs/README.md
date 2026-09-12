@@ -156,6 +156,19 @@ trust.
 
 Runs before 24 predate that format and exist only as captured stdout.
 
+Runs 45 and 46 are one cell in two arms: 300,000 tokens at 0.9 fill, `none` against
+`tool_summary_anchored`, with run 45 on the **fixed** payload every earlier cell used and run 46 on
+the payload **scaled to the window**, which is now the default. Run 45 is one seed, run 46 five, no
+throttling in either. Run 46 holds the project's first resolvable saving with full retention --
+three seeds at -21%, -23% and -33% keeping 53/53 -- and two seeds where the coverage gate shut and
+the row cost more while losing nine facts.
+
+**Neither cell is ranked.** Both carried only `none` and `tool_summary_anchored`, so the leanest
+strategy row is the one adding the record's own messages and the instrument withdraws the cost
+comparison with `CONTROL DIVERGED`. It is a false positive -- control peak 133 against strategy 135,
+and the record contributes exactly 2 -- but the spread guard is gone, so read the per-seed figures
+in `RESULTS.md` and not a cell verdict.
+
 Run 44 is the same shape at a 100,000-token window, five seeds, 90 records, one file per seed,
 no throttling. It is the cell that diagnosed the sizing bug the 170K run only exposed: at 47 turns
 the shortfall is -8.3% against 80 turns' -7.6%, so the error is constant rather than compounding.

@@ -819,3 +819,29 @@ per model; the spread needs the solver to iterate or the analysis to use achieve
 5/5. 170K: +113%, 47/53, 4/5. Retention survives to 100K and breaks after; cost degrades
 monotonically and steeply. The strategy's case is a small-window case.
 
+## 3o. Runs 45 and 46: scaling the payload, and the first resolvable saving
+
+300,000/0.9, luna, `none` vs `tool_summary_anchored`. Run 45 fixed payload (1 seed), run 46 scaled
+(5 seeds). No throttling in either.
+
+**Fixed arm completes the series:** removed 28.8 -> 22.6 -> 17.0 -> 11.7%, hit 88 -> 74 -> 66 ->
+62%, cost -6% -> +21% -> +113% -> **+212%** at 60K/100K/170K/300K. The actable payload never grows;
+the conversation does.
+
+**Scaled arm:** three of five seeds at **-21%, -23%, -33% with 53/53**, hit 96% against the
+control's 98%. First resolvable saving with full retention in this project. Two seeds failed the
+coverage gate (`UNCOVERED:4`) and cost +29% and +19% at 44/53.
+
+**The gate is the whole difference.** `--coverage-share 0.8` demands the record quote 80% of every
+digit-bearing token in a group; a 26,814-token result holds the same 8 codes among 7.7x more
+filler. No notion of result size, calibrated at 3,500-token results.
+
+**Two caveats, both mine.** The cell is unranked -- `CONTROL DIVERGED MSGS:-2` -- because I ran only
+`none,tool_summary_anchored` despite section 3h recording that exact trap and its fix (include
+`truncation`). Verifiably a false positive (133 vs 135, record adds 2) but the spread guard is lost.
+And fixed-vs-scaled moves turn count too (120 vs 51 filler turns), which is intrinsic and not
+separable by this design.
+
+**Next:** `--coverage-share` sweep at this cell **with `truncation` included**, which answers the
+gate question and restores the verdict machinery in one run.
+
