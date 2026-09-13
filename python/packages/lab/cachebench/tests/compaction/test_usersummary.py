@@ -37,14 +37,28 @@ from agent_framework._compaction import (
     included_token_count,
     project_included_messages,
 )
-from agent_framework_lab_cachebench.compaction._preserve import set_preserved
+from agent_framework_lab_cachebench.compaction._preserve import (
+    PRESERVE_REASON_KEY,
+    PRESERVED_KEY,
+    is_preserved,
+    set_preserved,
+)
 from agent_framework_lab_cachebench.compaction._usersummary import (
     DEFAULT_KEEP_HEAD_USER_TURNS,
     DEFAULT_KEEP_TAIL_USER_TURNS,
     DEFAULT_MIN_BAND_SHARE,
+    DEFAULT_SUMMARY_MODE,
+    DEFAULT_USER_FOLD_PROMPT,
     DEFAULT_USER_TRIGGER_FRACTION,
     EXCLUDE_REASON,
+    FOLD_EXCLUDE_REASON,
+    FOLD_ID_PREFIX,
+    PRESERVE_REASON,
     SUMMARY_ID_PREFIX,
+    SUMMARY_MODE_BOUNDARY,
+    SUMMARY_MODE_FOLD,
+    SUMMARY_MODE_RECOMPACT,
+    SUMMARY_MODES,
     USER_SUMMARY_MARKER,
     UserTurnAnchoredSummarizationCompactionStrategy,
 )
@@ -779,6 +793,678 @@ async def test_the_four_outcomes_of_a_pass_partition_the_passes() -> None:
     assert strategy.user_summary_failures == 0
     assert failing.user_compactions == 0, "the failing arm never replaced anything"
     assert failing.user_summary_failures > 0, "and says so rather than reading as a band nobody wanted"
+
+
+#: Characters in a user turn of the user-heavy fixture, against ``_LIGHT_REPLY_CHARS`` in its reply.
+#:
+#: Eight to one, the reverse of the lopsided fixture above, and for the opposite reason. The
+#: three modes differ only in what they do with the summaries they leave behind, so they come
+#: apart only on a conversation where those summaries are a share of the prompt worth arguing
+#: over. On the lopsided fixture the standing summaries are 0.35% of the prompt and the three
+#: modes are three passes each, indistinguishable at a glance; here the user half is most of
+#: the prompt, and a summarizer that keeps a stated fraction of what it reads leaves summaries
+#: large enough for the boundary mode's floor to be visible and the fold's threshold to be met.
+_HEAVY_USER_CHARS = 4_000
+
+#: Characters in an assistant reply of the user-heavy fixture. See ``_HEAVY_USER_CHARS``.
+_LIGHT_REPLY_CHARS = 500
+
+#: Characters of a fixed, large summary: about 750 tokens under the character estimator.
+#:
+#: Large enough that three of them are a measurable share of the eight-turn fixture, which is
+#: what a test of the fold's threshold needs, and fixed so that the share can be computed from
+#: the conversation and asserted as the test's premise.
+_LARGE_SUMMARY_CHARS = 3_000
+
+
+class _RatioSummarizer:
+    """A summarizer whose answer is a stated fraction of what it was asked to summarise.
+
+    The stub summarizer above answers with one fixed sentence, which is right for every test
+    about *which* turns are replaced and wrong for every test about what a summary costs: a
+    fixed twelve-token summary makes the standing summaries a rounding error of the prompt in
+    every mode, so the whole difference between the modes -- what the floor is worth, and
+    whether a fold repays its break -- never shows. A fraction is the shape a real summarizer
+    has: it keeps some of what it reads, and a fold of summaries keeps some of that.
+    """
+
+    def __init__(self, ratio: float) -> None:
+        self.ratio = ratio
+        self.requests: list[list[Message]] = []
+
+    async def get_response(self, messages: list[Message], *, stream: bool = False, **kwargs: Any) -> ChatResponse:
+        self.requests.append(list(messages))
+        body = messages[-1].text or ""
+        return ChatResponse(messages=[Message(role="assistant", contents=["s" * int(len(body) * self.ratio)])])
+
+
+class _NumberedSummarizer:
+    """A summarizer whose every answer is different, so a rewrite is visible as bytes.
+
+    The fixed-sentence stub would make a replaced summary render identically to the one it
+    replaced, and a test of whether the cached prefix survived a pass would then pass on a
+    strategy that rewrote it. A real summarizer never answers twice alike.
+    """
+
+    def __init__(self) -> None:
+        self.requests: list[list[Message]] = []
+
+    async def get_response(self, messages: list[Message], *, stream: bool = False, **kwargs: Any) -> ChatResponse:
+        self.requests.append(list(messages))
+        return ChatResponse(messages=[Message(role="assistant", contents=[f"Summary number {len(self.requests)}."])])
+
+
+def _heavy_turn(index: int) -> list[Message]:
+    """Return one user turn and a reply an eighth of its size. See ``_HEAVY_USER_CHARS``."""
+    return [
+        Message(role="user", contents=[f"Turn {index}: " + "u" * _HEAVY_USER_CHARS], message_id=f"u{index}"),
+        Message(role="assistant", contents=[f"Reply {index}: " + "a" * _LIGHT_REPLY_CHARS], message_id=f"a{index}"),
+    ]
+
+
+def _tiny_turn(index: int) -> list[Message]:
+    """Return one turn too small to move anything: the slow growth a fold must not thrash on."""
+    return [
+        Message(role="user", contents=[f"Turn {index}: " + "u" * 40], message_id=f"u{index}"),
+        Message(role="assistant", contents=[f"Reply {index}: " + "a" * 40], message_id=f"a{index}"),
+    ]
+
+
+def _standing(messages: list[Message]) -> list[Message]:
+    """Return the strategy's summaries still being sent, by the test's own recognition rule."""
+    return [
+        message for message in project_included_messages(messages) if message.role == "user" and _is_summary(message)
+    ]
+
+
+def _rendered_messages(messages: list[Message]) -> list[str]:
+    """Return what the model would be sent, one string per included message, in order."""
+    rendered: list[str] = []
+    for message in project_included_messages(messages):
+        parts: list[str] = []
+        for content in message.contents:
+            result = getattr(content, "result", None)
+            text = getattr(content, "text", None)
+            parts.append(str(result) if result is not None else (text if text is not None else str(content)))
+        rendered.append("\n".join(parts))
+    return rendered
+
+
+def _outcome_of(strategy: UserTurnAnchoredSummarizationCompactionStrategy, before: tuple[int, ...]) -> str:
+    """Name which of the five counters a pass moved, given the four it could have moved."""
+    after = (
+        strategy.user_compactions,
+        strategy.user_folds,
+        strategy.user_passes_declined,
+        strategy.user_passes_below_trigger,
+    )
+    names = ("compacted", "folded", "declined", "under")
+    moved = [name for name, was, now in zip(names, before, after, strict=True) if now > was]
+    return moved[0] if moved else "failed"
+
+
+async def _grow_in_mode(
+    strategy: UserTurnAnchoredSummarizationCompactionStrategy,
+    turns: int,
+    *,
+    turn: Any = _heavy_turn,
+    messages: list[Message] | None = None,
+    first_turn: int = 0,
+) -> tuple[list[Message], list[tuple[int, int, str]]]:
+    """Run one pass per turn, recording what each pass did and how many summaries stood before it.
+
+    The same driver as ``_grow_and_compact`` with the outcome named per pass, because the fold's
+    two guards are statements about consecutive passes: a fold may not follow a pass that left
+    fewer than two summaries standing, and that is only checkable pass by pass.
+
+    Args:
+        strategy: The strategy under test.
+        turns: How many turns to append.
+
+    Keyword Args:
+        turn: Builds one turn from its index.
+        messages: A conversation to continue, or None to start one.
+        first_turn: Index the appended turns are numbered from.
+
+    Returns:
+        The conversation, and one ``(turn, summaries standing before the pass, outcome)`` per turn.
+    """
+    if messages is None:
+        messages = [Message(role="system", contents=["You are an assistant."], message_id="sys")]
+    events: list[tuple[int, int, str]] = []
+    for offset in range(turns):
+        index = first_turn + offset
+        messages += turn(index)
+        standing_before = len(_standing(messages))
+        before = (
+            strategy.user_compactions,
+            strategy.user_folds,
+            strategy.user_passes_declined,
+            strategy.user_passes_below_trigger,
+        )
+        await strategy(messages)
+        events.append((index, standing_before, _outcome_of(strategy, before)))
+    return messages, events
+
+
+def test_the_default_mode_is_the_recompacting_one_until_a_run_has_measured_the_arms() -> None:
+    """The default does not move until a run has measured both arms, which is this package's rule.
+
+    A live run is measuring the recompacting mode as this is written, and flipping the default
+    under it would invalidate the comparison the boundary mode exists to be measured in. So the
+    default is pinned, and pinned to the *literal* rather than to whichever mode reads best in
+    the module docstring, because reading best is not the same as having been measured.
+    """
+    assert DEFAULT_SUMMARY_MODE == SUMMARY_MODE_RECOMPACT
+    assert SUMMARY_MODES == (SUMMARY_MODE_RECOMPACT, SUMMARY_MODE_BOUNDARY, SUMMARY_MODE_FOLD)
+    assert _strategy().summary_mode == SUMMARY_MODE_RECOMPACT
+    assert _strategy().recompacts_summaries is True
+    with pytest.raises(ValueError, match="summary_mode"):
+        _strategy(summary_mode="boundaries")
+
+
+async def test_a_standing_summary_is_neither_re_read_nor_replaced_by_a_later_pass() -> None:
+    """The boundary mode's whole promise, asserted on the object rather than on a count.
+
+    The recompacting test above proves its mode by the earlier summary being excluded and the
+    new one standing for it. This is the same two facts negated, and it has to be the *same*
+    object: a pass that quietly replaced the boundary with an identical copy would satisfy any
+    count and break the cache all the same.
+    """
+    summarizer = _Summarizer()
+    strategy = _strategy(summarizer, summary_mode=SUMMARY_MODE_BOUNDARY)
+    messages = _conversation(8)
+
+    assert await strategy(messages) is True
+    (first,) = _standing(messages)
+
+    messages += _conversation(6, first_turn=8)
+
+    assert await strategy(messages) is True
+    standing = _standing(messages)
+
+    assert len(standing) == 2, "the earlier summary stands beside the new one"
+    assert standing[0] is first, "and it is the same object, not a copy at the same position"
+    assert first.additional_properties.get(EXCLUDED_KEY, False) is False
+    assert _summarized_by(first) is None, "nothing stands for it"
+    assert first.message_id not in _summary_of_message_ids(standing[1]), "and the new summary does not claim to"
+    asked = summarizer.requests[1][-1].text or ""
+    assert USER_SUMMARY_MARKER not in asked, "the boundary was not sent to the summarizer"
+    assert strategy.user_compactions == 2
+    assert strategy.user_messages_replaced == 6, "Turn 7, the old tail, through Turn 12 -- and not the summary"
+
+
+async def test_the_band_after_a_boundary_holds_only_turns_newer_than_it() -> None:
+    """Where the second pass's band begins is the rule, and the summarizer's request is the proof.
+
+    What reaches the summarizer is exactly the band, so the request is read directly: every
+    turn newer than the boundary but the tail, no turn older than it, and not the boundary.
+    """
+    summarizer = _Summarizer()
+    strategy = _strategy(summarizer, summary_mode=SUMMARY_MODE_BOUNDARY)
+    messages = _conversation(8)
+    assert await strategy(messages) is True
+    messages += _conversation(6, first_turn=8)
+
+    assert await strategy(messages) is True
+    asked = summarizer.requests[1][-1].text or ""
+    superseded = [
+        message.message_id
+        for message in messages
+        if message.role == "user" and message.additional_properties.get(EXCLUDE_REASON_KEY) == EXCLUDE_REASON
+    ]
+
+    assert all(f"Turn {index}:" in asked for index in range(7, 13)), "Turn 7 through Turn 12 are the band"
+    assert "Turn 13:" not in asked, "the tail is kept"
+    assert not any(f"Turn {index}:" in asked for index in range(7)), "nothing older than the boundary is re-read"
+    assert superseded == [f"u{index}" for index in range(1, 13)]
+
+
+async def test_n_passes_leave_n_standing_summaries_in_the_boundary_modes_and_one_when_recompacting() -> None:
+    """The floor, counted on the conversation and on the counters, in all three modes.
+
+    Three crossings of the eight-turn fixture with the fixed-sentence summarizer: 54 tokens of
+    summary standing after the recompacting run, 162 after the boundary run, and the prompt
+    108 tokens larger for it -- 22,755 against 22,863 under the character estimator. Small,
+    because the stub's summaries are small; the user-heavy test below is where it is not. The
+    fold mode leaves three as well here, because three twelve-token summaries are nowhere near
+    a tenth of the prompt, which is the fold's threshold doing its job.
+    """
+    left: dict[str, tuple[int, int, int]] = {}
+    for mode in SUMMARY_MODES:
+        strategy = _strategy(summary_mode=mode)
+        messages = _conversation(8)
+        assert await strategy(messages) is True
+        for start in (8, 14):
+            messages += _conversation(6, first_turn=start)
+            assert await strategy(messages) is True
+        standing = _standing(messages)
+        assert strategy.user_compactions == 3
+        assert strategy.user_summaries_in_conversation == len(standing), "the counter is the conversation"
+        assert strategy.user_summary_tokens == included_token_count(standing), "and so are the tokens"
+        assert strategy.user_folds == 0
+        left[mode] = (len(standing), strategy.user_summary_tokens, _included(messages))
+
+    assert left[SUMMARY_MODE_RECOMPACT][0] == 1, "one message stands for everything behind it"
+    assert left[SUMMARY_MODE_BOUNDARY][0] == 3, "one summary per pass, and none replaced"
+    assert left[SUMMARY_MODE_FOLD][0] == 3, "no fold while the summaries are a rounding error of the prompt"
+    assert left[SUMMARY_MODE_BOUNDARY][1] > left[SUMMARY_MODE_RECOMPACT][1]
+    assert left[SUMMARY_MODE_BOUNDARY][2] > left[SUMMARY_MODE_RECOMPACT][2], "the floor is on the prompt"
+
+
+async def test_the_prefix_up_to_the_newest_boundary_is_byte_identical_across_a_later_pass() -> None:
+    """The cache claim, and the one assertion worth making directly.
+
+    Prompt caching is strict-prefix, so what the boundary mode buys is precisely this: every
+    message up to and including the newest boundary renders to the same bytes, in the same
+    order, before and after a later pass, and they are the same objects. The recompacting mode
+    is asserted in the same test to break that prefix at the summary's position -- with a
+    summarizer whose answers differ, because the fixed-sentence stub would let a rewrite render
+    identically and pass a test it should fail.
+    """
+    outcomes: dict[str, tuple[bool, bool]] = {}
+    for mode in (SUMMARY_MODE_RECOMPACT, SUMMARY_MODE_BOUNDARY):
+        strategy = _strategy(_NumberedSummarizer(), summary_mode=mode)
+        messages = _conversation(8)
+        assert await strategy(messages) is True
+        projected = project_included_messages(messages)
+        boundary_at = next(index for index, message in enumerate(projected) if _is_summary(message))
+        prefix_objects = projected[: boundary_at + 1]
+        prefix_bytes = _rendered_messages(messages)[: boundary_at + 1]
+
+        messages += _conversation(6, first_turn=8)
+        assert await strategy(messages) is True
+
+        after_objects = project_included_messages(messages)[: boundary_at + 1]
+        same_bytes = _rendered_messages(messages)[: boundary_at + 1] == prefix_bytes
+        same_objects = all(a is b for a, b in zip(after_objects, prefix_objects, strict=False))
+        outcomes[mode] = (same_bytes, same_objects)
+
+    assert outcomes[SUMMARY_MODE_BOUNDARY] == (True, True), "the prefix through the boundary is untouched"
+    assert outcomes[SUMMARY_MODE_RECOMPACT] == (False, False), (
+        "and the recompacting mode rewrites it at the summary's position, which is what the "
+        "measured hit rate tracking USERREPLACED was"
+    )
+
+
+async def test_the_first_pass_in_the_boundary_mode_honours_the_head() -> None:
+    """No boundary yet means the ordinary band, head and all.
+
+    The boundary rule replaces the head only once there is a boundary to start from. On the
+    first pass there is none, and a first pass that started from the beginning of the
+    conversation would summarise the task statement -- the one turn every deleting strategy was
+    measured losing first.
+    """
+    strategy = _strategy(keep_head_user_turns=2, summary_mode=SUMMARY_MODE_BOUNDARY)
+    messages = _conversation(8)
+
+    assert await strategy(messages) is True
+
+    assert [text[:7] for text in _user_texts(messages)] == ["Turn 0:", "Turn 1:", USER_SUMMARY_MARKER[:7], "Turn 7:"]
+    assert strategy.user_summaries_in_conversation == 1
+
+
+async def test_a_boundary_is_preserved_under_its_own_reason_and_re_marked_on_every_pass() -> None:
+    """The protection is the subpackage's one mark, applied every pass, and only in the boundary modes.
+
+    ``PRESERVED_KEY`` is what every removal path in ``_anchored`` and ``_toolsummary`` already
+    honours, so marking the boundary is what makes "the record half cannot reach a user group"
+    a contract rather than an accident of group kinds. Re-applied every pass because the mark is
+    not promised to survive a reload, as ``_preserve_records`` re-applies it to the record. And
+    *not* applied in the recompacting mode: ``_band`` skips a preserved turn, so a marked summary
+    could never be recompacted and that mode would silently have become this one.
+    """
+    summarizer = _Summarizer()
+    strategy = _strategy(summarizer, summary_mode=SUMMARY_MODE_BOUNDARY)
+    messages = _conversation(8)
+    assert await strategy(messages) is True
+    (summary,) = _standing(messages)
+
+    assert is_preserved(summary)
+    assert summary.additional_properties[PRESERVE_REASON_KEY] == PRESERVE_REASON == "user_summary_boundary"
+
+    del summary.additional_properties[PRESERVED_KEY]
+    del summary.additional_properties[PRESERVE_REASON_KEY]
+    assert await strategy(messages) is False, "nothing new, so the pass declines"
+    assert len(summarizer.requests) == 1, "and did not re-read the boundary on its way to declining"
+    assert is_preserved(summary), "but the mark is back, because every pass re-applies it"
+    assert summary.additional_properties[PRESERVE_REASON_KEY] == PRESERVE_REASON
+
+    recompacting = _strategy()
+    plain = _conversation(8)
+    assert await recompacting(plain) is True
+    assert not is_preserved(_standing(plain)[0]), "the recompacting mode's summary must stay replaceable"
+
+
+async def test_the_head_is_not_re_counted_once_a_boundary_stands() -> None:
+    """After a boundary the band starts at the boundary, and not at the head-th unprotected turn.
+
+    On an ordinary conversation the two readings agree, because everything in front of the
+    boundary is a head turn or a superseded one. They come apart when another strategy has
+    claimed a head turn: re-counting the head over the unprotected turns would then land it on
+    the first turn after the boundary and protect that turn for the rest of the run, which is
+    neither the head nor the tail nor anything the caller asked for. So the rule is asserted on
+    that case, where only the explicit boundary rule gets it right.
+    """
+    summarizer = _Summarizer()
+    strategy = _strategy(summarizer, summary_mode=SUMMARY_MODE_BOUNDARY)
+    messages = _conversation(8)
+    assert await strategy(messages) is True
+    set_preserved(next(message for message in messages if message.message_id == "u0"), preserved=True, reason="a test")
+    messages += _conversation(6, first_turn=8)
+
+    assert await strategy(messages) is True
+    asked = summarizer.requests[1][-1].text or ""
+
+    assert "Turn 7:" in asked, "the first turn after the boundary is in the band, whatever happened to the head"
+    assert "Turn 0:" not in asked
+    assert strategy.user_messages_replaced == 6
+
+
+async def test_the_share_clears_less_often_after_a_boundary_and_the_numbers_are_recorded() -> None:
+    """The part most likely to surprise, measured on the growing fixture rather than tuned away.
+
+    In the recompacting mode the band the share is taken of includes the previous summary, which
+    inflates it; after a boundary the band is only the turns newer than the boundary, and the
+    prompt it is weighed against is larger by every standing summary. So the same share clears
+    later. On the forty-turn lopsided fixture: the recompacting mode fires on turns 7, 13 and 23,
+    the boundary mode on 7, 14 and 25 -- the same three passes, each later crossing one or two
+    turns later, with thirty passes held in both. Not fewer passes on this fixture, because its
+    summaries are twelve tokens; the user-heavy test below is where the count moves too.
+
+    Asserted as an ordering rather than as those constants, because the constants are what a
+    later change would quietly re-tune: the boundary mode fires no more often, never earlier,
+    and strictly later at least once.
+    """
+    recompacting = _strategy()
+    boundary = _strategy(summary_mode=SUMMARY_MODE_BOUNDARY)
+
+    recompact_passes = await _grow_and_compact(recompacting, 40)
+    boundary_passes = await _grow_and_compact(boundary, 40)
+    recompact_fired = [index for index, _, fired in recompact_passes if fired]
+    boundary_fired = [index for index, _, fired in boundary_passes if fired]
+
+    assert len(recompact_fired) >= 2, "one pass cannot show the share being cleared again"
+    assert len(boundary_fired) <= len(recompact_fired), "no more passes with a boundary than without"
+    assert recompact_fired[0] == boundary_fired[0], "the first pass is the same pass: there is no boundary yet"
+    assert all(later >= earlier for earlier, later in zip(recompact_fired, boundary_fired, strict=False))
+    assert any(later > earlier for earlier, later in zip(recompact_fired, boundary_fired, strict=False)), (
+        "and at least one later crossing clears the share strictly later, because the previous "
+        "summary is no longer in the band -- a boundary mode that still read it would fire on the "
+        "recompacting mode's turns exactly"
+    )
+    assert boundary.user_passes_declined >= recompacting.user_passes_declined
+    assert boundary.user_summaries_in_conversation == boundary.user_compactions
+
+
+async def test_the_three_modes_side_by_side_on_a_conversation_whose_summaries_matter() -> None:
+    """The comparison the flag exists for, on the fixture where the arms come apart.
+
+    Sixty user-heavy turns, a summarizer keeping 35% of what it reads, one share for all three.
+    Measured: the recompacting mode fires 36 times and leaves one summary of 589 tokens in a
+    12,030-token prompt; the boundary mode fires 20 times, holds 28, and leaves twenty summaries
+    standing -- 20,855 tokens, 63% of a 33,325-token prompt, which is the accumulation the
+    counter exists to show; the fold mode fires 26 times, folds 11 times, and leaves three
+    summaries of 2,288 tokens in a 13,729-token prompt. So the fold brings the floor back to
+    within a sixth of the recompacting prompt at a third of its whole-prefix breaks -- and none of
+    that is a fidelity claim, because nothing here can measure what eleven generations of
+    summary kept. Asserted as orderings, for the reason the test above gives.
+    """
+    runs: dict[str, UserTurnAnchoredSummarizationCompactionStrategy] = {}
+    prompts: dict[str, int] = {}
+    for mode in SUMMARY_MODES:
+        strategy = _strategy(_RatioSummarizer(0.35), summary_mode=mode)
+        messages, _ = await _grow_in_mode(strategy, 60)
+        runs[mode] = strategy
+        prompts[mode] = _included(messages)
+        assert strategy.user_summaries_in_conversation == len(_standing(messages))
+    recompacting, boundary, fold = (runs[mode] for mode in SUMMARY_MODES)
+
+    assert recompacting.user_summaries_in_conversation == 1
+    assert boundary.user_summaries_in_conversation == boundary.user_compactions > 1, "N passes, N standing"
+    assert boundary.user_passes_declined > recompacting.user_passes_declined, "the share bites harder"
+    assert boundary.user_summary_tokens > prompts[SUMMARY_MODE_BOUNDARY] // 2, "the floor is most of the prompt"
+    assert prompts[SUMMARY_MODE_BOUNDARY] > prompts[SUMMARY_MODE_RECOMPACT], "and it is the whole difference"
+
+    assert fold.user_folds > 0, "the fixture has to reach a fold or the third arm is the second under a new name"
+    assert fold.user_summaries_in_conversation < boundary.user_summaries_in_conversation
+    assert fold.user_summary_tokens < boundary.user_summary_tokens // 4, "the fold lowered the floor"
+    assert prompts[SUMMARY_MODE_FOLD] < prompts[SUMMARY_MODE_BOUNDARY]
+    assert fold.user_folds < recompacting.user_compactions, (
+        "and paid fewer whole-prefix breaks than the recompacting mode pays passes, which is the trade"
+    )
+
+
+async def test_a_fold_needs_two_standing_summaries_and_so_never_follows_a_fold() -> None:
+    """The hard precondition, checked pass by pass on a run that folds many times.
+
+    Folding one summary is a rewrite of one message at one position -- the recompacting mode
+    with extra steps -- so the fold path must be unreachable with fewer than two. That is also
+    the whole of what stops one fold following another: a fold leaves one summary standing, so
+    the next needs an ordinary pass first, and that pass is bounded by the share.
+    """
+    strategy = _strategy(_RatioSummarizer(0.35), summary_mode=SUMMARY_MODE_FOLD)
+
+    _, events = await _grow_in_mode(strategy, 60)
+    folds = [(turn, standing_before) for turn, standing_before, outcome in events if outcome == "folded"]
+    outcomes = [outcome for _, _, outcome in events]
+
+    assert len(folds) >= 3, "the fixture has to fold repeatedly or the rule is not being tested"
+    assert all(standing_before >= 2 for _, standing_before in folds), "never with fewer than two standing"
+    assert "folded" not in [b for a, b in zip(outcomes, outcomes[1:], strict=False) if a == "folded"], (
+        "and never on the pass after a fold, which left exactly one"
+    )
+    assert strategy.user_summaries_in_conversation >= 1
+
+
+def _fold_scenario(summarizer: Any, **kwargs: Any) -> UserTurnAnchoredSummarizationCompactionStrategy:
+    """Return a fold-mode strategy over the compacting ceiling."""
+    return _strategy(summarizer, summary_mode=SUMMARY_MODE_FOLD, **kwargs)
+
+
+async def test_a_single_standing_summary_is_never_folded_even_when_nothing_bounds_the_share() -> None:
+    """The two-summary precondition is hard, and the share is not what enforces it.
+
+    At any share above zero a fold of one summary is refused by arithmetic alone -- what it would
+    remove is the summaries less the largest, which is nothing -- so the precondition is only
+    load-bearing where the share is zero. That is the arm ``--user-min-band-share 0`` exists to
+    run, and on it a fold of one summary would be a rewrite of one message at one position on
+    every starved pass: the recompacting mode's whole defect, reached through the fold.
+    """
+    summarizer = _Summarizer()
+    strategy = _fold_scenario(summarizer, min_band_share=0.0)
+    messages = _conversation(8)
+    assert await strategy(messages) is True
+    assert len(_standing(messages)) == 1
+
+    assert await strategy(messages) is False, "nothing newer than the boundary but the tail"
+
+    assert (strategy.user_folds, strategy.user_passes_declined) == (0, 1), "declined, not folded"
+    assert len(summarizer.requests) == 1, "and the summarizer was not asked to rewrite one summary as one summary"
+    assert len(_standing(messages)) == 1
+
+
+async def _three_standing(strategy: UserTurnAnchoredSummarizationCompactionStrategy) -> list[Message]:
+    """Return the eight-turn fixture after three crossings, leaving three summaries standing."""
+    messages = _conversation(8)
+    assert await strategy(messages) is True
+    for start in (8, 14):
+        messages += _conversation(6, first_turn=start)
+        assert await strategy(messages) is True
+    assert len(_standing(messages)) == 3, "three crossings, three boundaries, no fold yet"
+    return messages
+
+
+def _fold_terms(messages: list[Message]) -> tuple[int, int, int]:
+    """Return the fold's ``R``, the undeducted total, and ``B``, computed from the conversation.
+
+    Written out here rather than read off the strategy, so a test can state the fixture's ratio
+    as its own premise: what the fold would remove is the standing summaries less the largest,
+    and what it would re-bill is the included prompt from the oldest of them to the end. The
+    undeducted total is returned beside ``R`` so a test can sit a share between the two and
+    catch a fold that forgot the deduction.
+    """
+    _included(messages)
+    standing = _standing(messages)
+    sizes = [included_token_count([message]) for message in standing]
+    behind = included_token_count(messages[messages.index(standing[0]) :])
+    return sum(sizes) - max(sizes), sum(sizes), behind
+
+
+async def test_a_fold_is_declined_until_the_standing_summaries_repay_the_break() -> None:
+    """The second condition, at its own boundary: the break-even, not the band having stalled.
+
+    Three standing summaries of about 790 tokens each on the eight-turn fixture are 1,584
+    removable tokens against 22,985 behind the oldest of them -- about 7% -- and then one
+    tiny turn arrives, so the band is starved. At the default share of a tenth that is not a
+    fold, and the pass is declined with the summarizer untouched; at a share of a twentieth the
+    same conversation folds. The fixture's ratio is asserted between the two shares first, so
+    that the test cannot go vacuous by the summaries drifting to either side of both. A third
+    share sits between the deducted ratio and the undeducted one -- 7% against 10% -- and is
+    declined too, which is what pins the deduction: a fold that counted the whole of the
+    standing summaries as its removal would fold there, and at the default share as well.
+    """
+    large = "x" * _LARGE_SUMMARY_CHARS
+    declining_summarizer = _Summarizer(large)
+    declining = _fold_scenario(declining_summarizer)
+    declining_messages = await _three_standing(declining)
+    folding = _fold_scenario(_Summarizer(large), min_band_share=0.05)
+    folding_messages = await _three_standing(folding)
+    undeducted = _fold_scenario(_Summarizer(large), min_band_share=0.08)
+    undeducted_messages = await _three_standing(undeducted)
+    removable, total, behind = _fold_terms(declining_messages)
+    assert _fold_terms(folding_messages) == _fold_terms(undeducted_messages) == (removable, total, behind), (
+        "one conversation, three shares"
+    )
+    assert 0.05 * behind <= removable < 0.08 * behind <= total, (
+        f"the premise: {removable} removable and {total} undeducted against {behind} behind"
+    )
+    assert DEFAULT_MIN_BAND_SHARE > 0.08, "so the default share declines it too, whichever removal is counted"
+
+    declining_messages += _conversation(1, first_turn=20)
+    folding_messages += _conversation(1, first_turn=20)
+    undeducted_messages += _conversation(1, first_turn=20)
+    requests_before = len(declining_summarizer.requests)
+
+    assert await declining(declining_messages) is False
+    assert (declining.user_folds, declining.user_passes_declined) == (0, 1), "not worth the break: declined"
+    assert len(declining_summarizer.requests) == requests_before, "and no call spent finding that out"
+    assert len(_standing(declining_messages)) == 3
+
+    assert await folding(folding_messages) is True
+    assert (folding.user_folds, folding.user_passes_declined) == (1, 0), "worth it at the lower share: folded"
+    assert len(_standing(folding_messages)) == 1
+
+    assert await undeducted(undeducted_messages) is False
+    assert (undeducted.user_folds, undeducted.user_passes_declined) == (0, 1), (
+        "declined at the share between the two ratios: the largest summary is not counted as removed"
+    )
+
+
+async def test_a_fold_collapses_every_standing_summary_into_one_new_boundary() -> None:
+    """What a fold does, step by step, and that the cycle continues behind it.
+
+    The fold's output has to be a boundary by the same test as any other summary, stand where
+    the oldest summary stood, carry the ids of everything it folded, and be preserved; each
+    folded summary has to be excluded under the fold's own reason, point back at the fold, and
+    be released from preservation, so that "preserved" and "included" go on meaning one thing.
+    And the summarizer has to have been told it was reading summaries, with the marker stripped.
+    Then one more crossing: the band starts after the fold, and the fold is not re-read.
+    """
+    summarizer = _Summarizer("x" * _LARGE_SUMMARY_CHARS)
+    strategy = _fold_scenario(summarizer, min_band_share=0.05)
+    messages = await _three_standing(strategy)
+    folded = _standing(messages)
+    oldest_index = messages.index(folded[0])
+    messages += _conversation(1, first_turn=20)
+    replies_before = [m.message_id for m in project_included_messages(messages) if m.role == "assistant"]
+
+    assert await strategy(messages) is True
+    (fold,) = _standing(messages)
+
+    assert (fold.message_id or "").startswith(FOLD_ID_PREFIX) and _is_summary(fold)
+    assert messages.index(fold) == oldest_index, "it stands where the oldest summary stood"
+    assert _summary_of_message_ids(fold) == [m.message_id for m in folded]
+    assert len(_summary_of_group_ids(fold)) == 3
+    assert is_preserved(fold) and fold.additional_properties[PRESERVE_REASON_KEY] == PRESERVE_REASON
+    for message in folded:
+        assert message.additional_properties[EXCLUDED_KEY] is True
+        assert message.additional_properties[EXCLUDE_REASON_KEY] == FOLD_EXCLUDE_REASON
+        assert _summarized_by(message) == fold.message_id
+        assert not is_preserved(message), "released: the promise travels to the replacement"
+    system, transcript = summarizer.requests[-1]
+    assert system.text == DEFAULT_USER_FOLD_PROMPT, "the summarizer was told it was reading summaries"
+    assert USER_SUMMARY_MARKER not in (transcript.text or ""), "and was not sent the marker as content"
+    assert (transcript.text or "").count("\n") == 2, "three numbered lines, one per folded summary"
+    assert [m.message_id for m in project_included_messages(messages) if m.role == "assistant"] == replies_before, (
+        "nothing between the summaries was touched"
+    )
+    assert _user_texts(messages)[0].startswith("Turn 0:"), "nor the head"
+    assert strategy.user_summaries_in_conversation == 1
+    assert strategy.user_summary_tokens == included_token_count([fold])
+
+    messages += _conversation(6, first_turn=21)
+    assert await strategy(messages) is True
+    asked = summarizer.requests[-1][-1].text or ""
+    assert "Turn 20:" in asked and "Turn 21:" in asked, "the band after the fold starts at the first turn newer than it"
+    assert USER_SUMMARY_MARKER not in asked and "x" * 100 not in asked, "and the fold itself is not in it"
+    assert len(_standing(messages)) == 2 and _standing(messages)[0] is fold
+
+
+async def test_a_fold_whose_summarizer_fails_leaves_the_standing_summaries_as_they_were() -> None:
+    """Degrading safely is the fold's contract too: no text, no supersession, and it is counted."""
+    strategy = _fold_scenario(_Summarizer("x" * _LARGE_SUMMARY_CHARS), min_band_share=0.05)
+    messages = await _three_standing(strategy)
+    messages += _conversation(1, first_turn=20)
+    standing = _standing(messages)
+    strategy.client = _FailingSummarizer()
+
+    assert await strategy(messages) is False
+
+    assert _standing(messages) == standing
+    assert all(is_preserved(message) for message in standing), "still boundaries, still protected"
+    assert (strategy.user_folds, strategy.user_summary_failures, strategy.user_passes_declined) == (0, 1, 0)
+
+
+async def test_a_slowly_growing_conversation_does_not_fold_repeatedly() -> None:
+    """The thrash guard, on the shape that would thrash: a starved band and a prompt that creeps.
+
+    Thirty user-heavy turns with a summarizer keeping half of what it reads fold six times, and
+    that is the fold working on a conversation whose summaries are a large share of it. Then
+    sixty turns too small to move anything: the band stays starved, the prompt creeps up, and a
+    fold on every starved pass would break the whole prefix sixty times to free a few hundred
+    tokens each. Measured, one fold in those sixty turns, and what stops it is the two
+    conditions together -- a fold leaves one summary, the next needs an ordinary pass first, an
+    ordinary pass needs a band worth a tenth of the prompt, and fifty tiny turns are what that
+    takes.
+    """
+    strategy = _fold_scenario(_RatioSummarizer(0.5))
+    messages, events = await _grow_in_mode(strategy, 30)
+    heavy_folds = strategy.user_folds
+    assert heavy_folds >= 3, "the fixture has to be one that folds while it is growing fast"
+
+    _, slow_events = await _grow_in_mode(strategy, 60, turn=_tiny_turn, messages=messages, first_turn=30)
+    slow_folds = strategy.user_folds - heavy_folds
+
+    assert slow_folds <= 1, f"{slow_folds} folds while creeping, against {heavy_folds} while growing"
+    assert all(standing_before >= 2 for _, standing_before, outcome in events + slow_events if outcome == "folded")
+    assert strategy.user_passes_declined + strategy.user_passes_below_trigger >= 50, "the creep was mostly refused"
+
+
+async def test_the_five_outcomes_of_a_pass_partition_the_passes_in_the_fold_mode() -> None:
+    """The partition the four-outcome test pins, with the fifth outcome present and non-zero."""
+    strategy = _fold_scenario(_RatioSummarizer(0.35))
+    _, events = await _grow_in_mode(strategy, 60)
+
+    assert strategy.user_folds > 0
+    assert (
+        strategy.user_compactions
+        + strategy.user_folds
+        + strategy.user_passes_declined
+        + strategy.user_passes_below_trigger
+        + strategy.user_summary_failures
+        == len(events)
+    ), "every pass lands in exactly one of the five"
 
 
 def _is_summary(message: Message) -> bool:

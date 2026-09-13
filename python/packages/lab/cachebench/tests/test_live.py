@@ -106,6 +106,7 @@ from agent_framework_lab_cachebench._live_cli import (
     _seed_spread,
     _spread,
     _strategy_options,
+    _strategy_settings,
     _summarizer_cost,
     _to_joint,
     _workload_settings,
@@ -792,6 +793,7 @@ def test_every_argument_the_runner_reads_is_defined() -> None:
         "keep_tail_user_turns",
         "user_trigger_fraction",
         "user_min_band_share",
+        "user_summary_mode",
         "record_repeats",
         "min_correctness",
         "summarizer_provider",
@@ -1597,7 +1599,7 @@ async def test_a_row_with_no_record_strategy_in_it_still_gets_no_middleware(monk
 async def test_both_halves_counters_are_read_off_the_composed_rows_own_parts(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """The five columns a composed row owes the file, taken from two objects rather than one.
+    """The eight columns a composed row owes the file, taken from two objects rather than one.
 
     ``run_live`` reads them off a narrowed reference it resolves once, and that reference used
     to be an ``isinstance`` test -- which a composition fails, so every one of these columns
@@ -1631,6 +1633,18 @@ async def test_both_halves_counters_are_read_off_the_composed_rows_own_parts(
         def user_messages_replaced(self) -> int:
             return 11
 
+        @property
+        def user_summaries_in_conversation(self) -> int:
+            return 5
+
+        @property
+        def user_summary_tokens(self) -> int:
+            return 777
+
+        @property
+        def user_folds(self) -> int:
+            return 2
+
     composed = ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy(
         tokenizer=TOKENIZER,
         tool_results=_CountedRecordPhase(max_input_tokens=29_952, tokenizer=TOKENIZER),
@@ -1649,6 +1663,9 @@ async def test_both_halves_counters_are_read_off_the_composed_rows_own_parts(
     assert (outcome.records_in_conversation, outcome.groups_kept_uncovered) == (2, 3), "the record half"
     assert outcome.fallbacks_after_record == 1
     assert (outcome.user_compactions, outcome.user_messages_replaced) == (4, 11), "and the user half"
+    assert (outcome.user_summaries_in_conversation, outcome.user_summary_tokens, outcome.user_folds) == (5, 777, 2), (
+        "and the floor and the folds the boundary modes added, read off the same part"
+    )
 
 
 def _composed_over(ceiling: int = 12_000) -> ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
@@ -1844,6 +1861,146 @@ def test_two_cells_differing_only_in_a_user_band_setting_do_not_merge() -> None:
         "and the band share hardest of all: it decides whether the row compacts once or once "
         "per turn, which is the whole money side of it"
     )
+
+
+def test_the_summary_mode_flag_reaches_the_user_band_strategy_and_the_composed_rows_half() -> None:
+    """The fifth user-band knob, checked the way the other four are, and on both rows at once.
+
+    The mode is the whole difference between three arms of one measurement, so a flag that
+    parsed and reached nothing would leave a sweep of it producing three identical rows with no
+    way to tell that from a null result. The composed row's half is checked beside the single
+    row because the two are built by one builder and must not be in different modes under one
+    command line -- and its shared line is asserted untouched, because the fold sits behind the
+    trigger check rather than beside it.
+    """
+    summarizer = _StubSummarizer()
+    default = _strategy_options(build_parser().parse_args(["azure"]), TOKENIZER, summarizer)
+    folding = _strategy_options(
+        build_parser().parse_args(["azure", "--user-summary-mode", "fold"]), TOKENIZER, summarizer
+    )
+
+    single = build_strategy("user_summary_anchored", default)
+    assert isinstance(single, UserTurnAnchoredSummarizationCompactionStrategy)
+    assert single.summary_mode == "recompact", "the default is the arm every archived row ran"
+
+    folded = build_strategy("user_summary_anchored", folding)
+    assert isinstance(folded, UserTurnAnchoredSummarizationCompactionStrategy)
+    assert folded.summary_mode == "fold"
+
+    composed = _composed_strategy(folding)
+    assert composed.user_turns.summary_mode == "fold", "the same builder, so the same mode"
+    assert composed.user_trigger_fraction == composed.tool_results.trigger_fraction, "and the shared line is untouched"
+
+    with pytest.raises(SystemExit):
+        build_parser().parse_args(["azure", "--user-summary-mode", "sometimes"])
+
+
+def test_the_summary_mode_is_recorded_from_the_built_options_and_keys_cells_apart() -> None:
+    """Two runs in different modes are not one cell, which is the reason the settings block exists.
+
+    The mode decides the whole cache side of the row -- whether a message just behind the head
+    is rewritten on every pass, never, or occasionally -- so two runs differing in it pooled into
+    one row would print a mean over two different mechanisms. Read off the built options rather
+    than the flag, for the reason every other setting is.
+    """
+    args = build_parser().parse_args(["azure", "--user-summary-mode", "boundary"])
+    options = _strategy_options(args, TOKENIZER, _StubSummarizer())
+
+    settings = _strategy_settings(args, options, summarizer=None)
+
+    assert settings.user_summary_mode == "boundary"
+    assert _cell_params(settings=_settings(user_summary_mode="boundary")).key != _cell_params(settings=_settings()).key
+    assert (
+        _cell_params(settings=_settings(user_summary_mode="fold")).key
+        != _cell_params(settings=_settings(user_summary_mode="boundary")).key
+    )
+
+
+def test_a_settings_block_written_before_the_summary_mode_reads_it_as_recompacting() -> None:
+    """The band-share licence, one schema along: what those runs did, written as the literal.
+
+    A schema 10 record could select ``user_summary_anchored`` and could only recompact, so
+    recompacting is what it demonstrably did. It has to pool with a rerun in the same mode and
+    refuse to pool with one in either boundary mode -- and it has to keep doing so after the
+    strategy's default moves, which is why the reader fills in the literal and not the default.
+    """
+    written = _cell_params(settings=_settings()).to_dict()
+    del written["settings"]["user_summary_mode"]
+
+    settings = CellParams.from_dict(written).settings
+
+    assert settings is not None
+    assert settings.user_summary_mode == "recompact", "what those runs did"
+    assert _cell_params(settings=settings).key == _cell_params(settings=_settings(user_summary_mode="recompact")).key
+    assert _cell_params(settings=settings).key != _cell_params(settings=_settings(user_summary_mode="boundary")).key
+
+
+async def test_the_standing_summary_floor_and_the_fold_count_reach_the_seed_record_and_the_flags_column(
+    tmp_path: Path,
+) -> None:
+    """The boundary mode's whole risk is the floor, so it travels the four handoffs RECORDS does.
+
+    A conversation accumulating standing summaries has every other column reading as though
+    compaction were working -- the message count keeps rising and each pass reports having acted
+    -- and only this count and its tokens say the unshrinkable part has grown. The fold count is
+    the other half: a run that folded twice and one that never folded differ by two whole-prefix
+    breaks, and nothing else separates them. Strategy, outcome, seed record, column; and an older
+    record reads back as not having measured the floor, and as never having folded.
+    """
+    strategy = UserTurnAnchoredSummarizationCompactionStrategy(
+        max_input_tokens=12_000, tokenizer=TOKENIZER, client=_StubSummarizer(), summary_mode="boundary"
+    )
+    messages = _user_band_conversation(8)
+    assert await strategy(messages) is True
+    for index in range(8, 14):
+        messages += [
+            Message(role="user", contents=[f"Turn {index}: " + "u" * 4_000], message_id=f"u{index}"),
+            Message(role="assistant", contents=[f"Reply {index}: " + "a" * 4_000], message_id=f"a{index}"),
+        ]
+    assert await strategy(messages) is True
+
+    assert (strategy.user_summaries_in_conversation, strategy.user_folds) == (2, 0)
+    assert strategy.user_summary_tokens > 0
+    notes = _strategy_notes(strategy)
+    assert "USERSUMMARIES:2" in notes
+    assert f"USERSUMMTOKENS:{strategy.user_summary_tokens}" in notes
+    assert not [note for note in notes if note.startswith("USERFOLD")], "never folded: absent, not zero"
+
+    outcome, scenario = await _probed(StubChatClient(usage=UsageDetails(input_token_count=1_000)), repeats=1)
+    record = _record(
+        replace(
+            outcome,
+            strategy_notes=(*notes, "USERFOLD:3"),
+            user_summaries_in_conversation=strategy.user_summaries_in_conversation,
+            user_summary_tokens=strategy.user_summary_tokens,
+            user_folds=3,
+        ),
+        scenario,
+        strategy="user_summary_anchored",
+    )
+    tokens = strategy.user_summary_tokens
+
+    assert (record.user_summaries_in_conversation, record.user_summary_tokens, record.user_folds) == (2, tokens, 3)
+    cell = _aggregate("user_summary_anchored", [record])
+    assert "USERSUMMARIES:2" in _flags(cell, None) and "USERFOLD:3" in _flags(cell, None)
+    assert "USERSUMMARIES:2" in _render(None, [cell], set(), show_answers=False)
+
+    path = tmp_path / "results.jsonl"
+    append_seed_record(path, record)
+    (read_back,) = read_seed_records(path)
+    assert (read_back.user_summaries_in_conversation, read_back.user_summary_tokens, read_back.user_folds) == (
+        2,
+        tokens,
+        3,
+    )
+    assert read_back.schema == SCHEMA_VERSION
+
+    dropped = {"user_summaries_in_conversation", "user_summary_tokens", "user_folds"}
+    older = {key: value for key, value in record.to_dict().items() if key not in dropped}
+    older["schema"] = SCHEMA_VERSION - 1
+    old = SeedRecord.from_dict(older)
+    assert (old.user_summaries_in_conversation, old.user_summary_tokens) == (None, None), "a floor nobody measured"
+    assert old.user_folds == 0, "and a fold nobody could have made"
 
 
 async def test_the_dry_run_checks_the_configuration_it_is_printing_a_plan_for(
@@ -3989,6 +4146,9 @@ def test_the_two_accuracy_measures_are_named_acc1_and_acc2() -> None:
         records_in_conversation=0,
         user_compactions=0,
         user_messages_replaced=0,
+        user_summaries_in_conversation=0,
+        user_summary_tokens=0,
+        user_folds=0,
         strategy_notes=(),
         dropped_options=(),
         answer="",
@@ -4192,6 +4352,9 @@ def _control_cell(seeded: int) -> dict[str, CellStats]:
         records_in_conversation=0,
         user_compactions=0,
         user_messages_replaced=0,
+        user_summaries_in_conversation=0,
+        user_summary_tokens=0,
+        user_folds=0,
         strategy_notes=(),
         dropped_options=(),
         answer="",
@@ -5491,6 +5654,9 @@ def test_a_progress_line_shows_what_a_watcher_needs() -> None:
         records_in_conversation=0,
         user_compactions=0,
         user_messages_replaced=0,
+        user_summaries_in_conversation=0,
+        user_summary_tokens=0,
+        user_folds=0,
         strategy_notes=(),
         dropped_options=(),
         answer="",
@@ -5783,6 +5949,7 @@ def _settings(**overrides: Any) -> StrategySettings:
         "keep_tail_user_turns": 1,
         "user_trigger_fraction": 0.8,
         "user_min_band_share": 0.1,
+        "user_summary_mode": "recompact",
         "token_budget_fraction": 0.5,
         "max_output_tokens": 2_048,
         "answer_max_tokens": 12_000,

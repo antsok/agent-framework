@@ -613,6 +613,30 @@ class LiveOutcome:
     Zero on every strategy that keeps no such count, which is all of them but
     ``user_summary_anchored`` and the composed row that runs it as a phase.
     """
+    user_summaries_in_conversation: int = 0
+    """Summaries ``user_summary_anchored`` left standing in the conversation, as it last stood.
+
+    The boundary mode's floor: every standing summary there is preserved and only a fold merges
+    them, so N passes leave N of these, each one a floor under the prompt that no later pass can
+    lower. One in the recompacting mode after any pass. Reported as a number beside the
+    ``USERSUMMARIES`` flag for the reason ``records_in_conversation`` is -- a flag says a row is
+    affected, a number can be meaned over the seeds of a cell.
+
+    Zero on every strategy that keeps no such count, which is all of them but
+    ``user_summary_anchored`` and the composed row that runs it as a phase.
+    """
+    user_summary_tokens: int = 0
+    """Tokens those standing summaries occupied at the same reading: the floor in the unit that matters.
+
+    Beside the ``USERSUMMTOKENS`` flag, and zero on every strategy that keeps no such count.
+    """
+    user_folds: int = 0
+    """Passes where ``user_summary_anchored`` collapsed every standing summary into one.
+
+    The fold mode's cost: each one re-bills the prompt from the oldest summary's position, which
+    is very nearly the whole of it. Beside the ``USERFOLD`` flag, and zero on every strategy
+    that keeps no such count.
+    """
     record_text: str = ""
     """The recall record the run produced, exactly as the model wrote it.
 
@@ -902,6 +926,9 @@ def _strategy_notes(strategy: Any) -> tuple[str, ...]:
         ("user_passes_declined", "USERHELD"),
         ("user_summary_failures", "USERSUMMFAIL"),
         ("user_passes_starved", "USERSTARVED"),
+        ("user_summaries_in_conversation", "USERSUMMARIES"),
+        ("user_summary_tokens", "USERSUMMTOKENS"),
+        ("user_folds", "USERFOLD"),
     ):
         value = getattr(strategy, attribute, None)
         if isinstance(value, int) and value:
@@ -1982,6 +2009,11 @@ async def run_live(
         records_in_conversation=recording.records_in_conversation if recording is not None else 0,
         user_compactions=user_compacting.user_compactions if user_compacting is not None else 0,
         user_messages_replaced=user_compacting.user_messages_replaced if user_compacting is not None else 0,
+        user_summaries_in_conversation=(
+            user_compacting.user_summaries_in_conversation if user_compacting is not None else 0
+        ),
+        user_summary_tokens=user_compacting.user_summary_tokens if user_compacting is not None else 0,
+        user_folds=user_compacting.user_folds if user_compacting is not None else 0,
         # Taken from the snapshot rather than from the live session, so it is the record the
         # probes were answered from and not one a probe's own compaction pass moved.
         record_text=recall_record_text(agent, snapshot),

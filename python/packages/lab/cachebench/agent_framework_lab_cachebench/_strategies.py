@@ -70,6 +70,7 @@ from .compaction import (
     DEFAULT_KEEP_TAIL_USER_TURNS,
     DEFAULT_MIN_BAND_SHARE,
     DEFAULT_MIN_GAIN_FRACTION,
+    DEFAULT_SUMMARY_MODE,
     DEFAULT_TRIGGER_FRACTION,
     DEFAULT_USER_TRIGGER_FRACTION,
     AnchoredCompactionStrategy,
@@ -195,6 +196,15 @@ class StrategyOptions:
     after its first pass is its own summary plus the turns since. Sweepable because the right
     value is a property of the workload's user share rather than of the strategy: 0.0 is the
     behaviour every run before this measured, and every archived row is one.
+    """
+    user_summary_mode: str = DEFAULT_SUMMARY_MODE
+    """What ``user_summary_anchored`` does with the summary its previous pass left behind.
+
+    ``recompact``, ``boundary`` or ``fold``; ``compaction/_usersummary`` says what each buys and
+    what each costs. Sweepable because the three are the arms of one measurement, and the default
+    is the arm the archive was taken on -- the recompacting one -- until a run has measured the
+    others against it. It reaches the composed row's user half through the same builder as the
+    single row, so the two cannot be in different modes under one command line.
     """
     token_budget_fraction: float = 0.5
     summarizer: SupportsChatGetResponse[Any] | None = None
@@ -393,6 +403,7 @@ def _build_user_summary_anchored(options: StrategyOptions) -> UserTurnAnchoredSu
         keep_tail_user_turns=options.keep_tail_user_turns,
         trigger_fraction=options.user_trigger_fraction,
         min_band_share=options.user_min_band_share,
+        summary_mode=options.user_summary_mode,
     )
 
 
@@ -401,9 +412,9 @@ def _build_tool_and_user_summary_anchored(options: StrategyOptions) -> Compactio
 
     Built from the same two builders the single rows use rather than from two fresh
     constructor calls, which is what makes the comparison the row exists for legitimate: a
-    sweep moving ``--coverage-share`` or ``--keep-head-user-turns`` moves this row's half in
-    exactly the way it moves the corresponding single row, and neither half can drift into a
-    configuration no other row was measured at.
+    sweep moving ``--coverage-share``, ``--keep-head-user-turns`` or ``--user-summary-mode``
+    moves this row's half in exactly the way it moves the corresponding single row, and neither
+    half can drift into a configuration no other row was measured at.
 
     The one setting that does not reach this row is ``--user-trigger-fraction``. The composition
     judges both halves at ``--trigger-fraction``, taking that line from the record half it was

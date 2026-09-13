@@ -362,7 +362,8 @@ was measured losing — 29 of 53 facts left in a prompt the model could not use.
 live request, and a model answering a summary of the question it was just asked answers a
 different question. The turn before that has already been answered and has no such claim.
 
-**It recompacts its own output, and `_anchored.py::_shorten` deliberately does not.** That
+**It recompacts its own output in its default mode, and `_anchored.py::_shorten` deliberately does
+not.** That
 method refuses to touch a result already carrying `REMOVAL_MARKER`, because its trigger is the
 band's geometry: a result sits in the band from the turn it ages out of the tail until the end
 of the run, so "trim what is in the band" fires every single pass and re-trimming would be a
@@ -405,10 +406,49 @@ reaches a tenth of the prompt never being compacted at all; `USERHELD:<n>`
 (`user_passes_declined`) is what says so, and a row with `USERHELD` and no `USERCOMPACT` is a
 share set too high for that workload rather than a strategy that failed.
 
-Refusing to recompact is not the neutral option either: the summary is a user message, so a
-strategy that would not re-read its own output would have to keep every earlier summary beside
-every new one. That is `records_in_conversation`'s accumulation problem exactly — a floor under
-the prompt that no later pass can lower — and recompaction is what stops it rising.
+**Refusing to recompact is the other arm, and it is a mode rather than a rejected idea.**
+`summary_mode` decides what a pass does with the summary the previous pass left behind, and the
+three values are three arms of one measurement. `recompact`, the default, is everything above.
+`boundary` never re-reads its own output: the summary is marked with `PRESERVED_KEY` under the
+reason `user_summary_boundary` — the subpackage's one vocabulary for "no strategy may shorten,
+drop or shed this", re-applied every pass as `_preserve_records` re-applies it to the record, and
+not the way the boundary is *found*, which is `_is_summary`'s id prefix and text marker — and the
+next pass's band is the turns newer than the newest standing summary, less the tail. The prefix up
+to that boundary is byte-identical before and after every later pass, which is the cache claim,
+and it is measured rather than assumed: on the composed row the hit rate tracked how often the user
+half had rewritten its summary, 89% at `USERREPLACED` 8 down to 70% at 16, against a record half
+whose one preserved message holds 94-95%. What it costs is the thing recompaction was preventing:
+N passes leave N standing summaries, `records_in_conversation`'s accumulation problem exactly, a
+floor under the prompt that no later pass can lower, and `user_summaries_in_conversation` with
+`user_summary_tokens` (`USERSUMMARIES:<n>`, `USERSUMMTOKENS:<n>`) is what says how high it has
+risen. The same share bites harder here — the band no longer includes the previous summary and the
+prompt includes every standing one — so `USERHELD` rises; on the forty-turn lopsided fixture the
+recompacting mode fires on turns 7, 13 and 23 and the boundary mode on 7, 14 and 25, thirty held in
+both.
+
+`fold` is the boundary mode with a bound on the accumulation. On a pass whose ordinary band was
+declined, and only then, `_fold_due` asks two more things: at least two summaries stand — folding
+one is a rewrite of one message, the recompacting mode with extra steps, so the path is unreachable
+with fewer, and that is also what stops a fold following a fold — and the fold repays the break.
+The threshold is not a new constant: it is `R > B * (p - c) / (p + T * c)` with the fold's own terms,
+`R` the standing summaries' tokens less the largest of them (the fold's output is assumed no larger
+than the largest piece it folds, which errs towards keeping) and `B` the included prompt from the
+oldest summary to the end, and `(p - c) / (p + T * c)` at the measured prices and this benchmark's
+length is `min_band_share` — so the condition is `R >= B * min_band_share`, and a caller who moves the
+share moves both decisions together. Every standing summary is then collapsed into one, inserted
+where the oldest stood, linked both ways under `user_summaries_folded`, and preserved as the new
+boundary; `USERFOLD:<n>` counts them. On the user-heavy fixture with a summarizer keeping 35% of its
+input, sixty turns: `recompact` 36 passes, one summary of 589 tokens, a 12,030-token prompt;
+`boundary` 20 passes, 28 held, twenty summaries of 20,855 tokens in a 33,325-token prompt; `fold` 26
+passes, 11 folds, three summaries of 2,288 tokens in a 13,729-token prompt. Sixty tiny turns after
+six folds produced one more fold, which is the thrash guard: a fold leaves one summary, the next
+needs an ordinary pass first, and that pass needs a band worth a tenth of the prompt.
+
+A fold summarises summaries, so fidelity degrades across generations, and this benchmark cannot see
+it: its planted facts live in tool results, so `facts` and `acc1` are structurally blind to anything
+done to a user turn, and for the user half it measures compaction percentage and cost only. A fold
+row's accuracy columns reading as the control's is the instrument declining to look, not evidence
+that folding is free. The default stays `recompact` until a live run has measured the arms.
 
 A pass whose band holds **only** the previous summary does nothing, because rewriting one
 message at one position for no reduction is the thrash `_shorten` refuses. The band must contain
