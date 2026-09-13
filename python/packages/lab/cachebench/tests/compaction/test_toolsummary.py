@@ -21,13 +21,14 @@ import pytest
 from agent_framework import CharacterEstimatorTokenizer, Message
 from agent_framework._compaction import included_token_count, project_included_messages
 from agent_framework_lab_cachebench.compaction._anchored import REMOVAL_MARKER
-from agent_framework_lab_cachebench.compaction._preserve import is_preserved, set_preserved
+from agent_framework_lab_cachebench.compaction._preserve import PRESERVE_REASON_KEY, is_preserved, set_preserved
 from agent_framework_lab_cachebench.compaction._toolsummary import (
     DEFAULT_COVERAGE_SHARE,
     DEFAULT_FALLBACK_FRACTION,
     DEFAULT_RECORD_MAX_TOKENS,
     DEFAULT_RECORD_TARGET_TOKENS,
     DEFAULT_TRIGGER_FRACTION,
+    PRESERVE_REASON_UNCOVERED,
     RECALL_TOOL_NAME,
     RECORD_MARKER,
     RecallGate,
@@ -347,27 +348,34 @@ async def test_a_fallback_taken_behind_a_record_is_counted_apart_from_one_taken_
 
     Only the give-up path incremented a counter, and it is not the path taken here: this one
     finds a record, drops what the record covers, sees the prompt still over the ceiling, and
-    hands the rest to the fallback -- which shortens tool results in place, including the very
-    groups the coverage check has just refused to delete. So the row is measuring the fallback
-    strategy over most of its material while its flags column says nothing at all.
+    hands the rest to the fallback. So the row is measuring the fallback strategy over part of
+    its material while its flags column says nothing at all.
 
     Measured on a live seed reporting UNCOVERED:4: it lost the same facts as the control while
     sitting three messages shorter and 16,617 tokens lighter, which is shortening rather than
     deletion. The count is separate from ``fallbacks_used`` because the two events differ --
     no record ever arrived, against one that arrived and did not free enough -- and joined to
     it in meaning, because either says part of the row belongs to another strategy.
+
+    **What the fallback may work on has since narrowed, and this fixture moved with it.** The
+    groups the coverage check declines to delete are now held out of the fallback's reach, so a
+    conversation whose only removable material was those groups gives the fallback nothing and
+    the count stays at zero -- which is the fix, not a regression. The bulk here therefore sits
+    *after* the record, where no record was ever asked to cover it, and the two uncovered groups
+    in front of the record are asserted intact.
     """
     strategy = _strategy(max_input_tokens=500, trigger_fraction=0.1, fallback_fraction=0.9)
-    messages = _conversation(tool_turns=6, record=_covering_record(2))
+    messages = _conversation(tool_turns=4, record=_covering_record(2))
+    messages += _conversation(tool_turns=4, first_turn=4)[3:]
 
     assert await strategy(messages) is True
 
     assert strategy.fallbacks_after_record == 1
     assert strategy.fallbacks_used == 0, "the give-up path never ran: a record was there and was anchored on"
-    assert strategy.groups_kept_uncovered == 4, "and those four are what the fallback then went to work on"
+    assert strategy.groups_kept_uncovered == 2, "two groups the record never quoted, and they are held"
     rendered = _rendered(messages)
-    assert "CODE-2" not in rendered, "the fallback shed a group the coverage check had just kept"
-    assert "CODE-3" not in rendered, "and another, which is the loss the count exists to make visible"
+    assert "CODE-2 x" in rendered and "CODE-3 x" in rendered, "the fallback may not touch what the check kept"
+    assert "CODE-4 x" not in rendered, "it shed the material behind the record instead, which is what it counts"
 
 
 async def test_a_fallback_that_changed_nothing_is_not_counted_as_one() -> None:
@@ -954,6 +962,295 @@ async def test_an_uninvited_recall_call_is_not_protected_as_though_it_had_record
     await strategy(messages)
 
     assert {message.message_id for message in messages if is_preserved(message)} == {"rec_call", "rec_res"}
+
+
+# region the two layers between an uncovered group and the fallback
+
+
+def _held(messages: list[Message]) -> set[str]:
+    """Return the ids of every message this strategy is holding out of its fallback's reach."""
+    return {
+        message.message_id or ""
+        for message in messages
+        if is_preserved(message) and message.additional_properties.get(PRESERVE_REASON_KEY) == PRESERVE_REASON_UNCOVERED
+    }
+
+
+def _result_text(messages: list[Message], message_id: str) -> str:
+    """Return the tool result text carried by the message with ``message_id``."""
+    (message,) = (message for message in messages if message.message_id == message_id)
+    return "\n".join(str(content.result) for content in message.contents if content.type == "function_result")
+
+
+#: A ceiling the six-turn fixture never reaches, with the trigger low enough that every pass
+#: runs. The chain tests below need a pass on every call -- an ask is judged by the passes
+#: that follow it -- and a fixture that dips under the trigger after the record drops its two
+#: groups would stop reaching the chain at all, and pass against any bound whatever.
+_CHAIN_CEILING = 20_000
+
+
+def _chained(**kwargs: Any) -> ToolResultAnchoredSummarizationCompactionStrategy:
+    kwargs.setdefault("max_input_tokens", _CHAIN_CEILING)
+    kwargs.setdefault("trigger_fraction", 0.1)
+    return _strategy(**kwargs)
+
+
+async def test_a_partial_record_asks_for_another_record_and_holds_what_it_missed() -> None:
+    """Layer one: the pass that finds the shortfall asks for another record, and asks once.
+
+    The coverage check keeps the groups a record failed to cover, and until now that was all
+    it did: the fallback that runs when the prompt is still over the ceiling could shorten them
+    in place like any other group. The four archived rows that carried ``UNCOVERED:4`` beside
+    ``RECFALLBACK`` and lost a fact were the brief for closing that gap; they are since
+    attributed to a counting defect that ran the fallback on prompts under the ceiling, so they
+    are not a measure of how often the gap is reached -- the gap itself is what this tests.
+    What the check kept has to be out of the fallback's reach from the same pass, because the
+    ask made here is answered two passes later and the fallback can run in between -- a group
+    shortened while its record is in flight is a group that record can no longer quote. The
+    ask itself is one-shot, like the gate on the other side of the middleware.
+    """
+    strategy = _chained()
+    messages = _conversation(tool_turns=6, record=_covering_record(2))
+
+    assert await strategy(messages) is True
+
+    assert strategy.groups_kept_uncovered == 4
+    assert _held(messages) == {f"a_call_{index}" for index in range(2, 6)} | {f"t_res_{index}" for index in range(2, 6)}
+    assert strategy.groups_preserved_uncovered == 0, "held for an ask in flight is not yet preserved for good"
+    assert strategy.take_reforce() is True, "the pass that found the shortfall asked for another record"
+    assert strategy.take_reforce() is False, "and asked once"
+
+
+async def test_the_middleware_pins_the_call_after_the_strategys_ask_and_counts_it_apart() -> None:
+    """The ask crosses to the middleware on a call exit and pins the next call, whatever else is true.
+
+    The middleware holds no reference to the strategy, so the strategy's decision reaches it
+    the way the gate's does: through one callable it asks on the exit of every call it did not
+    pin. The size trigger is kept out of range here so the only thing that can pin is the ask,
+    and repeats are left at their default of off, because this must fire without them -- it
+    asks on a measured shortfall, which is exactly the case the repeats default protects
+    against firing on.
+    """
+    _armings.clear()
+    strategy = _chained()
+    middleware = ToolResultRecallMiddleware(
+        max_input_tokens=10_000_000, tokenizer=TOKENIZER, arm=lambda: _armings.append(1), reforce=strategy.take_reforce
+    )
+    messages = _conversation(tool_turns=6, record=_covering_record(2))
+
+    first = await _run(middleware, messages)
+    await strategy(messages)
+    second = await _run(middleware, messages)
+    third = await _run(middleware, messages)
+    fourth = await _run(middleware, messages)
+
+    assert middleware.repeat_records is False
+    assert "tool_choice" not in first, "nothing had been asked for yet"
+    assert "tool_choice" not in second, "the ask is taken on this call's exit and applied to the next"
+    assert third["tool_choice"] == {"mode": "required", "required_function_name": RECALL_TOOL_NAME}
+    assert "tool_choice" not in fourth, "one ask, one pinned call"
+    assert (middleware.forced_calls, middleware.reforced_calls) == (1, 1), "counted as a forced call and as a re-force"
+    assert len(_armings) == 1
+
+
+async def test_a_re_force_that_covers_the_rest_prevents_any_preservation() -> None:
+    """The re-force fixing the shortfall: the held groups are released and dropped, nothing settles.
+
+    This is the measured case on gpt-5.6-luna, whose record covers two of six groups and whose
+    second covers the rest -- run 40's repeat arm and run 41's read ``UNCOVERED:0`` on every
+    seed. A held group has to stay a candidate for the record it was held for, or the hold
+    would be a permanent floor: the first version of the preserved-skip in ``_drop_before``
+    treated every mark alike, and would have left these four in the prompt for good with a
+    complete account of them sitting one message later.
+    """
+    strategy = _chained()
+    messages = _conversation(tool_turns=6, record=_covering_record(2))
+
+    await strategy(messages)
+    assert strategy.take_reforce() is True
+    await strategy(messages)
+    assert strategy.groups_kept_uncovered == 4, "the pinned call's own pass sees no record yet, and keeps holding"
+    messages += _record_messages(_covering_record(4, first_turn=2), call_id="rec2")
+
+    assert await strategy(messages) is True
+
+    assert strategy.groups_kept_uncovered == 0
+    assert strategy.groups_preserved_uncovered == 0
+    assert not _held(messages), "the holds came off with the coverage"
+    assert "CODE-3 x" not in _rendered(messages), "and the groups were dropped, not shortened"
+    assert strategy.take_reforce() is False, "nothing left to ask for"
+
+
+async def test_a_re_force_that_fails_leads_to_preservation_and_the_fallback_cannot_shorten_those_groups() -> None:
+    """Layer two: a record that covers none of what it was asked for settles the groups for good.
+
+    Settled means preserved under this strategy's own reason for as long as the groups stay
+    uncovered, and the fallback honours that mark exactly as it honours the record's. The
+    material added behind the records at the end is what gives the fallback something it *may*
+    take, so the test can show it ran -- ``fallbacks_after_record`` moves -- while the four held
+    results stay intact to the last character. What is left is a prompt over the ceiling,
+    which is the accepted consequence: the row reads ``DQ`` instead of losing a fact.
+    """
+    strategy = _strategy(max_input_tokens=500, trigger_fraction=0.1, fallback_fraction=0.9)
+    messages = _conversation(tool_turns=6, record=_covering_record(2))
+
+    await strategy(messages)
+    assert strategy.take_reforce() is True
+    await strategy(messages)
+    messages += _record_messages("nothing further to record.", call_id="rec2")
+    await strategy(messages)
+
+    assert strategy.groups_preserved_uncovered == 4 == strategy.groups_kept_uncovered
+    assert strategy.take_reforce() is False, "asking stopped helping, so it stopped"
+    assert strategy.fallbacks_after_record == 0, "so far the fallback has had nothing it may take"
+
+    messages += _conversation(tool_turns=4, first_turn=6)[3:]
+
+    assert await strategy(messages) is True
+
+    rendered = _rendered(messages)
+    assert strategy.fallbacks_after_record == 1, "the fallback ran behind the record and found the new material"
+    for index in range(2, 6):
+        assert f"CODE-{index} x" in rendered, f"lookup_{index} is preserved, so it is still whole"
+        assert REMOVAL_MARKER not in _result_text(messages, f"t_res_{index}"), "and carries no trim marker"
+    assert "CODE-6 x" not in rendered, "while a group nothing protected was shed"
+    assert strategy.groups_preserved_uncovered == 4
+    assert included_token_count(messages) > 500, "the prompt is left over the ceiling, for the caller to see"
+
+
+async def test_an_ask_that_brings_no_record_ends_the_chain_on_the_pass_that_could_have_seen_it() -> None:
+    """A pinned call that wrote nothing is the model declining, and the bound holds against it.
+
+    The pinned call's own pass runs before the model writes anything, so it cannot see a
+    record and must not be read as a failure; the pass after it -- the follow-up carrying the
+    tool result -- is the first that can, and a record not there by then was not written. One
+    pass too few would settle every ask on the call that was still answering it; one too many
+    would hold the groups on the evidence of an ask that had already failed.
+    """
+    strategy = _chained()
+    messages = _conversation(tool_turns=6, record=_covering_record(2))
+
+    await strategy(messages)
+    assert strategy.take_reforce() is True
+
+    await strategy(messages)
+    assert strategy.groups_preserved_uncovered == 0, "the pinned call's own pass is not yet a failed ask"
+
+    await strategy(messages)
+    assert strategy.groups_preserved_uncovered == 4, "the pass that could have seen the record, and did not"
+    assert strategy.take_reforce() is False
+
+    for _ in range(5):
+        assert await strategy(messages) is False
+        assert strategy.take_reforce() is False, "no further ask, however many passes go by"
+    assert _held(messages) == {f"a_call_{index}" for index in range(2, 6)} | {f"t_res_{index}" for index in range(2, 6)}
+
+
+async def test_re_forcing_continues_while_each_record_helps_and_stops_on_the_first_that_does_not() -> None:
+    """The bound on asking again is progress, and progress is finite because groups are.
+
+    A re-force that produces another partial record must not re-arm for ever. Each ask that
+    continues the chain has retired at least one group -- covered, and so dropped -- and the
+    first ask that retires none ends it, so the asks made over one shortfall number at most
+    the groups in it. Here the second record covers two of the four, which earns a third ask
+    for the two it left; the third record covers nothing, and those two are settled.
+    """
+    strategy = _chained()
+    messages = _conversation(tool_turns=6, record=_covering_record(2))
+
+    await strategy(messages)
+    assert strategy.take_reforce() is True
+    await strategy(messages)
+    messages += _record_messages(_covering_record(2, first_turn=2), call_id="rec2")
+    await strategy(messages)
+
+    assert strategy.groups_kept_uncovered == 2
+    assert strategy.groups_preserved_uncovered == 0
+    assert strategy.take_reforce() is True, "a record that helped earns another ask for what it left"
+
+    await strategy(messages)
+    messages += _record_messages("already recorded above.", call_id="rec3")
+    await strategy(messages)
+
+    assert strategy.groups_preserved_uncovered == 2
+    assert _held(messages) == {"a_call_4", "t_res_4", "a_call_5", "t_res_5"}
+    for _ in range(5):
+        await strategy(messages)
+        assert strategy.take_reforce() is False, "a record that helped nothing ended the chain"
+    assert strategy.records_in_conversation == 3
+
+
+async def test_a_settled_group_a_later_record_quotes_is_released_and_dropped() -> None:
+    """Settled is not a third state: the one thing that lifts a hold is coverage, and it still does.
+
+    The middleware's own repeat rule can bring a record the chain never asked for, and a record
+    that quotes a settled group's values licenses its deletion like any other. That is not the
+    fallback resuming: the group leaves whole, and the count that said it was preserved stops
+    saying so, because the count describes the prompt as it now stands.
+    """
+    strategy = _chained()
+    messages = _conversation(tool_turns=6, record=_covering_record(2))
+
+    await strategy(messages)
+    assert strategy.take_reforce() is True
+    await strategy(messages)
+    await strategy(messages)
+    assert strategy.groups_preserved_uncovered == 4
+
+    messages += _record_messages(_covering_record(4, first_turn=2), call_id="rec2")
+
+    assert await strategy(messages) is True
+    assert (strategy.groups_kept_uncovered, strategy.groups_preserved_uncovered) == (0, 0)
+    assert not _held(messages)
+    assert "CODE-5 x" not in _rendered(messages)
+
+
+async def test_the_shed_loop_stops_when_everything_it_may_take_is_preserved_and_leaves_the_overflow_visible() -> None:
+    """Preserving must be able to fail loudly and must never become a loop.
+
+    With every candidate in the fallback's band held or a record, the shed loop drops nothing,
+    breaks on its own "nothing moved" test, and returns False -- which no caller reads as "it
+    fits": the pass leaves the prompt over the ceiling, changes nothing on the passes after,
+    and the caller sends it as it stands. ``included_token_count`` is the only thing that says
+    whether it fits, and here it says no.
+    """
+    strategy = _strategy(max_input_tokens=500, trigger_fraction=0.1, fallback_fraction=0.9)
+    messages = _conversation(tool_turns=6, record=_covering_record(2))
+
+    await strategy(messages)
+    assert strategy.take_reforce() is True
+    await strategy(messages)
+    await strategy(messages)
+    assert strategy.groups_preserved_uncovered == 4
+    before = _rendered(messages)
+
+    for _ in range(3):
+        assert await strategy(messages) is False, "nothing may be removed, so nothing is"
+
+    assert _rendered(messages) == before
+    assert strategy.fallbacks_after_record == 0, "a fallback that took nothing is not counted as one"
+    assert included_token_count(messages) > 500, "and the overflow is left where the caller can see it"
+
+
+async def test_a_group_another_strategy_protected_is_not_mistaken_for_one_of_this_strategys_holds() -> None:
+    """The hold is told apart by its reason, so another strategy's mark still takes the group out of the running.
+
+    Skipping only marks that are not this strategy's is what lets a held group be released; it
+    must not also let this strategy release, or count as uncovered, a group somebody else has
+    declared irreplaceable.
+    """
+    strategy = _chained()
+    messages = _conversation(tool_turns=6, record=_covering_record(6))
+    for message in messages:
+        if message.message_id in {"a_call_1", "t_res_1"}:
+            set_preserved(message, preserved=True, reason="another_strategy")
+
+    assert await strategy(messages) is True
+
+    assert "CODE-1 x" in _rendered(messages), "protected elsewhere, so not dropped"
+    assert strategy.groups_kept_uncovered == 0, "and not reported as the record falling short"
+    assert strategy.take_reforce() is False, "nor asked for"
+    assert not _held(messages)
 
 
 class _Recorder:

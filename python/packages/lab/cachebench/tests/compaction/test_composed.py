@@ -60,6 +60,7 @@ from agent_framework_lab_cachebench.compaction._composed import (
 from agent_framework_lab_cachebench.compaction._preserve import PRESERVE_REASON_KEY, is_preserved
 from agent_framework_lab_cachebench.compaction._toolsummary import (
     DEFAULT_TRIGGER_FRACTION,
+    PRESERVE_REASON_UNCOVERED,
     RECALL_TOOL_NAME,
     RECORD_MARKER,
     ToolResultAnchoredSummarizationCompactionStrategy,
@@ -191,7 +192,7 @@ def _tool_group(index: int) -> list[Message]:
     ]
 
 
-def _record_messages(values: str) -> list[Message]:
+def _record_messages(values: str, *, call_id: str = "rec") -> list[Message]:
     """Return the matched recall call and result the record phase anchors on.
 
     A matched pair rather than a bare tool result, because the strategy refuses a record whose
@@ -201,19 +202,23 @@ def _record_messages(values: str) -> list[Message]:
     Args:
         values: The record's text, as the model would have written it.
 
+    Keyword Args:
+        call_id: Distinguishes one record from another, so a test can put a second record in
+            the conversation the way a re-force does.
+
     Returns:
         The two messages.
     """
     return [
         Message(
             role="assistant",
-            contents=[{"type": "function_call", "call_id": "rec", "name": RECALL_TOOL_NAME, "arguments": "{}"}],
-            message_id="rec_call",
+            contents=[{"type": "function_call", "call_id": call_id, "name": RECALL_TOOL_NAME, "arguments": "{}"}],
+            message_id=f"{call_id}_call",
         ),
         Message(
             role="tool",
-            contents=[{"type": "function_result", "call_id": "rec", "result": f"{RECORD_MARKER} {values}"}],
-            message_id="rec_res",
+            contents=[{"type": "function_result", "call_id": call_id, "result": f"{RECORD_MARKER} {values}"}],
+            message_id=f"{call_id}_res",
         ),
     ]
 
@@ -1109,6 +1114,7 @@ async def test_every_counter_of_both_halves_is_readable_off_the_composed_row() -
     assert strategy.fallbacks_used == strategy.tool_results.fallbacks_used == 0
     assert strategy.fallbacks_after_record == strategy.tool_results.fallbacks_after_record == 0
     assert strategy.groups_kept_uncovered == strategy.tool_results.groups_kept_uncovered == 0
+    assert strategy.groups_preserved_uncovered == strategy.tool_results.groups_preserved_uncovered == 0
     assert strategy.user_compactions == strategy.user_turns.user_compactions == 1
     assert strategy.user_messages_replaced == strategy.user_turns.user_messages_replaced == 6
     assert strategy.user_summary_failures == strategy.user_turns.user_summary_failures == 0
@@ -1116,6 +1122,47 @@ async def test_every_counter_of_both_halves_is_readable_off_the_composed_row() -
     assert strategy.user_summary_tokens == strategy.user_turns.user_summary_tokens > 0
     assert strategy.user_folds == strategy.user_turns.user_folds == 0
     assert strategy.user_summaries_replayed == strategy.user_turns.user_summaries_replayed == 0
+
+
+async def test_the_composed_row_holds_what_its_record_missed_asks_again_and_then_preserves() -> None:
+    """Both layers run inside the composed row, through the same seam its own row uses.
+
+    The record phase is called through ``compact_against`` here rather than ``__call__``, so a
+    layer wired into the wrong one of the two would work on the single row and vanish on this
+    one. The trigger is set low so every pass reaches the chain: the user half fires on the
+    first pass and takes the prompt well under the shared line, and a chain that is judged by
+    the passes after its ask cannot be judged by passes that return at the trigger.
+
+    The held groups are tool groups marked under the record half's other reason, which the
+    user half neither reads nor moves, and the records stay where they were: what asking
+    needs -- the ask reaching the middleware -- is the wiring test in ``test_live``.
+    """
+    strategy = _composed(tool_results=_record_phase(trigger_fraction=0.1))
+    messages = _conversation(record=_covering_record(2))
+
+    assert await strategy(messages) is True
+
+    assert strategy.groups_kept_uncovered == 2
+    held = {
+        message.message_id
+        for message in messages
+        if is_preserved(message) and message.additional_properties.get(PRESERVE_REASON_KEY) == PRESERVE_REASON_UNCOVERED
+    }
+    assert held == {"c3", "r3", "c4", "r4"}, "the two groups the record never quoted, and only those"
+    assert strategy.tool_results.take_reforce() is True, "and the record phase asked for another record"
+    assert strategy.user_compactions == 1, "while the user half compacted its own half of the same pass"
+    assert "code_1=CODE-3 " in _rendered(messages) and "code_1=CODE-4 " in _rendered(messages)
+
+    await strategy(messages)
+    messages += _record_messages("nothing to add.", call_id="rec2")
+    await strategy(messages)
+
+    assert strategy.groups_preserved_uncovered == 2, "the re-forced record covered nothing, so layer two settled them"
+    assert strategy.tool_results.take_reforce() is False
+    assert find_record_index(messages) == len(messages) - 1, "the newest record is reachable where it was put"
+    preserved = {message.message_id for message in messages if is_preserved(message)}
+    assert preserved >= {"rec_call", "rec_res", "rec2_call", "rec2_res"}, "both records stay preserved"
+    assert "code_1=CODE-3 " in _rendered(messages) and "code_1=CODE-4 " in _rendered(messages), "still whole"
 
 
 def test_two_halves_measuring_against_two_ceilings_are_refused() -> None:

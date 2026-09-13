@@ -111,6 +111,41 @@ performs is licensed by the record, so trimming the record afterwards destroys t
 surviving copy of what was already deleted. Both halves therefore agree through
 :mod:`._preserve`: this strategy marks every record it observes, and the anchored strategy
 skips preserved messages in each of its three removal paths.
+
+**What the record failed to cover is held out of the fallback's reach too, and asked for
+again.** The coverage check keeps a group the record does not carry, and for a while that was
+the whole of it: the group stayed in the prompt as an ordinary tool group, and the fallback
+that runs when the prompt is still over the ceiling could then shorten or shed it like any
+other. That is a gap in the headline claim -- this row is supposed never to lose a fact -- and
+it is reachable whenever the fallback legitimately runs behind a partial record, which is not a
+one-model concern: gpt-5.4-mini's ``RECFALLBACK`` records sit at 0.89 to 0.955 of the billed
+ceiling and are genuine firings. Two layers now stand between an uncovered group and the
+fallback, in this order. First the
+strategy asks the middleware for another record while the group is still whole, and holds the
+group out of the fallback's reach until that record has had its chance --
+:meth:`ToolResultAnchoredSummarizationCompactionStrategy.take_reforce` is the channel, and the
+bound on asking again is stated on :meth:`ToolResultAnchoredSummarizationCompactionStrategy._reforce_or_settle`.
+Second, once asking has stopped working, the group is preserved for good under
+:data:`PRESERVE_REASON_UNCOVERED`, which the fallback honours exactly as it honours the record.
+A preserved group still counts against the ceiling, so the accepted consequence is a prompt
+that cannot be brought under it and a row that reads ``DQ``: loud, and preferable to the quiet
+loss it replaces. ``REFORCED`` and ``PRESERVED`` in the flags say which layer acted.
+
+**The evidence the two layers were commissioned on has been withdrawn, and they stand on the
+mechanism alone.** The brief was the archive: across the 58 records of ``tool_summary_anchored``
+in runs 41 to 48, the four that lost a fact all carried ``UNCOVERED`` beside ``RECFALLBACK``,
+and none of the 21 carrying either flag alone had lost one. That reading was right about the
+pair and wrong about the cause. The framework's compaction counter tokenises the encrypted
+reasoning payload gpt-5.6-luna returns on every call -- ``_serialize_content`` in
+``agent_framework._compaction`` drops ``raw_representation`` but not ``protected_data`` -- and
+base64 counts at about three times the rate of prose, so luna's local count ran 1.2 to 1.45
+times what the provider billed and the fallback fired at 0.61 to 0.64 of the billed ceiling
+where gpt-5.4-mini, which returns no such payload, fires at 0.93 to 0.95. On all four of those
+seeds the true prompt was at or under the ceiling and the fallback should not have run at all.
+So the four losses show what the gap does when it is reached and nothing about how often it is
+reached, and no clean measurement of that frequency exists yet. The earlier wording of this
+docstring, of the ``UNCOVERED`` and ``RECFALLBACK`` flag help and of the schema 13 note cited
+them as the frequency; that is stated here as withdrawn rather than silently reworded.
 """
 
 from __future__ import annotations
@@ -118,6 +153,7 @@ from __future__ import annotations
 import string
 from collections import Counter
 from collections.abc import Awaitable, Callable, Sequence
+from dataclasses import dataclass
 from math import ceil
 from typing import TYPE_CHECKING, Any, Final
 
@@ -132,7 +168,7 @@ from agent_framework._compaction import (
 )
 
 from ._anchored import AnchoredCompactionStrategy
-from ._preserve import any_preserved, set_preserved
+from ._preserve import PRESERVE_REASON_KEY, is_preserved, set_preserved
 
 if TYPE_CHECKING:
     from agent_framework import CompactionStrategy, TokenizerProtocol
@@ -143,6 +179,7 @@ __all__ = [
     "DEFAULT_RECORD_MAX_TOKENS",
     "DEFAULT_RECORD_TARGET_TOKENS",
     "DEFAULT_TRIGGER_FRACTION",
+    "PRESERVE_REASON_UNCOVERED",
     "RECALL_TOOL_NAME",
     "RECORD_MARKER",
     "RecallGate",
@@ -183,6 +220,33 @@ DEFAULT_RECORD_MAX_TOKENS: Final[int] = 4_000
 #: Reason recorded on the record's messages when this strategy protects them, so a caller
 #: reading a conversation back can tell which strategy claimed them.
 PRESERVE_REASON: Final[str] = "tool_summary_record"
+
+#: Reason recorded on a tool group this strategy holds out of its fallback's reach because no
+#: record has covered it yet, or ever will.
+#:
+#: Its own string rather than :data:`PRESERVE_REASON`, because the two marks are read
+#: differently on the next pass. A record stays preserved for the rest of the run. A held group
+#: is a candidate again the moment a later record quotes its values, and is released and dropped
+#: then -- which is the whole point of asking for that record. ``_drop_before`` tells the two
+#: apart by this string, and skips a group only when something *else* has claimed it.
+PRESERVE_REASON_UNCOVERED: Final[str] = "tool_summary_uncovered"
+
+#: Compaction passes a re-forced record is given to reach the history before the ask is judged
+#: to have failed.
+#:
+#: Two, and the number is the pipeline's shape rather than a patience setting. The ask is made
+#: on a pass; the middleware takes it on the exit of that pass's call and pins the call after
+#: it; that pinned call runs its own compaction pass before the model writes anything, which is
+#: the first pass after the ask and cannot see a record. The model's tool call is executed and
+#: the follow-up call carries its result, so the follow-up's pass -- the second -- is the first
+#: that can see the record, and a record not there by then was not written: the model ignored
+#: the pin, the provider cut the call, or the option was refused. Waiting longer would hold the
+#: groups out of the fallback's reach on the evidence of an ask that has already failed; waiting
+#: less would judge the ask on a pass that could not have seen its answer. A re-sent call adds a
+#: pass and can settle a group one call early, which errs towards preserving and costs nothing
+#: a later record cannot undo: a settled group that a record then quotes is released and
+#: dropped like any other.
+_REFORCE_ARRIVAL_PASSES: Final[int] = 2
 
 #: Share of a group's distinctive values the record must quote before the group may be dropped.
 #:
@@ -572,6 +636,46 @@ def _preserve_records(messages: list[Message]) -> int:
     return records
 
 
+def _claimed_elsewhere(messages: Sequence[Message]) -> bool:
+    """Return whether something other than this strategy's own hold protects any of ``messages``.
+
+    The hold this strategy puts on an uncovered group is the one preservation that must *not*
+    take the group out of the running: it is there so the fallback cannot shorten the group
+    while another record is asked for, and the record that then quotes the group's values has
+    to be able to release it and drop it. Every other reason -- a record's own mark, or one
+    another strategy left -- means the group is not this strategy's to decide about.
+
+    Args:
+        messages: One group's span.
+
+    Returns:
+        True when a member is preserved under any reason but :data:`PRESERVE_REASON_UNCOVERED`.
+    """
+    return any(
+        is_preserved(message) and message.additional_properties.get(PRESERVE_REASON_KEY) != PRESERVE_REASON_UNCOVERED
+        for message in messages
+    )
+
+
+@dataclass(slots=True)
+class _Reforce:
+    """One outstanding ask for another record, and what it is being judged against.
+
+    ``targets`` are the uncovered groups the ask was made for, so the next record can be read
+    for progress as "did any of these come back covered". ``records`` is how many records the
+    conversation held when the ask was made, so that record's arrival can be told from its
+    absence without trusting a message id. ``passes`` counts the passes since without one,
+    against :data:`_REFORCE_ARRIVAL_PASSES`. ``taken`` says the middleware has consumed the ask,
+    so a second call exit before the next pass -- a probe answered from a restored snapshot, for
+    one -- cannot pin a second call for the same ask.
+    """
+
+    targets: frozenset[str]
+    records: int
+    passes: int = 0
+    taken: bool = False
+
+
 def _droppable_groups_after(messages: list[Message], record_index: int | None) -> int:
     """Count the tool-call groups a record would be asked to cover.
 
@@ -772,6 +876,15 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
         # The group ids the most recent pass declined to drop, replaced rather than added to.
         # See :attr:`groups_kept_uncovered`.
         self._uncovered: set[str] = set()
+        # The ask for another record that is outstanding, if one is. See :meth:`take_reforce`.
+        self._reforce: _Reforce | None = None
+        # Group ids whose asking has ended -- uncovered still, after a record that covered none
+        # of them or after an ask that produced no record -- and which are preserved for good
+        # while they stay uncovered. Accumulated, because an ended chain must not restart.
+        self._settled: set[str] = set()
+        # The uncovered groups the most recent pass preserved for good, rebuilt every pass like
+        # ``_uncovered``. See :attr:`groups_preserved_uncovered`.
+        self._preserved: set[str] = set()
 
     @property
     def fallbacks_used(self) -> int:
@@ -886,8 +999,55 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
         :attr:`ToolResultRecallMiddleware.records_volunteered` had to be fixed: the same group
         is re-examined on every later compaction, and counting each look would report one
         uncovered group as eighteen.
+
+        Every group counted here is held out of the fallback's reach for as long as it is
+        counted, so beside ``RECFALLBACK`` it no longer means the fallback may have shortened
+        these groups. The four archived rows that carried the pair and lost a fact are since
+        attributed to a counting defect rather than to this gap -- see the module docstring.
+        Which of the two layers is holding a group is :attr:`groups_preserved_uncovered`.
         """
         return len(self._uncovered)
+
+    @property
+    def groups_preserved_uncovered(self) -> int:
+        """Uncovered tool groups preserved for good, as the conversation now stands: layer two.
+
+        Non-zero says asking for another record stopped helping -- the record it brought
+        covered none of these, or no record came -- and these groups are now held out of the
+        fallback's reach for the rest of the run, counted against the ceiling in full. Read it
+        beside ``UNCOVERED`` and ``REFORCED``: ``REFORCED`` without this is the re-force fixing
+        the shortfall; ``REFORCED`` with this equal to ``UNCOVERED`` is the re-force failing
+        and the preservation standing in; neither flag is a record that covered what it was
+        asked to. An ``UNCOVERED`` count larger than this is the difference still waiting on an
+        ask, which the run ended before it was answered.
+
+        The state as it now stands rather than a history of it, for the reason
+        :attr:`groups_kept_uncovered` is: a settled group a later record quotes is released and
+        dropped, and a count that kept reporting it would say the row was carrying a floor it
+        no longer carries.
+        """
+        return len(self._preserved)
+
+    def take_reforce(self) -> bool:
+        """Consume the outstanding ask for another record, if there is one.
+
+        Layer one's channel between the two halves, and the mirror of :meth:`RecallGate.take`
+        on the other side of the middleware. The strategy decides that a record is wanted, on
+        the pass that found groups its standing record does not cover; the middleware, which
+        holds no reference to the strategy and cannot read coverage, asks this on the exit of
+        every call it did not pin -- see :meth:`ToolResultRecallMiddleware._record_due` -- and
+        pins the next call when the answer is yes. One-shot for the reason the gate is: a call
+        exit that finds the ask already taken must not pin a second call for it, and a probe
+        answered from a restored snapshot is exactly such an exit.
+
+        Returns:
+            True once per ask, on the first call after the pass that made it.
+        """
+        request = self._reforce
+        if request is None or request.taken:
+            return False
+        request.taken = True
+        return True
 
     async def __call__(self, messages: list[Message]) -> bool:
         """Request a record, or drop what an existing record covers.
@@ -943,8 +1103,13 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
             #
             # The count comes back from the same walk. Taken as a maximum because this runs on
             # every later pass over the same conversation; see ``records_in_conversation``.
-            self._records_in_conversation = max(self._records_in_conversation, _preserve_records(messages))
+            records = _preserve_records(messages)
+            self._records_in_conversation = max(self._records_in_conversation, records)
             changed = self._drop_before(messages, anchor)
+            # Layer one and layer two, in that order, over what ``_drop_before`` has just found
+            # uncovered -- and before the fallback below, which is what both exist to keep away
+            # from those groups.
+            self._reforce_or_settle(records)
             # Even a good record may not be enough on its own: the groups after it are
             # untouched by design, and they can exceed the ceiling by themselves.
             if included_token_count(messages) > self.max_input_tokens:
@@ -1048,6 +1213,17 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
         earlier. The union is what the conversation actually still holds, so it is what the
         deletion is licensed against.
 
+        **An uncovered group is held, and a covered group that was held is released.** Keeping a
+        group is not enough on its own: the fallback that runs when the prompt is still over the
+        ceiling shortens and sheds ordinary tool groups, and an uncovered group used to be one.
+        So every group this method declines to delete is marked with
+        :data:`PRESERVE_REASON_UNCOVERED` on the same pass, before the fallback can see it, and a
+        group carrying that mark is still a candidate here -- :func:`_claimed_elsewhere` is what
+        skips a group, and it skips only marks that are not this one -- so the record asked for
+        on its behalf can cover it, at which point the mark comes off and the group is dropped
+        like any other. What becomes of a group no record ever covers is
+        :meth:`_reforce_or_settle`'s question, and it is answered after this method returns.
+
         Returns:
             True if anything was excluded.
         """
@@ -1070,10 +1246,12 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
                 # groups behind *it* -- the same loss this strategy exists to prevent, one
                 # level removed, and quieter, because the newer record looks like coverage.
                 continue
-            if any_preserved(messages[group["start_index"] : group["end_index"] + 1]):
+            if _claimed_elsewhere(messages[group["start_index"] : group["end_index"] + 1]):
                 # Something else has already declared this group irreplaceable. Not counted as
                 # uncovered: it was never a candidate for deletion, so reporting it would put a
-                # protected message in a diagnostic that means "the record fell short".
+                # protected message in a diagnostic that means "the record fell short". A hold
+                # of this strategy's own is not that: the group is a candidate still, so the
+                # record it was held for can release it -- see ``PRESERVE_REASON_UNCOVERED``.
                 continue
             candidates.append((
                 group,
@@ -1096,13 +1274,94 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
         # See ``groups_kept_uncovered``.
         uncovered: set[str] = set()
         for group, names, values in candidates:
+            members = messages[group["start_index"] : group["end_index"] + 1]
             if not self._is_covered(quoted, names=names, values=values, named=named):
                 uncovered.add(str(group["group_id"]))
+                # Held from the pass that finds it uncovered, not from the pass that gives up
+                # on it: the ask for another record is made now and answered two passes later,
+                # and the fallback can run in between. A group shortened while its record is
+                # in flight is a group that record can no longer quote. Re-applied every pass,
+                # as the record's own mark is, because annotations do not survive a reload. Not
+                # folded into ``changed``, for the reason the record's mark is not.
+                for message in members:
+                    set_preserved(message, preserved=True, reason=PRESERVE_REASON_UNCOVERED)
                 continue
-            for message in messages[group["start_index"] : group["end_index"] + 1]:
+            for message in members:
+                # A hold of ours, if any -- anything else's was skipped above. Released before
+                # the exclusion, so a covered group leaves no protection behind it for another
+                # strategy to trip over.
+                if is_preserved(message):
+                    set_preserved(message, preserved=False)
                 changed = set_excluded(message, excluded=True, reason="tool_summary_anchored") or changed
         self._uncovered = uncovered
         return changed
+
+    def _reforce_or_settle(self, records: int) -> None:
+        """Advance the ask for another record, and settle what asking has stopped helping.
+
+        Layer one and layer two of the uncovered-group defence, in that order, run once per
+        pass over what :meth:`_drop_before` has just found uncovered.
+
+        **Layer one asks while asking works.** An uncovered group that no ask is outstanding
+        for gets one: the middleware takes it through :meth:`take_reforce`, pins the next call,
+        and the record that call writes is read on the pass after -- :data:`_REFORCE_ARRIVAL_PASSES`
+        says why that is the second pass and not the third. The ask is judged on its targets:
+        if any of them came back covered the record helped, and whatever is still uncovered is
+        asked for again; if none did, or no record came at all, the targets still uncovered are
+        settled.
+
+        **The bound is progress, and it is a bound because groups are finite.** Every ask that
+        continues the chain has removed at least one group from it for good -- a covered group
+        is dropped, not re-examined -- and every ask that does not ends it, settling every
+        target it had. So each ask retires at least one group from ever being a target again,
+        the asks made over a run number at most the tool groups ever found uncovered, and a
+        shortfall a later record opens on new material gets its own chain on the same terms. A
+        fixed count of asks was rejected in both directions. One further ask is measured to be
+        enough on gpt-5.6-luna, whose record covers two of six groups and whose second covers
+        the rest: the repeat arms of runs 40 and 41 read ``UNCOVERED:0`` with two records on
+        every seed, where run 41's arm without repeats read ``UNCOVERED:3`` on two seeds of
+        five. A chain that stops on the first ask that helps nothing costs that model nothing.
+        Any larger constant is a constant number of pinned calls spent on a model that has
+        already shown it will not cover them, which is what run 40's gpt-5.4-mini repeat arm
+        looked like on two seeds of three: three records, and five to six groups still
+        uncovered.
+
+        **Layer two settles, and settled means preserved for good.** A settled group keeps the
+        hold layer one put on it for as long as it stays uncovered, and nothing here lifts it:
+        not the fallback, which honours the mark, and not a further ask, because the chain has
+        ended. The one thing that lifts it is a later record quoting its values, which is a
+        deletion the record licenses and not an escape. The prompt may then sit over the
+        ceiling with nothing left the fallback may take; the fallback stops there rather than
+        looping, the caller sends the prompt as it stands, and the row reads ``DQ``. That is the
+        accepted consequence, and it is not softened here.
+
+        Args:
+            records: How many records the conversation holds on this pass, from
+                :func:`_preserve_records`, so an arrival is a count that grew.
+        """
+        uncovered = self._uncovered
+        request = self._reforce
+        if request is not None:
+            if records > request.records:
+                # The record came. Progress is a target that is no longer uncovered; a record
+                # that covered none of them is the model declining, and the chain ends there.
+                if not request.targets - uncovered:
+                    self._settled |= request.targets & uncovered
+                self._reforce = None
+            else:
+                request.passes += 1
+                if request.passes >= _REFORCE_ARRIVAL_PASSES:
+                    # Nothing came by the pass that could have seen it: the model ignored the
+                    # pin, the call was cut, or the option was refused. Ended rather than
+                    # retried, because the bound has to hold against a model that declines
+                    # every time.
+                    self._settled |= request.targets & uncovered
+                    self._reforce = None
+        if self._reforce is None:
+            wanted = uncovered - self._settled
+            if wanted:
+                self._reforce = _Reforce(targets=frozenset(wanted), records=records)
+        self._preserved = uncovered & self._settled
 
     def _is_covered(self, quoted: set[str], *, names: set[str], values: set[str], named: set[str]) -> bool:
         """Return whether one group's contents demonstrably survive in the record.
@@ -1202,6 +1461,16 @@ class ToolResultRecallMiddleware(ChatMiddleware):
             none, since the head carries the task rather than tool work. Over-counting forces
             a record slightly early and costs an agent turn; under-counting would let a record
             be asked to cover more than the model will, which is the thing this prevents.
+        reforce: Asked on the exit of every call this middleware did not pin, and consumed by
+            the asking. True means the strategy has found tool groups its standing record does
+            not cover and wants another record for them before its fallback runs, and this
+            middleware then pins the next call whatever the other rules say. Wired to
+            :meth:`ToolResultAnchoredSummarizationCompactionStrategy.take_reforce`, and the
+            bound on how often it can say yes lives on that side; ``None`` leaves the strategy
+            to preserve those groups without asking. Independent of ``repeat_records`` on
+            purpose: that flag is off because a repeat on a complete record can only cost, and
+            this asks only on a measured shortfall, so it cannot fire on the case the flag
+            protects. :attr:`reforced_calls` counts the calls it pinned.
     """
 
     def __init__(
@@ -1214,6 +1483,7 @@ class ToolResultRecallMiddleware(ChatMiddleware):
         record_max_tokens: int | None = DEFAULT_RECORD_MAX_TOKENS,
         max_groups_before_record: int | None = None,
         repeat_records: bool = False,
+        reforce: Callable[[], bool] | None = None,
     ) -> None:
         """Validate and store the configuration.
 
@@ -1238,8 +1508,11 @@ class ToolResultRecallMiddleware(ChatMiddleware):
         self.record_max_tokens = record_max_tokens
         self.max_groups_before_record = max_groups_before_record
         self.repeat_records = repeat_records
+        self.reforce = reforce
         self._force_next = False
+        self._reforce_next = False
         self._forced = 0
+        self._reforced = 0
         self._records_forced = 0
         self._records_volunteered = 0
         self._records_truncated = 0
@@ -1261,12 +1534,25 @@ class ToolResultRecallMiddleware(ChatMiddleware):
         ask on the evidence of a turn that no longer exists.
         """
         self._force_next = False
+        self._reforce_next = False
         self._awaiting_record = False
 
     @property
     def forced_calls(self) -> int:
         """How many times the recall tool was forced. Zero means phase 1 never fired."""
         return self._forced
+
+    @property
+    def reforced_calls(self) -> int:
+        """Forced calls made at the strategy's request, for groups its standing record missed.
+
+        A subset of :attr:`forced_calls`, and layer one's count: each is one pinned call spent
+        asking for a record aimed at the groups the last one failed to cover. Zero on a run
+        whose records were complete, which is what makes the flag readable -- it appears only
+        where a shortfall was measured. Counted when the call is pinned rather than when the
+        ask is taken, so an ask a restored snapshot discarded is not reported as a call made.
+        """
+        return self._reforced
 
     @property
     def records_forced(self) -> int:
@@ -1355,6 +1641,9 @@ class ToolResultRecallMiddleware(ChatMiddleware):
             context.options = options
             self._force_next = False
             self._forced += 1
+            if self._reforce_next:
+                self._reforce_next = False
+                self._reforced += 1
 
         await call_next()
 
@@ -1403,6 +1692,9 @@ class ToolResultRecallMiddleware(ChatMiddleware):
         *pending* for the droppable tool work no record accounts for: the non-recall tool-call
         groups after the newest record, or all of them when there is no record yet. Then
 
+        - the strategy's own ask for another record, ``reforce``, pins whenever one is
+          outstanding, whatever else is true: it is made on a measured shortfall and bounded
+          where it is made, so nothing here needs to second-guess it;
         - the group bound asks whenever ``pending`` reaches ``max_groups_before_record``,
           whatever else is true, because setting that bound is asking for repeats outright;
         - the size trigger asks for the *first* record as soon as the prompt passes
@@ -1427,6 +1719,9 @@ class ToolResultRecallMiddleware(ChatMiddleware):
         Returns:
             True when the next call should be forced.
         """
+        if self.reforce is not None and self.reforce():
+            self._reforce_next = True
+            return True
         pending = _droppable_groups_after(messages, record_index)
         if self.max_groups_before_record is not None and pending >= self.max_groups_before_record:
             return True

@@ -945,6 +945,8 @@ def _seed_record(
         summarizer_failures=outcome.summarizer_failures,
         groups_kept_uncovered=outcome.groups_kept_uncovered,
         fallbacks_after_record=outcome.fallbacks_after_record,
+        reforced_calls=outcome.reforced_calls,
+        groups_preserved_uncovered=outcome.groups_preserved_uncovered,
         records_in_conversation=outcome.records_in_conversation,
         user_compactions=outcome.user_compactions,
         user_messages_replaced=outcome.user_messages_replaced,
@@ -1743,6 +1745,24 @@ def _sample_groups(samples: Sequence[Sequence[float]]) -> str:
     return "  ".join("[" + " ".join(f"{value:.0%}" for value in seed) + "]" for seed in samples if seed)
 
 
+def _facts_groups(records: Sequence[SeedRecord], total: int) -> str:
+    """Return each seed's surviving facts, for the block printed under the table.
+
+    The column is a mean over seeds, and on the record row the seeds do not spread around
+    it: a seed holds every fact or drops a whole group's worth, so a cell at 50/53 is four
+    seeds at 53 and one at 37 and no seed near 50. Printed for a row whose seeds disagree,
+    in the shape the acc blocks use, so the reader can see which seed it was.
+
+    Args:
+        records: The seeds, in the order they were recorded.
+        total: Facts the cell planted, so every reading is against one denominator.
+
+    Returns:
+        One bracketed group of per-seed counts, followed by the denominator.
+    """
+    return "[" + " ".join(str(record.facts_left) for record in records) + f"] of {total}"
+
+
 def _money(value: float | None) -> str:
     """Return a cost, or ``?`` when the records behind the row never measured it.
 
@@ -1978,7 +1998,13 @@ _LEGEND: Final[tuple[str, ...]] = (
     "            Scored against the snapshot, which is exactly the context every probe was",
     "            answered from. Scored against a closing prompt instead, this was circular:",
     "            each answer re-listed codes into the history, so a code compaction had",
-    "            destroyed came back because the model had recited it two questions earlier",
+    "            destroyed came back because the model had recited it two questions earlier.",
+    "            A mean over seeds, and where the seeds disagree it is a value no seed took:",
+    "            the record row's retention is a draw between every fact and a whole group's",
+    "            worth fewer, so 50/53 there is four seeds at 53 and one at 37. A row whose",
+    "            seeds disagree gets a per-seed line under the table, in the acc blocks'",
+    "            shape; a row whose seeds agree does not, because the column already says",
+    "            what every seed did",
     "lost      = compaction removed it, so the model could not use it  <- the damage",
     "nofetch   = the agent never called that tool, so the fact never entered the history at",
     "            all. Not compaction damage: an uncompacted run shows these too",
@@ -2048,15 +2074,27 @@ _LEGEND: Final[tuple[str, ...]] = (
     "            that record may cover only part of what it was asked to preserve and the",
     "            missing part is scored as compaction damage. UNCOVERED:<n> tool-call groups",
     "            the record never named, which the strategy therefore refused to delete. This",
-    "            is the coverage check holding the row back, and it is a cost rather than a",
+    "            is the coverage check holding the row back. Alone it is a cost rather than a",
     "            loss: those groups are still in the prompt, so the row paid for tokens a",
-    "            complete record would have replaced and lost nothing. Read it as how far the",
-    "            model fell short of what the recall tool asked for -- the record is required",
-    "            to group its content by the tool that produced it, so a tool it never names",
-    "            is a tool it did not account for. Before the check existed those groups were",
-    "            deleted anyway and the facts in them arrived in acc1 as compaction damage,",
-    "            with nothing in any column saying where they went. A row with UNCOVERED is",
-    "            not measuring this strategy working; it is measuring it declining to guess.",
+    "            complete record would have replaced and lost nothing -- five archived",
+    "            records carry it alone and every one held every fact. Beside RECFALLBACK it",
+    "            is the opposite. The check keeps an uncovered group but does not preserve",
+    "            it, so the fallback that runs when the prompt is still over the ceiling may",
+    "            shorten it in place or shed it whole like any other group in its band, and",
+    "            the four record rows in the archive that lost a fact all read UNCOVERED:4",
+    "            beside RECFALLBACK, while no record carrying either flag alone has lost",
+    "            one; three carrying both held, all at 60,000 tokens. Read the flag alone as",
+    "            a cost and the pair as where a loss can happen. Read the count as",
+    "            how far the model fell short of what the recall tool asked for -- the record",
+    "            is required to group its content by the tool that produced it, so a tool it",
+    "            never names is a tool it did not account for. Before the check existed those",
+    "            groups were deleted anyway and the facts in them arrived in acc1 as",
+    "            compaction damage, with nothing in any column saying where they went. A row",
+    "            with UNCOVERED alone is not measuring this strategy working; it is measuring",
+    "            it declining to guess, and a row with both is measuring the fallback",
+    "            deciding for it -- on a row written before schema 13; since then the check",
+    "            holds the group, see REFORCED and PRESERVED. The archived losses that",
+    "            reading rested on have been re-attributed, and that is stated under REFORCED.",
     "            USERCOMPACT:<n> passes where user_summary_anchored replaced a band of the",
     "            user's own turns with one summary of them, and USERREPLACED:<n> how many",
     "            turns the most recent of those passes stood in for. Read them together: the",
@@ -2117,6 +2155,33 @@ _LEGEND: Final[tuple[str, ...]] = (
     "            two halves had two lines -- the record half fires at the lower one and",
     "            holds the prompt below the higher one from before it is ever reached --",
     "            and a caller who sets them apart again is asking for that row back.",
+    "            REFORCED:<n> calls the recall middleware pinned at the strategy's own request,",
+    "            because the standing record left tool groups uncovered: layer one of the",
+    "            answer to the gap UNCOVERED beside RECFALLBACK names, where the fallback could",
+    "            shorten or shed the very groups the coverage check had kept. The gap is real",
+    "            whenever the fallback genuinely fires behind a partial record; what is",
+    "            withdrawn is the frequency the two entries above put on it. Their four",
+    "            archived losses are since attributed to the framework's compaction counter",
+    "            charging gpt-5.6-luna's encrypted reasoning payload as prompt text -- a local",
+    "            count 1.2 to 1.45 times the billed size, a fallback firing at 0.61 to 0.64 of",
+    "            the billed ceiling where gpt-5.4-mini fires at 0.93 to 0.95 -- so on all four",
+    "            the true prompt was under the ceiling and the fallback should not have run.",
+    "            How often a genuine firing reaches the gap has not been measured.",
+    "            The groups are held out of the fallback's reach from the pass that finds them,",
+    "            another record is asked for while they are still whole, and the ask repeats",
+    "            only while each record covers at least one of them. PRESERVED:<n> uncovered",
+    "            groups the strategy has preserved for good because asking stopped helping --",
+    "            the re-forced record covered none of them, or none came: layer two. Read the",
+    "            three together. REFORCED without PRESERVED is the re-force clearing the",
+    "            shortfall; REFORCED with PRESERVED equal to UNCOVERED is the re-force failing",
+    "            and the preservation standing in; UNCOVERED larger than PRESERVED is the",
+    "            difference still waiting on an ask when the run ended. A preserved group still",
+    "            counts against the ceiling and cannot be shed, so PRESERVED beside DQ is the",
+    "            row failing loudly where a row written before schema 13 could lose the",
+    "            group's values quietly; that is the intended reading, not a defect in the",
+    "            flag. From schema 13 on, UNCOVERED beside RECFALLBACK no longer means the",
+    "            fallback may have shortened those groups: it ran behind the record, over",
+    "            material other than the held groups.",
     "            FALLBACK:<n> times it gave up",
     "            and compacted another way. A row with",
     "            FALLBACK is measuring that other strategy, not the one named.",
@@ -2128,8 +2193,11 @@ _LEGEND: Final[tuple[str, ...]] = (
     "            a non-zero value here means part of what this row measured is the fallback",
     "            strategy and not the one named. It is the quieter of the two: the fallback",
     "            shortens tool results in place, so the row keeps its message count and loses",
-    "            its values, and beside UNCOVERED it is shortening exactly the groups the",
-    "            coverage check had just declined to delete. Uncounted until a seed reporting",
+    "            its values, and beside UNCOVERED it is shortening or shedding exactly the",
+    "            groups the coverage check had just declined to delete, which is the only way",
+    "            a record row in the archive has lost a fact: four times in the 58 records of",
+    "            runs 41 to 48, every one at UNCOVERED:4 -- a reading since withdrawn, see",
+    "            REFORCED below. Uncounted until a seed reporting",
     "            UNCOVERED:4 was measured losing the control's facts three messages shorter",
     "            and 16,617 tokens lighter, with no flag anywhere saying so. NO:<opt> the",
     "            provider rejected that option so it was dropped; a run that dropped",
@@ -2296,6 +2364,16 @@ def _render(
     lines += ["", "per-sample acc2, one group per seed:"]
     for cell in ordered:
         lines.append(f"  {cell.strategy:<28}{_sample_groups(cell.combined_samples)}")
+    # The facts column is a mean too, and where the seeds disagree the mean is a value no
+    # seed took: the record row's retention is a draw between every fact and a whole group
+    # fewer, so 50/53 there is four seeds at 53 and one at 37. Only the rows whose seeds
+    # disagree are printed -- a row at one value on every seed says so in the column already,
+    # and a block of those would bury the row this exists to expose.
+    divided = [cell for cell in ordered if len({record.facts_left for record in cell.records}) > 1]
+    if divided:
+        lines += ["", "per-seed facts, one reading per seed, rows whose seeds disagree only:"]
+        for cell in divided:
+            lines.append(f"  {cell.strategy:<28}{_facts_groups(cell.records, cell.facts_total)}")
     # The probe half is a draw between two values, so its column is a mean over a mixture and
     # the per-seed pairs are what say which seeds drew which -- and that the seeding half
     # beside them did not move with the draw.

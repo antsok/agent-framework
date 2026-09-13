@@ -1468,6 +1468,47 @@ So luna writes at great length about the first two lookups and never reaches the
 is a property of the model's writing, not of a setting, and no bound reachable from the CLI moved
 it.
 
+### Runs 41 to 48 -- the record row's retention is bimodal, 13 September
+
+Re-reading the archive after run 48 printed the record row at 50/53 on the cell where run 47 had
+printed 53/53. `tool_summary_anchored` has 58 records in runs 41 to 48 (47a included) and four of
+them lost facts:
+
+| run | seed | facts | flags | cell |
+| --- | ---: | ---: | --- | --- |
+| 43 | 3 | 21/53 | `UNCOVERED:4 RECFALLBACK:43` | 170,000/0.9, fixed payload |
+| 46 | 1 | 44/53 | `UNCOVERED:4 RECFALLBACK:8` | 300,000/0.9, scaled payload |
+| 46 | 5 | 44/53 | `UNCOVERED:4 RECFALLBACK:2` | 300,000/0.9, scaled payload |
+| 48 | 3 | 37/53 | `UNCOVERED:4 RECFALLBACK:3` | 170,000/0.9, scaled payload, recompact arm |
+
+Split by the two counters: neither, 30 records, none lost; `RECFALLBACK` alone, 16, none lost;
+`UNCOVERED` alone, 5, none lost; both, 7, four lost and three held -- the three at 60,000 tokens.
+**Every loss carries `UNCOVERED:4` beside `RECFALLBACK`, no record carrying either alone has lost
+a fact, and the pair is where a loss can happen rather than a loss in itself.** The mechanism is
+in the source: the coverage check keeps an uncovered group but does not preserve it, a kept group
+is why the prompt stays over the ceiling, and over the ceiling the fallback shortens and sheds
+every tool group in its band that is not a record -- the uncovered ones and the ones behind the
+record alike. `STATE.md` §3u has the budgets and the arithmetic of each loss.
+
+What this changes in the sections below, each marked in place:
+
+- **Run 41's "53/53 in all 25 rows" and run 42's "matches all 25 rows"** are 30 draws at 60,000
+  tokens, and 60,000 is not a floor: the fallback's budget behind the record there is 2,897 and
+  2,414 tokens against 3,500-token results, and driven offline it shortened one and lost three.
+- **Run 44's "retention survives to 100,000 and breaks after"** reads a threshold into five draws
+  that all carry `UNCOVERED:0`, where the pair could not occur.
+- **Run 43's 4 of 5** is the pair, and 32 lost facts is four whole eight-code groups.
+- **Runs 45 and 46's "three of five seeds keep every fact"** stands, and the other two are the
+  pair: the gate shutting is why the fallback ran, and the fallback is what took the nine facts.
+- **Run 47's "four rows keep every fact"** is, on the record row, five draws; run 48 on the same
+  cell drew 37/53 on one seed of five, and its section below did not say so.
+
+Seeds are not paired across runs -- the scenario salt carries a timestamp, so run 47's seed 3 and
+run 48's seed 3 share no codes -- and at 7% a record (14% from 100,000 tokens up) two five-seed
+runs of one cell disagree on "held every fact" about 42% (50%) of the time. A five-seed 53/53 on
+this row is a draw. The table now prints a per-seed `facts` line for any row whose seeds
+disagree, so a 50/53 that is four 53s and a 37 says so under the table.
+
 ### Run 47 -- all twenty at 170,000/0.9, and the two user-turn rows measured
 
 > **Correction, 13 September.** Two things in this section are withdrawn; the text is kept as
@@ -1493,6 +1534,10 @@ it.
 > the composition drew the low probe on any seed, so the other three `hit%` figures are honest. The
 > `boundary` and `fold` modes were built against the withdrawn measurement; the strict-prefix
 > argument for them stands on its own, and run 48 (next section) could not rank them.
+>
+> **Qualified, 13 September.** The record row's 53/53 is five draws of a row whose retention is
+> bimodal across the archive: run 48's recompact arm, the same cell, drew 37/53 on one seed of
+> five at `UNCOVERED:4 RECFALLBACK:3`. See the runs 41 to 48 section above this one.
 
 `gpt-5.6-luna` through the harness agent, 170,000-token window, 0.9 fill, the scaled payload --
 six results of ~15,125 tokens at a 60% tool share -- every registered strategy, five seeds, 100
@@ -1501,7 +1546,9 @@ across the run. It is the first archived cell to carry `user_summary_anchored` a
 `tool_and_user_summary_anchored` as they now stand -- the band share on, the composed row on its
 shared line -- and run 47a beside it in `runs/` is the aborted attempt that measured neither.
 
-**Four rows keep every fact, and one of them compacts to 30% of the window.**
+**Four rows keep every fact on all five seeds, and one of them compacts to 30% of the window.**
+On the record row that is a draw (qualification above); on the composed row it has since held
+on all 21 of its archived records.
 
 | row | `msgs` | `tok` left/peak | `snap%` | `hit%` | `seed$` | `seed$+-` | `summ$` | `vs none$` | facts | `acc1` |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -1578,7 +1625,10 @@ carries `tool_summary_anchored`, which does not read the mode. Two throttled cal
 arm's control, nothing else; fills -2.8% to -3.5%. The run was made to choose between the modes
 and **it cannot**, which is the result. Seeding-phase hit is `(cached - probe_cached) / (input -
 probe_input)` from the records; a low probe is a seed whose probe phase drew 33.3% (`STATE.md`
-§3t). Retention is 53/53 on every user-half row of every arm.
+§3t). Retention is 53/53 on every user-half row of every arm; the recompact arm's
+`tool_summary_anchored` row is not -- 37/53 on seed 3 (`-s2`, `UNCOVERED:4 RECFALLBACK:3`) and
+53/53 on the other four, printed as 50/53 at `acc1` 94% and `seed+-` 30pp -- the fourth archived
+loss on that row and the same flag pair as the other three (runs 41 to 48 section above).
 
 | arm | row | `snap%` | `hit%` | seeding hit | low probe | `seed$` | `seed$+-` | `vs none$` | user-half flags |
 | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
@@ -1684,7 +1734,11 @@ cached prefix; 22,000 tokens scattered through a 270,000-token conversation cann
 `--coverage-share 0.8` asks the record to quote 80% of every digit-bearing token in a group, and a
 26,814-token result holds the same eight planted codes among 7.7x more filler. The gate has no
 notion of result size and was calibrated when results were 3,500 tokens. It is the difference
-between -33% and +29%.
+between -33% and +29%. It is also the difference between 53 and 44: `UNCOVERED:4` sits beside
+`RECFALLBACK` on both failed seeds, the pair every archived loss on this row carries, because a
+group the gate keeps is not preserved and the fallback that runs over the ceiling shortens the
+band's results to fixed budgets -- the same nine facts on both seeds (runs 41 to 48 section
+above).
 
 **Two caveats, both mine.**
 
@@ -1752,6 +1806,11 @@ Retention survives to 100,000 and breaks after it; **cost degrades monotonically
 the whole way. Whatever case the strategy has, it is a small-window case, and nothing in the 60K
 work suggested where the edge was.
 
+**Qualified, 13 September.** The retention column of that series is a count of draws, not a
+property of the window: all five 100,000 records carry `UNCOVERED:0`, so the flag pair every
+archived loss carries could not occur here, and at the archive's per-record loss rate five clean
+draws happen about two times in three (runs 41 to 48 section above). The cost column stands.
+
 ### Run 43 -- 170,000 tokens at 0.9 fill, where the sizing stops holding
 
 All 18 strategies, `gpt-5.6-luna`, 170,000-token window, 0.9 fill, five seeds, 90 records, run one
@@ -1783,7 +1842,11 @@ not explain it: `r = -0.22`, the worst collapse sits at 86% fill and a clean 53 
 That bounds a claim this project has been making. At 60,000 tokens `tool_summary_anchored` held
 53/53 in **all 25 rows** of run 41 and in run 42. At 170,000 and 0.9 fill it holds 4 of 5 and
 costs **+113%** with a 92% spread, against -1% to -6% in the small cells. **Reliable retention was
-a property of the cells it was measured in, not of the strategy.**
+a property of the cells it was measured in, not of the strategy.** The lost seed reads
+`UNCOVERED:4 RECFALLBACK:43`, and 32 facts is four whole eight-code groups: with 3,500-token
+results the fallback's budget at this window is at least 6,998 at every band position, so
+nothing could be shortened and the shed phase took the oldest tool groups in the band, which are
+the four the record left uncovered (runs 41 to 48 section above).
 
 | strategy | snap% | `vs none$` | `seed$+-` | facts | acc1 |
 | --- | ---: | ---: | ---: | ---: | ---: |
@@ -1836,7 +1899,8 @@ is sent or what it writes. Facts and `acc1` are unaffected.
 | `sliding_window` | **8/53** | 17% |
 
 `tool_summary_anchored` is the only compacting strategy that retains everything, which matches all
-25 rows of run 41 on a field four times wider. `summarization` -- the ladder the framework leads
+25 rows of run 41 on a field four times wider -- five more draws at the same window, see the runs
+41 to 48 section above. `summarization` -- the ladder the framework leads
 with -- sits at 18/53, level with blind truncation.
 
 **Method note for the next run.** Concurrency has to be sized against strategies-per-invocation,
@@ -1880,6 +1944,10 @@ than across runs. **100 records, no throttling, retries or errors.** Not compara
 payloads, repeats on and off, coverage succeeding and failing, fallback firing and not. On the
 same conversations `anchored` reads 35-53 and `truncation` 21-45. No other strategy retains
 reliably, and this is the first run where that comparison is made inside single invocations.
+**Qualified, 13 September:** 25 draws at 60,000 tokens of a row that is bimodal across the
+archive, and 60,000 is not a floor -- the fallback can shorten a 3,500-token result behind the
+record there and did offline (runs 41 to 48 section above). Three of these 25 carry the flag
+pair every later loss carries, and held.
 
 **Cost still refuses to resolve.** Two arms name `tool_summary_anchored` and both print
 `NOT SUPPORTED` -- a 1% gap against a 36% spread, and 3% against 19%. Three arms name `none`. So
