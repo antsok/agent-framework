@@ -42,7 +42,7 @@ from agent_framework import (
     TruncationStrategy,
     UsageDetails,
 )
-from agent_framework._compaction import EXCLUDED_KEY
+from agent_framework._compaction import EXCLUDED_KEY, included_token_count
 from agent_framework_lab_cachebench import (
     AGENT_KINDS,
     FillPlan,
@@ -1655,6 +1655,10 @@ async def test_the_recall_middleware_is_wired_for_the_composed_strategy(monkeypa
         "the ask and the wait are one setting, and a composed row must not split them"
     )
     assert middleware[0].max_input_tokens == nested.max_input_tokens
+    assert middleware[0].reforce == nested.take_reforce, (
+        "the record phase's ask for another record has to reach the middleware, or a composed row's "
+        "uncovered groups go straight to preservation with no re-force ever made"
+    )
 
 
 async def test_a_row_with_no_record_strategy_in_it_still_gets_no_middleware(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1713,6 +1717,10 @@ async def test_both_halves_counters_are_read_off_the_composed_rows_own_parts(
         def fallbacks_after_record(self) -> int:
             return 1
 
+        @property
+        def groups_preserved_uncovered(self) -> int:
+            return 2
+
     class _CountedUserPhase(UserTurnAnchoredSummarizationCompactionStrategy):
         @property
         def user_compactions(self) -> int:
@@ -1751,6 +1759,7 @@ async def test_both_halves_counters_are_read_off_the_composed_rows_own_parts(
 
     assert (outcome.records_in_conversation, outcome.groups_kept_uncovered) == (2, 3), "the record half"
     assert outcome.fallbacks_after_record == 1
+    assert outcome.groups_preserved_uncovered == 2, "and the groups it preserved, read off the same part"
     assert (outcome.user_compactions, outcome.user_messages_replaced) == (4, 11), "and the user half"
     assert (outcome.user_summaries_in_conversation, outcome.user_summary_tokens, outcome.user_folds) == (5, 777, 2), (
         "and the floor and the folds the boundary modes added, read off the same part"
@@ -4087,6 +4096,52 @@ async def test_a_row_that_cannot_split_shows_its_whole_run_hit_rate_alone() -> N
     assert re.search(r"\s0\.0%\s+n/a\s+0\.0%\s", zero), zero
 
 
+async def test_a_row_whose_seeds_disagree_on_facts_gets_a_per_seed_line() -> None:
+    """The facts column is a mean, and on the record row the mean is a value no seed took.
+
+    Run 48's recompact arm printed the record row at 50/53 -- four seeds at 53 and one at 37 --
+    where the column reads as uniform mild loss. The line under the table is what says which
+    it was, and it is printed only for rows whose seeds disagree, so the control, which held
+    on every seed, gets no line and the block does not grow for nothing.
+    """
+    outcome, scenario = await _probed(StubChatClient(usage=UsageDetails(input_token_count=1_000)), repeats=1)
+    base = _record(outcome, scenario)
+    total = base.facts_total
+    assert total >= 2, "the scenario has to plant enough facts for one seed to lose some"
+    held = [replace(base, seed=seed, facts_left=total) for seed in range(1, 6)]
+    divided = [
+        replace(record, strategy="tool_summary_anchored", facts_left=total - 1 if record.seed == 3 else total)
+        for record in held
+    ]
+    cells = [_aggregate("none", held), _aggregate("tool_summary_anchored", divided)]
+
+    table = _render(None, cells, set(), show_answers=False)
+
+    heading = "per-seed facts, one reading per seed, rows whose seeds disagree only:"
+    assert heading in table
+    lines = table.splitlines()
+    start = lines.index(heading) + 1
+    block = lines[start : next(index for index in range(start, len(lines)) if not lines[index].strip())]
+    assert block == [f"  {'tool_summary_anchored':<28}[{total} {total} {total - 1} {total} {total}] of {total}"], block
+    assert not any(line.strip().startswith("none") for line in block), "a row whose seeds agree gets no line"
+
+
+async def test_rows_whose_seeds_agree_on_facts_print_no_per_seed_block() -> None:
+    """A cell where every row held on every seed says so in the column, and nowhere else."""
+    outcome, scenario = await _probed(StubChatClient(usage=UsageDetails(input_token_count=1_000)), repeats=1)
+    base = _record(outcome, scenario)
+    total = base.facts_total
+    cells = [
+        _aggregate(name, [replace(base, strategy=name, seed=seed, facts_left=left) for seed in range(1, 4)])
+        for name, left in (("none", total), ("truncation", max(total - 1, 0)))
+    ]
+
+    table = _render(None, cells, set(), show_answers=False)
+
+    assert "per-seed facts" not in table
+    assert "per-sample acc2, one group per seed:" in table, "the neighbouring blocks are unaffected"
+
+
 async def test_the_cross_cell_report_carries_both_hit_rates(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     """A row compared on cache anywhere is shown its seeding half, with the probe half beside it.
 
@@ -4510,6 +4565,8 @@ def test_the_two_accuracy_measures_are_named_acc1_and_acc2() -> None:
         summarizer_failures=0,
         groups_kept_uncovered=0,
         fallbacks_after_record=0,
+        reforced_calls=0,
+        groups_preserved_uncovered=0,
         records_in_conversation=0,
         user_compactions=0,
         user_messages_replaced=0,
@@ -4718,6 +4775,8 @@ def _control_cell(seeded: int) -> dict[str, CellStats]:
         summarizer_failures=0,
         groups_kept_uncovered=0,
         fallbacks_after_record=0,
+        reforced_calls=0,
+        groups_preserved_uncovered=0,
         records_in_conversation=0,
         user_compactions=0,
         user_messages_replaced=0,
@@ -5025,7 +5084,7 @@ async def test_a_run_that_was_not_cut_short_says_nothing() -> None:
 _RECORD_CEILING = 22_000
 
 
-def _tool_conversation(tool_turns: int, *, covered: int) -> list[Message]:
+def _tool_conversation(tool_turns: int, *, covered: int, trailing: int = 0) -> list[Message]:
     """Return a conversation whose recall record names only the first ``covered`` tools.
 
     The live benchmark's own shape: one no-argument tool per scope, named ``lookup_<n>``, so a
@@ -5034,23 +5093,27 @@ def _tool_conversation(tool_turns: int, *, covered: int) -> list[Message]:
     fixture calling a single tool repeatedly would exercise only the degenerate case.
 
     Args:
-        tool_turns: How many lookup turns to generate.
+        tool_turns: How many lookup turns to generate in front of the record.
 
     Keyword Args:
         covered: How many of them the record names. Fewer than ``tool_turns`` is the measured
             shape of a model that named some tools and stopped.
+        trailing: Lookup turns appended *after* the record, numbered on from the last. Material
+            no record was asked to cover, and so the only material the fallback may still work
+            on now that the groups a record failed to cover are held out of its reach.
 
     Returns:
-        The messages, the record last.
+        The messages, the record after the first ``tool_turns`` of them.
     """
     messages = [
         Message(role="system", contents=["You are an assistant."], message_id="sys"),
         Message(role="user", contents=["Requirement: region is EU-WEST-1."], message_id="u0"),
         Message(role="assistant", contents=["Understood."], message_id="a0"),
     ]
-    for index in range(tool_turns):
+
+    def _turn(index: int) -> list[Message]:
         call_id = f"call_{index}"
-        messages += [
+        return [
             Message(role="user", contents=[f"Look up {index}."], message_id=f"u_{index}"),
             Message(
                 role="assistant",
@@ -5073,9 +5136,11 @@ def _tool_conversation(tool_turns: int, *, covered: int) -> list[Message]:
                 message_id=f"t_res_{index}",
             ),
         ]
+
+    for index in range(tool_turns):
+        messages += _turn(index)
     values = " ".join(f"lookup_{index}: CODE-{index}." for index in range(covered))
-    return [
-        *messages,
+    messages += [
         Message(
             role="assistant",
             contents=[{"type": "function_call", "call_id": "rec", "name": RECALL_TOOL_NAME, "arguments": "{}"}],
@@ -5087,6 +5152,9 @@ def _tool_conversation(tool_turns: int, *, covered: int) -> list[Message]:
             message_id="rec_res",
         ),
     ]
+    for index in range(tool_turns, tool_turns + trailing):
+        messages += _turn(index)
+    return messages
 
 
 async def test_groups_a_record_never_named_reach_the_seed_record_and_the_flags_column() -> None:
@@ -5156,13 +5224,25 @@ async def test_a_fallback_taken_behind_a_record_reaches_the_seed_record_and_the_
     So the count has to travel from the strategy through the outcome and the seed record to
     the column a reader looks at, which is the same four handoffs UNCOVERED makes and the same
     four places to lose it.
+
+    The groups the coverage check declines to delete are now held out of the fallback's reach,
+    so the material the fallback works on here trails the record: with nothing but held groups
+    in front of it the fallback takes nothing and the count, rightly, stays at zero.
     """
     strategy = ToolResultAnchoredSummarizationCompactionStrategy(
         max_input_tokens=500, tokenizer=TOKENIZER, trigger_fraction=0.1, fallback_fraction=0.9
     )
+    messages = _tool_conversation(4, covered=2, trailing=4)
 
-    assert await strategy(_tool_conversation(6, covered=2)) is True
+    assert await strategy(messages) is True
     assert strategy.fallbacks_after_record == 1
+    assert strategy.groups_kept_uncovered == 2
+    assert all(
+        f"CODE-{index}" in "".join(str(content.result) for content in message.contents)
+        for index in (2, 3)
+        for message in messages
+        if message.message_id == f"t_res_{index}"
+    ), "the fallback ran behind the record and left the two held groups whole"
     assert strategy.fallbacks_used == 0, "the give-up path is a different event and must stay at zero"
 
     notes = _strategy_notes(strategy)
@@ -5258,6 +5338,194 @@ async def test_the_post_record_fallback_count_survives_the_file_and_an_older_rec
     older["schema"] = SCHEMA_VERSION - 1
 
     assert SeedRecord.from_dict(older).fallbacks_after_record is None, "an uncounted fallback is not a fallback of zero"
+
+
+async def test_both_layers_reach_the_seed_record_the_file_and_the_flags_column(tmp_path: Path) -> None:
+    """A reader of an archived row has to be able to tell which layer acted, and from the row alone.
+
+    Three readings, and the flags have to separate them: ``REFORCED`` without ``PRESERVED`` is
+    the re-force clearing the shortfall, ``REFORCED`` with ``PRESERVED`` equal to ``UNCOVERED``
+    is the re-force failing and the preservation standing in, and neither is a complete
+    record. Both counts travel the four handoffs ``groups_kept_uncovered`` travels -- strategy,
+    outcome, seed record, column -- and both read back as zero from a record written before
+    they existed, because zero is what those runs did.
+    """
+    strategy = ToolResultAnchoredSummarizationCompactionStrategy(
+        max_input_tokens=20_000, tokenizer=TOKENIZER, trigger_fraction=0.1
+    )
+    messages = _tool_conversation(6, covered=2)
+
+    await strategy(messages)
+    assert strategy.take_reforce() is True, "the ask the middleware would have taken"
+    await strategy(messages)
+    await strategy(messages)
+
+    assert strategy.groups_preserved_uncovered == 4, "no record came, so the four were preserved"
+    notes = _strategy_notes(strategy)
+    assert "PRESERVED:4" in notes and "UNCOVERED:4" in notes
+
+    outcome, scenario = await _probed(StubChatClient(usage=UsageDetails(input_token_count=1_000)), repeats=1)
+    record = _record(
+        replace(
+            outcome,
+            strategy_notes=(*notes, "REFORCED:1"),
+            reforced_calls=1,
+            groups_preserved_uncovered=strategy.groups_preserved_uncovered,
+        ),
+        scenario,
+        strategy="tool_summary_anchored",
+    )
+
+    assert (record.reforced_calls, record.groups_preserved_uncovered) == (1, 4), "both must survive scoring"
+    cell = _aggregate("tool_summary_anchored", [record])
+    flags = _flags(cell, None)
+    assert "REFORCED:1" in flags and "PRESERVED:4" in flags
+    table = _render(None, [cell], set(), show_answers=False)
+    assert "REFORCED:1" in table and "PRESERVED:4" in table
+
+    path = tmp_path / "results.jsonl"
+    append_seed_record(path, record)
+    (read_back,) = read_seed_records(path)
+    assert (read_back.reforced_calls, read_back.groups_preserved_uncovered) == (1, 4)
+    assert read_back.schema == SCHEMA_VERSION
+
+    older = {
+        key: value
+        for key, value in record.to_dict().items()
+        if key not in {"reforced_calls", "groups_preserved_uncovered"}
+    }
+    older["schema"] = SCHEMA_VERSION - 1
+    old = SeedRecord.from_dict(older)
+    assert (old.reforced_calls, old.groups_preserved_uncovered) == (0, 0), "a run that could do neither did neither"
+
+
+async def test_a_run_whose_records_were_complete_carries_neither_layers_flag() -> None:
+    """Both flags have to be silent on the good case, or the column stops being read."""
+    strategy = ToolResultAnchoredSummarizationCompactionStrategy(max_input_tokens=_RECORD_CEILING, tokenizer=TOKENIZER)
+
+    assert await strategy(_tool_conversation(8, covered=8)) is True
+    assert strategy.take_reforce() is False, "a complete record asks for nothing"
+    assert not [note for note in _strategy_notes(strategy) if note.startswith(("PRESERVED", "REFORCED"))]
+
+    outcome, scenario = await _probed(StubChatClient(usage=UsageDetails(input_token_count=1_000)), repeats=1)
+    record = _record(outcome, scenario, strategy="tool_summary_anchored")
+
+    assert (record.reforced_calls, record.groups_preserved_uncovered) == (0, 0)
+    assert not [flag for flag in _flags(_aggregate("tool_summary_anchored", [record]), None) if "PRESERVED" in flag]
+
+
+class _StubbornRecordStub(StubChatClient):
+    """A model that obeys every pin but whose every record quotes the first tool result it ever saw.
+
+    The shape that defeats layer one: the re-forced record covers nothing the first did not,
+    so the chain ends on its first ask and layer two has to stand in. It bills the prompt at
+    the size compaction left it, read off the same annotations the strategy wrote, so that a
+    prompt the strategy could not bring under the ceiling is billed as one.
+    """
+
+    def __init__(self, **kwargs: Any) -> None:
+        """Create the stub, obeying pins so the lookups and the records are all made."""
+        super().__init__(obey_tool_choice=True, **kwargs)
+        self.first_result: str | None = None
+        self.records = 0
+
+    def _inner_get_response(
+        self,
+        *,
+        messages: Sequence[Message],
+        stream: bool,
+        options: Mapping[str, Any],
+        **kwargs: Any,
+    ) -> Any:
+        if self.first_result is None:
+            self.first_result = next(
+                (
+                    str(content.result)
+                    for message in messages
+                    for content in message.contents
+                    if content.type == "function_result"
+                ),
+                None,
+            )
+        self.usage = UsageDetails(input_token_count=included_token_count(list(messages)))
+        choice = options.get("tool_choice")
+        pinned = choice.get("required_function_name") if isinstance(choice, Mapping) else None
+        if pinned != RECALL_TOOL_NAME:
+            return super()._inner_get_response(messages=messages, stream=stream, options=options, **kwargs)
+        self.seen.append(len(messages))
+        self.options_seen.append(dict(options))
+        self.records += 1
+
+        async def _go() -> ChatResponse[Any]:
+            return ChatResponse(
+                messages=Message(
+                    role="assistant",
+                    contents=[
+                        Content.from_function_call(
+                            call_id=f"call_record_{self.records}",
+                            name=RECALL_TOOL_NAME,
+                            arguments=json.dumps({"values": self.first_result or ""}),
+                        )
+                    ],
+                ),
+                usage_details=self.usage,
+            )
+
+        return _go()
+
+
+async def test_a_shortfall_the_re_force_cannot_clear_ends_in_a_disqualified_row_and_not_a_lost_fact() -> None:
+    """The accepted consequence, end to end: the row fails loudly where it used to lose quietly.
+
+    Driven through the real pipeline, because every piece of this is an ordering question
+    between layers a mock would skip: the strategy holds the groups on the pass that finds them
+    uncovered, the middleware takes the ask on that call's exit and pins the next call, the
+    model's second record covers nothing new, the strategy settles the groups, and from then
+    on the fallback may take everything but them -- which is not enough. The prompt goes out
+    over the window it stands in for, the billed peak says so, and the row reads ``DQ`` with
+    ``REFORCED`` and ``PRESERVED`` beside it. What it does not read is a lost fact: every value
+    in a held group is in the snapshot verbatim.
+
+    **Sized deliberately, and the premises are asserted.** The window is small and the results
+    are sized so the record is asked for and arrives before the give-up line -- a fixture that
+    crossed that line first would be measuring the pre-record fallback -- and so that the held
+    groups plus the anchors exceed the window on their own. The two lookups whose pins the two
+    record calls took are scored as never fetched, which is the price of a pinned call and not
+    compaction damage.
+    """
+    window = 12_000
+    scenario = build_live_scenario(salt="dq", filler_turns=6, filler_tokens=50, tool_turns=6)
+    client = _StubbornRecordStub()
+
+    outcome = await run_live(
+        ProviderRuntime(client=client, model="stub"),
+        strategy_name="tool_summary_anchored",
+        options=StrategyOptions(tokenizer=TOKENIZER, max_context_window_tokens=window, max_output_tokens=512),
+        scenario=scenario,
+        tool_result_tokens=800,
+        probe_repeats=1,
+    )
+
+    assert outcome.error is None
+    assert client.records == 2, "one record asked for by size, one re-forced for the shortfall, and no third"
+    assert outcome.reforced_calls == 1 and "REFORCED:1" in outcome.strategy_notes, "layer one acted"
+    assert outcome.groups_kept_uncovered == outcome.groups_preserved_uncovered > 0, "and failed, so layer two did"
+    assert f"PRESERVED:{outcome.groups_preserved_uncovered}" in outcome.strategy_notes
+    assert outcome.fallbacks_after_record > 0, "the fallback ran behind the record, over everything but the held groups"
+    assert not [note for note in outcome.strategy_notes if note.startswith("FALLBACK:")], (
+        "the record arrived before the give-up line, so the pre-record fallback never ran"
+    )
+    assert outcome.disqualified(window), "the held groups cannot be shed, so the prompt went out over the window"
+
+    quoted = client.first_result or ""
+    for scope, codes in scenario.tool_lookups.items():
+        if scope in outcome.scopes_called and not all(code in quoted for code in codes):
+            assert all(code in outcome.snapshot_prompt for code in codes), f"{scope} was held, and must be whole"
+
+    record = _record(outcome, scenario, cell=_cell_params(context_window=window), strategy="tool_summary_anchored")
+    assert record.disqualified and record.facts_lost == 0
+    row = _row(_aggregate("tool_summary_anchored", [record]), None, excluded=False, limit=window)
+    assert "DQ" in row and "REFORCED:1" in row and f"PRESERVED:{outcome.groups_preserved_uncovered}" in row
 
 
 #: A ceiling that leaves the two-record fixture between the strategy's thresholds, chosen the
@@ -6022,6 +6290,8 @@ def test_a_progress_line_shows_what_a_watcher_needs() -> None:
         summarizer_failures=0,
         groups_kept_uncovered=0,
         fallbacks_after_record=0,
+        reforced_calls=0,
+        groups_preserved_uncovered=0,
         records_in_conversation=0,
         user_compactions=0,
         user_messages_replaced=0,

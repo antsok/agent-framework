@@ -373,7 +373,11 @@ none                    37/37   50,914/50,914    84%     30 1,020,578   94%  13,
 That is a strategy that kept every fact, removed about a third of the control's snapshot, and came
 in 3% under it on cost — and the run's own verdict line reads `NOT SUPPORTED`, because 3% is
 inside a 19% seed spread. Reading the columns in order is how you arrive at that rather than at
-"-3%".
+"-3%". Its flags carry `UNCOVERED:3` beside `RECFALLBACK:1` — the pair under which every archived
+loss on this row has happened; it held here, three of seven such records did, and the four that
+did not are in `RESULTS.md` (runs 41 to 48). Reading the flags is how you know a 53/53 was a
+draw and not a property, and a row whose seeds disagree on `facts` gets its own line under the
+table.
 
 The tool prints the full legend under every table; this is the short form.
 
@@ -394,7 +398,7 @@ The tool prints the full legend under every table; this is the short form.
 | `seed$+-` | spread between the cheapest and dearest seed, on `seed$`. **A gap smaller than this is not a result.** `0%` with one seed means stability is unknown, not that it is stable |
 | `summ$` | what this strategy's own summarization calls cost, of `seed$` |
 | `vs none$` | `seed$` against the control's. `?` means the comparison is unavailable |
-| `facts` | planted facts surviving compaction into the snapshot: recall's ceiling, scored against exactly the context every probe was answered from |
+| `facts` | planted facts surviving compaction into the snapshot: recall's ceiling, scored against exactly the context every probe was answered from. A mean over seeds; a row whose seeds disagree gets a per-seed line under the table, because 50/53 on the record row is four seeds at 53 and one at 37 |
 | `lost` | compaction removed it, so the model could not use it — **the damage** |
 | `nofetch` | the agent never called that tool, so the fact never entered the history. Not compaction damage; an uncompacted run shows these too |
 | `ignored` | still in the snapshot but unused: the model's failing, not compaction's |
@@ -435,9 +439,9 @@ the money columns.
 | `RECORDS:<n>` | how many records the conversation ended up carrying. Every record is preserved — unshrinkable, undroppable, never merged — so each one raises a floor under the prompt that no later pass can lower, and a row above 1 has money columns that are partly that floor rather than the workload |
 | `FORCED:<n>` | how many times a record was asked for. One record per ask is the mechanism working; more records than asks is a defect, and it was one |
 | `TRUNCATED:<n>` | forced calls the provider cut at `--record-max-tokens`, so that record may cover only part of what it was asked to preserve, and the missing part is scored as compaction damage |
-| `UNCOVERED:<n>` | tool-call groups the record never named, which the strategy therefore refused to delete. **A cost rather than a loss**: those groups are still in the prompt, so the row paid for tokens a complete record would have replaced and lost nothing. A row with `UNCOVERED` is not measuring this strategy working; it is measuring it declining to guess |
+| `UNCOVERED:<n>` | tool-call groups the record never named, which the strategy therefore refused to delete. **Alone, a cost rather than a loss**: those groups are still in the prompt, so the row paid for tokens a complete record would have replaced and lost nothing. **Beside `RECFALLBACK`, the opposite**: a kept group is not preserved, and the fallback that runs when the record leaves the prompt over the ceiling shortens and sheds the band's tool groups — every archived loss on this row reads `UNCOVERED:4` with `RECFALLBACK`, and none reads either alone. A row with `UNCOVERED` alone is measuring the strategy declining to guess; a row with both is measuring the fallback deciding for it |
 | `FALLBACK:<n>` | times it gave up and compacted another way. **A row with this is measuring that other strategy, not the one named** |
-| `RECFALLBACK:<n>` | passes where a record did exist, was anchored on, and the row still fell back — what the record freed left the prompt over the ceiling. The quieter of the two: the fallback shortens tool results in place, so the row keeps its message count and loses its values |
+| `RECFALLBACK:<n>` | passes where a record did exist, was anchored on, and the row still fell back — what the record freed left the prompt over the ceiling. The quieter of the two: the fallback shortens tool results in place, so the row keeps its message count and loses its values — and beside `UNCOVERED` it is the only way this row has lost a fact in the archive |
 | `NOGAIN:<n>` | collapses `anchored_min_gain` declined as below its break-even floor. Distinguishes "never fired" from "fired to no effect" |
 | `USERCOMPACT:<n>` | passes where `user_summary_anchored` replaced a band of the user's own turns with one summary of them. Every pass re-bills the prompt from its edit to the end, and where that edit lands is `--user-summary-mode`: in the `recompact` mode above 1 is the strategy rewriting its own earlier summary just behind the head, and in the `boundary` and `fold` modes the earlier summary stands and the edit lands only on the turns newer than it. `USERCOMPACT:0` is the uncompacted control under another name, and exactly one of the next three says why |
 | `USERREPLACED:<n>` | turns the most recent of those passes stands in for — how much of the conversation the row carries as a summary rather than verbatim, which is what moved `snap%` |

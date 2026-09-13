@@ -279,7 +279,14 @@ older record is the sole account of the groups behind *it*.
 that matched the control on both. Run 41, on the same conversations as `anchored` and
 `truncation` inside single invocations: **53/53 in all 25 rows** — two models, two payloads,
 repeats on and off, coverage succeeding and failing, fallback firing and not — where `anchored`
-read 35 to 53 and `truncation` 21 to 45.
+read 35 to 53 and `truncation` 21 to 45. **Qualified 13 September:** those are 30 draws at
+60,000 tokens of a row that is bimodal across the archive. Runs 41 to 48 hold 58 records of it
+and four lost 16 to 32 facts, every one at `UNCOVERED:4` beside `RECFALLBACK` and none with
+either flag alone: a group the coverage check keeps is not preserved, so when the record leaves
+the prompt over the ceiling the fallback shortens and sheds the band's tool groups, uncovered
+and behind-the-record alike. What it buys is retention on a conversation the record covers,
+and a five-seed 53/53 is a draw whose complement is a whole group's worth of facts
+(`STATE.md` §3u, `RESULTS.md` runs 41 to 48).
 
 **What it does not buy is money.** Two run-41 arms named it at -1% and -3% against not
 compacting and the instrument printed `NOT SUPPORTED` on both; three arms named `none`, and on
@@ -428,8 +435,9 @@ different summaries on consecutive calls. Both rows drew the high probe on every
 whole-run figure is honest here. What it did not answer is money. `seed$` $0.1471
 against the control's $0.1113, `vs none$` +32%, of which the summarizer is $0.0118; the row's own
 seeds spread 24% and the control's 19%. That +32% is the one figure among the three compacting
-rows that keep every fact which clears the instrument's rule — a gap wider than either row's
-spread — and every seed is dearer than its control, +23% to +45%. So the direction is supported
+rows that kept every fact in run 47 (the record row has since drawn 37/53 on this cell, in run
+48) which clears the instrument's rule — a gap wider than either row's spread — and every seed
+is dearer than its control, +23% to +45%. So the direction is supported
 and the size is not: five seeds do not say whether the penalty is a quarter or a half, and it is
 not to be quoted as either. One seed of the five seeded 10.2% under target and is in the
 aggregate; without it the control's spread falls from 19% to 4% and this row's from 24% to 15%,
@@ -523,6 +531,10 @@ aborted attempt at the two-line row, kept as evidence of what the shared line re
 reach below either alone, and this is the deepest-compacting row in the cell that loses nothing:
 `facts` 53/53 and `acc1` 100% on every seed, with an agent turn and a summarizer both in the
 loop, where every row below it in `snap%` lost 33 to 45 facts and landed between 17% and 38%.
+That has held on all 21 of the row's archived records (runs 47, 47a and 48), one of them at
+`UNCOVERED:4 RECFALLBACK:1`; its record half alone is the row that has lost facts under that
+pair, four times in 58 records, so read the 53/53 as 21 draws and the flags as the place to
+look (`STATE.md` §3u).
 The user half fired `USERCOMPACT` 4 to 7 a run — about three crossings, the counter being
 double-counted until `8c463f0e7` — against `USERHELD` 2 to 4, the newest summary standing for 8 to
 16 turns — the record half's removal leaves the band a larger share of what remains, so the share

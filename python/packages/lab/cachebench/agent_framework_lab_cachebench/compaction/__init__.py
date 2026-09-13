@@ -45,7 +45,11 @@ What is here:
 - :func:`set_preserved` and :func:`is_preserved` carry one annotation between the two: a
   message no strategy may shorten, drop or shed. It exists because the record is a tool
   result, the anchored strategy trims tool results, and for a while it trimmed the record --
-  destroying the only surviving copy of everything the other strategy had just deleted.
+  destroying the only surviving copy of everything the other strategy had just deleted. The
+  record strategy puts the same mark, under :data:`PRESERVE_REASON_UNCOVERED`, on a tool group
+  its record failed to cover: first while it asks for another record to cover it, then for
+  good if asking stops helping, so the fallback can shorten neither and the row overflows
+  loudly rather than losing the group's values quietly.
 
 **This depends on ``agent_framework._compaction``, which is private API.** Grouping, token
 annotation and the exclusion flags all come from there; nothing public exposes them. That
@@ -88,6 +92,7 @@ from ._toolsummary import (
     DEFAULT_RECORD_MAX_TOKENS,
     DEFAULT_RECORD_TARGET_TOKENS,
     DEFAULT_TRIGGER_FRACTION,
+    PRESERVE_REASON_UNCOVERED,
     RECALL_TOOL_NAME,
     RECORD_MARKER,
     RecallGate,
@@ -135,6 +140,7 @@ __all__ = [
     "MARKER_ID_PREFIX",
     "PRESERVED_KEY",
     "PRESERVE_REASON_KEY",
+    "PRESERVE_REASON_UNCOVERED",
     "RECALL_TOOL_NAME",
     "RECORD_MARKER",
     "REMOVAL_MARKER",

@@ -165,7 +165,10 @@ or errors**, $18.22 across the run, and `--from-jsonl` over the five files rebui
 on, the composed row on its shared line -- which is what makes run 47a below evidence rather than
 data. Four rows keep 53/53 at `acc1` 100%: the control at 86% of the window, the record row at 50%,
 the user row at 71% and the composition at 30%, with the composition's cache hit rate at 76%
-against the record row's 95% and the control's 97%. Those three `hit%` figures are the whole run,
+against the record row's 95% and the control's 97%. The record row's five 53/53 are five draws of
+a row whose retention is bimodal across runs 41 to 48 -- run 48 on this same cell drew 37/53 on
+one seed of five -- so read them as draws rather than as a property (`RESULTS.md`, runs 41 to
+48). Those three `hit%` figures are the whole run,
 seeding and probes together; split by phase (`STATE.md` §3t) the seeding half reads 84% / 92% /
 95.5%, and the composition's 76% carries a probe-phase draw of 33.3% on four seeds of five. The
 user-half counters in these records are inflated by the double pass fixed in `8c463f0e7`:
@@ -236,6 +239,12 @@ the records show directly.
   arm's 4 to 9 against a counter that reads 1 in that mode by construction. The two passes also
   sent two different summaries at one position on consecutive calls, in every arm alike -- a cache
   break no mode was designed around, and a second reason the arms could not separate.
+- The recompact arm's `tool_summary_anchored` row read **37/53 on `-s2`** (seed 3, `UNCOVERED:4
+  RECFALLBACK:3`) and 53/53 on the other four, printed as 50/53 at `acc1` 94% and `seed+-` 30pp;
+  run 47 had read 53/53 on all five at this cell. It is the fourth archived loss on that row and
+  carries the same flag pair as the other three (`RESULTS.md`, runs 41 to 48). Seeds are not
+  paired across runs -- the salt carries a timestamp -- so this is a tenth draw of the cell, not a
+  re-read of run 47's third.
 
 The cost axis is inside the noise on every arm: the composed row's `seed$+-` is 83% / 49% / 17%,
 the recompact arm's verdict prints `NOT SUPPORTED` (a 59% spread against a 7% gap), and no money
@@ -246,7 +255,8 @@ Runs 45 and 46 are one cell in two arms: 300,000 tokens at 0.9 fill, `none` agai
 the payload **scaled to the window**, which is now the default. Run 45 is one seed, run 46 five, no
 throttling in either. Run 46 holds the project's first resolvable saving with full retention --
 three seeds at -21%, -23% and -33% keeping 53/53 -- and two seeds where the coverage gate shut and
-the row cost more while losing nine facts.
+the row cost more while losing nine facts each, at `UNCOVERED:4` beside `RECFALLBACK` -- the pair
+every archived loss on that row carries (`RESULTS.md`, runs 41 to 48).
 
 **Neither cell is ranked.** Both carried only `none` and `tool_summary_anchored`, so the leanest
 strategy row is the one adding the record's own messages and the instrument withdraws the cost
@@ -267,7 +277,9 @@ rather than five, because a single one runs near 1.3M tokens a minute; **no thro
 errors**. Its cost axis is sound and its **sizing is not**: the seeds seeded 124,636 to 155,530
 tokens against a 153,000 target, 73% to 91% of the window, because 80 turns compounds reply-length
 variance the solver cannot predict. Read the extremes of the ordering, not neighbouring rows, and
-re-solve the filler before measuring at this size again.
+re-solve the filler before measuring at this size again. Its record row lost 32 facts on one
+seed of five (`-s2`, 21/53 at `UNCOVERED:4 RECFALLBACK:43`), the first of the four archived
+losses on that row (`RESULTS.md`, runs 41 to 48).
 
 Run 42 is every registered strategy in one cell, `gpt-5.6-luna` at 60,000/0.86, five seeds, 90
 records, split one file per seed because the merged file exceeds the repository's 500 KB limit --

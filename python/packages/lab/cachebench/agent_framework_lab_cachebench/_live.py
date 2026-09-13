@@ -65,6 +65,7 @@ from ._recall import (
 )
 from ._runner import is_connection_error, is_rate_limited, retry_after_seconds, unsupported_option
 from ._strategies import StrategyOptions, build_strategy
+from ._tokenizers import stamp_reasoning_tokens
 from ._transcripts import TRUE_CHARS_PER_TOKEN, sized_text
 from .compaction import (
     DEFAULT_RECORD_MAX_TOKENS,
@@ -400,6 +401,15 @@ class UsageRecorder(ChatMiddleware):
         # UsageDetails is a TypedDict, so it is read with .get() rather than getattr:
         # attribute access on it silently yields None and reports every call as free.
         usage: dict[str, Any] = dict(getattr(context.result, "usage_details", None) or {})
+        # The provider reports the reasoning it billed on the response's usage, and the content
+        # that carries the encrypted payload says nothing about its size. Stamping the count
+        # here is what lets ProtectedDataStrippingTokenizer charge the replayed reasoning what
+        # the provider charges for it rather than zero: without it the local count is low by
+        # the decrypted reasoning in the prompt, which on a reasoning model is not a rounding
+        # error. Stamped after the call, on the messages the session goes on to persist, so
+        # the next pass over this conversation sees it.
+        if (reasoning_tokens := usage.get("reasoning_output_token_count")) and context.result is not None:
+            stamp_reasoning_tokens(context.result.messages, int(reasoning_tokens))
         self.calls.append(
             ModelCall(
                 messages_sent=len(sent),
@@ -569,6 +579,31 @@ class LiveOutcome:
     model never wrote a record; this means it wrote one that did not free enough, and the
     fallback then shortened the tool results still in the prompt -- the very groups a partial
     record left behind. Non-zero says part of this row measures the fallback strategy.
+
+    Zero on every strategy that keeps no such count, which is all of them but
+    ``tool_summary_anchored`` and the composed row that runs it as a phase.
+    """
+    reforced_calls: int = 0
+    """Forced calls the recall middleware made at the strategy's request, for uncovered groups.
+
+    Layer one of the answer to the loss ``groups_kept_uncovered`` beside
+    ``fallbacks_after_record`` used to permit: a record that failed to cover a group is asked
+    for again, while the group is still whole and only while asking helps, before the fallback
+    is allowed near it. Read it with ``groups_preserved_uncovered``: this without that is the
+    re-force fixing the shortfall, this with that is the re-force failing and layer two standing
+    in. Zero on every strategy that takes no record, and zero on a record row whose records
+    were complete, which is what keeps the ``REFORCED:<n>`` flag readable.
+    """
+    groups_preserved_uncovered: int = 0
+    """Uncovered tool groups the strategy has preserved for good, as the conversation last stood.
+
+    Layer two. Non-zero says asking stopped helping -- the re-forced record covered none of
+    them, or none came -- and these groups now sit in the prompt unshrinkable and undroppable,
+    which is what keeps the fallback off them and is also a floor under the prompt that may
+    put the row over the ceiling. A row carrying this beside ``DQ`` failed loudly where a row
+    written before schema 13 could lose the group's values quietly, and that is the intended
+    reading. The ``PRESERVED:<n>`` flag on
+    ``strategy_notes`` carries the same number; this is the column a cell can be meaned on.
 
     Zero on every strategy that keeps no such count, which is all of them but
     ``tool_summary_anchored`` and the composed row that runs it as a phase.
@@ -933,10 +968,12 @@ def _strategy_notes(strategy: Any) -> tuple[str, ...]:
         ("fallbacks_used", "FALLBACK"),
         ("fallbacks_after_record", "RECFALLBACK"),
         ("forced_calls", "FORCED"),
+        ("reforced_calls", "REFORCED"),
         ("records_forced", "RECFORCED"),
         ("records_volunteered", "RECVOLUNTEERED"),
         ("records_truncated", "TRUNCATED"),
         ("groups_kept_uncovered", "UNCOVERED"),
+        ("groups_preserved_uncovered", "PRESERVED"),
         ("declined_collapses", "NOGAIN"),
         ("user_compactions", "USERCOMPACT"),
         ("user_messages_replaced", "USERREPLACED"),
@@ -1758,6 +1795,11 @@ async def run_live(
             record_max_tokens=record_max_tokens,
             max_groups_before_record=max_groups_before_record,
             repeat_records=repeat_records,
+            # The strategy's own ask for another record, made when a record leaves tool groups
+            # uncovered. Wired here because the middleware holds no reference to the strategy
+            # and the strategy none to the middleware; found through the same nested lookup as
+            # everything else, so a composed row's record phase can ask too.
+            reforce=recording.take_reforce,
         )
 
     agent = build_live_agent(
@@ -2025,6 +2067,8 @@ async def run_live(
         strategy_notes=_strategy_notes(strategy) + _strategy_notes(recall_middleware),
         groups_kept_uncovered=recording.groups_kept_uncovered if recording is not None else 0,
         fallbacks_after_record=recording.fallbacks_after_record if recording is not None else 0,
+        reforced_calls=recall_middleware.reforced_calls if recall_middleware is not None else 0,
+        groups_preserved_uncovered=recording.groups_preserved_uncovered if recording is not None else 0,
         records_in_conversation=recording.records_in_conversation if recording is not None else 0,
         user_compactions=user_compacting.user_compactions if user_compacting is not None else 0,
         user_messages_replaced=user_compacting.user_messages_replaced if user_compacting is not None else 0,

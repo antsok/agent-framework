@@ -132,6 +132,13 @@ settings block before it existed.
 header with nothing under it, or a sample script reading a flag it never declared, both pass every
 other check and die on first use.
 
+**A mean must not hide a two-valued row.** `test_a_row_whose_seeds_disagree_on_facts_gets_a_per_seed_line`
+renders five seeds of the record row, four holding every fact and one short, and asserts the
+`per-seed facts` block under the table carries that row and only that row;
+`test_rows_whose_seeds_agree_on_facts_print_no_per_seed_block` asserts a cell where every row held
+on every seed prints no such block at all. Run 48's recompact arm printed the record row at 50/53
+-- four seeds at 53 and one at 37 -- and the column read as uniform mild loss.
+
 Two more in the same spirit pin a *value* rather than a shape.
 `test_the_default_thresholds_leave_a_whole_turn_for_the_record_to_arrive_in` asserts
 `(DEFAULT_TRIGGER_FRACTION, DEFAULT_FALLBACK_FRACTION) == (0.6, 0.9)` with the note "runs 26-39

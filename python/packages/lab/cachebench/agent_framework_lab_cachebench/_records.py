@@ -189,7 +189,25 @@ __all__ = [
 #: Spreading the total over twelve equal shares would be exactly the reading the fields exist
 #: to refute, and picking the four-and-eight pattern instead would be writing the conclusion
 #: into the evidence. Nobody took those numbers; the record says so.
-SCHEMA_VERSION: Final[int] = 12
+#:
+#: 13 adds ``reforced_calls`` and ``groups_preserved_uncovered``, and the bump is the version 5
+#: argument: it separates a run whose record strategy could ask for another record on a
+#: measured shortfall, and preserve what asking did not clear, from one whose strategy could do
+#: neither. Before it a tool group the record failed to cover stayed in the prompt as an
+#: ordinary group and the fallback behind the record could shorten or shed it -- ``UNCOVERED``
+#: beside ``RECFALLBACK``. Both read back as zero on an older record, because zero is what
+#: those runs did: no call was pinned on a shortfall and no uncovered group was held. The
+#: version is what lets a reader tell that zero from the zero a schema 13 row shows when its
+#: records were complete and nothing needed asking for.
+#:
+#: This note first cited the four archived record rows of runs 41 to 48 that carried that pair
+#: and lost a fact as the measured cost of the gap. Withdrawn: those losses are since attributed
+#: to the framework's compaction counter charging gpt-5.6-luna's encrypted reasoning payload as
+#: prompt text, which put its local count 1.2 to 1.45 times over the billed size and ran the
+#: fallback on prompts that were under the ceiling. They date the gap's discovery; they do not
+#: measure how often a genuine firing reaches it, and nothing yet does. See the
+#: ``_toolsummary`` module docstring.
+SCHEMA_VERSION: Final[int] = 14
 
 #: Versions this reader accepts, which is not only the current one.
 #:
@@ -253,7 +271,11 @@ SCHEMA_VERSION: Final[int] = 12
 #: and it says so by carrying no per-probe counts rather than a plausible division of the
 #: totals. Refusing it would discard every luna cell from run 34 on -- the cells the split
 #: exists to re-read.
-_READABLE_SCHEMAS: Final[frozenset[int]] = frozenset({2, 3, 4, 5, 6, 7, 8, 9, 10, 11, SCHEMA_VERSION})
+#:
+#: Version 12 joins on the version 5 argument: what its runs did about an uncovered tool group
+#: is not in doubt, because their code could neither ask for another record on its account nor
+#: preserve it, and the two counters read back as the zero those runs produced.
+_READABLE_SCHEMAS: Final[frozenset[int]] = frozenset({2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, SCHEMA_VERSION})
 
 #: The parameters that make two records the same cell, and so aggregable into one row.
 #:
@@ -1034,6 +1056,33 @@ class SeedRecord:
     one. Zero from a live run means what it says, including on the four strategies that take no
     record at all.
     """
+    reforced_calls: int
+    """Forced calls the recall middleware made at the strategy's request, for uncovered groups.
+
+    Layer one of the answer to ``groups_kept_uncovered`` beside ``fallbacks_after_record``: a
+    record that left tool groups uncovered is asked for again while those groups are still
+    whole, and the ask repeats only while each record covers at least one of them.
+    ``strategy_notes`` carries it as ``REFORCED:<n>``; the number is here so a cell can be
+    meaned on it. Read it with the field below: this without that is the re-force clearing
+    the shortfall, this with that is the re-force failing and the preservation standing in.
+
+    Zero for every strategy that takes no record, and zero on a record written before schema
+    13 -- see :data:`SCHEMA_VERSION` for why that zero is a measurement rather than a gap.
+    """
+    groups_preserved_uncovered: int
+    """Uncovered tool groups the strategy preserved for good, as the conversation last stood.
+
+    Layer two. Non-zero says asking stopped helping -- the re-forced record covered none of
+    these, or none came -- so the strategy holds them out of the fallback's reach for the rest
+    of the run, counted against the ceiling in full. That is what stops the fallback shortening
+    them, and it is also a floor the prompt cannot go under, so this beside ``disqualified`` is
+    the row failing loudly where a schema 12 row's fallback could take the group's values
+    quietly. ``strategy_notes`` carries it as ``PRESERVED:<n>``; the number is here so a cell
+    can be meaned on it.
+
+    Zero for every strategy that keeps no such count, and zero on a record written before
+    schema 13, on the reading the field above gives.
+    """
     records_in_conversation: int | None
     """Recall records the conversation ended up carrying, at the strategy's highest reading.
 
@@ -1343,6 +1392,14 @@ class SeedRecord:
         # recovered from the record. Zero would say the row stayed the strategy it is named
         # for, which is the exact claim the counter was added because nobody could make.
         values.setdefault("fallbacks_after_record", None)
+        # Zero, on the ``groups_kept_uncovered`` reading. A record written before schema 13 ran
+        # under a strategy that could neither ask for another record on a shortfall nor hold
+        # what no record covered, so no call was pinned for one and no group was preserved:
+        # zero is what those runs did, not a number this reader could not find. Required with
+        # no default on the class for the same reason as the counters above, so a live run
+        # cannot inherit the zero by forgetting to record it.
+        values.setdefault("reforced_calls", 0)
+        values.setdefault("groups_preserved_uncovered", 0)
         # None again, and for a third reason worth stating apart from the two above. A record
         # written before schema 6 comes from a run whose size trigger fired once per
         # conversation, so it took one record or none -- but which of the two is on the record
