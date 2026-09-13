@@ -1470,6 +1470,30 @@ it.
 
 ### Run 47 -- all twenty at 170,000/0.9, and the two user-turn rows measured
 
+> **Correction, 13 September.** Two things in this section are withdrawn; the text is kept as
+> written, with the two sentences concerned marked, so the correction can be checked against it.
+>
+> **`USERCOMPACT` in the run 47 records is inflated by up to 2x.** Wired the way the harness wires
+> it, the user-band strategy ran twice per crossing -- inside the model call, on copies the store
+> never saw, and again on the store -- and both passes counted until `8c463f0e7`. `USERCOMPACT:2`
+> on the standalone row is one compaction; the composed row's 4 to 7 is about three (run 48's
+> boundary and fold arms, whose `USERSUMMARIES` counter was wired, read 3 standing summaries
+> against `USERCOMPACT` 4 to 8 on the same cell).
+>
+> **The per-seed claim that the composed row's hit rate tracked its passes is false.** `hit%` is
+> the whole run, seeding and probes together, and the probe phase's hit rate is a two-valued draw
+> -- 33.3% or about 99.5%, never between (`STATE.md` §3t). Split by phase, the five seeds read
+> (`USERREPLACED`, seeding hit, probe hit, `hit%`): 16 / 85.7% / 33.3% / 73%; 8 / 85.0% / 99.6% /
+> 89%; 16 / 82.2% / 33.3% / 70%; 14 / 86.4% / 33.3% / 75%; 14 / 81.0% / 33.3% / 70%. The 89% was
+> the one seed that drew the high probe; the seeding half sits between 81% and 86% on every seed
+> and bears no relation to how often the summary was rewritten. What stands: the composed row's
+> seeding-phase hit, 84.1%, is below the record row's 92.3% and the control's 95.5% on every seed,
+> so rewriting the user summary does cost cache -- about eight points against the record half at
+> this cell, not the twenty-one the mixed column shows. Of the four rows in the table below, only
+> the composition drew the low probe on any seed, so the other three `hit%` figures are honest. The
+> `boundary` and `fold` modes were built against the withdrawn measurement; the strict-prefix
+> argument for them stands on its own, and run 48 (next section) could not rank them.
+
 `gpt-5.6-luna` through the harness agent, 170,000-token window, 0.9 fill, the scaled payload --
 six results of ~15,125 tokens at a 60% tool share -- every registered strategy, five seeds, 100
 records, one file per seed, two invocations at a time. No throttling, retries or errors; $18.22
@@ -1504,19 +1528,23 @@ rather than about the row. `snap%` 71 against 86 is what two passes buy.
 **The composition's user half fires, and the price is the cache.** No `USERSTARVED` on any seed,
 which is the aligned trigger behaving as designed; `USERCOMPACT` 4 to 7 against `USERHELD` 2 to
 4, because the record half's removal leaves the band a larger share of what remains. Every one of
-those passes rewrites the summary just behind the head turn, and the hit rate tracks them:
+those passes rewrites the summary just behind the head turn, and the hit rate tracks them --
+**withdrawn, see the correction above**; the two phase columns are added to the table, and the
+`USERCOMPACT` column is the double-counted figure:
 
-| seed | `USERCOMPACT` | `USERREPLACED` | `hit%` | `snap%` | `seed$` | `vs none$` |
-| --- | ---: | ---: | ---: | ---: | ---: | ---: |
-| s0 | 5 | 16 | 73% | 30% | $0.1295 | +14% |
-| s1 | 4 | 8 | 89% | 34% | $0.1166 | +3% |
-| s2 | 6 | 16 | 70% | 31% | $0.1506 | +28% |
-| s3 | 5 | 14 | 75% | 28% | $0.1257 | +31% |
-| s4 | 7 | 14 | 70% | 29% | $0.1558 | +35% |
+| seed | `USERCOMPACT` | `USERREPLACED` | `hit%` | seeding hit | probe hit | `snap%` | `seed$` | `vs none$` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| s0 | 5 | 16 | 73% | 85.7% | 33.3% | 30% | $0.1295 | +14% |
+| s1 | 4 | 8 | 89% | 85.0% | 99.6% | 34% | $0.1166 | +3% |
+| s2 | 6 | 16 | 70% | 82.2% | 33.3% | 31% | $0.1506 | +28% |
+| s3 | 5 | 14 | 75% | 86.4% | 33.3% | 28% | $0.1257 | +31% |
+| s4 | 7 | 14 | 70% | 81.0% | 33.3% | 29% | $0.1558 | +35% |
 
 76% against the record row's 95% and the control's 97% is the cost of rewriting the user summary
 in place on every pass, and it is the measurement behind the `boundary` and `fold` modes of
-`--user-summary-mode`, neither of which this run carried.
+`--user-summary-mode`, neither of which this run carried. **Withdrawn as a per-seed measurement**
+(correction above): what survives is the seeding-phase gap, 84.1% against 92.3% and 95.5%, and run
+48 carried both modes without separating them.
 
 **On money the cell resolves nothing, and this is the part to read carefully.** `seed$+-` runs
 19% to 30% across the four rows. The instrument's rule is that a gap is a result only when it is
@@ -1539,6 +1567,56 @@ every row; the composition still at 76% hit and 31% snap; the control's spread f
 4% and the user row's from 24% to 15%; `tool_summary_anchored` reads -20% against a 21% spread
 and the instrument still prints `NOT SUPPORTED`; the composition +20% against 26%; the user row
 +32% against 15%. Dropping it changes nothing the paragraphs above say.
+
+### Run 48 -- the three user-summary modes, and why it cannot rank them
+
+The three `--user-summary-mode` arms on run 47's cell: `gpt-5.6-luna`, 170,000/0.9, scaled
+payload, five seeds an arm, one invocation per seed and mode, 65 records, $11.42
+(`runs/run-48-luna-170k-fill90-usermodes-*`, one report per arm). Every arm carries `none`,
+`truncation`, `user_summary_anchored` and `tool_and_user_summary_anchored`; the recompact arm also
+carries `tool_summary_anchored`, which does not read the mode. Two throttled calls on the boundary
+arm's control, nothing else; fills -2.8% to -3.5%. The run was made to choose between the modes
+and **it cannot**, which is the result. Seeding-phase hit is `(cached - probe_cached) / (input -
+probe_input)` from the records; a low probe is a seed whose probe phase drew 33.3% (`STATE.md`
+§3t). Retention is 53/53 on every user-half row of every arm.
+
+| arm | row | `snap%` | `hit%` | seeding hit | low probe | `seed$` | `seed$+-` | `vs none$` | user-half flags |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| boundary | `user_summary_anchored` | 71% | 93% | 89.2% | 0 of 5 | $0.1506 | 23% | +32% | `USERCOMPACT:2`, `USERREPLACED:24`, `USERSUMMARIES:1`, `USERHELD` 29-38 |
+| fold | `user_summary_anchored` | 72% | 93% | 89.8% | 0 of 5 | $0.1517 | 12% | +30% | same, `USERHELD` 35-40, `USERFOLD:0` |
+| recompact | `user_summary_anchored` | 70% | 93% | 89.3% | 0 of 5 | $0.1485 | 35% | +30% | same on four seeds, `USERHELD` 26-37; `-s3` `USERCOMPACT:3`, `USERREPLACED:11` |
+| boundary | `tool_and_user_summary_anchored` | 34% | 72% | 84.1% | 5 of 5 | $0.1571 | 83% | +37% | `USERCOMPACT` 5-8, `USERSUMMARIES:3` |
+| fold | `tool_and_user_summary_anchored` | 39% | 81% | 84.8% | 3 of 5 | $0.1411 | 49% | +21% | `USERCOMPACT` 4-7, `USERSUMMARIES` 2-3, `USERFOLD:0` |
+| recompact | `tool_and_user_summary_anchored` | 31% | 83% | 85.1% | 2 of 5 | $0.1320 | 17% | +15% | `USERCOMPACT` 4-9, `USERSUMMARIES:1` |
+
+The controls read 97% `hit%` and 95.5% seeding hit in all three arms, at `seed$` $0.1145 to
+$0.1164; `truncation` 93-94% and $0.1002 to $0.1265.
+
+**The standalone row made one persistent crossing per seed in every arm.** `USERSUMMARIES:1`,
+`USERREPLACED:24` and `USERHELD` 26 to 40 on fourteen of fifteen records: at trigger 0.8 and fill
+0.9 the band never regrows to a tenth of the prompt after the first pass, and the three modes only
+differ from the second pass on. The arms were identical there by construction, and the table says
+so -- seeding hit within 0.6 of a point, `seed$` within 2%, retention level.
+
+**The composed row fired three times and its `hit%` spread is the probe draw.** Three standing
+summaries in the boundary and fold arms (`USERSUMMARIES:3`), so the modes did act differently
+there; but the eleven-point spread in `hit%` is five, three and two seeds drawing the low probe, and
+the seeding half -- the number that describes the strategy -- is 84.1% / 84.8% / 85.1%, one point
+apart. Whether the boundary mode's byte-identical prefix buys anything on the wire, this cell
+cannot say.
+
+**`USERCOMPACT` is double-counted throughout**, as in run 47: `8c463f0e7` found the strategy running
+once inside the model call and once on the store per crossing, both passes counting and both
+asking the summarizer, so the model was sent two different summaries at one position on
+consecutive calls in every arm alike. That is a cache break none of the modes was designed around,
+and a second reason the arms could not separate; the archived counts stand as recorded, halved when
+read.
+
+**Nothing here is a cost result.** The composed row's `seed$+-` runs 83%, 49% and 17%; the recompact
+arm's verdict names `tool_summary_anchored` at -7% and prints `NOT SUPPORTED` against a 59% spread.
+What a run that could rank the arms needs is at least two persistent passes on the standalone row
+-- a lower trigger, or a fill the band regrows under -- and per-probe cache accounting in the record
+so the probe draw can be read off rather than inferred (`STATE.md` §3s, §3t).
 
 ### What runs 45 and 46 say about the benchmark itself
 
@@ -1774,7 +1852,11 @@ at eighteen rows each was not.
 > window widens. Across 60,000/0.86 (run 41), 100,000/0.9 (run 44) and 170,000/0.9 (run 43),
 > `tool_summary_anchored` removed **28.8% -> 22.6% -> 17.0%** of the control's snapshot while its cache
 > hit rate fell **88% -> 74% -> 66%** against a control climbing **96% -> 97% -> 98%** -- read
-> here as a property of the strategy, and substantially a property of the workload. `tool_share`
+> here as a property of the strategy, and substantially a property of the workload. (**Corrected
+> 13 September**: those three are whole-run `hit%`; the seeding half alone reads **88.0% -> 87.5%
+> -> 76.2%**, and the 100,000 point's fall is entirely the probe-phase draw of `STATE.md` §3t --
+> `tool_summary_anchored` drew 33.3% on four of five seeds there and on all five at 170,000. The
+> removed-share series stands.) `tool_share`
 > is part of the cell key, so cells from either side of this date do not pool; re-running any
 > command line in `runs/` needs `--tool-share 0` to reproduce what it measured.
 

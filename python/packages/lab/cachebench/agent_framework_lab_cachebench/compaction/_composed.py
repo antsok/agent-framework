@@ -15,9 +15,11 @@ next measurement and states that it is not made there.
 This is that composition. Run 47 measured it on the shared line described below -- gpt-5.6-luna
 at a 170,000-token window and 0.9 fill, five seeds: both halves fired on every seed,
 ``USERSTARVED`` read zero throughout, 53 of 53 facts survived, the snapshot sat at 30% of the
-window against 50% for the record half alone and 71% for the user half alone, and the cache hit
-rate was 76% against their 95% and 93%. Its cost sits inside the seed spread, so that question is
-open. Everything else in this module is about mechanism -- which messages each phase selects,
+window against 50% for the record half alone and 71% for the user half alone, and the whole-run
+cache hit rate was 76% against their 95% and 93% -- 84% against 92% and 90% on the seeding half,
+the rest being the probe-phase draw ``STATE.md`` section 3t describes. Its cost sits inside the
+seed spread, so that question is open. Everything else in this module is about mechanism -- which
+messages each phase selects,
 which number each phase reads -- and the benchmark's ``RESULTS.md`` carries the run.
 
 **One reading of the prompt decides both halves, and one line is what both are judged against.**

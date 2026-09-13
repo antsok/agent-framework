@@ -1,0 +1,258 @@
+20 seed records from 5 files, in 1 cell(s).
+
+Cell: foundry:gpt-5.6-luna  agent harness  window 170,000  fill 90%  payload 15,125x6 at share 60%  probes 1  combined 5
+  seeds present: none 5/1, tool_and_user_summary_anchored 5/1, truncation 5/1, user_summary_anchored 5/1
+
+Model: gpt-5.6-luna   agent: harness   probe repeats: 1 (acc1), 5 (acc2)
+Pricing: $0.20/M in, $0.020/M cached, $1.20/M out
+Ranking: 3 of 4 rows kept at least 90% of the control's acc1 and are ranked first, cheapest seed$ first; the rest follow below the line.
+
+strategy                         msgs   tok left/peak  snap%  calls          in  hit%       out  seed in$    seed$   probe$     run$ seed$+-   summ$  vs none$    facts  lost nofetch ignored     acc1  seed+-  rep+-  acc2  rep2+-  vs none   dq     flags
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+none                            85/85 148,263/148,263    87%     54   5,164,374   97%    24,249   $0.0949  $0.1145  $0.0460  $0.1605     19%       -         -    53/53     0       0       0    100%*     0pp    0pp  100%     0pp        -   0%NO:temp,THROTTLED:2
+user_summary_anchored           62/86 121,031/121,031    71%     54   4,508,619   93%    23,155   $0.1206  $0.1506  $0.0393  $0.1899     23% $0.0117      +32%    53/53     0       0       0    100%      0pp    0pp  100%     0pp     100%   0%NO:temp,USERCOMPACT:2,USERHELD:29,USERHELD:36,USERHELD:37,USERHELD:38,USERREPLACED:24,USERSUMMARIES:1,USERSUMMTOKENS:157,USERSUMMTOKENS:179,USERSUMMTOKENS:181,USERSUMMTOKENS:223,USERSUMMTOKENS:341,USERUNDER:63,USERUNDER:64,USERUNDER:65,USERUNDER:72
+tool_and_user_summary_anchored    52/92   58,252/88,300    34%     56   3,018,440   72%    26,177   $0.1150  $0.1571  $0.1065  $0.2636     83% $0.0193      +37%    53/53     0       0       0    100%      0pp    0pp  100%     0pp     100%   0%NO:temp,FORCED:1,REC:1,RECFALLBACK:1,RECFORCED:1,RECORDS:1,UNCOVERED:4,USERCOMPACT:5,USERCOMPACT:6,USERCOMPACT:8,USERHELD:3,USERHELD:4,USERHELD:58,USERREPLACED:12,USERREPLACED:13,USERREPLACED:14,USERREPLACED:15,USERSUMMARIES:3,USERSUMMTOKENS:449,USERSUMMTOKENS:712,USERSUMMTOKENS:755,USERSUMMTOKENS:907,USERSUMMTOKENS:946,USERUNDER:44,USERUNDER:94,USERUNDER:95,USERUNDER:96
+------------------------------------------------------------------------------------------------------------- below 90% of the control's acc1 -------------------------------------------------------------------------------------------------------------
+truncation                      65/85   94,571/99,024    55%     54   3,871,208   94%    22,366   $0.0969  $0.1156  $0.0316  $0.1472     27%       -       +1%    29/53    24       0       0     55%     15pp    0pp   54%     0pp      55%   0%   NO:temp
+
+msgs      = messages in a probe's prompt, out of the most any call carried. Every probe
+            is asked from the same restored snapshot, so this no longer drifts downwards
+            through the questions the way it did when they were ordinary turns
+snap%     = the snapshot every question was asked from, as a share of the tried context
+            window. This is how hard compaction acted: the control sits at the fill the
+            cell was sized to, and a strategy below it removed that difference
+tok       = billed tokens in that same prompt, and at the peak. Watch this rather than
+            msgs: a strategy that rewrites content in place removes tokens without
+            removing messages, and msgs cannot see it
+calls     = model calls, seeding and probes together
+in        = input tokens billed across the whole run
+hit%      = share of those served from the provider's cache. Compaction breaks the
+            cached prefix by construction, so this is what it gives up to save tokens
+out       = output tokens billed across the whole run. Its own column because a total
+            driven by how much the model wrote is a different finding from one driven
+            by how much context it was sent, and one number cannot show which
+seed in$  = the prompt side of seed$: uncached and cached together, with output, the
+            summarizer and the probes all left out. The low-variance view of what
+            compaction changes: on a clean five-seed control the total moved 38% while
+            the input side moved 13%, because output is priced 57x a cache read and the
+            model's verbosity swamps the axis compaction acts on
+seed$     = what the conversation cost: seeding, plus the strategy's own summarizer
+            calls, and nothing else. The workload, and what the ranking, the verdict and
+            vs none$ are all taken on. This is the money a deployed agent moves
+probe$    = what the probing cost: the instrument. Every probe is asked from the restored
+            snapshot, so each one re-sends the whole snapshot, and a strategy that
+            compacted hard collects that discount once per probe -- twelve times over on
+            a phase no deployed agent has, since an agent continues the conversation
+            rather than being interrogated from a frozen state. Folded into the ranking
+            it turned one cell's -14.1% into -3.5% and flipped the sign on two others
+run$      = seed$ + probe$: what the run was actually billed. Here because it is the
+            number every earlier write-up quotes, not because it ranks anything
+seed$+-   = spread between the cheapest and dearest seed, on seed$. A gap smaller than
+            this is not a result. 0% with one seed means stability is unknown, not that
+            it is stable. Taken on seed$ rather than run$ because probing is the steadier
+            half -- one snapshot, the same questions -- so a spread on the total
+            understates how far the ranked half moved
+summ$     = what this strategy's own summarization calls cost, of seed$
+vs none$  = seed$ against the uncompacted control's seed$: what compaction moved on the
+            workload. '?' means the comparison is unavailable -- either a row could not
+            separate its probing from its seeding (NOSPLIT), or the control did not run
+            the strategies' conversation (MSGS) and there is nothing to compare against
+'?'       = in any money column, the records behind this row never measured that
+            quantity. Records written before schema 4 counted their calls in one total,
+            and no arithmetic over what they stored can separate the phases -- pricing
+            twelve probes at the final prompt's size is a model of the run, not the run.
+            Those rows carry NOSPLIT, show run$ alone, and are ranked on it
+facts     = planted facts surviving compaction into the snapshot: recall's ceiling.
+            Scored against the snapshot, which is exactly the context every probe was
+            answered from. Scored against a closing prompt instead, this was circular:
+            each answer re-listed codes into the history, so a code compaction had
+            destroyed came back because the model had recited it two questions earlier
+lost      = compaction removed it, so the model could not use it  <- the damage
+nofetch   = the agent never called that tool, so the fact never entered the history at
+            all. Not compaction damage: an uncompacted run shows these too
+ignored   = still in the snapshot but unused: the model's failing, not compaction's
+acc1      = the scoped questions -- requirements plus one per tool lookup. Mean share of
+            checks passed across every probe repeat of every seed, each reply scored only
+            against the values its own question asked for. A star marks the uncompacted
+            control, which is ordered by the same rule as every other row and can
+            therefore land below the line
+seed+-    = points between the least and most correct seed, on acc1. Different
+            conversations, so this is compaction's own reliability: whether it cleared a
+            retention boundary this time and not last time
+rep+-     = points between the least and most correct acc1 repeat *within* one seed,
+            averaged over seeds. Identical facts in identical positions, so this is the
+            model's willingness to enumerate and nothing else. The two used to arrive as
+            one number, and a strategy scoring 52, 52, 52 and 22 with exactly 27 facts
+            preserved every time read the same as one that lost different facts each time
+acc2      = the one combined question: share of all planted values present in its answer,
+            where the model is asked for everything at once, meaned over every attempt of
+            every seed. The same run measured a second way, not a second run -- one
+            question against acc1's seven, from a context the values are scattered
+            through. Asked from the snapshot like every other probe, so it is no longer
+            penalised for having been asked last, and asked --combined-repeats times
+            rather than --probe-repeats, since one answer is a whole reading of it
+rep2+-    = the same within-seed spread for acc2, over its own attempts. Read it beside
+            rep+-: at --probe-repeats 1 that column is 0pp by construction and this one
+            is the only within-seed variance the cell measures
+vs none   = acc1 against the uncompacted control's acc1, which is also what the ranking
+            and the verdict are judged on. Read it together with vs none$ on the left or
+            not at all -- cheaper and less correct is not a saving
+dq        = share of this cell's seeds that sent a prompt larger than the tried limit.
+            The limit is simulated, so it is enforced here or not at all. A cell that
+            disqualifies at all is excluded from the ranking rather than starred: a row
+            a model that size would have refused is not a baseline for anything
+flags     = DQ the dq column above is not zero, so this row sent a prompt a model of
+            this size would have refused. EXCL out of the ranking for the other reason:
+            it did not finish its turns. The two used to share the name DQ, which is how
+            a table came to show rows flagged DQ beside a dq of 0%. ERR failed turn,
+            THROTTLED:<n> calls re-sent after the provider refused them for rate
+            reasons; the seconds spent waiting are printed below the table, and they
+            matter because a cached prefix that expired during a wait is a miss the hit%
+            column charges to compaction. RECONNECTED:<n> calls re-sent because the
+            request never came back with an answer -- the connection dropped, or the
+            provider answered 5xx. Counted apart from THROTTLED because the waits are
+            seconds rather than a quota window, so this row's cached prefix is very
+            likely intact; without the retry it would not be a row at all, but a seed
+            that ended at the turn it happened on. DRIFT:<n> probes whose prompt was
+            not the snapshot verbatim, because the strategy acted again on the
+            restored state.
+            Those probes saw slightly less than survival was scored against, so a row
+            carrying this overstates what reached the model. S<n> summarizer failures,
+            <n>/<n>t turns
+            completed, REC:<n> whether the model ever wrote a record at all -- it
+            saturates at 1 and answers compliance, not quantity. RECORDS:<n> how many
+            records the conversation ended up carrying, which is a different question
+            and became one when the size trigger was allowed to ask more than once.
+            Every record is preserved: it may be neither shortened nor dropped, by this
+            strategy or by the fallback behind it, and nothing merges them -- an older
+            record is the sole account of the groups behind it, so a merge would rewrite
+            the evidence rather than the bulk. So each one raises a floor under the
+            prompt that no later pass can lower, and a row above 1 here is a row whose
+            money columns are partly that floor rather than the workload. Runs up to
+            39 were single-record by construction and carry no such number; the default
+            reproduces them and --record-repeats is what asks for more. FORCED:<n>
+            times it asked for
+            one, TRUNCATED:<n> forced calls the provider cut at --record-max-tokens, so
+            that record may cover only part of what it was asked to preserve and the
+            missing part is scored as compaction damage. UNCOVERED:<n> tool-call groups
+            the record never named, which the strategy therefore refused to delete. This
+            is the coverage check holding the row back, and it is a cost rather than a
+            loss: those groups are still in the prompt, so the row paid for tokens a
+            complete record would have replaced and lost nothing. Read it as how far the
+            model fell short of what the recall tool asked for -- the record is required
+            to group its content by the tool that produced it, so a tool it never names
+            is a tool it did not account for. Before the check existed those groups were
+            deleted anyway and the facts in them arrived in acc1 as compaction damage,
+            with nothing in any column saying where they went. A row with UNCOVERED is
+            not measuring this strategy working; it is measuring it declining to guess.
+            USERCOMPACT:<n> passes where user_summary_anchored replaced a band of the
+            user's own turns with one summary of them, and USERREPLACED:<n> how many
+            turns the most recent of those passes stood in for. Read them together: the
+            second is how much of the conversation the newest summary is carrying instead
+            of verbatim, which is what moved snap%, and the first is what it cost to get
+            there, because every pass re-bills the prompt from its own edit to the end.
+            USERREPLAY:<n> passes that replaced the same band with the summary already in
+            hand: the live path runs the strategy twice per crossing, inside the model
+            call on the loaded copies and after the turn on the store, and the second
+            pass replays the first's answer instead of asking again, so it costs no
+            summarizer call and no new break. One per crossing is the ordinary reading,
+            two on a turn that called a tool. Before it existed both passes counted as
+            USERCOMPACT, so an archived USERCOMPACT:2 is one compaction.
+            Where that edit lands is --user-summary-mode. In the recompact mode the
+            strategy re-reads its own earlier summary, so every pass rewrites a message
+            just behind the head and USERCOMPACT above 1 is that happening; in the
+            boundary and fold modes the earlier summary stands and the edit lands only on
+            the turns newer than it. USERSUMMARIES:<n> summaries the conversation was
+            carrying at the strategy's last reading, and USERSUMMTOKENS:<n> the tokens
+            they occupy: the boundary mode's floor, one summary per pass that no later
+            pass can lower, which is RECORDS:<n>'s accumulation on the user half. Reads 1
+            in the recompact mode after any pass. USERFOLD:<n> passes of the fold mode
+            that collapsed every standing summary into one, each a rewrite of the prefix
+            from the oldest summary's position -- the break the recompact mode pays on
+            every pass, paid here only when the standing summaries had grown to
+            --user-min-band-share of what is behind them. A run that folded twice and
+            one that never folded differ by two of those breaks and a floor lowered
+            twice, and only this flag separates them.
+            A row with USERCOMPACT:0 never fired and is the uncompacted control
+            under another name -- and exactly one of the next three flags says why.
+            USERUNDER:<n> passes where the prompt never reached
+            --user-trigger-fraction, so the band was not even read. USERHELD:<n>
+            passes where it did and the band was not worth a pass under
+            --user-min-band-share: empty, holding nothing but the strategy's own
+            earlier summary, or too small a share of the prompt to pay for the
+            prefix a pass rewrites -- and, in the fold mode, the standing summaries
+            were not worth a fold either. That flag is the hysteresis working, and a row
+            with USERHELD and no USERCOMPACT is one whose band never cleared the
+            share -- a setting to change, not a strategy that failed. Before the
+            share existed this row fired once per turn: USERCOMPACT:31 with
+            USERREPLACED:2 and a 53% cache hit rate where the control held 95%.
+            USERSUMMFAIL:<n> passes where the summarizer raised or returned
+            nothing, so the band was left exactly as it was found and those passes
+            are the control too. USERSTARVED:<n> passes of
+            tool_and_user_summary_anchored where the record half's removals are why
+            the prompt was under the user half's trigger, so the user half was never
+            consulted. It is the subset of USERUNDER the composition caused rather
+            than the conversation, and the only reading of USERCOMPACT:0 that is not
+            about the user half at all. It counts a pass whenever the prompt would
+            have been over that trigger with what the record half removed on earlier
+            passes, while the user half was declining at its own line, still in it.
+            Zero is the ordinary reading now, and zero is what the default produces:
+            both halves of that row are judged at --trigger-fraction, against one
+            reading of the prompt taken before either acts, so the record half never
+            removes anything on a pass the user half was not offered. Non-zero on a
+            default row is a defect report. It was the row's ordinary state while the
+            two halves had two lines -- the record half fires at the lower one and
+            holds the prompt below the higher one from before it is ever reached --
+            and a caller who sets them apart again is asking for that row back.
+            FALLBACK:<n> times it gave up
+            and compacted another way. A row with
+            FALLBACK is measuring that other strategy, not the one named.
+            RECFALLBACK:<n> passes where a record did exist, was anchored on, and the
+            row still fell back: what the record freed left the prompt over the ceiling.
+            Counted apart from FALLBACK because the two say different things about the
+            model -- FALLBACK is a model that never wrote a record, this is a model that
+            wrote one that did not go far enough -- but read them the same way, because
+            a non-zero value here means part of what this row measured is the fallback
+            strategy and not the one named. It is the quieter of the two: the fallback
+            shortens tool results in place, so the row keeps its message count and loses
+            its values, and beside UNCOVERED it is shortening exactly the groups the
+            coverage check had just declined to delete. Uncounted until a seed reporting
+            UNCOVERED:4 was measured losing the control's facts three messages shorter
+            and 16,617 tokens lighter, with no flag anywhere saying so. NO:<opt> the
+            provider rejected that option so it was dropped; a run that dropped
+            tool_choice chose its own tool calls and is not comparable with one that did
+            not. FETCH this row gathered a different set of facts than the control.
+            MSGS:<+-n> this row is the control and its conversation was n messages away
+            from the leanest strategy row's on the same turn list. Compaction only adds
+            to the stored history, so the control has to match that row and cannot come
+            in under it; when it does, every vs none$ in the cell compares two different
+            workloads, and the control is excluded so that none of them is ranked.
+            NOSPLIT this row cannot say what its probing cost, so its money columns are
+            the invoice rather than the workload
+
+per-sample acc1, one group per seed:
+  none                        [100%]  [100%]  [100%]  [100%]  [100%]
+  user_summary_anchored       [100%]  [100%]  [100%]  [100%]  [100%]
+  tool_and_user_summary_anchored[100%]  [100%]  [100%]  [100%]  [100%]
+  truncation                  [50%]  [50%]  [65%]  [56%]  [56%]
+
+per-sample acc2, one group per seed:
+  none                        [100% 100% 100% 100% 100%]  [100% 100% 100% 100% 100%]  [100% 100% 100% 100% 100%]  [100% 100% 100% 100% 100%]  [100% 100% 100% 100% 100%]
+  user_summary_anchored       [100% 100% 100% 100% 100%]  [100% 100% 100% 100% 100%]  [100% 100% 100% 100% 100%]  [100% 100% 100% 100% 100%]  [100% 100% 100% 100% 100%]
+  tool_and_user_summary_anchored[100% 100% 100% 100% 100%]  [100% 100% 100% 100% 100%]  [100% 100% 100% 100% 100%]  [100% 100% 100% 100% 100%]  [100% 100% 100% 100% 100%]
+  truncation                  [49% 49% 49% 49% 49%]  [49% 49% 49% 49% 49%]  [64% 64% 64% 64% 64%]  [55% 55% 55% 55% 55%]  [55% 55% 55% 55% 55%]
+
+Fill: 147,693 tokens seeded against a target of 153,000 (90% of 170,000), -3.5%. Payload 99,745 tokens, of which 91,791 is tool results.
+Tool share: 91,791 tokens of tool results is 62.1% of what was seeded, against 60% requested, +3.6%. Each result was built to ~15,125 tokens.
+
+Cost: seed$ is the conversation and probe$ is the instrument, priced apart. The ranking,
+the verdict and vs none$ are all on seed$, because every probe re-sends the whole snapshot
+and a strategy that compacted hard would otherwise collect that discount once per probe.
+
+Throttled: the provider refused these calls for rate reasons and they were re-sent
+after a wait. The measurement is unchanged; the wall clock is not, and neither is the
+cache hit rate if a prefix expired while a call was waiting.
+  none                        2 retries, 6s waiting
+
+VERDICT: none
+Every strategy that keeps the answer intact also costs more than not compacting. Leave it off unless the conversation would overflow the window.

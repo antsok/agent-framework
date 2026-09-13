@@ -492,7 +492,8 @@ class StrategySettings:
 
     The hysteresis, and the field that decides what a row of that strategy means. At ``0.0`` the
     strategy compacts on every pass past its trigger -- one summarizer call and one rewritten
-    prefix per turn, measured at ``USERCOMPACT:31`` with a 53% cache hit rate -- and above it
+    prefix per turn, measured at ``USERCOMPACT:31`` (double-counted, about fifteen passes) with a
+    seeding-phase cache hit rate of 77% against the control's 95% -- and above it
     the passes are bounded by how fast the band regrows. Two runs either side of that are not
     one cell, which is why it is here and not only in the strategy.
 
@@ -504,8 +505,9 @@ class StrategySettings:
     """What ``user_summary_anchored`` did with the summary its previous pass left behind.
 
     ``recompact``, ``boundary`` or ``fold``, and the field that decides the whole cache side of
-    the row: the recompacting arm rewrites a message just behind the head on every pass and was
-    measured losing hit rate with every rewrite, the boundary arm never rewrites it and
+    the row: the recompacting arm rewrites a message just behind the head on every pass -- a
+    strict-prefix break; the run 47 measurement once cited for it is withdrawn, ``STATE.md``
+    section 3t -- the boundary arm never rewrites it and
     accumulates a floor, and the fold arm collapses that floor when it is worth the break. Two
     runs in different modes are not one cell.
 

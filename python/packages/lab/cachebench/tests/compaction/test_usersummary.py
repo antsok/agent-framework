@@ -1084,8 +1084,8 @@ async def test_the_prefix_up_to_the_newest_boundary_is_byte_identical_across_a_l
 
     assert outcomes[SUMMARY_MODE_BOUNDARY] == (True, True), "the prefix through the boundary is untouched"
     assert outcomes[SUMMARY_MODE_RECOMPACT] == (False, False), (
-        "and the recompacting mode rewrites it at the summary's position, which is what the "
-        "measured hit rate tracking USERREPLACED was"
+        "and the recompacting mode rewrites it at the summary's position, which is the "
+        "strict-prefix break the boundary mode exists to avoid"
     )
 
 

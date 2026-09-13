@@ -377,8 +377,11 @@ thousands of tokens, the next one cannot happen until the conversation has grown
 back — and the offline replay below, where the default fires once on a 72-turn conversation,
 was read as confirming it. It does not generalise past that replay's shape. On gpt-5.6-luna at
 a 170,000-token window, 0.9 fill and a **scaled** payload, the row reported `USERCOMPACT:31`
-and `USERCOMPACT:30` on two seeds, `USERREPLACED:2` on both, snapshots of 82% and 76%, and
-cache hit rates of 53% and 61% against the uncompacted control's 95%.
+and `USERCOMPACT:30` on two seeds — double-counted, as every archived count is (`USERREPLAY`
+below), so about fifteen passes each — `USERREPLACED:2` on both, snapshots of 82% and 76%, and
+whole-run cache hit rates of 53% and 61% against the uncompacted control's 95%, of which the
+seeding half is 77% and 81%: the rest is the strategy re-firing on every probe (`DRIFT:12`), the
+benchmark's own phase and not a cost a conversation pays (`STATE.md` §3t).
 
 Two things are wrong with the old argument. The band is not the prompt: on that run it was 28%
 of it, and the rest is assistant replies and tool payload this strategy may not touch, so
@@ -405,8 +408,9 @@ that is **3 passes against 33** with the share switched off. What it costs is a 
 reaches a tenth of the prompt never being compacted at all; `USERHELD:<n>`
 (`user_passes_declined`) is what says so, and a row with `USERHELD` and no `USERCOMPACT` is a
 share set too high for that workload rather than a strategy that failed. Run 47 measured the row
-at `USERCOMPACT:2` against `USERHELD` 26 to 39 on every seed of the scaled payload, where the
-band is the minority of the prompt.
+at `USERCOMPACT:2` — one compaction, the count doubled by the pass `USERREPLAY` now absorbs —
+against `USERHELD` 26 to 39 on every seed of the scaled payload, where the band is the minority of
+the prompt.
 
 **Refusing to recompact is the other arm, and it is a mode rather than a rejected idea.**
 `summary_mode` decides what a pass does with the summary the previous pass left behind, and the
@@ -417,9 +421,13 @@ drop or shed this", re-applied every pass as `_preserve_records` re-applies it t
 not the way the boundary is *found*, which is `_is_summary`'s id prefix and text marker — and the
 next pass's band is the turns newer than the newest standing summary, less the tail. The prefix up
 to that boundary is byte-identical before and after every later pass, which is the cache claim,
-and it is measured rather than assumed: in run 47 the composed row's hit rate tracked how often the
-user half had rewritten its summary, 89% at `USERCOMPACT` 4 down to 70% at 7, against a record half
-whose one preserved message holds 94-95%. What it costs is the thing recompaction was preventing:
+and it is an argument rather than a measurement: **the run 47 figures this sentence used to cite —
+the composed row at 89% hit with `USERCOMPACT` 4, down to 70% at 7 — are withdrawn** (`STATE.md`
+§3t). They were whole-run `hit%`, one seed of five drew the probe phase's high value, and the
+seeding half sits at 81-86% on all five with no relation to the pass count; the record half's
+94-95% is honest, that row having drawn high on every seed. Run 48 measured the three modes side
+by side and found them one point apart on the seeding half, with one persistent crossing a seed on
+the standalone row (`STATE.md` §3s). What it costs is the thing recompaction was preventing:
 N passes leave N standing summaries, `records_in_conversation`'s accumulation problem exactly, a
 floor under the prompt that no later pass can lower, and `user_summaries_in_conversation` with
 `user_summary_tokens` (`USERSUMMARIES:<n>`, `USERSUMMTOKENS:<n>`) is what says how high it has
@@ -524,7 +532,9 @@ that is exactly "the assistant replies and the tool payload it may not touch". T
 names composing the two as the obvious next measurement. **Run 47 made it**: five seeds of
 `gpt-5.6-luna` at a 170,000-token window and 0.9 fill on the scaled payload, both halves firing on
 every seed, 53 of 53 facts, a 30% snapshot against 50% for the record half alone and 71% for the
-user half alone, and a 76% cache hit rate against their 95% and 93%. Its cost sits inside the seed
+user half alone, and a 76% whole-run cache hit rate against their 95% and 93% — 84% against 92%
+and 90% on the seeding half, the rest being the probe-phase draw of `STATE.md` §3t. Its cost sits
+inside the seed
 spread — +22% against the control with a 30% spread of its own — so the money question is open.
 The benchmark's `RESULTS.md` carries the run; everything below is mechanism.
 
