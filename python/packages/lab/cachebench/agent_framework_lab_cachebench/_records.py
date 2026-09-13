@@ -173,7 +173,23 @@ __all__ = [
 #: deduction from ``user_compactions`` rather than a number anybody took, and its size is not
 #: recoverable from the record at all. Deducing the count from another field would be a model
 #: of the run, which is the inference this module refuses everywhere else.
-SCHEMA_VERSION: Final[int] = 11
+#:
+#: 12 adds ``probe_input_samples`` and ``probe_cached_samples``, the probe phase's token counts
+#: per probe rather than in one total, and the bump is the version 4 argument one level down.
+#: Version 4 put the phase's totals on the record so the seeding half of the cache hit rate
+#: could be told from the probe half; what the totals cannot say is how the probe half divided
+#: among the twelve probes, and that turned out to be the finding. On the archived luna cells
+#: the probe half is two-valued -- about 99%, or 33.3% -- and 33.3% is arithmetically four
+#: probes served whole and eight served cold, the four being the only probes with a
+#: byte-identical predecessor. Arithmetically, because no record could show it: the per-probe
+#: figures were not written down, and the totals are consistent with twelve probes served a
+#: third each. These fields make it observation.
+#:
+#: They read back as ``None`` on every earlier record and never as a division of the totals.
+#: Spreading the total over twelve equal shares would be exactly the reading the fields exist
+#: to refute, and picking the four-and-eight pattern instead would be writing the conclusion
+#: into the evidence. Nobody took those numbers; the record says so.
+SCHEMA_VERSION: Final[int] = 12
 
 #: Versions this reader accepts, which is not only the current one.
 #:
@@ -230,7 +246,14 @@ SCHEMA_VERSION: Final[int] = 11
 #: as the value they ran and ``user_folds`` as the zero they did; and the two standing-summary
 #: columns come back as ``None``, because nobody took those numbers. Refusing it would discard
 #: the only cells of this row taken before it had arms to compare.
-_READABLE_SCHEMAS: Final[frozenset[int]] = frozenset({2, 3, 4, 5, 6, 7, 8, 9, 10, SCHEMA_VERSION})
+#:
+#: Version 11 joins on the version 4 argument. Everything it measured this version still
+#: measures, the probe phase's totals included, so its two hit rates split exactly as a record
+#: written today; the one thing it cannot say is which probes the cached tokens landed on,
+#: and it says so by carrying no per-probe counts rather than a plausible division of the
+#: totals. Refusing it would discard every luna cell from run 34 on -- the cells the split
+#: exists to re-read.
+_READABLE_SCHEMAS: Final[frozenset[int]] = frozenset({2, 3, 4, 5, 6, 7, 8, 9, 10, 11, SCHEMA_VERSION})
 
 #: The parameters that make two records the same cell, and so aggregable into one row.
 #:
@@ -907,6 +930,21 @@ class SeedRecord:
     """How many of those the provider served from cache, or ``None`` before version 4."""
     probe_output_tokens: int | None
     """Output tokens the probe phase billed, or ``None`` before version 4."""
+    probe_input_samples: tuple[int, ...] | None
+    """Input tokens each probe billed, one entry per probe in the order they were asked.
+
+    The order is the order the run asked them: each closing question in turn, each repeated
+    its own number of times, the combined question last. So on the archived configuration --
+    seven scoped questions once each, the combined question five times -- the last four
+    entries are the only probes with a byte-identical predecessor, and a probe half that hit
+    on those four and nothing else shows here as eight cold entries followed by four warm.
+
+    ``None`` on a record written before version 12, where the phase's totals were taken and
+    its division among the probes was not. Not a twelfth of the total each: that is the
+    reading these fields exist to test, and a record that predates them cannot vouch for it.
+    """
+    probe_cached_samples: tuple[int, ...] | None
+    """Input tokens each probe was served from cache, in the same order, or ``None`` before 12."""
     calls: int
     messages_left: int
     messages_peak: int
@@ -1099,8 +1137,88 @@ class SeedRecord:
 
     @property
     def hit_rate(self) -> float | None:
-        """Share of input tokens served from the provider's cache, None when nothing was billed."""
+        """Share of input tokens served from the provider's cache, None when nothing was billed.
+
+        Over the whole run, seeding and probes together: the ``run hit%`` column. What
+        compaction did to the cache is :attr:`seeding_hit_rate`; this mixes it with the
+        instrument's own draw, and is kept because every earlier write-up quotes it.
+        """
         return self.cached_tokens / self.input_tokens if self.input_tokens > 0 else None
+
+    @property
+    def seeding_input_tokens(self) -> int | None:
+        """Input tokens the conversation billed, the probes taken out.
+
+        Derived rather than stored, on the rule :attr:`input_cost` follows: the whole less the
+        probes, so the two halves add back to ``input_tokens`` whatever else the run did, and
+        a summarizer's calls or a probe that failed before it answered land in the seeding
+        half -- the direction that cannot flatter a strategy.
+
+        Returns:
+            The count, or None when the phases were never counted apart.
+        """
+        if self.probe_input_tokens is None:
+            return None
+        return max(self.input_tokens - self.probe_input_tokens, 0)
+
+    @property
+    def seeding_cached_tokens(self) -> int | None:
+        """How many of those the provider served from cache, or None before version 4."""
+        if self.probe_cached_tokens is None:
+            return None
+        return max(self.cached_tokens - self.probe_cached_tokens, 0)
+
+    @property
+    def seeding_hit_rate(self) -> float | None:
+        """Share of the conversation's input tokens served from cache: the ``seed hit%`` column.
+
+        The number that says what compaction did to the cache, because a deployed agent has
+        no probe phase: it continues the conversation rather than being interrogated twelve
+        times from a frozen copy of it. Until it was split out, the whole-run figure carried
+        the instrument's draw, and several archived rows read ten points high or low on it
+        for no reason the strategy supplied.
+
+        Returns:
+            The share, or None when the phases were never counted apart or nothing was billed.
+        """
+        billed, cached = self.seeding_input_tokens, self.seeding_cached_tokens
+        if billed is None or cached is None or billed <= 0:
+            return None
+        return cached / billed
+
+    @property
+    def probe_hit_rate(self) -> float | None:
+        """Share of the probe phase's input tokens served from cache: the ``probe hit%`` column.
+
+        The instrument. Every probe re-sends the snapshot from a restored copy, so this says
+        whether the provider served that snapshot to a prompt it had seen before, and on the
+        archived luna cells it takes one of two values. Kept beside the seeding half so a
+        reader can see which half a whole-run figure was made of, never quoted for compaction.
+
+        Returns:
+            The share, or None when the phases were never counted apart or nothing was billed.
+        """
+        if self.probe_input_tokens is None or self.probe_cached_tokens is None or self.probe_input_tokens <= 0:
+            return None
+        return self.probe_cached_tokens / self.probe_input_tokens
+
+    @property
+    def probe_hit_samples(self) -> tuple[float | None, ...] | None:
+        """Each probe's own share served from cache, in the order asked.
+
+        The observation the totals could only infer: on a 33.3% probe half, eight of these
+        read 0 and the last four read about 1, or they do not, and either is a finding.
+
+        Returns:
+            One share per probe, None for a probe that billed nothing; or None on a record
+            written before the per-probe counts existed.
+        """
+        if self.probe_input_samples is None or self.probe_cached_samples is None:
+            return None
+        return tuple(
+            cached / billed if billed > 0 else None
+            for billed, cached in zip(self.probe_input_samples, self.probe_cached_samples, strict=True)
+        )
 
     @property
     def input_cost(self) -> float:
@@ -1205,6 +1323,13 @@ class SeedRecord:
         # correction this field exists to make, already applied, and wrong.
         for name in ("probe_input_tokens", "probe_cached_tokens", "probe_output_tokens"):
             values.setdefault(name, None)
+        # None on the same reading, one schema along, and re-tupled by hand rather than through
+        # _TUPLE_FIELDS, whose rule turns an absent field into an empty tuple. Empty would say
+        # the run asked no probes; every run before schema 12 asked twelve and wrote down only
+        # their total, and the total must not be divided among them here -- see SCHEMA_VERSION.
+        for name in ("probe_input_samples", "probe_cached_samples"):
+            samples = values.get(name)
+            values[name] = None if samples is None else tuple(samples)
         # Zero, and for the connection-retry reason rather than the probe-token one. A record
         # written before schema 5 ran under a strategy that dropped every tool group in front
         # of the record without checking what the record covered, so no group was kept for want

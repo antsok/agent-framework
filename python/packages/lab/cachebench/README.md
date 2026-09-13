@@ -361,7 +361,8 @@ raises and no count can answer.
 ## Reading the live table
 
 Two real rows from `runs/run-41-luna-share80.txt`, with `summ$`, `nofetch`, `ignored`, `rep+-`
-and `rep2+-` cut out so the rest fits on a page:
+and `rep2+-` cut out so the rest fits on a page. They predate the cache split: the `hit%` there
+is what today's table prints as `run hit%`, with `seed hit%` and `probe hit%` in front of it.
 
 ```text
 strategy                 msgs   tok left/peak  snap%  calls        in  hit%     out  seed in$    seed$   probe$     run$ seed$+-  vs none$  facts  lost   acc1  seed+-  acc2  vs none   dq  flags
@@ -383,7 +384,9 @@ The tool prints the full legend under every table; this is the short form.
 | `snap%` | the snapshot every question was asked from, as a share of the tried window. How hard compaction acted: the control sits at the fill the cell was sized to, and a strategy below it removed that difference |
 | `calls` | model calls, seeding and probes together |
 | `in` / `out` | input and output tokens billed across the whole run. Output has its own column because a total driven by how much the model *wrote* is a different finding from one driven by how much context it was *sent* |
-| `hit%` | share of input served from the provider's cache. Compaction breaks the cached prefix by construction, so this is what it gives up to save tokens |
+| `seed hit%` | share of the conversation's input served from the provider's cache — seeding only, the probes taken out. **What compaction did to the cache, and the number to quote for it**: a deployed agent continues its conversation and has no probe phase. Compaction breaks the cached prefix by construction, so this is what it gives up to save tokens |
+| `probe hit%` | the same share over the probes — the instrument. On the archived luna cells from 100K up it takes one of two values: about 99%, or 33.3%, which is four of twelve probes served whole and eight cold — repeats two to five of the combined question hitting each other and nothing else. A row draws the low value when its strategy was still acting on the store as seeding ended. A fact about the instrument, not a cost: nothing else in the row reads it. The per-seed and per-probe blocks under the table show which seeds and which probes |
+| `run hit%` | seeding and probes together: what `hit%` was until schema 12. Kept because earlier write-ups quote it, not because it says what compaction did — the probes are about a third of a seed's input, so a seed that drew 33.3% on them reads a dozen points under one that drew 99% with the same seeding half |
 | `seed in$` | the prompt side of `seed$` — uncached and cached together, output and summarizer and probes left out. The low-variance view: on a clean five-seed control the total moved 38% while the input side moved 13%, because output is priced 57x a cache read and the model's verbosity swamps the axis compaction acts on |
 | `seed$` | what the conversation cost: seeding plus the strategy's own summarizer calls, and nothing else. **The ranking, the verdict and `vs none$` are all on this.** The money a deployed agent moves |
 | `probe$` | what the probing cost — the instrument. Every probe re-sends the whole snapshot, so a strategy that compacted hard collects that discount once per probe, on a phase no deployed agent has. Folding it in turned one cell's -14.1% into -3.5% and flipped the sign on two others |
@@ -423,7 +426,7 @@ the money columns.
 | `DQ` | this row sent a prompt a model of this size would have refused |
 | `EXCL` | out of the ranking for the other reason: it did not finish its turns |
 | `ERR` | a failed turn |
-| `THROTTLED:<n>` | calls re-sent after the provider refused them for rate reasons. The seconds waited are printed below the table, and they matter: a cached prefix that expired during a wait is a miss the `hit%` column charges to compaction |
+| `THROTTLED:<n>` | calls re-sent after the provider refused them for rate reasons. The seconds waited are printed below the table, and they matter: a cached prefix that expired during a wait is a miss the `seed hit%` column charges to compaction |
 | `RECONNECTED:<n>` | calls re-sent because the request never came back — connection dropped, or a 5xx. Counted apart from throttling because the waits are seconds rather than a quota window, so the prefix is very likely intact |
 | `DRIFT:<n>` | probes whose prompt was not the snapshot verbatim, because the strategy acted again on the restored state. **A row carrying this overstates what reached the model** |
 | `S<n>` | summarizer failures. The strategy catches its own errors and returns `False`, so a broken summarizer produces a run that never compacted and therefore scores *perfect* recall. A row with this flag is not evidence that summarization preserves anything |

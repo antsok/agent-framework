@@ -1168,3 +1168,20 @@ and the uncompacted control drew high on every luna record in the archive, so ev
 probe half beside it whenever a row is compared on cache at all. The table should print the split
 and the record should carry per-probe cached tokens; until they do, the arithmetic above is three
 fields from any record.
+
+**Built 13 September, uncommitted.** The table prints `seed hit%`, `probe hit%` and `run hit%` in
+place of `hit%` -- the money split's names, in that order, so the eye lands on the seeding half --
+with a per-seed `[seeding/probe]` block under it and, on records from schema 12 on, a per-probe
+block; the cross-cell section carries the first two. Schema 12 adds `probe_input_samples` and
+`probe_cached_samples`, one entry per probe in the order asked, `None` on every older record. No
+flag: a low probe half withdraws nothing and the column already carries it. Both cell figures are
+pooled over the seeds' tokens as `hit%` always was, so `run hit%` is exactly their token-weighted
+mix; the mean of the per-seed rates sits up to half a point off the pooled figure, and the block
+shows the per-seed values. Rerendered from the archive, the composed row reads 85.7/85.0/82.2/
+86.4/81.0 seeding against 33.3/99.6/33.3/33.3/33.3 probe in run 47, and run 48's arms 83.6/84.7/
+85.1 pooled (84.1/84.8/85.1 as per-seed means, the figures §3s quotes). Two things the rerender
+says that this section does not: at 60,000 tokens (runs 41 and 42) the probe half is *not*
+two-valued -- about 72% appears on five of fifteen `tool_summary_anchored` seeds -- so the two
+values are a property of the cells from 100,000 up; and the 88.0 -> 87.5 -> 76.2 series above is
+run 41's 60K figure and per-seed means, where the column prints run 42's 87.7 and, pooled, 87.4 ->
+75.4 for 100K and 170K.

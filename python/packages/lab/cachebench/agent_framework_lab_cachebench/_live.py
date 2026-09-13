@@ -762,6 +762,24 @@ class LiveOutcome:
         return sum(call.output_tokens for probe in self.probes for call in probe.calls)
 
     @property
+    def probe_input_samples(self) -> tuple[int, ...]:
+        """Input tokens each probe billed, one entry per probe in the order they were asked.
+
+        The totals above say what the probe phase cost; these say how it divided among the
+        probes, which is a different question and the one the totals cannot answer. A probe
+        phase whose cached total is four times one probe's prompt is four probes served whole
+        and eight served cold, or twelve served a third each, and only the per-probe figures
+        can tell those apart. The order is the order ``probes`` holds: each question in turn,
+        each asked its own number of times, the combined question last.
+        """
+        return tuple(sum(call.input_tokens for call in probe.calls) for probe in self.probes)
+
+    @property
+    def probe_cached_samples(self) -> tuple[int, ...]:
+        """Input tokens each probe was served from the provider's cache, in the same order."""
+        return tuple(sum(call.cached_tokens for call in probe.calls) for probe in self.probes)
+
+    @property
     def messages_left(self) -> int:
         """Messages in a probe's prompt: the snapshot as compaction left it, plus the question.
 
