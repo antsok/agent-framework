@@ -404,7 +404,9 @@ one pass per 11% of prompt growth at the default. On the package's own 40-turn g
 that is **3 passes against 33** with the share switched off. What it costs is a band that never
 reaches a tenth of the prompt never being compacted at all; `USERHELD:<n>`
 (`user_passes_declined`) is what says so, and a row with `USERHELD` and no `USERCOMPACT` is a
-share set too high for that workload rather than a strategy that failed.
+share set too high for that workload rather than a strategy that failed. Run 47 measured the row
+at `USERCOMPACT:2` against `USERHELD` 26 to 39 on every seed of the scaled payload, where the
+band is the minority of the prompt.
 
 **Refusing to recompact is the other arm, and it is a mode rather than a rejected idea.**
 `summary_mode` decides what a pass does with the summary the previous pass left behind, and the
@@ -415,8 +417,8 @@ drop or shed this", re-applied every pass as `_preserve_records` re-applies it t
 not the way the boundary is *found*, which is `_is_summary`'s id prefix and text marker — and the
 next pass's band is the turns newer than the newest standing summary, less the tail. The prefix up
 to that boundary is byte-identical before and after every later pass, which is the cache claim,
-and it is measured rather than assumed: on the composed row the hit rate tracked how often the user
-half had rewritten its summary, 89% at `USERREPLACED` 8 down to 70% at 16, against a record half
+and it is measured rather than assumed: in run 47 the composed row's hit rate tracked how often the
+user half had rewritten its summary, 89% at `USERCOMPACT` 4 down to 70% at 7, against a record half
 whose one preserved message holds 94-95%. What it costs is the thing recompaction was preventing:
 N passes leave N standing summaries, `records_in_conversation`'s accumulation problem exactly, a
 floor under the prompt that no later pass can lower, and `user_summaries_in_conversation` with
@@ -491,7 +493,8 @@ points, because what it replaces is around 75,000. And the floor at 41% is not t
 failing — it is the two halves it may not touch, the assistant's replies (~43,000 tokens) plus
 the tool payload (~22,000). Reaching below it needs this row *composed with* a tool-side one.
 That composition now exists — `ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy`,
-below — and has not been run, so this floor is still the last thing measured on the question.
+below — and run 47 measured it at 30% of the window on the scaled payload, where this row alone
+reached 71%; the two shapes are different cells, and the section below quotes the run.
 
 **When it does not work.** On a conversation whose bulk is tool output rather than user text,
 which is the shape `tool_summary_anchored` was built for; on short conversations, where the band
@@ -518,9 +521,12 @@ than compacts: it owns no selection rule and removes nothing itself.
 touch, and both say so. The record strategy works on the tool half — a seventh of run 43's
 prompt — and the user-turn strategy's offline replay bottomed out at 41% of the window, a floor
 that is exactly "the assistant replies and the tool payload it may not touch". The section above
-names composing the two as the obvious next measurement and does not make it. **That measurement
-has still not been made.** Nothing below is a result; it is what the mechanism does, and what a
-run of it would be answering.
+names composing the two as the obvious next measurement. **Run 47 made it**: five seeds of
+`gpt-5.6-luna` at a 170,000-token window and 0.9 fill on the scaled payload, both halves firing on
+every seed, 53 of 53 facts, a 30% snapshot against 50% for the record half alone and 71% for the
+user half alone, and a 76% cache hit rate against their 95% and 93%. Its cost sits inside the seed
+spread — +22% against the control with a 30% spread of its own — so the money question is open.
+The benchmark's `RESULTS.md` carries the run; everything below is mechanism.
 
 **Mechanism.** One pass runs the record strategy, re-reads the conversation, and runs the
 user-turn strategy. It returns True when either did. The two select disjoint messages —
@@ -598,10 +604,11 @@ band's apparent share and decline worthwhile passes by the other route.
 phase can only act on a pass whose entry size is above the shared line, and a pass above the line
 is a pass the user half is consulted on, so nothing the record phase removes is ever removed out
 of the user half's reach. A non-zero value on a default row is a defect report rather than a
-configuration note. On a row whose halves were deliberately set apart it still counts what it was
-written for: a pass is starved when the size it was judged against is at or below the user line
-and would have been above it with the record phase's earlier out-of-reach removals still in the
-conversation. It is a statement across passes and never within one — a pass is judged by the size
+configuration note, and run 47 read zero on all five seeds. On a row whose halves were
+deliberately set apart it still counts what it was written for: a pass is starved when the size
+it was judged against is at or below the user line and would have been above it with the record
+phase's earlier out-of-reach removals still in the conversation. It is a statement across passes
+and never within one — a pass is judged by the size
 it began with, so this pass's removal cannot explain this pass's reading — and the quantity it is
 decided against is exposed as `tokens_removed_out_of_user_reach` so the counter can be checked.
 On the package's growing fixture the aligned row reports `USERCOMPACT:4, USERHELD:1,

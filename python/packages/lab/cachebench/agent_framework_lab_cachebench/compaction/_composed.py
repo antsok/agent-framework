@@ -12,10 +12,13 @@ payload, and the user-turn strategy's offline replay put its floor at "the assis
 the tool payload it may not touch". ``STRATEGIES.md`` names composing the two as the obvious
 next measurement and states that it is not made there.
 
-This is that composition. What it reaches is the question a run of it would answer, and nothing
-in this module is a report of one: no row produced by this class has been measured since it was
-given the shared line described below, so every claim here is about mechanism -- which messages
-each phase selects, which number each phase reads -- and not about what the pair removed.
+This is that composition. Run 47 measured it on the shared line described below -- gpt-5.6-luna
+at a 170,000-token window and 0.9 fill, five seeds: both halves fired on every seed,
+``USERSTARVED`` read zero throughout, 53 of 53 facts survived, the snapshot sat at 30% of the
+window against 50% for the record half alone and 71% for the user half alone, and the cache hit
+rate was 76% against their 95% and 93%. Its cost sits inside the seed spread, so that question is
+open. Everything else in this module is about mechanism -- which messages each phase selects,
+which number each phase reads -- and the benchmark's ``RESULTS.md`` carries the run.
 
 **One reading of the prompt decides both halves, and one line is what both are judged against.**
 Those are two decisions, forced by the same measurement, so they are stated together.
@@ -25,8 +28,8 @@ The row this class first shipped as was structurally tool-only. The record phase
 :data:`~._usersummary.DEFAULT_USER_TRIGGER_FRACTION`, 0.8; the record phase goes first, removes
 the tool payload while the prompt is still in the 60s of the ceiling, and holds it there for the
 rest of the run. The prompt then never reaches 0.8 at all, so the user half is never consulted:
-gpt-5.6-luna at a 170,000-token window, 0.9 fill, seed 1, reported ``REC:1, RECORDS:1, FORCED:1,
-RECFORCED:1``, a 63% snapshot and no ``USERCOMPACT`` -- a composed row that was
+run 47a, gpt-5.6-luna at a 170,000-token window, 0.9 fill, seed 1, reported ``REC:1, RECORDS:1,
+FORCED:1, RECFORCED:1``, a 63% snapshot and no ``USERCOMPACT`` -- a composed row that was
 ``tool_summary_anchored`` under a longer name.
 
 *Giving the two halves the same fraction does not on its own fix that*, and this class does not
@@ -337,7 +340,7 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
         nothing the record phase removes is ever removed out of the user half's reach, the
         quantity below stays at zero, and so does this. A non-zero value on a row built with the
         default ``user_trigger_fraction`` is therefore a defect report rather than a
-        configuration note, and should be read as one.
+        configuration note, and should be read as one. Run 47 read zero on all five seeds.
 
         **What it counts, on a row whose halves were deliberately set apart.** A pass is starved
         when the size the pass was judged against is at or below the user line, *and* would have

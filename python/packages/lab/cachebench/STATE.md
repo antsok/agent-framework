@@ -959,7 +959,8 @@ guarded by `entry_tokens <= user_line`, which cannot both hold, including at exa
 neither phase acts. A non-zero value there is a defect report.
 
 **Smoke, 170,000/0.9 scaled payload, one seed, probes cut to 1** (mechanism only -- `seed+- 0%`
-means unknown, not stable):
+means unknown, not stable). **Superseded by run 47, below**, which measured the same rows on five
+seeds; the table stays because it is what cleared the relaunch:
 
 | row | msgs | tok left | snap% | hit% | seed$ | vs none$ | facts | acc1 | flags |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
@@ -990,4 +991,43 @@ Corrected in `STRATEGIES.md` and `compaction/STRATEGIES.md`.
 **Run 47 relaunched** with all twenty strategies, five seeds, two streams. Run 47a -- the aborted
 attempt -- is archived under `runs/` as evidence, because it is the only record behind figures
 the source quotes.
+
+**Run 47 completed and archived** -- `runs/run-47-luna-170k-fill90-all20.txt` and the five
+`-s{0..4}.jsonl` beside it: 100 records, $18.22, no throttling, retries or errors. What five seeds
+say, against the smoke above:
+
+| row | `snap%` | `hit%` | `seed$` | `seed$+-` | `vs none$` | facts | `acc1` | user-half flags |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| `none` | 86% | 97% | $0.1113 | 19% | -- | 53/53 | 100% | -- |
+| `tool_summary_anchored` | 50% | 95% | $0.0908 | 22% | -18% | 53/53 | 100% | -- |
+| `user_summary_anchored` | 71% | 93% | $0.1471 | 24% | +32% | 53/53 | 100% | USERCOMPACT:2 every seed, USERHELD 26-39, USERREPLACED:24, USERUNDER 62-75 |
+| `tool_and_user_summary_anchored` | 30% | 76% | $0.1357 | 30% | +22% | 53/53 | 100% | USERCOMPACT 4-7, USERHELD 2-4, USERREPLACED 8/14/16, USERUNDER 94-98, no USERSTARVED |
+
+- **The mechanism holds at five seeds.** Both halves of the composed row fired on every seed,
+  `USERSTARVED` is absent from all five, and the composition is the deepest-compacting row in the
+  cell that loses nothing -- 30% against the record half's 50 and the user half's 71, where every
+  row below it in `snap%` lost 33 to 45 facts. The smoke's `UNCOVERED:1` and 89% `acc1` on the
+  composed row did not recur: 53/53 and 100% on all five, `UNCOVERED` 0 throughout.
+- **The hysteresis finding holds**: `USERCOMPACT:2` against `USERHELD` 26 to 39 on the single row,
+  every seed. The band is the minority of the prompt under the scaled payload and the share
+  refuses it; this is the sizing, not the strategy.
+- **The cache penalty is the result.** 76% against 95% and 97%, and per seed the composed row's
+  hit rate tracked its passes -- 89% at `USERCOMPACT` 4, 73% and 75% at 5, 70% at 6 and at 7. That
+  is what rewriting the user summary in place costs, and it is the measurement the `boundary` and
+  `fold` modes now in the tree were written against. Neither mode ran here.
+- **Nothing here is a cost result, and the smoke's +63%/+65% were one seed.** `seed$+-` runs 19% to
+  30% across the four rows. The instrument printed `NOT SUPPORTED` on its own verdict
+  (`tool_summary_anchored` -18% against a 22% spread), and the composition's +22% is inside its
+  30%. The user row's +32% is the one figure that clears the rule -- 24% on the row, 19% on the
+  control, every seed dearer at +23% to +45% -- so its direction is supported and its size is not.
+  Paired by seed the record row is cheaper on all five (-8% to -30%) and the composition dearer on
+  all five (+3% to +35%); those are signs, not sizes. Quote no saving and no penalty from this cell
+  for either of those two rows -- `REVIEW-2026-09-06.md` §3 is the precedent.
+- **Seed 3 is off target and in the aggregate.** `-s3.jsonl` seeded 137,396 tokens, -10.2%, and
+  prints `FILL OFF TARGET` rendered alone; the other four sit at -2.1% to -3.9% and the merged cell
+  at -4.6%. Its control is the cheapest of the five ($0.0962, 15% under the next), so it is the
+  record row's worst seed at -8%. Re-rendered over the other four: retention unchanged on every
+  row, the composition still 76% and 31%, the control's spread down from 19% to 4% and the user
+  row's from 24% to 15%, the record row -20% against 21% (still `NOT SUPPORTED`), the composition
+  +20% against 26%, the user row +32% against 15%. Dropping it changes nothing above.
 
