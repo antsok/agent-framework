@@ -915,6 +915,8 @@ def _seed_record(
         probe_input_tokens=outcome.probe_input_tokens,
         probe_cached_tokens=outcome.probe_cached_tokens,
         probe_output_tokens=outcome.probe_output_tokens,
+        probe_input_samples=outcome.probe_input_samples,
+        probe_cached_samples=outcome.probe_cached_samples,
         calls=len(outcome.calls),
         messages_left=outcome.messages_left,
         messages_peak=outcome.messages_peak,
@@ -1114,6 +1116,19 @@ class CellStats:
     input_tokens: float
     cached_tokens: float
     output_tokens: float
+    seeding_input_tokens: float | None
+    """Input tokens the conversation billed per seed, the probes taken out.
+
+    The denominator of ``seed hit%``. None when any seed of this row predates the phase
+    split, on the rule ``seeding_cost`` follows: a mean over the seeds that happened to record
+    it would be a different row from the one the table names.
+    """
+    seeding_cached_tokens: float | None
+    """How many of those the provider served from cache, per seed: the numerator of ``seed hit%``."""
+    probe_input_tokens: float | None
+    """Input tokens the probe phase billed per seed: the denominator of ``probe hit%``."""
+    probe_cached_tokens: float | None
+    """How many of those the provider served from cache, per seed: the numerator of ``probe hit%``."""
     calls: float
     messages_left: float
     messages_peak: float
@@ -1158,8 +1173,34 @@ class CellStats:
 
     @property
     def hit_rate(self) -> float | None:
-        """Share of input tokens served from the provider's cache."""
+        """Share of input tokens served from the provider's cache, over the whole run.
+
+        The ``run hit%`` column: seeding and probes together, which is what ``hit%`` was
+        before the split. Pooled over the cell's tokens rather than meaned over its seeds, as
+        it always was, and the two halves below are pooled the same way so that this is
+        exactly their token-weighted mix.
+        """
         return self.cached_tokens / self.input_tokens if self.input_tokens > 0 else None
+
+    @property
+    def seeding_hit_rate(self) -> float | None:
+        """Share of the conversation's input tokens served from cache: ``seed hit%``.
+
+        None when the row cannot split its phases, or when the seeding half billed nothing.
+        """
+        if self.seeding_input_tokens is None or self.seeding_cached_tokens is None or self.seeding_input_tokens <= 0:
+            return None
+        return self.seeding_cached_tokens / self.seeding_input_tokens
+
+    @property
+    def probe_hit_rate(self) -> float | None:
+        """Share of the probe phase's input tokens served from cache: ``probe hit%``.
+
+        None when the row cannot split its phases, or when the probe half billed nothing.
+        """
+        if self.probe_input_tokens is None or self.probe_cached_tokens is None or self.probe_input_tokens <= 0:
+            return None
+        return self.probe_cached_tokens / self.probe_input_tokens
 
 
 def _aggregate(strategy: str, records: Sequence[SeedRecord]) -> CellStats:
@@ -1189,6 +1230,10 @@ def _aggregate(strategy: str, records: Sequence[SeedRecord]) -> CellStats:
     seeding = _measured([record.seeding_cost for record in records])
     probing = _measured([record.probe_cost for record in records])
     seeding_input = _measured([record.seeding_input_cost for record in records])
+    seeding_billed = _measured([record.seeding_input_tokens for record in records])
+    seeding_cached = _measured([record.seeding_cached_tokens for record in records])
+    probe_billed = _measured([record.probe_input_tokens for record in records])
+    probe_cached = _measured([record.probe_cached_tokens for record in records])
     return CellStats(
         strategy=strategy,
         records=tuple(records),
@@ -1203,6 +1248,10 @@ def _aggregate(strategy: str, records: Sequence[SeedRecord]) -> CellStats:
         input_tokens=fmean(record.input_tokens for record in records),
         cached_tokens=fmean(record.cached_tokens for record in records),
         output_tokens=fmean(record.output_tokens for record in records),
+        seeding_input_tokens=None if seeding_billed is None else fmean(seeding_billed),
+        seeding_cached_tokens=None if seeding_cached is None else fmean(seeding_cached),
+        probe_input_tokens=None if probe_billed is None else fmean(probe_billed),
+        probe_cached_tokens=None if probe_cached is None else fmean(probe_cached),
         calls=fmean(record.calls for record in records),
         messages_left=fmean(record.messages_left for record in records),
         messages_peak=fmean(record.messages_peak for record in records),
@@ -1528,15 +1577,19 @@ def _split_note(cells: Sequence[CellStats], split: bool) -> list[str]:
             "Cost: seed$ is the conversation and probe$ is the instrument, priced apart. The ranking,",
             "the verdict and vs none$ are all on seed$, because every probe re-sends the whole snapshot",
             "and a strategy that compacted hard would otherwise collect that discount once per probe.",
+            "Cache: seed hit% and probe hit% split the same tokens the same way. Quote seed hit% for",
+            "what compaction did; probe hit% is the instrument's own draw and says nothing about the",
+            "workload, and run hit% mixes the two.",
         ]
     missing = ", ".join(sorted(cell.strategy for cell in cells if cell.seeding_cost is None))
     return [
         "",
-        f"NO PHASE SPLIT ({missing}): these records counted seeding and probing in one total, so seed$",
-        "and probe$ cannot be recovered from them -- the per-probe prompts are not on the record, and",
-        "pricing twelve probes at the final prompt's size would be a model of the run rather than the",
-        "run. The ranking above is therefore on run$, which includes twelve re-reads of the snapshot",
-        "that no deployed agent pays for and which favour whichever strategy compacted hardest.",
+        f"NO PHASE SPLIT ({missing}): these records counted seeding and probing in one total, so seed$,",
+        "probe$, seed hit% and probe hit% cannot be recovered from them -- the per-probe prompts are",
+        "not on the record, and pricing twelve probes at the final prompt's size would be a model of",
+        "the run rather than the run. The ranking above is therefore on run$, which includes twelve",
+        "re-reads of the snapshot that no deployed agent pays for and which favour whichever strategy",
+        "compacted hardest, and the only cache figure is run hit%, which mixes those re-reads in.",
     ]
 
 
@@ -1706,6 +1759,71 @@ def _money(value: float | None) -> str:
     return "?" if value is None else "$" + format(value, ".4f")
 
 
+def _rate(cached: float | None, billed: float | None) -> str:
+    """Return a cache hit rate, or ``?`` when the records behind it never measured it.
+
+    The money convention applied to the cache columns: ``?`` is a record that counted its
+    phases in one total, ``n/a`` a phase that billed nothing, and the two are different
+    statements. One decimal rather than none, because the probe half takes values a whole
+    percent cannot separate -- 33.3% is four probes of twelve and 99.6% is all of them, and
+    a seeding half that moved by a point is a finding at five seeds.
+
+    Args:
+        cached: Tokens the provider served from cache, or None when not measured.
+        billed: Input tokens billed, or None when not measured.
+
+    Returns:
+        The rendered cell.
+    """
+    if cached is None or billed is None:
+        return "?"
+    return "n/a" if billed <= 0 else f"{cached / billed:.1%}"
+
+
+def _hit_pairs(records: Sequence[SeedRecord]) -> str:
+    """Return each seed's seeding and probe hit rates, for the block printed under the table.
+
+    The column is a mean over seeds and the probe half is not a spread but a draw between two
+    values, so a row at 46.6% on it is seeds at 33.3% and seeds at 99.6% and nothing at 46.6%.
+    Beside it, the seeding half of the same seeds, so the reader can see that it did not move
+    with the draw.
+
+    Args:
+        records: The seeds, in the order they were recorded.
+
+    Returns:
+        One bracketed ``seeding/probe`` pair per seed, in the shape the acc blocks use.
+    """
+    return "  ".join(
+        f"[{_rate(record.seeding_cached_tokens, record.seeding_input_tokens)}"
+        f"/{_rate(record.probe_cached_tokens, record.probe_input_tokens)}]"
+        for record in records
+    )
+
+
+def _probe_groups(records: Sequence[SeedRecord]) -> str:
+    """Return each seed's per-probe hit rates, in the order the probes were asked.
+
+    The observation behind the probe half: on a record at 33.3% these read eight cold and four
+    warm, or they read twelve at a third, and the totals cannot tell the two apart.
+
+    Args:
+        records: The seeds, in the order they were recorded.
+
+    Returns:
+        One bracketed group per seed, or ``not recorded`` for a seed written before the
+        per-probe counts existed.
+    """
+    groups: list[str] = []
+    for record in records:
+        samples = record.probe_hit_samples
+        if samples is None:
+            groups.append("not recorded")
+        else:
+            groups.append("[" + " ".join("n/a" if value is None else f"{value:.0%}" for value in samples) + "]")
+    return "  ".join(groups)
+
+
 def _row(
     stats: CellStats,
     control: CellStats | None,
@@ -1741,7 +1859,13 @@ def _row(
         relative = "-"
     else:
         relative = f"{stats.correctness / control.correctness:.0%}"
-    hit = "n/a" if stats.hit_rate is None else f"{stats.hit_rate:.0%}"
+    # The seeding half first, because it is the number that describes a deployed agent; the
+    # probe half beside it, because a whole-run figure is unreadable without knowing which
+    # of its two values the instrument drew; and the whole-run figure last, kept for the
+    # reason run$ is.
+    seed_hit = _rate(stats.seeding_cached_tokens, stats.seeding_input_tokens)
+    probe_hit = _rate(stats.probe_cached_tokens, stats.probe_input_tokens)
+    run_hit = _rate(stats.cached_tokens, stats.input_tokens)
     flags = _flags(stats, control, message_gap=message_gap)
     # ``DQ`` is the dq column crossing zero and nothing else. It used to be "excluded from the
     # ranking", which is a wider set: a row that failed a turn is excluded too, and the last
@@ -1763,7 +1887,7 @@ def _row(
         f"{stats.strategy:<28}{f'{stats.messages_left:.0f}/{stats.messages_peak:.0f}':>9}"
         f"{f'{stats.prompt_tokens_final:,.0f}/{stats.prompt_tokens_peak:,.0f}':>16}"
         f"{snap:>7}"
-        f"{stats.calls:>7.0f}{stats.input_tokens:>12,.0f}{hit:>6}"
+        f"{stats.calls:>7.0f}{stats.input_tokens:>12,.0f}{seed_hit:>11}{probe_hit:>12}{run_hit:>10}"
         f"{stats.output_tokens:>10,.0f}{_money(stats.seeding_input_cost):>10}"
         f"{_money(stats.seeding_cost):>9}{_money(stats.probe_cost):>9}{_money(stats.cost):>9}"
         f"{('?' if stats.seeding_cost_spread is None else format(stats.seeding_cost_spread, '.0%')):>8}"
@@ -1789,8 +1913,32 @@ _LEGEND: Final[tuple[str, ...]] = (
     "            removing messages, and msgs cannot see it",
     "calls     = model calls, seeding and probes together",
     "in        = input tokens billed across the whole run",
-    "hit%      = share of those served from the provider's cache. Compaction breaks the",
-    "            cached prefix by construction, so this is what it gives up to save tokens",
+    "seed hit%  = share of the conversation's input tokens served from the provider's cache:",
+    "            seeding only, the probes taken out. This is what compaction did to the cache,",
+    "            and the number to quote for it -- a deployed agent continues its conversation",
+    "            and has no probe phase. Compaction breaks the cached prefix by construction,",
+    "            so this is what it gives up to save tokens",
+    "probe hit% = the same share over the probes: the instrument. Every probe re-sends the",
+    "            snapshot from a restored copy, so this measures whether the provider served",
+    "            that snapshot to a prompt it had already seen, and on the archived luna cells",
+    "            from 100,000 tokens up it took one of two values and nothing between: about",
+    "            99%, or 33.3%. 33.3% is four of twelve probes served whole and eight served",
+    "            cold. The only four with a byte-identical predecessor are repeats two to five",
+    "            of the combined question, so it is those four hitting each other and nothing",
+    "            else -- the provider served the prefix to an identical prompt and not to a",
+    "            sibling that merely shared it. Which value a seed draws goes with whether the",
+    "            strategy was still acting on the store as seeding ended: a row at rest by then",
+    "            drew high on every seed, a summarizer that fires every turn drew 33.3% on",
+    "            every seed, and the rows between drew by the seed. A low value is a fact about",
+    "            the instrument and a warning about run hit%, not a cost: seed$, seed hit%,",
+    "            retention and accuracy never read it, and nothing is withdrawn by it. The",
+    "            per-probe block under the table shows which probes hit, where the record can",
+    "run hit%   = seeding and probes together, cached over input across the whole run: what",
+    "            hit% was before the split. Here because it is the number every earlier",
+    "            write-up quotes, not because it says what compaction did. The probes are a",
+    "            third of a seed's input on the archived cells, so two seeds of one row read",
+    "            73.5% and 88.8% here with seeding halves of 85.7% and 85.0%, and a row whose",
+    "            seeds all drew low sits eight to thirteen points under its seeding half",
     "out       = output tokens billed across the whole run. Its own column because a total",
     "            driven by how much the model wrote is a different finding from one driven",
     "            by how much context it was sent, and one number cannot show which",
@@ -1820,11 +1968,12 @@ _LEGEND: Final[tuple[str, ...]] = (
     "            workload. '?' means the comparison is unavailable -- either a row could not",
     "            separate its probing from its seeding (NOSPLIT), or the control did not run",
     "            the strategies' conversation (MSGS) and there is nothing to compare against",
-    "'?'       = in any money column, the records behind this row never measured that",
-    "            quantity. Records written before schema 4 counted their calls in one total,",
-    "            and no arithmetic over what they stored can separate the phases -- pricing",
-    "            twelve probes at the final prompt's size is a model of the run, not the run.",
-    "            Those rows carry NOSPLIT, show run$ alone, and are ranked on it",
+    "'?'       = in any money or cache column, the records behind this row never measured",
+    "            that quantity. Records written before schema 4 counted their calls in one",
+    "            total, and no arithmetic over what they stored can separate the phases --",
+    "            pricing twelve probes at the final prompt's size is a model of the run, not",
+    "            the run. Those rows carry NOSPLIT, show run$ and run hit% alone, and are",
+    "            ranked on run$",
     "facts     = planted facts surviving compaction into the snapshot: recall's ceiling.",
     "            Scored against the snapshot, which is exactly the context every probe was",
     "            answered from. Scored against a closing prompt instead, this was circular:",
@@ -1870,8 +2019,8 @@ _LEGEND: Final[tuple[str, ...]] = (
     "            a table came to show rows flagged DQ beside a dq of 0%. ERR failed turn,",
     "            THROTTLED:<n> calls re-sent after the provider refused them for rate",
     "            reasons; the seconds spent waiting are printed below the table, and they",
-    "            matter because a cached prefix that expired during a wait is a miss the hit%",
-    "            column charges to compaction. RECONNECTED:<n> calls re-sent because the",
+    "            matter because a cached prefix that expired during a wait is a miss the seed",
+    "            hit% column charges to compaction. RECONNECTED:<n> calls re-sent because the",
     "            request never came back with an answer -- the connection dropped, or the",
     "            provider answered 5xx. Counted apart from THROTTLED because the waits are",
     "            seconds rather than a quota window, so this row's cached prefix is very",
@@ -1992,7 +2141,8 @@ _LEGEND: Final[tuple[str, ...]] = (
     "            in under it; when it does, every vs none$ in the cell compares two different",
     "            workloads, and the control is excluded so that none of them is ranked.",
     "            NOSPLIT this row cannot say what its probing cost, so its money columns are",
-    "            the invoice rather than the workload",
+    "            the invoice rather than the workload, and its only cache figure is run hit%,",
+    "            which mixes the probes in",
 )
 
 
@@ -2109,7 +2259,8 @@ def _render(
     cell_params = cells[0].records[0].cell
     pricing = cell_params.pricing
     header = (
-        f"{'strategy':<28}{'msgs':>9}{'tok left/peak':>16}{'snap%':>7}{'calls':>7}{'in':>12}{'hit%':>6}"
+        f"{'strategy':<28}{'msgs':>9}{'tok left/peak':>16}{'snap%':>7}{'calls':>7}{'in':>12}"
+        f"{'seed hit%':>11}{'probe hit%':>12}{'run hit%':>10}"
         f"{'out':>10}{'seed in$':>10}{'seed$':>9}{'probe$':>9}{'run$':>9}{'seed$+-':>8}"
         f"{'summ$':>8}{'vs none$':>10}"
         f"{'facts':>9}{'lost':>6}{'nofetch':>8}{'ignored':>8}{'acc1':>9}{'seed+-':>8}{'rep+-':>7}"
@@ -2145,6 +2296,25 @@ def _render(
     lines += ["", "per-sample acc2, one group per seed:"]
     for cell in ordered:
         lines.append(f"  {cell.strategy:<28}{_sample_groups(cell.combined_samples)}")
+    # The probe half is a draw between two values, so its column is a mean over a mixture and
+    # the per-seed pairs are what say which seeds drew which -- and that the seeding half
+    # beside them did not move with the draw.
+    lines += ["", "per-seed cache hit, seeding/probe, one pair per seed:"]
+    for cell in ordered:
+        lines.append(f"  {cell.strategy:<28}{_hit_pairs(cell.records)}")
+    # And under those, which probes the cached tokens landed on, where the record can say. A
+    # cell written before the per-probe counts existed says so in one line rather than
+    # printing twenty rows of "not recorded".
+    if any(record.probe_hit_samples is not None for cell in ordered for record in cell.records):
+        lines += ["", "per-probe cache hit, one group per seed, probes in the order asked:"]
+        for cell in ordered:
+            lines.append(f"  {cell.strategy:<28}{_probe_groups(cell.records)}")
+    else:
+        lines += [
+            "",
+            "per-probe cache hit: not on these records. They were written before schema 12 and carry",
+            "  the probe phase's totals only, so which probes hit is arithmetic here, not observation.",
+        ]
     lines += _fill_note({cell.strategy: cell for cell in ordered}, cell_params.plan, control)
     lines += _divergence_note(message_gap, control)
     lines += _split_note(ordered, split)
@@ -2724,8 +2894,12 @@ def _combination_row(combination: _Combination, names: Sequence[str], *, mixed: 
     """
     stats = combination.stats
     control = "*" if stats.strategy == "none" else " "
+    # Both halves, on the rule the per-cell table follows: a row compared on cache at all is
+    # shown its seeding half, and the probe half beside it so that nobody reaches for run hit%.
     return (
         f"    {stats.strategy:<28}{_money(stats.seeding_cost):>9}{combination.spread:>8.0%} "
+        f"{_rate(stats.seeding_cached_tokens, stats.seeding_input_tokens):>10}"
+        f"{_rate(stats.probe_cached_tokens, stats.probe_input_tokens):>12} "
         f"{stats.correctness:>6.0%}{control}{combination.relative:>8.0%}{len(stats.records):>7}  "
         f"{_settings_label(combination.cell, names, mixed=mixed)}"
     )
@@ -2854,7 +3028,10 @@ def _workload_ranking(combinations: Sequence[_Combination]) -> list[str]:
     mixed = any(cell.settings is None for cell in cells)
     ordered = sorted(combinations, key=lambda combination: (not combination.eligible, combination.cost))
     eligible = [combination for combination in ordered if combination.eligible]
-    header = f"    {'strategy':<28}{'seed$':>9}{'seed$+-':>9}{'acc1':>7}{'vs none':>9}{'seeds':>7}  settings"
+    header = (
+        f"    {'strategy':<28}{'seed$':>9}{'seed$+-':>9}{'seed hit%':>11}{'probe hit%':>12}"
+        f"{'acc1':>7}{'vs none':>9}{'seeds':>7}  settings"
+    )
     lines = [header, "    " + "-" * (len(header) - 4)]
     for index, combination in enumerate(ordered):
         if index == len(eligible):

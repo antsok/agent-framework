@@ -16,8 +16,9 @@ Related documents:
 - [`agent_framework_lab_cachebench/compaction/STRATEGIES.md`](agent_framework_lab_cachebench/compaction/STRATEGIES.md)
   — the five strategies written here, in depth. **Read that for `anchored`,
   `anchored_min_gain`, `tool_summary_anchored`, `user_summary_anchored` and
-  `tool_and_user_summary_anchored`;** this file gives only their place in the set. Its account
-  of the composed row is behind the code — see the caveats at the end. It is separate because
+  `tool_and_user_summary_anchored`;** this file gives only their place in the set. It is
+  current on the composed row's shared trigger and on the `0.6`/`0.9` record thresholds — the
+  caveats at the end say where this file's own numbers come from. It is separate because
   the subpackage is meant to be lifted out whole into a repository
   of its own, and the design notes travel with the code rather than with the instrument that
   measured it. `tests/compaction/test_boundary.py` enforces the same boundary on the imports.
@@ -611,12 +612,13 @@ conversation looks like, and is why the table is ranked on correctness first.
   seed spreads, and the sections say so. Run 47a, the aborted attempt, predates
   `--user-min-band-share` and ran the two-line composed row; nothing it showed describes either
   row as it now stands.
-- **`compaction/STRATEGIES.md` is behind on two numbers and one design.** It documents
-  `trigger_fraction` 0.8 and `fallback_fraction` 0.95; both were reverted to 0.6 and 0.9 on
-  6 September 2026, which is what the code, the CLI and every archived run use. Its section on
-  `ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy` describes the two-line row that
-  class first shipped as — separate triggers, starvation reported rather than prevented, and a
-  `USERSTARVED` counted against everything the record phase removed over a run — all of which
-  `_composed.py` has replaced with the shared line described above. Its mechanism and design
-  reasoning for the other four strategies are current; those two defaults and that section are
-  not.
+- **`compaction/STRATEGIES.md` agrees with the code on the two numbers and the one design that
+  used to separate them.** It documents `trigger_fraction` 0.6 and `fallback_fraction` 0.9 —
+  and records that both were briefly 0.8 and 0.95 on 6 September 2026 and reverted the same
+  day, which is what the code, the CLI and every archived run use. Its section on
+  `ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy` describes the shared line: both
+  halves judged at `--trigger-fraction` against the size the pass began with, with the two-line
+  row that class first shipped as — separate triggers, starvation reported rather than
+  prevented — kept there as the measured failure the shared line replaced. Where the two files
+  differ is scope, not fact: that one carries the mechanism and the design reasoning, this one
+  the place of each row in the set and the cell it was measured at.

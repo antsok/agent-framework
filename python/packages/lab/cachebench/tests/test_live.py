@@ -102,6 +102,7 @@ from agent_framework_lab_cachebench._live_cli import (
     _flags,
     _probe_spread,
     _progress,
+    _rate,
     _render,
     _row,
     _seed_record,
@@ -3890,6 +3891,282 @@ async def test_a_record_written_before_the_phase_split_says_so_rather_than_guess
     assert _aggregate("none", [old]).seeding_cost is None
 
 
+class _ExactMatchCacheStub(StubChatClient):
+    """A provider whose cache serves a prompt only when an identical one has been sent before.
+
+    The narrowest reading of the archived probe halves. A record at 33.3% is consistent with
+    the provider serving the snapshot prefix to an identical prompt and not to a sibling that
+    merely shares it, and this stub does exactly that -- so a run through it has to show the
+    four repeats of the combined question warm behind eight cold probes, or the per-probe
+    fields are not observing what the totals' arithmetic inferred. Every prompt bills the same,
+    which is what makes the probe half read as a count of probes.
+    """
+
+    def __init__(self, *, prompt_tokens: int, **kwargs: Any) -> None:
+        """Create the stub.
+
+        Keyword Args:
+            prompt_tokens: What every call bills, and what a served call reads back as cached.
+            kwargs: Passed to the base stub.
+        """
+        super().__init__(**kwargs)
+        self.prompt_tokens = prompt_tokens
+        self.served: set[tuple[tuple[str, str], ...]] = set()
+
+    def _inner_get_response(
+        self, *, messages: Sequence[Message], stream: bool, options: Mapping[str, Any], **kwargs: Any
+    ) -> Any:
+        # Keyed on the whole prompt's text rather than on message identity, since a restored
+        # probe carries the same words under fresh ids and a real cache reads bytes.
+        key = tuple((str(message.role), _turn_text([message])) for message in messages)
+        cached = self.prompt_tokens if key in self.served else 0
+        self.served.add(key)
+        self.usage = UsageDetails(
+            input_token_count=self.prompt_tokens, output_token_count=20, cache_read_input_token_count=cached
+        )
+        return super()._inner_get_response(messages=messages, stream=stream, options=options, **kwargs)
+
+
+async def test_per_probe_cached_tokens_reach_the_record_and_show_which_probes_hit() -> None:
+    """The 4-of-12 pattern has to be readable off the record, not inferred from a ratio.
+
+    Every archived luna record from run 34 on carries a probe half of about 99% or 33.3%, and
+    33.3% was argued to be four probes served whole and eight served cold because the cached
+    total came to four times one probe's prompt -- arithmetic, since no record carried the
+    per-probe figures. Under a cache that serves identical prompts only, the seven scoped
+    questions and the first combined attempt are each new and the four repeats behind it are
+    not, so the record has to show exactly that shape, in that order, and it has to survive
+    the file as the tuples it was written as.
+    """
+    outcome, scenario = await _probed(_ExactMatchCacheStub(prompt_tokens=1_000), repeats=1)
+    record = _record(outcome, scenario)
+
+    assert record.probe_input_samples is not None
+    assert record.probe_cached_samples is not None
+    assert len(record.probe_input_samples) == 7 + DEFAULT_COMBINED_REPEATS, "seven scoped, then the combined"
+    # Every probe billed the same, so the pattern is a count of probes and nothing else.
+    assert set(record.probe_input_samples) == {1_000}
+    assert record.probe_cached_samples == (0,) * 8 + (1_000,) * (DEFAULT_COMBINED_REPEATS - 1)
+    assert record.probe_hit_samples == (0.0,) * 8 + (1.0,) * (DEFAULT_COMBINED_REPEATS - 1)
+    # The per-probe figures are the totals, divided: the same tokens, not a second count.
+    assert sum(record.probe_input_samples) == record.probe_input_tokens
+    assert sum(record.probe_cached_samples) == record.probe_cached_tokens
+    assert record.probe_hit_rate == pytest.approx(4 / 12)
+    # Nothing during seeding was ever re-sent verbatim, so the conversation's half is cold and
+    # the whole-run figure is the mix a reader had been quoting for it.
+    assert record.seeding_hit_rate == 0.0
+    assert record.hit_rate is not None
+    assert 0.0 < record.hit_rate < record.probe_hit_rate
+    assert record.schema == SCHEMA_VERSION
+
+    read_back = SeedRecord.from_dict(json.loads(json.dumps(record.to_dict())))
+
+    assert read_back.probe_cached_samples == record.probe_cached_samples
+    assert isinstance(read_back.probe_input_samples, tuple), "a list would compare unequal to the live path's tuple"
+    assert read_back == record
+
+    table = _render(None, [_aggregate("none", [record])], set(), show_answers=False)
+
+    assert "per-probe cache hit, one group per seed, probes in the order asked:" in table
+    assert "[0% 0% 0% 0% 0% 0% 0% 0% 100% 100% 100% 100%]" in table
+
+
+async def test_a_record_written_before_the_per_probe_counts_reads_them_as_unknown_and_still_splits() -> None:
+    """Every luna cell in the archive is schema 11 or older, and each has to keep splitting.
+
+    The totals those records carry are what the two hit-rate columns are made of, so the
+    columns must read off them exactly as off a record written today; the one thing they
+    cannot say is which probes the cached tokens landed on, and that reads back as unknown
+    rather than as a twelfth of the total each -- which is the very division the per-probe
+    fields exist to test, and which a record that predates them cannot vouch for.
+    """
+    outcome, scenario = await _probed(_ExactMatchCacheStub(prompt_tokens=1_000), repeats=1)
+    written = _record(outcome, scenario).to_dict()
+    written["schema"] = SCHEMA_VERSION - 1
+    del written["probe_input_samples"]
+    del written["probe_cached_samples"]
+
+    old = SeedRecord.from_dict(written)
+
+    assert old.probe_input_samples is None
+    assert old.probe_cached_samples is None
+    assert old.probe_hit_samples is None
+    assert old.probe_hit_rate == pytest.approx(4 / 12), "the totals still split the two halves"
+    assert old.seeding_hit_rate == 0.0
+    assert old.probe_cost is not None, "the money split does not depend on the per-probe counts"
+
+    table = _render(None, [_aggregate("none", [old])], set(), show_answers=False)
+    row = next(line for line in _body(table) if line.startswith("none"))
+
+    assert "33.3%" in row
+    assert "per-probe cache hit: not on these records" in table
+    assert "per-probe cache hit, one group per seed" not in table
+
+
+async def test_the_table_prints_the_seeding_and_probe_hit_rates_apart_and_first() -> None:
+    """The column a reader's eye lands on has to be the conversation's, not the instrument's.
+
+    Since run 34 the single ``hit%`` had been reporting the instrument as much as the strategy:
+    a seed that drew 33.3% on its probes read 73.5% on it beside a seed at 88.8%, with seeding
+    halves of 85.7% and 85.0%. So the seeding half is its own column, it precedes the probe
+    half, the whole-run figure follows both under a name that says what it mixes, and the
+    per-seed pairs under the table show which seeds drew which value.
+    """
+    outcome, scenario = await _probed(StubChatClient(usage=UsageDetails(input_token_count=1_000)), repeats=1)
+    base = _record(outcome, scenario)
+    # Run 47's composed row, seeds 1 and 2, to the token: the same seeding half either side of
+    # a probe half that drew low on one and high on the other.
+    low = replace(
+        base,
+        seed=1,
+        input_tokens=2_604_110,
+        cached_tokens=1_913_007,
+        probe_input_tokens=608_545,
+        probe_cached_tokens=202_652,
+    )
+    high = replace(
+        base,
+        seed=2,
+        input_tokens=2_700_296,
+        cached_tokens=2_396_627,
+        probe_input_tokens=693_157,
+        probe_cached_tokens=690_616,
+    )
+    assert low.seeding_hit_rate == pytest.approx(0.857, abs=0.0005)
+    assert high.seeding_hit_rate == pytest.approx(0.850, abs=0.0005)
+    assert low.probe_hit_rate == pytest.approx(0.333, abs=0.0005)
+    assert high.probe_hit_rate == pytest.approx(0.996, abs=0.0005)
+    assert low.hit_rate == pytest.approx(0.735, abs=0.0005)
+    assert high.hit_rate == pytest.approx(0.888, abs=0.0005)
+    cell = _aggregate("tool_and_user_summary_anchored", [low, high])
+
+    table = _render(None, [cell], set(), show_answers=False)
+
+    header = next(line for line in table.splitlines() if line.startswith("strategy"))
+    columns = re.split(r"\s{2,}", header.strip())
+    assert columns.index("in") < columns.index("seed hit%") < columns.index("probe hit%") < columns.index("run hit%")
+    assert "hit%" not in columns, "the mixed figure no longer goes by the unqualified name"
+    row = next(line for line in _body(table) if line.startswith("tool_and_user_summary_anchored"))
+    # Pooled over the cell's tokens, as hit% always was, so the three columns are one
+    # arithmetic: the whole-run figure is exactly the token-weighted mix of the two halves.
+    assert low.seeding_cached_tokens is not None and low.seeding_input_tokens is not None
+    assert high.seeding_cached_tokens is not None and high.seeding_input_tokens is not None
+    pooled_cached = low.seeding_cached_tokens + high.seeding_cached_tokens
+    pooled_billed = low.seeding_input_tokens + high.seeding_input_tokens
+    assert cell.seeding_hit_rate == pytest.approx(pooled_cached / pooled_billed)
+    assert re.search(r"\s85\.4%\s+68\.6%\s+81\.2%\s", row), row
+    assert "per-seed cache hit, seeding/probe, one pair per seed:" in table
+    assert "[85.7%/33.3%]  [85.0%/99.6%]" in table
+
+
+async def test_a_row_that_cannot_split_shows_its_whole_run_hit_rate_alone() -> None:
+    """Runs before 32 carry no probe totals, and their two halves have to read as unmeasured.
+
+    The money convention: ``?`` is a quantity the records never took, ``n/a`` a phase that
+    billed nothing, and neither is a number. The whole-run figure those records do carry
+    stays, under the name that says what it mixes, so a reader placing an old table beside a
+    new one still has the one number both printed.
+    """
+    outcome, scenario = await _probed(StubChatClient(usage=UsageDetails(input_token_count=1_000)), repeats=1)
+    record = _record(outcome, scenario)
+    unsplit = _phase_cell(record, strategy="truncation", cost=0.5, probe_input=None)
+    split = _phase_cell(record, strategy="none", cost=0.5, probe_input=0)
+
+    assert unsplit.seeding_hit_rate is None
+    assert unsplit.probe_hit_rate is None
+    assert unsplit.hit_rate is not None
+    table = _render(None, [split, unsplit], set(), show_answers=False)
+    row = next(line for line in _body(table) if line.startswith("truncation"))
+
+    assert re.search(r"\s\?\s+\?\s+0\.0%\s", row), row
+    assert "NOSPLIT" in row
+    assert "[?/?]" in table, "the per-seed block says the same thing about the same seed"
+    # A phase that was counted and billed nothing is a different statement from one never
+    # counted, and gets the other marker.
+    zero = next(line for line in _body(table) if line.startswith("none"))
+    assert re.search(r"\s0\.0%\s+n/a\s+0\.0%\s", zero), zero
+
+
+async def test_the_cross_cell_report_carries_both_hit_rates(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+    """A row compared on cache anywhere is shown its seeding half, with the probe half beside it.
+
+    The cross-cell section is where a strategy's arms are read against each other, which is
+    exactly where the whole-run figure misled: run 48's three modes were ranked on a column
+    that moved with the probe draw and not with the strategy.
+    """
+    off = _cell_params(settings=_settings(repeat_records=False))
+    rows = {"none": [(0.030, 1.0), (0.030, 1.0)], "truncation": [(0.020, 1.0), (0.020, 1.0)]}
+    records = [
+        replace(record, cached_tokens=record.input_tokens // 2, probe_input_tokens=100, probe_cached_tokens=25)
+        for record in await _priced_records(off, rows)
+    ]
+    on = _cell_params(settings=_settings(repeat_records=True))
+    path = _written(tmp_path / "hits.jsonl", records + await _priced_records(on, rows))
+
+    section = _across(await _rebuilt(capsys, path))
+
+    header = next(line for line in section.splitlines() if line.strip().startswith("strategy"))
+    columns = re.split(r"\s{2,}", header.strip())
+    assert columns.index("seed$+-") < columns.index("seed hit%") < columns.index("probe hit%") < columns.index("acc1")
+    expected = (records[0].seeding_cached_tokens or 0) / (records[0].seeding_input_tokens or 1)
+    assert f"{expected:.1%}" in section
+    assert "25.0%" in section, "the probe half of the arm that recorded one"
+
+
+def test_the_archived_cells_split_their_hit_rates_as_computed_by_hand() -> None:
+    """The columns have to reproduce the split that was done by hand before they existed.
+
+    These are the figures STATE.md section 3t and the run 48 write-up were corrected against,
+    computed as ``(cached - probe_cached) / (input - probe_input)`` per record. Pinned against
+    the actual records rather than a fixture, so a change to how the halves are taken cannot
+    quietly move a number a report already quotes. The cell figure is pooled over the seeds'
+    tokens, as ``hit%`` always was; a mean of the per-seed rates differs from it by half a
+    point on run 48's boundary arm, and that difference is stated here rather than hidden.
+    """
+    runs = Path(__file__).parents[1] / "runs"
+    run_47 = sorted(runs.glob("run-47-luna-170k-fill90-all20-s*.jsonl"))
+    assert run_47, "run 47 was not found, so this passed without reading anything"
+    composed = [
+        record
+        for path in run_47
+        for record in read_seed_records(path)
+        if record.strategy == "tool_and_user_summary_anchored"
+    ]
+
+    assert [_rate(record.seeding_cached_tokens, record.seeding_input_tokens) for record in composed] == [
+        "85.7%",
+        "85.0%",
+        "82.2%",
+        "86.4%",
+        "81.0%",
+    ]
+    assert [_rate(record.probe_cached_tokens, record.probe_input_tokens) for record in composed] == [
+        "33.3%",
+        "99.6%",
+        "33.3%",
+        "33.3%",
+        "33.3%",
+    ]
+    assert all(record.probe_hit_samples is None for record in composed), "run 47 predates the per-probe counts"
+
+    for arm, pooled, per_seed in (
+        ("boundary", "83.6%", 0.841),
+        ("fold", "84.7%", 0.848),
+        ("recompact", "85.1%", 0.851),
+    ):
+        paths = sorted(runs.glob(f"run-48-luna-170k-fill90-usermodes-{arm}-s*.jsonl"))
+        assert paths, f"run 48's {arm} arm was not found"
+        seeds = [
+            record
+            for path in paths
+            for record in read_seed_records(path)
+            if record.strategy == "tool_and_user_summary_anchored"
+        ]
+        cell = _aggregate("tool_and_user_summary_anchored", seeds)
+        assert _rate(cell.seeding_cached_tokens, cell.seeding_input_tokens) == pooled, arm
+        assert fmean(record.seeding_hit_rate or 0 for record in seeds) == pytest.approx(per_seed, abs=0.0005), arm
+
+
 async def test_a_cheap_lossy_row_ranks_below_a_dearer_faithful_one() -> None:
     """Cost ascending on its own promotes whichever strategy destroyed the most.
 
@@ -4205,6 +4482,8 @@ def test_the_two_accuracy_measures_are_named_acc1_and_acc2() -> None:
         probe_input_tokens=400,
         probe_cached_tokens=120,
         probe_output_tokens=8,
+        probe_input_samples=(100, 100, 100, 100),
+        probe_cached_samples=(30, 30, 30, 30),
         calls=4,
         messages_left=6,
         messages_peak=12,
@@ -4411,6 +4690,8 @@ def _control_cell(seeded: int) -> dict[str, CellStats]:
         probe_input_tokens=400,
         probe_cached_tokens=120,
         probe_output_tokens=8,
+        probe_input_samples=(100, 100, 100, 100),
+        probe_cached_samples=(30, 30, 30, 30),
         calls=4,
         messages_left=6,
         messages_peak=12,
@@ -5713,6 +5994,8 @@ def test_a_progress_line_shows_what_a_watcher_needs() -> None:
         probe_input_tokens=400,
         probe_cached_tokens=120,
         probe_output_tokens=8,
+        probe_input_samples=(100, 100, 100, 100),
+        probe_cached_samples=(30, 30, 30, 30),
         calls=4,
         messages_left=6,
         messages_peak=12,
