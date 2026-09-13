@@ -366,11 +366,15 @@ The replacement is a *user* message so that the next pass can read it as a turn.
 mode a later pass summarises the summary together with whatever has arrived since, and one message
 stands for everything behind it — the opposite of the anchored family's refusal to re-trim a result
 it has already shortened, and the two are one rule read from opposite ends: a pass has to be worth
-what a pass costs. What that buys is a bounded prompt; what it costs was measured on the composed
-row in run 47, whose cache hit rate tracked how often its user half had rewritten that message —
-89% at `USERCOMPACT` 4, 73% and 75% at 5, 70% at 6 and at 7 — because the summary sits just
-behind the head turn and a rewrite there re-bills very nearly the whole cached prefix. In the
-`boundary` mode the
+what a pass costs. What that buys is a bounded prompt; what it costs is the strict-prefix argument:
+the summary sits just behind the head turn and a rewrite there re-bills very nearly the whole
+cached prefix. **The per-seed measurement this paragraph used to cite — run 47's composed row at
+89% hit with `USERCOMPACT` 4, down to 70% at 7 — is withdrawn.** Those were whole-run `hit%`
+figures, and the spread between them is the probe-phase draw of `STATE.md` §3t, one seed of five
+drawing the high value; the seeding half reads 81% to 86% on all five seeds with no relation to
+the pass count, and the counts were double-counted (`USERCOMPACT` below). What run 47 does show is
+the composed row's seeding-phase hit at 84% against the record row's 92% and the control's 95.5%.
+In the `boundary` mode the
 summary is never re-read: it is preserved as a boundary, the next pass's band starts after the
 newest boundary and runs to the tail, and the prefix up to that boundary is byte-identical across
 passes — which makes the user half behave the way the record half already does, and costs exactly
@@ -383,8 +387,11 @@ pass, and only when the same break-even that sets the band share says it repays.
 user-heavy fixture with a summarizer keeping 35% of what it reads, over sixty turns: the recompacting
 mode fires 36 times and leaves one summary in a 12,030-token prompt; the boundary mode fires 20
 times, holds 28, and leaves twenty summaries worth 63% of a 33,325-token prompt; the fold mode fires
-26 times, folds 11 times, and leaves three in a 13,729-token prompt. The default stays `recompact`
-until a live run has measured the arms against each other. A fold summarises summaries, and
+26 times, folds 11 times, and leaves three in a 13,729-token prompt. The default stays `recompact`:
+run 48 put the three arms side by side on run 47's cell and could not rank them — one persistent
+crossing a seed on the standalone row, so the arms were identical there by construction, and the
+probe draw on the composed row, whose seeding-phase hit reads 84.1% / 84.8% / 85.1% across the
+three (`STATE.md` §3s, `RESULTS.md`). A fold summarises summaries, and
 nothing in this benchmark can see what that loses: the planted facts live in tool results, so
 `facts` and `acc1` are blind to the user half by construction.
 
@@ -409,13 +416,15 @@ says which, and the three silences ask for three different changes.
 seeds.** The four questions the previous version of this paragraph said a run would answer, it
 answered. `facts` 53/53 and `acc1` 100% on every seed, level with the control — the mechanism
 holding, since the row touches nothing the facts live in. `snap%` 71 against the control's 86,
-and the flags say why it is not lower: `USERCOMPACT:2` on all five seeds against `USERHELD` 26
-to 39 and `USERUNDER` 62 to 75, `USERREPLACED:24` — two passes a run, the second standing for
-twenty-four turns, and every other pass past the trigger refused because the band was not worth
-a tenth of the prompt. That is the hysteresis doing what it was written to do on a workload
+and the flags say why it is not lower: `USERCOMPACT:2` on all five seeds — one compaction, counted
+twice by the double pass `8c463f0e7` removed — against `USERHELD` 26 to 39 and `USERUNDER` 62 to
+75, `USERREPLACED:24`: one pass a run, standing for twenty-four turns, and every other pass past
+the trigger refused because the band was not worth a tenth of the prompt. That is the hysteresis doing what it was written to do on a workload
 where the band is the minority of the prompt, and it is a finding about this cell's sizing under
-the scaled payload rather than about the row. `hit%` 93 against 97 — four points for two
-rewrites of a message just behind the head. What it did not answer is money. `seed$` $0.1471
+the scaled payload rather than about the row. `hit%` 93 against 97, and on the seeding half alone
+(`STATE.md` §3t) 90 against 95.5 — six points for one crossing, which the double pass sent as two
+different summaries on consecutive calls. Both rows drew the high probe on every seed, so the
+whole-run figure is honest here. What it did not answer is money. `seed$` $0.1471
 against the control's $0.1113, `vs none$` +32%, of which the summarizer is $0.0118; the row's own
 seeds spread 24% and the control's 19%. That +32% is the one figure among the three compacting
 rows that keep every fact which clears the instrument's rule — a gap wider than either row's
@@ -425,7 +434,8 @@ not to be quoted as either. One seed of the five seeded 10.2% under target and i
 aggregate; without it the control's spread falls from 19% to 4% and this row's from 24% to 15%,
 `vs none$` stays at +32%, and the rest moves by a point or not at all. What a run would still
 answer: the size of that penalty, which wants more seeds than five; what the `boundary` and
-`fold` modes cost against this default, which no live run has carried; and how far the row
+`fold` modes cost against this default, which run 48 carried and could not resolve, the row making
+one crossing a seed in every arm (`STATE.md` §3s); and how far the row
 reaches on a workload where the band is the majority of the prompt, which the scaled payload
 no longer seeds.
 `RESULTS.md` has the per-seed table.
@@ -512,19 +522,25 @@ aborted attempt at the two-line row, kept as evidence of what the shared line re
 reach below either alone, and this is the deepest-compacting row in the cell that loses nothing:
 `facts` 53/53 and `acc1` 100% on every seed, with an agent turn and a summarizer both in the
 loop, where every row below it in `snap%` lost 33 to 45 facts and landed between 17% and 38%.
-The user half fired `USERCOMPACT` 4 to 7 times a run against `USERHELD` 2 to 4, the newest
-summary standing for 8 to 16 turns — the record half's removal leaves the band a larger share of
-what remains, so the share clears here where the single row's did not. What that costs is the
-cache: **`hit%` 76** against the record row's 95 and the control's 97, and per seed the rate
-tracked the passes — 89% at four rewrites, 73% and 75% at five, 70% at six and at seven. That is
-the measurement behind the `boundary` and `fold` modes, neither of which this run carried. What
-it did not answer is whether two edit positions' worth of broken prefix is repaid: `seed$`
+The user half fired `USERCOMPACT` 4 to 7 a run — about three crossings, the counter being
+double-counted until `8c463f0e7` — against `USERHELD` 2 to 4, the newest summary standing for 8 to
+16 turns — the record half's removal leaves the band a larger share of what remains, so the share
+clears here where the single row's did not. What that costs is the cache, and less of it than the
+column says: **`hit%` 76** against the record row's 95 and the control's 97 is the whole run, and
+split by phase (`STATE.md` §3t) the seeding half reads **84** against 92 and 95.5, the rest of the
+gap being the probe-phase draw that four of the five seeds drew. **The per-seed tracking this
+paragraph used to report — 89% at four rewrites down to 70% at seven — is withdrawn**: it was one
+seed drawing the high probe, and the seeding half runs 81% to 86% with no relation to the pass
+count. The `boundary` and `fold` modes were built against that withdrawn figure; run 48 carried
+them and could not rank them. What it did not answer is whether two edit positions' worth of
+broken prefix is repaid: `seed$`
 $0.1357 against the control's $0.1113, `vs none$` +22% with the summarizer at $0.0169, inside the
 row's own 30% seed spread, and per seed it runs +3% to +35%. Five seeds cannot separate this row
 from the control on money, in either direction, and no figure from that column is to be quoted
 as a result. Without the seed that seeded 10.2% under target it reads +20% inside 26%. What a
 run would still answer: that, with more seeds; and what the same row costs with its user half in
-the `boundary` or `fold` mode, which is the arm this measurement argues for.
+the `boundary` or `fold` mode, which run 48 measured at one point apart on the seeding half and
+inside the noise on money (`STATE.md` §3s).
 
 ## Summarization — `summarization`
 

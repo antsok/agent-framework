@@ -165,7 +165,11 @@ or errors**, $18.22 across the run, and `--from-jsonl` over the five files rebui
 on, the composed row on its shared line -- which is what makes run 47a below evidence rather than
 data. Four rows keep 53/53 at `acc1` 100%: the control at 86% of the window, the record row at 50%,
 the user row at 71% and the composition at 30%, with the composition's cache hit rate at 76%
-against the record row's 95% and the control's 97%. **Its cost axis is inside the noise**:
+against the record row's 95% and the control's 97%. Those three `hit%` figures are the whole run,
+seeding and probes together; split by phase (`STATE.md` §3t) the seeding half reads 84% / 92% /
+95.5%, and the composition's 76% carries a probe-phase draw of 33.3% on four seeds of five. The
+user-half counters in these records are inflated by the double pass fixed in `8c463f0e7`:
+`USERCOMPACT:2` on the standalone row is one compaction. **Its cost axis is inside the noise**:
 `seed$+-` of 19% to 30% on those four rows, `NOT SUPPORTED` on the verdict, and only the user
 row's +32% clears its own spread. Seed 3 (`-s3.jsonl`) seeded -10.2% against the target and prints
 `FILL OFF TARGET` rendered alone; the other four sit at -2.1% to -3.9% and the merged cell at
@@ -181,7 +185,11 @@ behind them, which is why it is here at all.
 What it shows, and what it is void for:
 
 - `user_summary_anchored` ran **unbounded**, at `USERCOMPACT:31` (seed 1, 53.4% hit rate) and
-  `USERCOMPACT:30` (seed 2, 61.3%), `USERREPLACED:2` on both, 53 of 53 facts on both. That is
+  `USERCOMPACT:30` (seed 2, 61.3%), `USERREPLACED:2` on both, 53 of 53 facts on both. Both counts
+  are inflated by the double pass fixed in `8c463f0e7` -- about fifteen passes each -- and both hit
+  rates are the whole run: the seeding half alone reads 77.0% and 80.6% against the control's
+  95.6%, and the probe half 0% and 17%, because the unbounded strategy fired again on every probe
+  (`DRIFT:12`), which is the instrument's phase and not a cost a conversation pays. That is
   the pass-per-turn behaviour `--user-min-band-share` was written to stop, and these records
   predate it: their `user_min_band_share` is absent and reads as `0.0`, which is what those runs
   did rather than what this version defaults to. The row as it now stands has no archived run.
@@ -195,6 +203,43 @@ What it shows, and what it is void for:
 
 No `.sh` is kept: the script that produced it is the same one run 47 uses, and re-running it
 against this tree produces the repaired rows rather than these.
+
+Run 48 is the three `--user-summary-mode` arms -- `recompact`, `boundary` and `fold` -- on the same
+cell as run 47 (170,000 tokens, 0.9 fill, scaled payload, `gpt-5.6-luna`), five seeds an arm, one
+invocation per seed and mode, 65 records: `none`, `truncation`, `user_summary_anchored` and
+`tool_and_user_summary_anchored` in every arm, plus `tool_summary_anchored` in the recompact arm only,
+since it does not read the mode. One file per seed and mode --
+`run-48-luna-170k-fill90-usermodes-<mode>-s{0..4}.jsonl` -- and one report per arm, rendered with
+`--from-jsonl` over that arm's five files; over all fifteen the report prints the three cells
+unlabelled, in the order boundary, fold, recompact. `run-48-usermodes.sh`, one seed index per
+argument. $11.42 across the run; two throttled calls, both on the boundary arm's control (`-s0` and
+`-s2`, 3 s each), no other retries and no errors; every arm seeded -2.8% to -3.5% against target.
+
+**It is kept as evidence, not as a ranking: run 48 cannot rank the three modes**, for three reasons
+the records show directly.
+
+- On the standalone `user_summary_anchored` row every arm made **one persistent crossing per seed**
+  -- `USERSUMMARIES:1`, `USERREPLACED:24` and `USERHELD` 26 to 40 on fourteen of the fifteen records
+  (the fifteenth, recompact `-s3`, read `USERCOMPACT:3`, `USERREPLACED:11`). At trigger 0.8 and fill
+  0.9 the band never regrows to a tenth of the prompt after the first pass, and the three modes only
+  differ from the second pass on, so the arms were identical there by construction: seeding-phase
+  hit 89.2% / 89.8% / 89.3% (boundary / fold / recompact) and `seed$` within 2%.
+- The composed row does fire at 0.6 and reached three standing summaries in the boundary and fold
+  arms (`USERSUMMARIES:3`), but its `hit%` -- 72% / 81% / 83% -- is the probe-phase draw of
+  `STATE.md` §3t and not the modes: the probe half of every record reads either 33.3% or about
+  99.5%, and the composed row drew 33.3% on five, three and two seeds of the three arms. The seeding
+  half alone reads 84.1% / 84.8% / 85.1%, one point apart.
+- `USERCOMPACT` in every record here is inflated by up to 2x. Until `8c463f0e7` the strategy ran
+  twice per crossing -- inside the model call on copies the store never saw, and again on the store
+  -- and both passes counted. `USERCOMPACT:2` is one compaction; the composed row's 4 to 8 in the
+  boundary and fold arms stands against `USERSUMMARIES` 3 (one fold record 2), and the recompact
+  arm's 4 to 9 against a counter that reads 1 in that mode by construction. The two passes also
+  sent two different summaries at one position on consecutive calls, in every arm alike -- a cache
+  break no mode was designed around, and a second reason the arms could not separate.
+
+The cost axis is inside the noise on every arm: the composed row's `seed$+-` is 83% / 49% / 17%,
+the recompact arm's verdict prints `NOT SUPPORTED` (a 59% spread against a 7% gap), and no money
+figure here is to be quoted. What a run that could rank the arms would need is in `STATE.md` §3s.
 
 Runs 45 and 46 are one cell in two arms: 300,000 tokens at 0.9 fill, `none` against
 `tool_summary_anchored`, with run 45 on the **fixed** payload every earlier cell used and run 46 on

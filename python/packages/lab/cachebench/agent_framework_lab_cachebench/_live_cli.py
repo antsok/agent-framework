@@ -97,8 +97,10 @@ FILL_TOLERANCE: Final[float] = 0.05
 #: sweep as the strategy degrading. Measured on ``tool_summary_anchored`` at a fixed
 #: 3,500-token payload -- 21,967 tokens of tool results at every one of the three windows --
 #: 60,000/0.86 (run 41), 100,000/0.9 (run 44) and 170,000/0.9 (run 43) removed 28.8%, 22.6% and
-#: 17.0% of the control's snapshot while its cache hit rate fell 88% -> 74% -> 66% against a
-#: control climbing 96% -> 97% -> 98%. Deriving the payload from the fill target instead keeps
+#: 17.0% of the control's snapshot while its seeding-phase cache hit rate fell 88.0% -> 87.5% ->
+#: 76.2% (the whole-run column read 88% -> 74% -> 66% against a control climbing 96% -> 97% ->
+#: 98%, the middle step being the probe-phase draw ``STATE.md`` section 3t describes). Deriving
+#: the payload from the fill target instead keeps
 #: the workload's proportions as the window moves, so two windows are one cell at two scales.
 #:
 #: 0.6 and 0.8 are the levels this project has treated as realistic payloads; 0.6 is the
@@ -514,8 +516,9 @@ def build_parser() -> argparse.ArgumentParser:
             "bounds the number of passes: without it the strategy fires once per turn for the "
             "rest of a run that stays above --user-trigger-fraction, because after its first "
             "pass the band is its own summary plus the turns since -- measured at "
-            "USERCOMPACT:31 with USERREPLACED:2 and a 53%% cache hit rate against the "
-            "control's 95%%. The default is the break-even share for a conversation of this "
+            "USERCOMPACT:31 (double-counted; about fifteen passes) with USERREPLACED:2 and a "
+            "seeding-phase cache hit rate of 77%% against the control's 95%%. The default is the "
+            "break-even share for a conversation of this "
             "benchmark's own length at the measured cached and uncached prices; raise it for "
             "shorter runs. 0 restores the unbounded behaviour every archived row was measured "
             "with, so the two can be run side by side, and USERHELD in the flags column says "
@@ -534,8 +537,9 @@ def build_parser() -> argparse.ArgumentParser:
             "recompact re-reads it: the next pass's band is the previous summary plus the turns "
             "since, one message stands for everything behind it, and every pass rewrites a "
             "message just behind the head -- which breaks the cached prefix from there to the "
-            "end, measured as the composed row's hit rate tracking USERREPLACED, 89%% at 8 down "
-            "to 70%% at 16. boundary never re-reads it: the summary is preserved as a boundary, "
+            "end (the run 47 per-seed figures once cited here are withdrawn, and run 48 could not "
+            "separate the modes: STATE.md sections 3s and 3t). boundary never re-reads it: the "
+            "summary is preserved as a boundary, "
             "the next pass compacts only the turns newer than it, and the prefix up to the "
             "newest boundary is byte-identical across passes -- at the price of one standing "
             "summary per pass, a floor no later pass lowers, which USERSUMMARIES and "
@@ -1943,8 +1947,9 @@ _LEGEND: Final[tuple[str, ...]] = (
     "            were not worth a fold either. That flag is the hysteresis working, and a row",
     "            with USERHELD and no USERCOMPACT is one whose band never cleared the",
     "            share -- a setting to change, not a strategy that failed. Before the",
-    "            share existed this row fired once per turn: USERCOMPACT:31 with",
-    "            USERREPLACED:2 and a 53% cache hit rate where the control held 95%.",
+    "            share existed this row fired on most turns: USERCOMPACT:31 (double-counted)",
+    "            with USERREPLACED:2 and a seeding-phase hit rate of 77% where the control",
+    "            held 95%.",
     "            USERSUMMFAIL:<n> passes where the summarizer raised or returned",
     "            nothing, so the band was left exactly as it was found and those passes",
     "            are the control too. USERSTARVED:<n> passes of",

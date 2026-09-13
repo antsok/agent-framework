@@ -571,6 +571,10 @@ Each of these produced a plausible wrong number first.
 - **`--tool-turns` is silently capped** by `--filler-turns`: extra tool groups are placed
   inside filler sections, so 16 requested with the default 6 filler turns yields 9. `plan_fill`
   now sizes the filler above that floor, and a test pins it.
+- **`hit%` mixes two phases, and the probe phase's hit rate is a two-valued draw.** 33.3% or about
+  99.5% a record on luna, decided by whether the strategy was still acting on the store when
+  seeding ended, and it is what most of the `hit%` spread between compacting rows has been since
+  run 34. Quote the seeding half for anything about compaction. §3t has the arithmetic and the reach.
 - **The history provider drops byte-identical messages, and this corrupts the control.**
   `filter_new_messages` falls back to `(role, serialized contents)` for identity when a message
   carries no `message_id`. A row running a strategy gets annotated and always has ids; the
@@ -737,7 +741,8 @@ Repairs confirmed live: `unc=0` on every no-repeat row, `recs=1` per trigger, `r
 three mini no-repeat seeds. Mini's shrink restored to 17-22% from 5-6%.
 
 Cost, from the instrument: luna +9% (no repeats) / **-7%** (repeats); mini **+44%** / **+98%**.
-Mini removes 17-22% of the snapshot and costs 44% more because the hit rate falls 81% -> 68% and
+Mini removes 17-22% of the snapshot and costs 44% more because the hit rate falls 81% -> 68% (the
+seeding half falls 73% -> 55%, further; §3t) and
 output rises 9,278 -> 13,261. **I published a mid-run reading off `snap%` that the cost axis
 refutes.** Do not read these arms on shrink.
 
@@ -826,7 +831,8 @@ monotonically and steeply. The strategy's case is a small-window case.
 
 **Fixed arm completes the series:** removed 28.8 -> 22.6 -> 17.0 -> 11.7%, hit 88 -> 74 -> 66 ->
 62%, cost -6% -> +21% -> +113% -> **+212%** at 60K/100K/170K/300K. The actable payload never grows;
-the conversation does.
+the conversation does. (The hit series is whole-run `hit%`; the seeding half reads 88.0 -> 87.5 ->
+76.2 -> 66.8, and the 100K step is entirely the probe-phase draw of §3t.)
 
 **Scaled arm:** three of five seeds at **-21%, -23%, -33% with 53/53**, hit 96% against the
 control's 98%. First resolvable saving with full retention in this project. Two seeds failed the
@@ -976,7 +982,8 @@ against 54 and 73. **Nothing here is a cost result.** One seed, and both user-ha
 +63% and +65% on a single sample.
 
 **The user half's hysteresis bites hard at this sizing.** `USERHELD:30` against `USERCOMPACT:2`
-on the single row, and `USERHELD:22` against `USERCOMPACT:5` composed. That is
+on the single row, and `USERHELD:22` against `USERCOMPACT:5` composed -- both `USERCOMPACT` figures
+double-counted, see §3s. That is
 `--user-min-band-share` 0.1 doing what it was written to do on a workload where the band is the
 minority of the prompt -- which is the other finding here.
 
@@ -1009,12 +1016,19 @@ say, against the smoke above:
   row below it in `snap%` lost 33 to 45 facts. The smoke's `UNCOVERED:1` and 89% `acc1` on the
   composed row did not recur: 53/53 and 100% on all five, `UNCOVERED` 0 throughout.
 - **The hysteresis finding holds**: `USERCOMPACT:2` against `USERHELD` 26 to 39 on the single row,
-  every seed. The band is the minority of the prompt under the scaled payload and the share
+  every seed -- and `USERCOMPACT:2` is one compaction, the count being doubled by the pass that
+  §3s describes. The band is the minority of the prompt under the scaled payload and the share
   refuses it; this is the sizing, not the strategy.
 - **The cache penalty is the result.** 76% against 95% and 97%, and per seed the composed row's
   hit rate tracked its passes -- 89% at `USERCOMPACT` 4, 73% and 75% at 5, 70% at 6 and at 7. That
   is what rewriting the user summary in place costs, and it is the measurement the `boundary` and
   `fold` modes now in the tree were written against. Neither mode ran here.
+  **Withdrawn 13 September, see §3t.** The per-seed figures are the probe-phase draw -- one seed of
+  five drew the high value and reads 89%, the four that drew the low value read 70-75% -- and the
+  seeding half sits at 81% to 86% on all five with no relation to the pass count, which was itself
+  double-counted. What stands is the seeding-phase gap: 84.1% against the record row's 92.3% and
+  the control's 95.5%, about eight points against the record half. The modes' strict-prefix
+  argument does not rest on the withdrawn figure; run 48 (§3s) carried them and could not rank them.
 - **Nothing here is a cost result, and the smoke's +63%/+65% were one seed.** `seed$+-` runs 19% to
   30% across the four rows. The instrument printed `NOT SUPPORTED` on its own verdict
   (`tool_summary_anchored` -18% against a 22% spread), and the composition's +22% is inside its
@@ -1034,10 +1048,12 @@ say, against the smoke above:
 
 ## 3s. Run 48: the three modes measured alike, and the double pass behind it
 
-Run 48 (`gpt-5.6-luna`, 170,000 at 0.9 fill, scaled payload, five seeds per mode; the records sat
-in a temp directory at the time of writing) put `recompact`, `boundary` and `fold` side by side.
-The standalone `user_summary_anchored` row read `USERCOMPACT:2, USERREPLACED:24, USERSUMMARIES:1`
-and 93% hit on every seed of every mode. Diagnosed offline by driving
+Run 48 (`gpt-5.6-luna`, 170,000 at 0.9 fill, scaled payload, five seeds per mode; archived 13
+September as `runs/run-48-luna-170k-fill90-usermodes-*`, one report per arm, $11.42, two throttled
+calls on the boundary arm's control and nothing else) put `recompact`, `boundary` and `fold` side
+by side. The standalone `user_summary_anchored` row read `USERCOMPACT:2, USERREPLACED:24,
+USERSUMMARIES:1` and 93% hit on fourteen of the fifteen records (recompact `-s3` read
+`USERCOMPACT:3`, `USERREPLACED:11`, 91%). Diagnosed offline by driving
 `build_live_agent(kind="harness")` against a stub client; the reduced form is
 `tests/test_live.py::test_the_user_band_strategy_compacts_the_stored_conversation_once_per_crossing`.
 
@@ -1052,7 +1068,8 @@ and 93% hit on every seed of every mode. Diagnosed offline by driving
   model was sent two different summaries at one position on consecutive calls: a second
   whole-suffix break per crossing, in every mode. A tool turn's second call adds a third copy pass,
   and a crossing the reply pushes over the line lands on the store pass alone, which is why the
-  composed row's `USERCOMPACT` reads 5, 7 and 9 against `USERSUMMARIES:3`.
+  composed row's `USERCOMPACT` reads 4 to 8 against `USERSUMMARIES:3` in the boundary and fold
+  arms, and 4 to 9 in the recompact arm, whose counter reads 1 by construction.
 - **So the standalone row made one persistent pass per seed in all three modes**, and the modes
   differ only from the second pass on. At trigger 0.8 and fill 0.9 the band cannot regrow to a
   tenth of the prompt before the run ends -- `USERHELD` 29 to 40 is that refusal -- so this cell
@@ -1060,16 +1077,18 @@ and 93% hit on every seed of every mode. Diagnosed offline by driving
   three standing summaries (`USERSUMMARIES:3` in boundary and fold against 1 in recompact).
 - **The composed row's hit rates do not rank the modes either.** Split by phase, seeding sits at
   85.1% / 84.1% / 84.8% (recompact / boundary / fold), and the probe phase is bimodal per seed --
-  0.333 or about 0.99, independent of mode -- with boundary drawing 0.333 on five of five seeds
-  against two of five for recompact. The headline 89% against 72% is that draw. `hit%` mixes the
-  two phases; read the seed half when comparing modes.
-- **Fix, in the tree and uncommitted:** the strategy keeps its last summarizer request and replays
+  0.333 or about 0.99 -- with boundary drawing 0.333 on five of five seeds, fold on three and
+  recompact on two: not separable by mode at five seeds an arm, and §3t says why the draw is a
+  property of the instrument rather than of a mode. The headline 83% against 72% (the recompact
+  and boundary arms' `hit%`; this bullet used to say 89%, which is run 47's one high-drawing seed)
+  is that draw. `hit%` mixes the two phases; read the seeding half when comparing modes.
+- **Fix, committed as `8c463f0e7`:** the strategy keeps its last summarizer request and replays
   the answer, under the same id, when the identical request comes round -- no call, no counted
   compaction, and the store carries the bytes the model already saw. `USERREPLAY:<n>` counts those
   passes (`user_summaries_replayed`, proxied on the composed row). `USERCOMPACT` now counts
   persistent compactions only, so archived `USERCOMPACT` from runs 47 and 48 is inflated by up to
   2x against new rows, and summary ids in the store are consecutive again (`user_summary_0`, `_1`
-  rather than `_1`, `_3`, `_5`). Six tests added; 594 pass.
+  rather than `_1`, `_3`, `_5`). Seven tests added; 595 pass.
 - **`USERFOLD:0` is right**: standing summaries were 1.3% to 1.7% of the composed prompt against a
   10% threshold, and the standalone row never had the two summaries a fold needs. The three
   schema-11 counters are wired end to end; the records carry non-zero `USERSUMMARIES` and
@@ -1078,3 +1097,74 @@ and 93% hit on every seed of every mode. Diagnosed offline by driving
   row, so a trigger low enough, or a fill high enough, that the user band regrows a tenth of the
   prompt after the first pass -- the composed row's 0.6 does it on this workload. Until then the
   arms cost the same and measure the same, and more seeds at this sizing buy nothing.
+
+## 3t. The probe phase's hit rate is a two-valued draw, and every `hit%` mixes it in
+
+Found 13 September while checking run 48 against its records. `hit%` is `cached_tokens /
+input_tokens` over the whole run, seeding and probes together. Split at the record's own `probe_*`
+fields -- seeding hit `(cached - probe_cached) / (input - probe_input)`, probe hit `probe_cached /
+probe_input` -- the probe half on `gpt-5.6-luna` is **bimodal: 32.8-33.3% or 99.0-99.9%, nothing
+between**, on 100 of 100 run 47 records and 64 of 65 run 48 records (one `truncation` record at
+97.4%). The seeding half is continuous, and it is the number that says what compaction did to the
+cache.
+
+**What 33.3% is.** Twelve probes a record: seven scoped questions once each and the combined
+question five times. On every 33.3% record checked, across prompts of 17,000 to 64,000 tokens, the
+probe phase's cached total is 3.98 to 4.0 times one probe's prompt. That is four probes served
+entirely from cache and eight served cold, and the only four probes with a byte-identical
+predecessor are repeats two to five of the combined question. On those records the provider served
+the snapshot prefix to an identical prompt and not to a sibling that shared it; on a 99.5% record it
+served it to all twelve. The records carry no per-call usage, so this is arithmetic rather than
+observation. Per-probe cached tokens in the record is the instrument change that would make it
+observation, and the change this section asks for.
+
+**Which records draw it is not a coin flip, and it is not a property of the mode.** Across run
+47's twenty rows: the control, `context_window` and its two variants, `truncation`, `anchored`,
+`tool_summary_anchored`, `tool_result`, `selective_tool_call`, `token_budget_window_first` and
+`user_summary_anchored` drew the high value on all five seeds; `sliding_window`, `summarization`,
+`token_budget_tools_first` and `token_budget_truncate_first` drew 33.3% on all five;
+`token_budget_fallback`, `token_budget_summarize` and the composed row on four of five;
+`anchored_no_assistant` and `anchored_min_gain` on one of five. The rows at rest by the end of
+seeding hit; the rows still acting on the store when seeding ended -- a summarizer that fires
+every turn, a ceiling the last turns crossed, a user summary rewritten on the last crossing --
+miss; on the rows between, which value a seed draws is decided by whether the strategy acted on
+the final seed turns, and that is the seed's draw, not the mode's. `context_drift` is 0 on nearly
+every 33.3% record, so the probe prompts did begin with the snapshot verbatim (`prompt_text` is
+the projected post-compaction prompt, so the counter can see a re-fire); what they did not begin
+with is any prompt the provider had already served, because the store changed after the last seed
+call -- `prompt_tokens_final` under `seed_prompt_tokens` on `token_budget_truncate_first` and
+`anchored_no_assistant -s2`, 53 summarizer calls in 54 on `summarization`. That is the common
+property, and it is consistent with every record here; it is not the mechanism, because a prefix
+cache is documented to serve a shared prefix to a sibling, and the direct test -- send A+B, then
+A+C on this route, read `cached_tokens` on the second -- has not been run. Run 47a's unbounded user
+row, which re-fired on every probe (`DRIFT:12`), drew 0% and 17%: the same shape with no
+identical repeats left to hit.
+
+**Where it reaches.** Every archived luna record from run 34 on carries it. Runs 32 and 33
+(`gpt-5.4-mini`, 270 records) drew high throughout, and mini's probe half in runs 40 and 41 sits
+at 74-93% rather than at either pole. The rows whose archived `hit%` is materially the draw and not
+the strategy: `anchored` and `anchored_min_gain` at 120K, 170K and 200K (runs 34, 43, 44);
+`tool_summary_anchored` at 100K, 170K and 300K fixed (runs 44, 43, 45); `truncation` at 60K (run
+34); the `token_budget` family and the composed row at 60K to 170K (runs 42 to 47). The claims this
+changes:
+
+- The composed row's per-seed "hit rate tracks `USERREPLACED`" in run 47 -- withdrawn, §3r and
+  `RESULTS.md`. Seeding hit 81-86% on all five seeds, the 89% one seed's high draw.
+- The run 48 mode ranking -- there is none, §3s. Seeding hit 84.1 / 84.8 / 85.1.
+- `tool_summary_anchored`'s hit rate "falling 88 -> 74 -> 66 -> 62" across 60K/100K/170K/300K
+  (§3o, `RESULTS.md`, `README.md`, and the `--tool-share` rationale in `_live_cli.py`): the seeding
+  half reads **88.0 -> 87.5 -> 76.2 -> 66.8**. The 100K step is entirely the draw (four of five
+  seeds at 33.3%); the fall from 170K on is real and about two thirds the size the mixed column
+  shows. The removed-share series the payload change rests on is `snap%` and untouched.
+- Run 40's "mini costs 44% more because the hit rate falls 81 -> 68" (§3k): the seeding half falls
+  73 -> 55, further, so the conclusion stands and the mixed column understated it.
+
+What it does not reach: every cost ranking, verdict and `vs none$` since the money split is on
+`seed$`, which excludes the probes by construction; retention and accuracy never read the cache;
+and the uncompacted control drew high on every luna record in the archive, so every "control at
+95-98%" statement stands. Runs before 32 carry no `probe_*` fields and cannot be split.
+
+**Rule from here.** Quote the seeding-phase hit when the claim is about compaction, and put the
+probe half beside it whenever a row is compared on cache at all. The table should print the split
+and the record should carry per-probe cached tokens; until they do, the arithmetic above is three
+fields from any record.

@@ -48,11 +48,14 @@ summarizer and the replacement mechanics are the same in all three.
 **What the two sides of that choice buy, and the measurement behind it.** Prompt caching is
 strict-prefix: a mutation at position K re-bills everything behind K at the uncached price.
 Recompaction rewrites a message that sits just behind the head turn on every pass it makes, so
-every pass is a break of very nearly the whole cached prefix. Measured in run 47 -- gpt-5.6-luna
-at a 170,000-token window and 0.9 fill, five seeds -- the composed row's cache hit rate tracked
-how many times its user half had rewritten that message: ``USERCOMPACT`` 4 held an 89% hit rate,
-5 held 73% and 75%, and 6 and 7 held 70% -- against a record half whose one preserved message is
-immutable once written and holds 94-95% on the same seeds. The boundary mode makes the user half
+every pass is a break of very nearly the whole cached prefix. The per-seed measurement this
+docstring used to cite for it -- run 47's composed row at an 89% hit rate with ``USERCOMPACT`` 4,
+down to 70% at 7 -- is withdrawn: those were whole-run figures, the spread between them is the
+probe-phase draw ``STATE.md`` section 3t describes (one seed of five drew the high value), and the
+seeding half reads 81% to 86% on all five seeds with no relation to the pass count, which was
+itself double-counted (see ``user_compactions``). What run 47 does show is the composed row's
+seeding-phase hit at 84% against 92% for a record half whose one preserved message is immutable
+once written, and 95.5% for the control. The boundary mode makes the user half
 behave the way the record half already does. The prefix up to the newest boundary is
 byte-identical before and after every later pass, so a later pass breaks the cache only from the
 band's first position, which is the newest part of the prompt rather than the oldest.
@@ -91,8 +94,11 @@ ceiling, a pass removes tens of thousands of tokens, so the next pass cannot hap
 conversation has grown all of that back -- once or twice in a run rather than once per turn.
 Measured in run 47a on gpt-5.6-luna at a 170,000-token window, 0.9 fill, scaled payload, this
 row reported ``USERCOMPACT:31 USERREPLACED:2`` on one seed and ``USERCOMPACT:30 USERREPLACED:2``
-on another: about one pass per turn, each replacing the previous summary and one new turn,
-with the cache hit rate down to 53% and 61% against the uncompacted control's 95%.
+on another -- double-counted like every archived count, so about fifteen passes each, one on
+most turns past the trigger, each replacing the previous summary and the turns since -- with the
+whole-run cache hit rate down to 53% and 61% against the uncompacted control's 95%. The seeding
+half of those is 77% and 81%; the rest is the strategy re-firing on every probe, which is the
+benchmark's phase and not a cost a conversation pays (``STATE.md`` section 3t).
 
 The argument has two holes and either one is enough on its own.
 
@@ -336,8 +342,9 @@ DEFAULT_USER_TRIGGER_FRACTION: Final[float] = 0.8
 #: after its first compaction, three on one that grows by a third, against one per turn before.
 #:
 #: **What it costs.** A band that never reaches a tenth of the prompt is never compacted, and on
-#: a workload whose bulk is tool output that can be every band in a run -- run 47 measured two
-#: passes a seed against 26 to 39 held, on every seed of the scaled payload. The row is then the
+#: a workload whose bulk is tool output that can be every band in a run -- run 47 measured one
+#: crossing a seed (``USERCOMPACT:2``, double-counted) against 26 to 39 held, on every seed of
+#: the scaled payload. The row is then the
 #: uncompacted control on its user half -- but it says so, in
 #: :attr:`UserTurnAnchoredSummarizationCompactionStrategy.user_passes_declined`, which is the
 #: difference between this and the silent degradation the counters in this package exist to
@@ -356,8 +363,7 @@ DEFAULT_MIN_BAND_SHARE: Final[float] = 0.1
 #: What a pass does with the summary the previous pass left behind.
 #:
 #: Re-read it and replace it, so one message stands for everything behind it. The behaviour
-#: every archived row of this strategy ran, and the one the module docstring's measurement of
-#: ``USERCOMPACT`` against the cache hit rate was taken on.
+#: every archived row of this strategy before run 48 ran.
 SUMMARY_MODE_RECOMPACT: Final[str] = "recompact"
 
 #: Leave it standing as a boundary, never re-read and never replaced. Each pass emits a new
@@ -375,10 +381,13 @@ SUMMARY_MODES: Final[tuple[str, ...]] = (SUMMARY_MODE_RECOMPACT, SUMMARY_MODE_BO
 
 #: The mode a caller inherits, and it is the recompacting one on purpose.
 #:
-#: Not because it measured best -- the module docstring's own measurement says it breaks the
-#: cached prefix on every pass -- but because it is what every archived row ran, run 47 included,
-#: and this package's standing rule is that a default does not move until a run has measured
-#: both arms. That is the rule ``--user-min-band-share 0``
+#: Not because it measured best -- the strict-prefix argument in the module docstring says it
+#: breaks the cached prefix on every pass -- but because it is what every archived row before run
+#: 48 ran, and run 48, which put the three arms side by side, could not separate them: one
+#: persistent crossing a seed on the standalone row, and a probe-phase draw on the composed row
+#: (``STATE.md`` sections 3s and 3t). This package's standing rule is that a default does not
+#: move until a run has measured both arms, and none has yet. That is the rule
+#: ``--user-min-band-share 0``
 #: still exists for. Flipping it later is this one line: the records module reads an absent
 #: setting as :data:`SUMMARY_MODE_RECOMPACT` on its own account rather than as this constant,
 #: so moving this cannot relabel an archived cell.
