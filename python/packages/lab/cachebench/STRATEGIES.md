@@ -360,14 +360,31 @@ and four here — already drop, and that on a stateful route the framework skips
 entirely, so a preserved count would protect nothing. The in-place mechanism exists to keep a
 tool call paired with its result; a user turn has no pairing to protect.
 
-**It recompacts its own output, so compaction stacks over compaction.** The replacement is a
-*user* message so that the next pass can read it as a turn: a later pass summarises the
-summary together with whatever has arrived since, and one message stands for everything behind
-it. Refusing to re-read its own output is not the neutral option — the strategy would then keep
-every earlier summary beside every new one, which is the accumulation `RECORDS:<n>` reports on
-the record row, a floor under the prompt that no later pass can lower. It is the opposite of the
-anchored family's refusal to re-trim a result it has already shortened, and the two are one
-rule read from opposite ends: a pass has to be worth what a pass costs.
+**What it does with its own earlier summary is `--user-summary-mode`, and the default recompacts.**
+The replacement is a *user* message so that the next pass can read it as a turn. In the `recompact`
+mode a later pass summarises the summary together with whatever has arrived since, and one message
+stands for everything behind it — the opposite of the anchored family's refusal to re-trim a result
+it has already shortened, and the two are one rule read from opposite ends: a pass has to be worth
+what a pass costs. What that buys is a bounded prompt; what it costs was measured on the composed
+row, whose cache hit rate tracked how often its user half had rewritten that message — 89% at
+`USERREPLACED` 8, 75% at 14, 73% and 70% at 16 — because the summary sits just behind the head
+turn and a rewrite there re-bills very nearly the whole cached prefix. In the `boundary` mode the
+summary is never re-read: it is preserved as a boundary, the next pass's band starts after the
+newest boundary and runs to the tail, and the prefix up to that boundary is byte-identical across
+passes — which makes the user half behave the way the record half already does, and costs exactly
+what recompaction was refusing: N passes leave N standing summaries, the accumulation `RECORDS:<n>`
+reports on the record row, reported here as `USERSUMMARIES:<n>` and `USERSUMMTOKENS:<n>`. The `fold`
+mode is the trade between the two: once the band has stopped yielding and the standing summaries
+are worth `--user-min-band-share` of what is behind them, all of them are collapsed into one new
+boundary, counted as `USERFOLD:<n>` — the whole-prefix break paid occasionally instead of on every
+pass, and only when the same break-even that sets the band share says it repays. On the package's
+user-heavy fixture with a summarizer keeping 35% of what it reads, over sixty turns: the recompacting
+mode fires 36 times and leaves one summary in a 12,030-token prompt; the boundary mode fires 20
+times, holds 28, and leaves twenty summaries worth 63% of a 33,325-token prompt; the fold mode fires
+26 times, folds 11 times, and leaves three in a 13,729-token prompt. The default stays `recompact`
+until a live run has measured the arms against each other. A fold summarises summaries, and
+nothing in this benchmark can see what that loses: the planted facts live in tool results, so
+`facts` and `acc1` are blind to the user half by construction.
 
 **What the counters say.** `USERCOMPACT:<n>` is the passes that replaced a band, read together
 with `USERREPLACED:<n>`, the turns the most recent of them stands for. `USERCOMPACT:0` is the

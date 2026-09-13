@@ -29,6 +29,7 @@ from .compaction import (
     DEFAULT_KEEP_HEAD_USER_TURNS,
     DEFAULT_KEEP_TAIL_USER_TURNS,
     DEFAULT_USER_TRIGGER_FRACTION,
+    SUMMARY_MODE_RECOMPACT,
 )
 
 if TYPE_CHECKING:
@@ -158,7 +159,21 @@ __all__ = [
 #: rather than forcing the whole settings block to ``None``, and :func:`_settings_from_dict`
 #: says why: they are consulted by one strategy no older record can carry a row for, so on an
 #: older record they describe an inapplicable knob rather than an unrecorded measurement.
-SCHEMA_VERSION: Final[int] = 10
+#:
+#: 11 adds ``user_summary_mode`` to the settings block, and ``user_summaries_in_conversation``,
+#: ``user_summary_tokens`` and ``user_folds`` to the record. The setting is the version 10
+#: argument again: every run before it recompacted its own summary, because no other mode
+#: existed, so an absent value reads back as ``recompact`` -- the value those runs demonstrably
+#: ran, written as that literal and not as the strategy's default, which is allowed to move --
+#: and it keys them apart from a rerun in either boundary mode, which is the point of recording
+#: it. The three counters split two ways. ``user_folds`` reads back as zero on the version 9
+#: argument: no strategy an older record could select could fold, so zero folds is what those
+#: runs did. The standing-summary count and its tokens read back as ``None`` on the version 4
+#: argument: those runs carried at most one standing summary, but whether they carried it is a
+#: deduction from ``user_compactions`` rather than a number anybody took, and its size is not
+#: recoverable from the record at all. Deducing the count from another field would be a model
+#: of the run, which is the inference this module refuses everywhere else.
+SCHEMA_VERSION: Final[int] = 11
 
 #: Versions this reader accepts, which is not only the current one.
 #:
@@ -209,7 +224,13 @@ SCHEMA_VERSION: Final[int] = 10
 #: whose floor is zero. So ``user_min_band_share`` reads back as ``0.0`` on those records: not a
 #: default filled in for an unrecorded setting, which version 7's rule forbids, but the value
 #: they demonstrably ran, and the value that keys them apart from anything measured since.
-_READABLE_SCHEMAS: Final[frozenset[int]] = frozenset({2, 3, 4, 5, 6, 7, 8, 9, SCHEMA_VERSION})
+#:
+#: Version 10 joins on the same two arguments one version along: what its runs did with their
+#: summaries is not in doubt, because only one mode existed, so ``user_summary_mode`` reads back
+#: as the value they ran and ``user_folds`` as the zero they did; and the two standing-summary
+#: columns come back as ``None``, because nobody took those numbers. Refusing it would discard
+#: the only cells of this row taken before it had arms to compare.
+_READABLE_SCHEMAS: Final[frozenset[int]] = frozenset({2, 3, 4, 5, 6, 7, 8, 9, 10, SCHEMA_VERSION})
 
 #: The parameters that make two records the same cell, and so aggregable into one row.
 #:
@@ -479,6 +500,20 @@ class StrategySettings:
     default: those runs had no such floor, which is the same thing as a floor of zero. See
     :data:`SCHEMA_VERSION`.
     """
+    user_summary_mode: str
+    """What ``user_summary_anchored`` did with the summary its previous pass left behind.
+
+    ``recompact``, ``boundary`` or ``fold``, and the field that decides the whole cache side of
+    the row: the recompacting arm rewrites a message just behind the head on every pass and was
+    measured losing hit rate with every rewrite, the boundary arm never rewrites it and
+    accumulates a floor, and the fold arm collapses that floor when it is worth the break. Two
+    runs in different modes are not one cell.
+
+    ``recompact`` on a record written before schema 11, and that is a measurement rather than a
+    default: no other mode existed, so recompacting is what those runs did. Read as the literal
+    rather than as the strategy's default, so that the default moving cannot relabel them. See
+    :data:`SCHEMA_VERSION`.
+    """
     token_budget_fraction: float
     max_output_tokens: int
     """The output reservation, which every anchored and composed ceiling is the window less.
@@ -566,6 +601,11 @@ def _settings_from_dict(data: Mapping[str, Any]) -> StrategySettings:
         # minimum band share, which is a minimum band share of zero -- so 0.0 here is what that
         # run did, and keying it apart from a run that set the default is the point.
         user_min_band_share=float(data.get("user_min_band_share", 0.0)),
+        # The same licence as the band share, one schema along: a record written before 11 ran
+        # a strategy that could only recompact, so that mode is what it did. The literal and
+        # not DEFAULT_SUMMARY_MODE on purpose -- the default is allowed to move once the arms
+        # have been measured, and an archived cell must not move with it.
+        user_summary_mode=str(data.get("user_summary_mode", SUMMARY_MODE_RECOMPACT)),
         token_budget_fraction=float(data["token_budget_fraction"]),
         max_output_tokens=int(data["max_output_tokens"]),
         answer_max_tokens=int(data["answer_max_tokens"]),
@@ -993,13 +1033,47 @@ class SeedRecord:
     """User turns the most recent such compaction superseded.
 
     The state as it stands rather than a running total, which is the rule
-    ``groups_kept_uncovered`` follows and for the same reason: the strategy recompacts its own
-    earlier summary, so a total would count a turn once when it was first replaced and again
-    inside every summary of the summary. What this answers is how much of the conversation the
-    one surviving summary is standing in for, which is what the prompt's size is made of.
+    ``groups_kept_uncovered`` follows and for the same reason: in its default mode the strategy
+    recompacts its own earlier summary, so a total would count a turn once when it was first
+    replaced and again inside every summary of the summary. What this answers is how much of
+    the conversation the newest surviving summary is standing in for, which is what the
+    prompt's size is made of; in the boundary modes the older summaries stand for the rest, and
+    ``user_summaries_in_conversation`` says how many of them there are.
 
     Zero for every strategy that keeps no such count, and zero on a record written before
     schema 9, on the same reading as the field above.
+    """
+    user_summaries_in_conversation: int | None
+    """Summaries ``user_summary_anchored`` left standing in the conversation, as it last stood.
+
+    The boundary mode's floor, in messages. Every standing summary there is preserved and
+    nothing but a fold merges them, so in that mode this is one per pass and each is a floor
+    under the prompt that no later pass can lower -- ``records_in_conversation``'s reading, one
+    row along, and reported for the same reason: no other column says the unshrinkable part has
+    grown. One in the recompacting mode after any pass, which is the bound that mode buys.
+    ``strategy_notes`` carries it as ``USERSUMMARIES:<n>``; the number is here so a cell can be
+    meaned on it.
+
+    ``None`` on a record written before schema 11, and neither one nor zero. Those runs
+    recompacted, so they carried one standing summary if they ever compacted and none if not --
+    but which is a deduction from ``user_compactions`` rather than a number anybody took, and
+    this module stores what was measured. See :data:`SCHEMA_VERSION`.
+    """
+    user_summary_tokens: int | None
+    """Tokens those standing summaries occupied, at the same reading: the floor in the unit that matters.
+
+    ``strategy_notes`` carries it as ``USERSUMMTOKENS:<n>``. ``None`` on a record written before
+    schema 11, where it is not recoverable from the record at all.
+    """
+    user_folds: int
+    """Passes where ``user_summary_anchored`` collapsed every standing summary into one.
+
+    The fold mode's cost in the unit it is paid in: each fold re-bills the prompt from the oldest
+    summary's position, which is very nearly the whole of it, and lowers the floor the two fields
+    above report. ``strategy_notes`` carries it as ``USERFOLD:<n>``. Zero for every strategy
+    that keeps no such count, and zero on a record written before schema 11 on the
+    ``user_compactions`` reading: no strategy those runs could select could fold, so zero is
+    what they did.
     """
     strategy_notes: tuple[str, ...]
     dropped_options: tuple[str, ...]
@@ -1154,6 +1228,14 @@ class SeedRecord:
         # cannot inherit the same zero by forgetting to record it.
         values.setdefault("user_compactions", 0)
         values.setdefault("user_messages_replaced", 0)
+        # Zero on the same reading, one schema along: no strategy a record written before
+        # schema 11 could select could fold.
+        values.setdefault("user_folds", 0)
+        # None, on the probe-token reading. A record written before schema 11 carried one
+        # standing summary or none, and which is a deduction from ``user_compactions`` rather
+        # than a number anybody took; the tokens are not recoverable at all.
+        values.setdefault("user_summaries_in_conversation", None)
+        values.setdefault("user_summary_tokens", None)
         try:
             return cls(cell=CellParams.from_dict(data["cell"]), **values)
         except (KeyError, TypeError) as error:

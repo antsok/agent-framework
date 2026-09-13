@@ -127,6 +127,20 @@ apart, which is the whole point of having them. On an aligned row the starvation
 by construction, so a silent user half there is always the user half's own doing -- which is
 what makes the other three readable as instructions to change something.
 
+**The user half's summary mode is the user half's own, and neither boundary mode can reach the
+record.** ``user_turns`` decides whether it recompacts its summary, leaves it standing as a
+boundary, or folds the standing ones, and it decides that from its own configuration: nothing
+here reads or sets it, so the mode reaches this row through the same builder that reaches the
+single row. What composing has to guarantee is that a boundary or a fold cannot disturb the
+record half's one preserved message, and it cannot. The user half reads user groups alone in
+every mode; a fold excludes only the standing summaries and inserts one message where the
+oldest of them stood; and the record -- a tool result, marked preserved under the record half's
+own reason -- is neither read, excluded, nor moved relative to anything but that one insertion,
+exactly as it is not by an ordinary pass. Nor does any of it touch the shared line: the fold sits
+inside :meth:`~._usersummary.UserTurnAnchoredSummarizationCompactionStrategy.compact_against`,
+behind the same trigger check :meth:`ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy.__call__`
+hands the pass-entry size to.
+
 **It has no ceiling and no fallback of its own.** Returning False does not mean the prompt now
 fits, exactly as it does not for either part: the record phase carries its own fallback behind
 its own ceiling, the user phase has none by design, and adding a third shed step here would put
@@ -266,6 +280,21 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
     def user_messages_replaced(self) -> int:
         """:attr:`~._usersummary.UserTurnAnchoredSummarizationCompactionStrategy.user_messages_replaced`."""
         return self.user_turns.user_messages_replaced
+
+    @property
+    def user_summaries_in_conversation(self) -> int:
+        """:attr:`~._usersummary.UserTurnAnchoredSummarizationCompactionStrategy.user_summaries_in_conversation`."""
+        return self.user_turns.user_summaries_in_conversation
+
+    @property
+    def user_summary_tokens(self) -> int:
+        """:attr:`~._usersummary.UserTurnAnchoredSummarizationCompactionStrategy.user_summary_tokens`."""
+        return self.user_turns.user_summary_tokens
+
+    @property
+    def user_folds(self) -> int:
+        """:attr:`~._usersummary.UserTurnAnchoredSummarizationCompactionStrategy.user_folds`."""
+        return self.user_turns.user_folds
 
     @property
     def user_summary_failures(self) -> int:

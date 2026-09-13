@@ -57,14 +57,17 @@ from agent_framework._compaction import (
 from agent_framework_lab_cachebench.compaction._composed import (
     ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy,
 )
+from agent_framework_lab_cachebench.compaction._preserve import PRESERVE_REASON_KEY, is_preserved
 from agent_framework_lab_cachebench.compaction._toolsummary import (
     DEFAULT_TRIGGER_FRACTION,
     RECALL_TOOL_NAME,
     RECORD_MARKER,
     ToolResultAnchoredSummarizationCompactionStrategy,
+    find_record_index,
 )
 from agent_framework_lab_cachebench.compaction._usersummary import (
     DEFAULT_USER_TRIGGER_FRACTION,
+    SUMMARY_MODE_FOLD,
     USER_SUMMARY_MARKER,
     UserTurnAnchoredSummarizationCompactionStrategy,
 )
@@ -1109,6 +1112,9 @@ async def test_every_counter_of_both_halves_is_readable_off_the_composed_row() -
     assert strategy.user_compactions == strategy.user_turns.user_compactions == 1
     assert strategy.user_messages_replaced == strategy.user_turns.user_messages_replaced == 6
     assert strategy.user_summary_failures == strategy.user_turns.user_summary_failures == 0
+    assert strategy.user_summaries_in_conversation == strategy.user_turns.user_summaries_in_conversation == 1
+    assert strategy.user_summary_tokens == strategy.user_turns.user_summary_tokens > 0
+    assert strategy.user_folds == strategy.user_turns.user_folds == 0
 
 
 def test_two_halves_measuring_against_two_ceilings_are_refused() -> None:
@@ -1125,3 +1131,72 @@ def test_two_halves_measuring_against_two_ceilings_are_refused() -> None:
             tool_results=_record_phase(20_000),
             user_turns=_user_phase(24_000),
         )
+
+
+def _light_turn(index: int) -> list[Message]:
+    """Return a user turn and a short reply, for continuing the fixture without crossing the ceiling.
+
+    The fixture's own turns are 4,000 characters each way, and three crossings of those would
+    take the conversation past the compacting ceiling, where the record phase's fallback starts
+    shedding assistant replies -- correct, but a different test. These keep the user half
+    growing and the prompt under the ceiling.
+    """
+    return [
+        Message(role="user", contents=[f"Turn {index}: " + "u" * 1_500], message_id=f"u{index}"),
+        Message(role="assistant", contents=[f"Reply {index}: " + "a" * 500], message_id=f"a{index}"),
+    ]
+
+
+class _RatioSummarizer:
+    """A summarizer keeping a stated fraction of what it reads, so a fold can be worth its break."""
+
+    def __init__(self, ratio: float) -> None:
+        self.ratio = ratio
+
+    async def get_response(self, messages: list[Message], *, stream: bool = False, **kwargs: Any) -> ChatResponse:
+        body = messages[-1].text or ""
+        return ChatResponse(messages=[Message(role="assistant", contents=["s" * int(len(body) * self.ratio)])])
+
+
+async def test_a_fold_in_the_user_half_leaves_the_record_where_it_was() -> None:
+    """A fold rewrites the prefix at the oldest summary's position, and the record sits behind it.
+
+    The record half has one preserved message in the same conversation, and the fold is the one
+    thing the user half does that reaches back past its newest boundary. So the whole of what
+    composing has to guarantee is asserted here: the record is not excluded, not shortened, not
+    moved relative to anything but the one inserted message, still found by ``find_record_index``
+    and still preserved under the record half's own reason -- and the shared line is still the
+    record half's, judged at pass entry, because the fold sits behind the same trigger check.
+
+    The fixture is driven to a fold and asserts that it got there, since a composed row whose
+    user half never folded would pass every invariant here for nothing.
+    """
+    strategy = _composed(
+        user_turns=_user_phase(summarizer=_RatioSummarizer(0.5), summary_mode=SUMMARY_MODE_FOLD),
+    )
+    messages = _conversation()
+    (record,) = (message for message in messages if message.message_id == "rec_res")
+
+    assert await strategy(messages) is True
+    for start in (8, 14):
+        messages += [message for index in range(start, start + 6) for message in _light_turn(index)]
+        assert await strategy(messages) is True
+    assert strategy.user_summaries_in_conversation == 3 and strategy.user_folds == 0, "three boundaries first"
+    messages += _light_turn(20)
+    before = [m.message_id for m in messages if m.role != "user"]
+
+    assert await strategy(messages) is True
+    assert strategy.user_folds == 1, "the fixture has to fold or the invariants below are vacuous"
+
+    assert strategy.user_summaries_in_conversation == 1 and strategy.user_summary_tokens > 0
+    assert messages[find_record_index(messages) or -1] is record, "the record is still the anchor"
+    assert record.additional_properties.get(EXCLUDED_KEY, False) is False
+    assert is_preserved(record) and record.additional_properties[PRESERVE_REASON_KEY] == "tool_summary_record"
+    assert "lookup_1: CODE-1." in _rendered(messages), "and unshortened"
+    assert [m.message_id for m in messages if m.role != "user"] == before, (
+        "every message that is not a user turn is where it was, in the order it was"
+    )
+    assert strategy.records_in_conversation == 1
+    assert strategy.fallbacks_after_record == 0, "the prompt stayed under the ceiling, so this is about the fold alone"
+    assert strategy.user_trigger_fraction == DEFAULT_TRIGGER_FRACTION, "the alignment is untouched"
+    assert strategy.user_passes_starved == 0

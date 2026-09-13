@@ -61,8 +61,10 @@ from .compaction import (
     DEFAULT_MIN_GAIN_FRACTION,
     DEFAULT_RECORD_MAX_TOKENS,
     DEFAULT_RECORD_TARGET_TOKENS,
+    DEFAULT_SUMMARY_MODE,
     DEFAULT_TRIGGER_FRACTION,
     DEFAULT_USER_TRIGGER_FRACTION,
+    SUMMARY_MODES,
 )
 
 if TYPE_CHECKING:
@@ -517,7 +519,35 @@ def build_parser() -> argparse.ArgumentParser:
             "benchmark's own length at the measured cached and uncached prices; raise it for "
             "shorter runs. 0 restores the unbounded behaviour every archived row was measured "
             "with, so the two can be run side by side, and USERHELD in the flags column says "
-            "how many passes it refused. Default %(default)s."
+            "how many passes it refused. One share for every --user-summary-mode: in the "
+            "boundary and fold modes the band excludes the standing summaries and the prompt "
+            "includes them, so it clears less often there, and in the fold mode it is also the "
+            "fold's own threshold. Default %(default)s."
+        ),
+    )
+    parser.add_argument(
+        "--user-summary-mode",
+        choices=SUMMARY_MODES,
+        default=DEFAULT_SUMMARY_MODE,
+        help=(
+            "What user_summary_anchored does with the summary its previous pass left behind. "
+            "recompact re-reads it: the next pass's band is the previous summary plus the turns "
+            "since, one message stands for everything behind it, and every pass rewrites a "
+            "message just behind the head -- which breaks the cached prefix from there to the "
+            "end, measured as the composed row's hit rate tracking USERREPLACED, 89%% at 8 down "
+            "to 70%% at 16. boundary never re-reads it: the summary is preserved as a boundary, "
+            "the next pass compacts only the turns newer than it, and the prefix up to the "
+            "newest boundary is byte-identical across passes -- at the price of one standing "
+            "summary per pass, a floor no later pass lowers, which USERSUMMARIES and "
+            "USERSUMMTOKENS in the flags column report. fold is boundary plus a bound: once the "
+            "band has stopped yielding and the standing summaries are worth "
+            "--user-min-band-share of what is behind them, all of them are collapsed into one, "
+            "counted as USERFOLD. The band share clears less often in the two boundary modes, "
+            "so expect more USERHELD there; it is not re-tuned per mode, because the three are "
+            "the arms of one comparison. The default is the mode every archived row ran and the "
+            "live run in progress is measuring, and it does not move until a run has measured "
+            "the arms against it. Reaches the composed row's user half through the same "
+            "builder. Default %(default)s."
         ),
     )
     parser.add_argument(
@@ -912,6 +942,9 @@ def _seed_record(
         records_in_conversation=outcome.records_in_conversation,
         user_compactions=outcome.user_compactions,
         user_messages_replaced=outcome.user_messages_replaced,
+        user_summaries_in_conversation=outcome.user_summaries_in_conversation,
+        user_summary_tokens=outcome.user_summary_tokens,
+        user_folds=outcome.user_folds,
         strategy_notes=outcome.strategy_notes,
         dropped_options=outcome.dropped_options,
         answer=outcome.answer,
@@ -1874,12 +1907,24 @@ _LEGEND: Final[tuple[str, ...]] = (
     "            USERCOMPACT:<n> passes where user_summary_anchored replaced a band of the",
     "            user's own turns with one summary of them, and USERREPLACED:<n> how many",
     "            turns the most recent of those passes stood in for. Read them together: the",
-    "            second is how much of the conversation that row is carrying as a summary",
-    "            instead of verbatim, which is what moved snap%, and the first is what it cost",
-    "            to get there, because every pass re-bills the prompt from its own edit to the",
-    "            end. That strategy is deliberately willing to recompact its own earlier",
-    "            summary, which is the opposite of the anchored family's refusal to re-trim a",
-    "            result it has already shortened, and USERCOMPACT above 1 is that happening.",
+    "            second is how much of the conversation the newest summary is carrying instead",
+    "            of verbatim, which is what moved snap%, and the first is what it cost to get",
+    "            there, because every pass re-bills the prompt from its own edit to the end.",
+    "            Where that edit lands is --user-summary-mode. In the recompact mode the",
+    "            strategy re-reads its own earlier summary, so every pass rewrites a message",
+    "            just behind the head and USERCOMPACT above 1 is that happening; in the",
+    "            boundary and fold modes the earlier summary stands and the edit lands only on",
+    "            the turns newer than it. USERSUMMARIES:<n> summaries the conversation was",
+    "            carrying at the strategy's last reading, and USERSUMMTOKENS:<n> the tokens",
+    "            they occupy: the boundary mode's floor, one summary per pass that no later",
+    "            pass can lower, which is RECORDS:<n>'s accumulation on the user half. Reads 1",
+    "            in the recompact mode after any pass. USERFOLD:<n> passes of the fold mode",
+    "            that collapsed every standing summary into one, each a rewrite of the prefix",
+    "            from the oldest summary's position -- the break the recompact mode pays on",
+    "            every pass, paid here only when the standing summaries had grown to",
+    "            --user-min-band-share of what is behind them. A run that folded twice and",
+    "            one that never folded differ by two of those breaks and a floor lowered",
+    "            twice, and only this flag separates them.",
     "            A row with USERCOMPACT:0 never fired and is the uncompacted control",
     "            under another name -- and exactly one of the next three flags says why.",
     "            USERUNDER:<n> passes where the prompt never reached",
@@ -1887,7 +1932,8 @@ _LEGEND: Final[tuple[str, ...]] = (
     "            passes where it did and the band was not worth a pass under",
     "            --user-min-band-share: empty, holding nothing but the strategy's own",
     "            earlier summary, or too small a share of the prompt to pay for the",
-    "            prefix a pass rewrites. That flag is the hysteresis working, and a row",
+    "            prefix a pass rewrites -- and, in the fold mode, the standing summaries",
+    "            were not worth a fold either. That flag is the hysteresis working, and a row",
     "            with USERHELD and no USERCOMPACT is one whose band never cleared the",
     "            share -- a setting to change, not a strategy that failed. Before the",
     "            share existed this row fired once per turn: USERCOMPACT:31 with",
@@ -2251,6 +2297,7 @@ def _strategy_options(args: argparse.Namespace, tokenizer: Any, summarizer: Any 
         keep_tail_user_turns=args.keep_tail_user_turns,
         user_trigger_fraction=args.user_trigger_fraction,
         user_min_band_share=args.user_min_band_share,
+        user_summary_mode=args.user_summary_mode,
         token_budget_fraction=args.budget_fraction,
         summarizer=summarizer,
     )
@@ -2299,6 +2346,7 @@ def _strategy_settings(
         keep_tail_user_turns=options.keep_tail_user_turns,
         user_trigger_fraction=options.user_trigger_fraction,
         user_min_band_share=options.user_min_band_share,
+        user_summary_mode=options.user_summary_mode,
         token_budget_fraction=options.token_budget_fraction,
         max_output_tokens=options.max_output_tokens,
         answer_max_tokens=args.answer_max_tokens,

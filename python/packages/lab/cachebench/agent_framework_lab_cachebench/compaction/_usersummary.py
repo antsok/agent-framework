@@ -1,6 +1,6 @@
 # Copyright (c) Microsoft. All rights reserved.
 
-"""Summarise the user's own turns, and re-summarise the summary when it fills up again.
+"""Summarise the user's own turns: re-summarising the summary, or leaving it standing as a boundary.
 
 **The half of the conversation nothing here was touching.** Every other strategy in this
 subpackage sheds tool output: :class:`~._anchored.AnchoredCompactionStrategy` shortens tool
@@ -25,7 +25,56 @@ which is the one place the selection rule is written down. That independence is 
 the point of the row is to be comparable with the tool-side rows in the same table, and a
 strategy that shed both halves would answer neither question.
 
-**It recompacts its own output, and that is the opposite of what ``_shorten`` does.**
+**Three modes, one selection rule, and the default is the one every archived row ran.**
+``summary_mode`` decides what a pass does with the summary the previous pass left behind, and
+nothing else about the strategy moves with it: the trigger, the anchors, the band share, the
+summarizer and the replacement mechanics are the same in all three.
+
+- :data:`SUMMARY_MODE_RECOMPACT` re-reads its own output. The summary is a user message, the
+  next pass's band is the previous summary plus the turns arrived since, and one message
+  stands for everything behind it. This is the default, and it stays the default until a run
+  has measured the arms against each other; see :data:`DEFAULT_SUMMARY_MODE`.
+- :data:`SUMMARY_MODE_BOUNDARY` never re-reads it. The summary a pass emits is a *boundary*:
+  it is marked with :data:`~._preserve.PRESERVED_KEY`, the next pass's band starts after the
+  newest boundary and runs to the tail, and each pass emits a new summary beside the standing
+  ones rather than folding them in. :meth:`UserTurnAnchoredSummarizationCompactionStrategy._band`
+  is where the boundary rule is written down, and it is written down nowhere else.
+- :data:`SUMMARY_MODE_FOLD` is the boundary mode with a bound on the accumulation. Once the
+  ordinary band has stopped yielding and the standing summaries are worth what a fold would
+  cost, all of them are collapsed into one summary, which becomes the new boundary -- a rare
+  major collection behind the frequent minor ones. :meth:`UserTurnAnchoredSummarizationCompactionStrategy._fold_due`
+  is the rule, and it is derived from the same break-even as everything else here.
+
+**What the two sides of that choice buy, and the measurement behind it.** Prompt caching is
+strict-prefix: a mutation at position K re-bills everything behind K at the uncached price.
+Recompaction rewrites a message that sits just behind the head turn on every pass it makes, so
+every pass is a break of very nearly the whole cached prefix. Measured on gpt-5.6-luna at a
+170,000-token window and 0.9 fill, the composed row's cache hit rate tracked how many times
+its user half had rewritten that message: ``USERREPLACED`` 8 held an 89% hit rate, 14 held 75%,
+and 16 held 73% and 70% -- against a record half whose one preserved message is immutable once
+written and holds 94-95% on the same runs. The boundary mode makes the user half behave the way
+the record half already does. The prefix up to the newest boundary is byte-identical before and
+after every later pass, so a later pass breaks the cache only from the band's first position,
+which is the newest part of the prompt rather than the oldest.
+
+What it costs is the thing recompaction exists to prevent, and choosing against recompaction
+does not make the objection go away: **recompaction is what bounds the prompt.** A boundary is
+never re-read, so N passes leave N standing summaries, each one a floor under the prompt that
+no later pass can lower -- exactly the accumulation
+:attr:`~._toolsummary.ToolResultAnchoredSummarizationCompactionStrategy.records_in_conversation`
+reports on the record row, and the reason that row consolidates nothing. In the recompacting
+mode the floor is one summary; in the boundary mode it is one summary per pass, and
+:attr:`UserTurnAnchoredSummarizationCompactionStrategy.user_summaries_in_conversation` with
+:attr:`UserTurnAnchoredSummarizationCompactionStrategy.user_summary_tokens` is what says how
+high it has risen, because nothing else in a table would -- the message count keeps rising and
+every pass still reports having acted. The fold mode is the trade between the two: it pays the
+whole-prefix break occasionally instead of on every pass, and it pays it only when the
+standing summaries have grown large enough for the break to repay itself, by the same
+arithmetic the band share is derived from. What a fold cannot be measured for is stated at the
+end of this docstring, because it is the one cost the table cannot show.
+
+**It recompacts its own output in the default mode, and that is the opposite of what
+``_shorten`` does.**
 :meth:`~._anchored.AnchoredCompactionStrategy._shorten` refuses to touch a tool result that
 already carries :data:`~._anchored.REMOVAL_MARKER`, and the comment there says why: the
 replacement carries the marker's own tokens on top of the budget, so a second pass would
@@ -82,12 +131,14 @@ So the same argument that makes re-trimming wrong in ``_shorten`` makes re-summa
 affordable here only once a pass is required to be worth something, and the two are now
 decided by one rule read from opposite ends rather than by one of them forgetting the other.
 
-Refusing to recompact is not a neutral alternative either. The summary is a user message, so a
-strategy that would not re-read its own output would have to keep every earlier summary
-alongside every new one -- exactly the accumulation
-:attr:`~._toolsummary.ToolResultAnchoredSummarizationCompactionStrategy.records_in_conversation`
-exists to report, where each preserved record raises a floor under the prompt that no later
-pass can lower. Recompaction is what stops the floor rising.
+**The share bites harder in the boundary and fold modes, and that is measured rather than
+tuned away.** In the recompacting mode the band the share is taken of includes the previous
+summary, which inflates it; after a boundary the band is only the turns newer than the
+boundary, and the prompt it is weighed against is larger by every standing summary. So the
+same share clears less often, ``user_passes_declined`` rises, and the boundary modes fire
+fewer passes than the recompacting one on the same conversation. The tests beside this module
+hold the three modes to one share on one fixture and record the numbers, because the point of
+the flag is that the arms be comparable, and a share re-tuned per mode would compare nothing.
 
 **It will not run on nothing new.** A pass whose band holds only this strategy's own earlier
 summary would rewrite one message at one position and free exactly nothing, which is precisely
@@ -96,16 +147,33 @@ summary -- the same shape as
 :meth:`~._toolsummary.ToolResultRecallMiddleware._record_due`, which re-arms its trigger on new
 material rather than on size. That rule is necessary and, as the measurement above shows, not
 sufficient: one new turn satisfies it, so it is the ``f = 0`` corner of the share rule and both
-are checked in the one place.
+are checked in the one place. After a boundary the same statement is the empty band: no turn
+between the newest boundary and the tail is nothing new, and it is declined by the same rule.
 
 **The replacement is a user message, where the framework's own summarizer writes an assistant
 one.** ``SummarizationStrategy`` summarises whole groups of every kind, so its output belongs to
 neither speaker and assistant is the neutral choice. This replaces user turns only, and the
 replacement has to be readable *as* those turns on the next pass: a summary written as
-assistant prose would be invisible to the selection rule above, so nothing could ever
-recompact it, and the first summary would sit in the prompt for the rest of the run. It also
-keeps the conversation's shape legal -- an assistant message inserted between a user turn and
-the assistant reply to it puts two assistant messages in a row, which several providers reject.
+assistant prose would be invisible to the selection rule above, so in the recompacting mode
+nothing could ever recompact it, and in the boundary modes it could not be found as the
+boundary at all. It also keeps the conversation's shape legal -- an assistant message inserted
+between a user turn and the assistant reply to it puts two assistant messages in a row, which
+several providers reject.
+
+**A boundary is protected by the same mark the record is, and found by a different one.**
+:data:`~._preserve.PRESERVED_KEY` is this subpackage's one vocabulary for "no strategy may
+shorten, drop or shed this", and a standing summary is exactly that: the sole surviving copy
+of the turns behind it, which no later pass will stand for again. Every removal path in
+``_anchored`` and ``_toolsummary`` already honours the mark, so marking the summary is what
+turns "the record half cannot reach a user group" from an accident of group kinds into a
+stated contract. The mark is *not* how the boundary is found, because the mark is also set by
+other strategies on turns that are not boundaries, and because it does not survive storage:
+the boundary is the newest included message :func:`_is_summary` recognises, by the id prefix
+and the text marker that already survive a store round trip, and the mark is re-applied to
+every standing summary on every pass, as :func:`~._toolsummary._preserve_records` re-applies
+it to every record. In the recompacting mode the summary is deliberately *not* marked --
+:meth:`UserTurnAnchoredSummarizationCompactionStrategy._band` skips preserved turns, so a
+marked summary could never be recompacted, and that mode would silently become this one.
 
 **How it marks what it replaced is the framework's mechanism and not a new one.**
 ``SummarizationStrategy`` inserts its summary at the first index it superseded, annotates the
@@ -122,6 +190,16 @@ answers is how much of a conversation is user-side and therefore how much a stra
 touch it can remove -- ``snap%`` in the benchmark's table. What the summariser managed to keep
 is a separate question, and one the recall instrument cannot ask of filler turns that carry no
 planted facts.
+
+**And a fold is where that blindness matters most, so it is stated rather than implied.** A
+fold summarises summaries, and fidelity degrades across generations: what the second summary
+keeps of the first is bounded by what the first kept of the turns, and nothing in this
+benchmark can see either loss. Its planted facts live in tool results, so ``facts`` and ``acc1``
+are structurally blind to anything done to a user turn, and for the user half the benchmark
+measures compaction percentage and cost only. That scope is accepted, not overlooked. The
+numbers a fold row shows are therefore its price and its size, never its fidelity, and a fold
+row's accuracy columns reading as the control's is not evidence that folding is free -- it is
+the instrument declining to look.
 """
 
 from __future__ import annotations
@@ -143,9 +221,11 @@ from agent_framework._compaction import (
     set_excluded,
 )
 
-from ._preserve import any_preserved
+from ._preserve import any_preserved, set_preserved
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from agent_framework import TokenizerProtocol
     from agent_framework._clients import SupportsChatGetResponse
 
@@ -153,10 +233,18 @@ __all__ = [
     "DEFAULT_KEEP_HEAD_USER_TURNS",
     "DEFAULT_KEEP_TAIL_USER_TURNS",
     "DEFAULT_MIN_BAND_SHARE",
+    "DEFAULT_SUMMARY_MODE",
+    "DEFAULT_USER_FOLD_PROMPT",
     "DEFAULT_USER_SUMMARY_PROMPT",
     "DEFAULT_USER_TRIGGER_FRACTION",
     "EXCLUDE_REASON",
+    "FOLD_EXCLUDE_REASON",
+    "FOLD_ID_PREFIX",
     "SUMMARY_ID_PREFIX",
+    "SUMMARY_MODES",
+    "SUMMARY_MODE_BOUNDARY",
+    "SUMMARY_MODE_FOLD",
+    "SUMMARY_MODE_RECOMPACT",
     "USER_SUMMARY_MARKER",
     "UserTurnAnchoredSummarizationCompactionStrategy",
 ]
@@ -233,7 +321,47 @@ DEFAULT_USER_TRIGGER_FRACTION: Final[float] = 0.8
 #: :attr:`UserTurnAnchoredSummarizationCompactionStrategy.user_passes_declined`, which is the
 #: difference between this and the silent degradation the counters in this package exist to
 #: rule out. ``0.0`` restores the old behaviour exactly, so the two can be run side by side.
+#:
+#: **One share for all three modes, and it is also the fold's threshold.** After a boundary the
+#: band is smaller -- the previous summary is not in it -- and the prompt it is weighed against
+#: is larger by every standing summary, so the same share clears less often there; that is
+#: measured on the fixture in ``tests`` rather than compensated for, because a share re-tuned
+#: per mode would make the modes incomparable. In the fold mode the same number decides the
+#: fold as well, with the fold's own ``R`` and ``B``: see
+#: :meth:`UserTurnAnchoredSummarizationCompactionStrategy._fold_due`, which is the break-even
+#: above with the terms renamed and not a second constant.
 DEFAULT_MIN_BAND_SHARE: Final[float] = 0.1
+
+#: What a pass does with the summary the previous pass left behind.
+#:
+#: Re-read it and replace it, so one message stands for everything behind it. The behaviour
+#: every archived row of this strategy ran, and the one the module docstring's measurement of
+#: ``USERREPLACED`` against the cache hit rate was taken on.
+SUMMARY_MODE_RECOMPACT: Final[str] = "recompact"
+
+#: Leave it standing as a boundary, never re-read and never replaced. Each pass emits a new
+#: summary beside the standing ones; the prefix up to the newest boundary is byte-identical
+#: before and after every later pass, and N passes leave N standing summaries.
+SUMMARY_MODE_BOUNDARY: Final[str] = "boundary"
+
+#: The boundary mode, plus a fold: once the ordinary band has stopped yielding and the standing
+#: summaries are worth what a fold costs, all of them are collapsed into one, which becomes the
+#: new boundary. See :meth:`UserTurnAnchoredSummarizationCompactionStrategy._fold_due`.
+SUMMARY_MODE_FOLD: Final[str] = "fold"
+
+#: Every mode the constructor accepts, in the order the three were written.
+SUMMARY_MODES: Final[tuple[str, ...]] = (SUMMARY_MODE_RECOMPACT, SUMMARY_MODE_BOUNDARY, SUMMARY_MODE_FOLD)
+
+#: The mode a caller inherits, and it is the recompacting one on purpose.
+#:
+#: Not because it measured best -- the module docstring's own measurement says it breaks the
+#: cached prefix on every pass -- but because it is what every archived row ran and what the
+#: live run in progress is measuring, and this package's standing rule is that a default does
+#: not move until a run has measured both arms. That is the rule ``--user-min-band-share 0``
+#: still exists for. Flipping it later is this one line: the records module reads an absent
+#: setting as :data:`SUMMARY_MODE_RECOMPACT` on its own account rather than as this constant,
+#: so moving this cannot relabel an archived cell.
+DEFAULT_SUMMARY_MODE: Final[str] = SUMMARY_MODE_RECOMPACT
 
 #: User turns kept verbatim at the start.
 #:
@@ -258,7 +386,8 @@ DEFAULT_KEEP_TAIL_USER_TURNS: Final[int] = 1
 #: Two jobs, as :data:`~._anchored.REMOVAL_MARKER` has two. It tells the model that what it is
 #: reading stands for turns that are no longer present, which a model shown a silently reduced
 #: conversation cannot know; and it is how a later pass recognises its own earlier output,
-#: which decides whether there is new material to compact at all.
+#: which decides whether there is new material to compact at all -- or, in the boundary modes,
+#: where the band begins.
 USER_SUMMARY_MARKER: Final[str] = "[earlier turns in this conversation, compacted]"
 
 #: Prefix of the ``message_id`` given to every summary this strategy inserts.
@@ -266,14 +395,32 @@ USER_SUMMARY_MARKER: Final[str] = "[earlier turns in this conversation, compacte
 #: The identification is doubled deliberately: the id is what the framework's own trace
 #: metadata is keyed on, and the marker above is what survives a round trip through a store
 #: that assigns its own ids. Either one alone has a failure mode in which the strategy stops
-#: recognising its own output and starts accumulating summaries instead of replacing them.
+#: recognising its own output: the recompacting mode then accumulates summaries instead of
+#: replacing them, and the boundary modes re-read a boundary as though it were a turn.
 SUMMARY_ID_PREFIX: Final[str] = "user_summary_"
+
+#: Prefix of the ``message_id`` given to the summary a fold inserts.
+#:
+#: Under :data:`SUMMARY_ID_PREFIX`, so :func:`_is_summary` recognises a fold's output as a
+#: boundary by the same test as any other summary, and numbered by fold rather than by pass so
+#: that an id can never collide with an ordinary summary's.
+FOLD_ID_PREFIX: Final[str] = f"{SUMMARY_ID_PREFIX}fold_"
 
 #: Reason recorded on the turns this strategy supersedes.
 #:
 #: Named after the framework's own ``"summarized"``, and distinct from it, so a conversation
 #: read back says which of the two strategies claimed a message.
 EXCLUDE_REASON: Final[str] = "user_turn_summarized"
+
+#: Reason recorded on the standing summaries a fold supersedes, distinct from
+#: :data:`EXCLUDE_REASON` so a conversation read back says whether a message was a turn the
+#: strategy summarised or a summary it folded.
+FOLD_EXCLUDE_REASON: Final[str] = "user_summaries_folded"
+
+#: Reason recorded on a standing summary when it is protected as a boundary, so a caller
+#: reading the conversation back can tell this strategy's boundaries from the record
+#: ``_toolsummary`` preserves under its own reason.
+PRESERVE_REASON: Final[str] = "user_summary_boundary"
 
 #: What the summarizer is asked for.
 #:
@@ -291,6 +438,26 @@ DEFAULT_USER_SUMMARY_PROMPT: Final[str] = (
     "codes, names, numbers, paths, URLs, versions, states, timestamps. Drop pleasantries, "
     "restatements and anything a later turn superseded. Write about the user in the third "
     "person and add nothing that is not in the text you were given."
+)
+
+#: What the summarizer is asked for when a fold collapses the standing summaries.
+#:
+#: The same instruction as :data:`DEFAULT_USER_SUMMARY_PROMPT` with one difference stated up
+#: front: the input is not the user's turns but earlier summaries of them, each already
+#: standing for turns that are gone. Saying so matters, because the ordinary prompt tells the
+#: model to drop pleasantries and restatements, and a summary has none of the first and is
+#: made of the second -- a model told it is reading turns would compress what is already
+#: compressed as though it were padding.
+DEFAULT_USER_FOLD_PROMPT: Final[str] = (
+    "You are compacting a conversation to save space. Below are earlier compaction summaries "
+    "of the user's own turns, in the order those turns were spoken; each one already stands "
+    "for turns that are no longer present, and none of it is padding. Rewrite them as a "
+    "single, shorter account of what the user asked for, in the order they asked for it. Keep "
+    "every requirement, constraint, correction and preference exactly as stated, and quote "
+    "verbatim any value that could not be reconstructed or guessed: identifiers, codes, names, "
+    "numbers, paths, URLs, versions, states, timestamps. Drop only what a later summary "
+    "superseded. Write about the user in the third person and add nothing that is not in the "
+    "text you were given."
 )
 
 
@@ -328,8 +495,13 @@ def _is_summary(message: Message) -> bool:
     the cheaper check, but a message id is assigned by whoever stores the conversation and a
     round trip is free to replace it; the marker travels inside the text and cannot be lost
     without losing the message. Getting this wrong in the false direction is not a crash, which
-    is why it is worth doubling: the strategy simply stops recognising its own output, treats
-    every pass as new material, and accumulates summaries it believes are turns.
+    is why it is worth doubling: the recompacting mode simply stops recognising its own output,
+    treats every pass as new material, and accumulates summaries it believes are turns; the
+    boundary modes lose the boundary and re-read it as a turn.
+
+    This is also the whole of how a boundary is identified. The preserved mark is the
+    boundary's protection, not its identity -- see the module docstring for why the two are
+    kept apart.
 
     Args:
         message: The message to inspect.
@@ -342,7 +514,38 @@ def _is_summary(message: Message) -> bool:
     return USER_SUMMARY_MARKER in (message.text or "")
 
 
-def _format_turns(turns: list[Message]) -> str:
+def _is_standing_summary(message: Message) -> bool:
+    """Return whether ``message`` is a summary this strategy wrote that is still being sent.
+
+    A superseded summary -- one the recompacting mode replaced, or one a fold collapsed -- is
+    excluded and stands for nothing on the wire, so it is neither a boundary nor part of the
+    floor the standing count reports. Only user messages are read: every summary is one, and
+    the text test in :func:`_is_summary` is the one scan here that costs anything.
+
+    Args:
+        message: The message to inspect.
+
+    Returns:
+        True when it is an included summary.
+    """
+    return (
+        message.role == "user" and not message.additional_properties.get(EXCLUDED_KEY, False) and _is_summary(message)
+    )
+
+
+def _summary_body(message: Message) -> str:
+    """Return a summary's text without the marker line a fold would otherwise re-summarise.
+
+    Args:
+        message: A summary this strategy wrote.
+
+    Returns:
+        The summarizer's own text.
+    """
+    return (message.text or "").removeprefix(USER_SUMMARY_MARKER).strip()
+
+
+def _format_turns(turns: list[Message], *, text: Callable[[Message], str | None] | None = None) -> str:
     """Return the user turns as the numbered transcript the summarizer reads.
 
     Numbered because order is part of what has to survive: a later turn may correct an earlier
@@ -352,10 +555,18 @@ def _format_turns(turns: list[Message]) -> str:
     Args:
         turns: The user messages about to be replaced, in conversation order.
 
+    Keyword Args:
+        text: How to read one message. None reads the turn's own text; a fold passes
+            :func:`_summary_body` so the marker is not sent to the summarizer as content.
+
     Returns:
         One line per turn.
     """
-    return "\n".join(f"{index}. {message.text or ''}" for index, message in enumerate(turns, start=1))
+    lines: list[str] = []
+    for index, message in enumerate(turns, start=1):
+        body = message.text if text is None else text(message)
+        lines.append(f"{index}. {body or ''}")
+    return "\n".join(lines)
 
 
 class UserTurnAnchoredSummarizationCompactionStrategy:
@@ -387,7 +598,15 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
             run. This is the hysteresis: without it the strategy fires once per turn for the
             rest of a run that stays above the trigger. ``0.0`` restores that behaviour, which
             is what every run before this one measured. See :data:`DEFAULT_MIN_BAND_SHARE`.
+        summary_mode: What a pass does with the summary the previous pass left behind: one of
+            :data:`SUMMARY_MODES`. The recompacting default re-reads and replaces it; the
+            boundary mode leaves it standing and compacts only what is newer; the fold mode does
+            that and collapses the standing summaries into one once they are worth the break.
+            See the module docstring for what each buys, and :data:`DEFAULT_SUMMARY_MODE` for
+            why the default is the one it is.
         prompt: What the summarizer is asked for. See :data:`DEFAULT_USER_SUMMARY_PROMPT`.
+        fold_prompt: What the summarizer is asked for when a fold collapses the standing
+            summaries. Read in the fold mode only. See :data:`DEFAULT_USER_FOLD_PROMPT`.
     """
 
     def __init__(
@@ -400,20 +619,24 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
         keep_tail_user_turns: int = DEFAULT_KEEP_TAIL_USER_TURNS,
         trigger_fraction: float = DEFAULT_USER_TRIGGER_FRACTION,
         min_band_share: float = DEFAULT_MIN_BAND_SHARE,
+        summary_mode: str = DEFAULT_SUMMARY_MODE,
         prompt: str | None = None,
+        fold_prompt: str | None = None,
     ) -> None:
         """Validate and store the configuration.
 
         Raises:
             ValueError: If the ceiling is not positive, either anchor is negative, the trigger
-                is outside ``(0.0, 1.0]``, or the band share is outside ``[0.0, 1.0)``. A
-                trigger of zero would fire on an empty conversation, where the band is empty
-                and the only thing a pass can produce is a summarizer call; above one it can
-                never fire, which is a row that silently measures the uncompacted control under
-                another name. A band share of one demands a band that is the whole prompt, which
-                is the same never-fires row by the other route; zero is legal and is the
-                behaviour this class had before the share existed, kept so the two can be run
-                side by side.
+                is outside ``(0.0, 1.0]``, the band share is outside ``[0.0, 1.0)``, or the
+                mode is not one of :data:`SUMMARY_MODES`. A trigger of zero would fire on an
+                empty conversation, where the band is empty and the only thing a pass can
+                produce is a summarizer call; above one it can never fire, which is a row that
+                silently measures the uncompacted control under another name. A band share of
+                one demands a band that is the whole prompt, which is the same never-fires row
+                by the other route; zero is legal and is the behaviour this class had before
+                the share existed, kept so the two can be run side by side. An unknown mode is
+                refused rather than read as the default, because a misspelt mode that quietly
+                ran the default would be a row measuring the wrong arm under the right name.
         """
         if max_input_tokens <= 0:
             raise ValueError("max_input_tokens must be positive.")
@@ -423,6 +646,8 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
             raise ValueError("trigger_fraction must be in (0.0, 1.0].")
         if not 0.0 <= min_band_share < 1.0:
             raise ValueError("min_band_share must be in [0.0, 1.0).")
+        if summary_mode not in SUMMARY_MODES:
+            raise ValueError(f"summary_mode must be one of {SUMMARY_MODES}, not {summary_mode!r}.")
         self.max_input_tokens = max_input_tokens
         self.tokenizer = tokenizer
         self.client = client
@@ -430,12 +655,26 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
         self.keep_tail_user_turns = keep_tail_user_turns
         self.trigger_fraction = trigger_fraction
         self.min_band_share = min_band_share
+        self.summary_mode = summary_mode
         self.prompt = prompt or DEFAULT_USER_SUMMARY_PROMPT
+        self.fold_prompt = fold_prompt or DEFAULT_USER_FOLD_PROMPT
         self._compactions = 0
         self._replaced = 0
         self._failures = 0
         self._below_trigger = 0
         self._declined = 0
+        self._folds = 0
+        self._summaries_in_conversation = 0
+        self._summary_tokens = 0
+
+    @property
+    def recompacts_summaries(self) -> bool:
+        """Whether a pass re-reads the previous summary, which is the recompacting mode alone.
+
+        The one question the two boundary modes answer alike, read off the mode in one place so
+        that :meth:`_band` and :meth:`_observe_summaries` cannot disagree about it.
+        """
+        return self.summary_mode == SUMMARY_MODE_RECOMPACT
 
     @property
     def user_compactions(self) -> int:
@@ -467,12 +706,78 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
         summary of them plus ten more, would report eighty-one turns replaced out of eighty-one
         that ever existed, while the prompt carries one message.
 
+        In the boundary modes the most recent pass's band holds no earlier summary, so this is
+        the turns behind the *newest* boundary only, and the whole of what the standing
+        summaries stand for is spread across :attr:`user_summaries_in_conversation` of them. A
+        fold does not move it: a fold supersedes summaries, not turns.
+
         It is not reset by a pass that declines, because what it describes is the summary
         sitting in the prompt and that summary is still standing for those turns. Zero
         therefore means one thing only: no compaction has happened, which is the same reading
         :attr:`user_compactions` gives and is why the two are reported together.
         """
         return self._replaced
+
+    @property
+    def user_summaries_in_conversation(self) -> int:
+        """Summaries this strategy wrote that the conversation is still sending, as it now stands.
+
+        The floor. In the boundary mode every one of them is preserved -- neither re-read by
+        this strategy nor shortened or dropped by any other -- and nothing merges them, so each
+        raises a floor under the prompt that no later pass can lower: N passes, N of these. That
+        is the accumulation
+        :attr:`~._toolsummary.ToolResultAnchoredSummarizationCompactionStrategy.records_in_conversation`
+        reports on the record row, and it is reported here for the same reason: a row whose
+        compaction has stopped paying for a good reason and one whose unshrinkable part has
+        quietly grown are otherwise the same row. In the recompacting mode it reads one after
+        the first pass and never more, which is the bound that mode buys.
+
+        **As it now stands, not at its peak**, which is where this differs from the record
+        count. Records never decrease; standing summaries do, because a fold collapses them, so
+        a maximum would report a floor the prompt no longer has. Read it beside
+        :attr:`user_folds`: a low count with folds is a floor that was lowered, and a high count
+        without them is the boundary mode's cost arriving.
+
+        Read at the start of every pass over the trigger and again after every pass that
+        inserts a summary, so the last state a run leaves is counted whether or not a later
+        pass reads it. Zero means no summary is being sent, whichever mode wrote or replaced
+        or folded it.
+        """
+        return self._summaries_in_conversation
+
+    @property
+    def user_summary_tokens(self) -> int:
+        """Tokens the standing summaries occupy in the prompt, at the same reading as the count.
+
+        The floor in the unit a reader actually needs. A count of standing summaries says the
+        floor exists; this says how much of the prompt it is, which is what decides whether a
+        fold would repay itself and what the boundary mode is costing against the recompacting
+        one. Measured with the same annotations
+        :func:`~agent_framework._compaction.included_token_count` reads, so it is a share of the
+        same number the trigger is judged against.
+        """
+        return self._summary_tokens
+
+    @property
+    def user_folds(self) -> int:
+        """Passes that collapsed every standing summary into one, which became the new boundary.
+
+        The fold mode's whole cost, in the unit it is paid in: each fold rewrites the prompt at
+        the oldest summary's position, which is just behind the head turn, so it re-bills very
+        nearly the whole cached prefix once -- the same break the recompacting mode pays on
+        every pass, paid here only when :meth:`_fold_due` says the standing summaries have grown
+        large enough to repay it. A run that folded twice and one that never folded differ by
+        two of those breaks and by a floor that was twice lowered, and no other counter
+        separates them.
+
+        A fifth outcome of a pass, beside the four :attr:`user_passes_below_trigger` lists. A
+        fold is a pass whose ordinary band was not worth compacting and whose standing
+        summaries were, so it is counted here and *not* under :attr:`user_passes_declined`, and
+        the five still partition every pass over a non-empty conversation. A fold whose
+        summarizer did not answer is a :attr:`user_summary_failures`, exactly as an ordinary
+        pass's is.
+        """
+        return self._folds
 
     @property
     def user_summary_failures(self) -> int:
@@ -503,8 +808,9 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
         conversation never reached the line; :attr:`user_passes_declined` says it did and the
         band was not worth a pass; :attr:`user_summary_failures` says the band was and the
         summarizer was not. Together with :attr:`user_compactions` the four partition every
-        pass over a non-empty conversation, so a row where the user half did nothing always has
-        exactly one non-zero number saying why.
+        pass over a non-empty conversation -- five with :attr:`user_folds`, which is a pass the
+        band declined and the standing summaries did not -- so a row where the user half did
+        nothing always has exactly one non-zero number saying why.
 
         On a composed row this number is the one
         :attr:`~._composed.ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy.user_passes_starved`
@@ -524,10 +830,13 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
         Thirty of them is what the live run in the module docstring measured.
 
         It is one number for three refusals, because they are one statement -- there was not
-        enough here to be worth a pass. The band was empty (the anchors cover the conversation),
-        or it held only this strategy's own earlier summary (nothing new has been said), or it
-        was worth less than ``min_band_share`` of the prompt (something new has been said and it
-        is not enough). :meth:`_worth_compacting` is where all three are written down.
+        enough here to be worth a pass. The band was empty (the anchors cover the conversation,
+        or after a boundary nothing but the tail is newer than it), or it held only this
+        strategy's own earlier summary (nothing new has been said), or it was worth less than
+        ``min_band_share`` of the prompt (something new has been said and it is not enough).
+        :meth:`_worth_compacting` is where all three are written down. In the fold mode a pass
+        counted here is one where the standing summaries were not worth a fold either; a pass
+        where they were is a :attr:`user_folds`, not a decline.
 
         **Read it as a ratio against :attr:`user_compactions`, not alone.** Non-zero beside a
         non-zero compaction count is the mechanism working. Non-zero beside *zero* compactions
@@ -542,9 +851,10 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
 
         Two conditions, and the second one is why this is not once per turn: the trigger says
         the prompt is large enough to act on, and :meth:`_worth_compacting` says this band is
-        worth the pass. Each refusal increments the counter that names it, so the four outcomes
-        -- under the line, declined, summarizer failed, compacted -- partition the passes and a
-        row that did nothing says which.
+        worth the pass. Each refusal increments the counter that names it, so the five outcomes
+        -- under the line, declined, summarizer failed, compacted, folded -- partition the
+        passes and a row that did nothing says which. The fold is reached only through a
+        declined band, and only in the fold mode: see :meth:`_fold_due`.
 
         Nothing is mutated until the summary is in hand. That ordering is the whole of the
         "degrade safely" contract: exclusion flags and the summary's back-references are
@@ -612,8 +922,17 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
             self._below_trigger += 1
             return False
 
-        band = self._band(messages)
+        # Before the band is read, so a boundary is protected before anything is decided
+        # against it, and the floor is counted on every pass over the trigger. Not folded into
+        # the return value: annotating a message is not a change to what the model sees.
+        standing = self._observe_summaries(messages)
+        band = self._band(messages, standing)
         if not self._worth_compacting(messages, band, included_token_count(messages)):
+            # The band has stopped yielding. That is the signal a fold waits for and not, on
+            # its own, a reason to fold: the fold has its own condition, and a pass that fails
+            # both is declined and counted as one.
+            if self._fold_due(messages, standing):
+                return await self._fold(messages, standing)
             self._declined += 1
             return False
 
@@ -621,10 +940,17 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
         if summary is None:
             return False
 
-        self._replace(messages, band, summary)
+        # The id is numbered by compaction rather than by conversation length, which is what
+        # the framework uses. Length is not unique across passes here: in the recompacting mode
+        # this strategy's own summary is superseded by the next one, so a conversation can be
+        # compacted at the same length twice and the second summary would claim the first
+        # one's id, silently pointing every back-reference at the wrong message.
+        self._replace(messages, band, summary, summary_id=f"{SUMMARY_ID_PREFIX}{self._compactions}")
+        self._compactions += 1
+        self._replaced = len(band)
         return True
 
-    def _band(self, messages: list[Message]) -> list[dict[str, Any]]:
+    def _band(self, messages: list[Message], standing: list[dict[str, Any]]) -> list[dict[str, Any]]:
         """Return the user groups this pass may replace, oldest first.
 
         **User groups and nothing else.** ``group_messages`` gives every user message a group of
@@ -645,6 +971,22 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
         subtler bug: a preserved last turn would otherwise take the tail's place and let the
         live request be summarised.
 
+        **The boundary rule, which is the whole difference between the modes.** In the
+        recompacting mode, and on any pass with no standing summary, the band is the turns
+        between the head and the tail, previous summary included -- the head is honoured on the
+        first pass in every mode. In the boundary modes, once a summary stands, the band is the
+        turns *newer than the newest standing summary*, less the tail: the boundary is never
+        re-read, everything in front of it is already behind a boundary and out of reach by
+        construction, and the head needs no second reading because the start of the
+        conversation was protected on the pass that wrote the first boundary. A standing summary
+        is preserved, so it is not in ``turns`` at all; the boundary is taken from ``standing``
+        rather than searched for here, so that this method and :meth:`_observe_summaries` read
+        one list. On an ordinary conversation the two rules select the same band -- everything
+        in front of the boundary is either a head turn or superseded -- and the explicit rule
+        is what keeps that true when it stops being ordinary: a head turn another strategy has
+        preserved or excluded would otherwise shift the re-counted head onto the first turn
+        after the boundary and protect it for the rest of the run.
+
         **Whether the band is worth replacing is not decided here.** This returns what a pass
         *may* touch; :meth:`_worth_compacting` decides whether a pass runs at all. The two were
         one method until the band's own size had to be weighed, and separating them is what
@@ -653,6 +995,8 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
 
         Args:
             messages: The conversation, already grouped.
+            standing: The standing summaries' spans, oldest first, as
+                :meth:`_observe_summaries` returned them. Empty on a first pass.
 
         Returns:
             The spans this pass may replace, empty when the anchors leave nothing between them.
@@ -664,10 +1008,17 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
             and not messages[span["start_index"]].additional_properties.get(EXCLUDED_KEY, False)
             and not any_preserved(messages[span["start_index"] : span["end_index"] + 1])
         ]
-        last = len(turns) - self.keep_tail_user_turns
-        if last <= self.keep_head_user_turns:
+        if self.recompacts_summaries or not standing:
+            last = len(turns) - self.keep_tail_user_turns
+            if last <= self.keep_head_user_turns:
+                return []
+            return turns[self.keep_head_user_turns : last]
+        boundary = int(standing[-1]["start_index"])
+        newer = [span for span in turns if span["start_index"] > boundary]
+        last = len(newer) - self.keep_tail_user_turns
+        if last <= 0:
             return []
-        return turns[self.keep_head_user_turns : last]
+        return newer[:last]
 
     def _worth_compacting(self, messages: list[Message], band: list[dict[str, Any]], prompt_tokens: int) -> bool:
         """Return whether this band is worth what a pass costs.
@@ -682,7 +1033,8 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
         - **A band holding only this strategy's own earlier summary.** Replacing it frees
           exactly nothing: one message is rewritten at one position and the prompt is the size
           it was. This is :meth:`~._toolsummary.ToolResultRecallMiddleware._record_due`'s rule,
-          re-arming on new material rather than on size.
+          re-arming on new material rather than on size. Vacuous in the boundary modes, whose
+          band never holds a summary, where the same statement is the empty band above.
         - **A band worth less than ``min_band_share`` of the included prompt.** The rule the
           other two are corners of, and the one the measurement forced. The condition that fires
           a pass is the prompt's size, and the prompt does not shrink to the size of the band --
@@ -717,11 +1069,158 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
             return False
         return included_token_count(replaced) >= prompt_tokens * self.min_band_share
 
-    async def _summarize(self, turns: list[Message]) -> str | None:
+    def _observe_summaries(self, messages: list[Message]) -> list[dict[str, Any]]:
+        """Protect every standing summary as a boundary, and read the floor they make.
+
+        Re-applied on every pass rather than set once, for the reason
+        :func:`~._toolsummary._preserve_records` is: compaction may run against a freshly loaded
+        conversation, and an annotation a previous pass wrote is not promised to be there when
+        the next one starts. Every standing summary, not only the newest -- an older boundary is
+        the sole surviving copy of the turns behind *it*, and the newest one does not stand for
+        them.
+
+        Only the boundary modes mark anything. In the recompacting mode the summary must stay
+        an ordinary candidate, and :meth:`_band` skips a preserved turn, so marking it there
+        would turn that mode into this one without anyone having asked.
+
+        The count and the tokens come back from the same walk, so the floor reported is the
+        floor that was protected and not a second reading that could disagree with it. Both are
+        the state as it now stands rather than a maximum: a fold lowers them, and a peak would
+        report a floor the prompt no longer carries.
+
+        Args:
+            messages: The conversation, already grouped and token-annotated. Mutated in place
+                in the boundary modes, by annotation only.
+
+        Returns:
+            The standing summaries' spans, oldest first, which is what :meth:`_band` takes the
+            boundary from and what a fold collapses.
+        """
+        standing = [
+            span
+            for span in group_messages(messages)
+            if span.get("kind") == "user" and _is_standing_summary(messages[span["start_index"]])
+        ]
+        summaries = [messages[span["start_index"]] for span in standing]
+        if not self.recompacts_summaries:
+            for message in summaries:
+                set_preserved(message, preserved=True, reason=PRESERVE_REASON)
+        self._summaries_in_conversation = len(summaries)
+        self._summary_tokens = included_token_count(summaries)
+        return standing
+
+    def _fold_due(self, messages: list[Message], standing: list[dict[str, Any]]) -> bool:
+        """Return whether the standing summaries are worth collapsing into one.
+
+        Reached only from a pass whose ordinary band was declined, which is the signal and not
+        the decision: a band that has stopped yielding while the standing summaries are a
+        couple of percent of the prompt is not a reason to break the whole cached prefix for a
+        couple of percent. Three conditions, and all three are required.
+
+        - **The fold mode.** The boundary mode never folds; that is what makes it the arm whose
+          floor is the pure cost of never re-reading, against which the fold is measured.
+        - **At least two standing summaries.** Folding one summary is a rewrite of one message
+          at one position -- the recompacting mode with extra steps -- so the fold path cannot
+          be reached with fewer. This is also the guard against fold thrashing: a fold leaves
+          one standing summary, so the next fold cannot happen until an ordinary boundary pass
+          has left a second one, and that pass needs the prompt to have grown by
+          ``1 / (1 - min_band_share)`` since the last. Folds are therefore at most one per
+          ordinary pass, and each of those is already bounded geometrically.
+        - **The fold repays the break.** This is the anchored family's break-even,
+          :data:`~._anchored.DEFAULT_MIN_GAIN_FRACTION`'s ``R > B * (p - c) / (p + T * c)``, with
+          the fold's own terms and no new constant. ``R`` is what the fold would remove: the
+          standing summaries' tokens less the largest of them, on the stated assumption that a
+          summary of summaries is no larger than the largest piece it folds -- the neutral
+          estimate is their mean, and the largest is the one that errs towards keeping, which
+          is the direction this package errs in everywhere. ``B`` is what the fold would
+          re-bill: the included prompt from the oldest standing summary to the end, which is
+          very nearly the whole prompt, because the oldest summary sits just behind the head
+          turn. ``(p - c) / (p + T * c)`` at the measured prices and this benchmark's own
+          conversation length is :data:`DEFAULT_MIN_BAND_SHARE` -- that constant's docstring
+          carries the derivation -- so the condition is ``R >= B * min_band_share``, and a
+          caller who moves the share moves both decisions together. The formula fits this
+          decision exactly, since a fold is a single edit at one position re-billing everything
+          behind it once and saving its removal on every turn after; what it says is that a
+          fold pays only once the summaries are a tenth of what is behind them, which on a
+          long conversation with small summaries is rarely, and that is the finding rather than
+          a defect.
+
+        What the threshold does not deduct is the replacement's real size, because it is not
+        known until the summarizer has answered; the largest-summary deduction is the stated
+        stand-in for it.
+
+        Args:
+            messages: The conversation, already grouped and token-annotated.
+            standing: The standing summaries' spans, as :meth:`_observe_summaries` returned them.
+
+        Returns:
+            True when a fold may go on to spend a summarizer call.
+        """
+        if self.summary_mode != SUMMARY_MODE_FOLD or len(standing) < 2:
+            return False
+        sizes = [included_token_count([messages[span["start_index"]]]) for span in standing]
+        removable = sum(sizes) - max(sizes)
+        behind = included_token_count(messages[int(standing[0]["start_index"]) :])
+        return removable >= behind * self.min_band_share
+
+    async def _fold(self, messages: list[Message], standing: list[dict[str, Any]]) -> bool:
+        """Collapse every standing summary into one, which becomes the new boundary.
+
+        The mechanics are :meth:`_replace`'s, applied to summaries instead of turns: the fold's
+        output is inserted where the oldest summary stood, carries the ids of every summary and
+        group it folds, and each folded summary carries the fold's id back and is excluded with
+        :data:`FOLD_EXCLUDE_REASON`. The messages between the standing summaries -- assistant
+        replies, tool groups, the record half's preserved record on a composed row -- are not
+        read, not moved relative to each other and not excluded; the fold touches the summaries
+        it collapses and inserts one message, exactly as an ordinary pass inserts one. The
+        fold's output is a summary by :func:`_is_summary`'s test and is marked preserved by the
+        observation :meth:`_replace` ends with, so the next pass's band starts after it and the
+        cycle continues.
+
+        The folded summaries' preservation is released before they are excluded. The mark
+        promised that no strategy would drop them; the strategy that made the promise is the
+        one superseding them, and the replacement carries the promise forward. Releasing it
+        keeps "preserved" and "included" meaning one thing on a conversation read back.
+
+        Nothing is mutated until the summary is in hand, on the same contract as an ordinary
+        pass: a summarizer that raises or answers with nothing leaves the conversation as it
+        was and is counted under :attr:`user_summary_failures`.
+
+        Args:
+            messages: The conversation, mutated in place.
+            standing: The standing summaries' spans, oldest first, at least two of them.
+
+        Returns:
+            True if the outgoing messages changed.
+        """
+        summaries = [messages[span["start_index"]] for span in standing]
+        summary = await self._summarize(summaries, prompt=self.fold_prompt, text=_summary_body)
+        if summary is None:
+            return False
+        for message in summaries:
+            set_preserved(message, preserved=False)
+        self._replace(
+            messages, standing, summary, summary_id=f"{FOLD_ID_PREFIX}{self._folds}", reason=FOLD_EXCLUDE_REASON
+        )
+        self._folds += 1
+        return True
+
+    async def _summarize(
+        self,
+        turns: list[Message],
+        *,
+        prompt: str | None = None,
+        text: Callable[[Message], str | None] | None = None,
+    ) -> str | None:
         """Return the summary of ``turns``, or None when the summarizer did not produce one.
 
         Args:
             turns: The user messages about to be replaced, in conversation order.
+
+        Keyword Args:
+            prompt: What to ask for. None asks for :attr:`prompt`; a fold asks for
+                :attr:`fold_prompt`.
+            text: How each message is read into the transcript. See :func:`_format_turns`.
 
         Returns:
             The summary text, stripped, or None on either failure.
@@ -729,8 +1228,8 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
         try:
             response = await self.client.get_response(
                 [
-                    Message(role="system", contents=[self.prompt]),
-                    Message(role="user", contents=[_format_turns(turns)]),
+                    Message(role="system", contents=[prompt or self.prompt]),
+                    Message(role="user", contents=[_format_turns(turns, text=text)]),
                 ],
                 stream=False,
             )
@@ -749,7 +1248,15 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
             return None
         return summary
 
-    def _replace(self, messages: list[Message], band: list[dict[str, Any]], summary: str) -> None:
+    def _replace(
+        self,
+        messages: list[Message],
+        band: list[dict[str, Any]],
+        summary: str,
+        *,
+        summary_id: str,
+        reason: str = EXCLUDE_REASON,
+    ) -> None:
         """Put one user message in place of the band, linked to what it supersedes.
 
         Every step here is ``SummarizationStrategy``'s, performed in its order: the summary
@@ -766,18 +1273,28 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
         equal, and a search would find the earlier one and insert the summary in front of a turn
         the head was protecting.
 
-        The id is numbered by compaction rather than by conversation length, which is what the
-        framework uses. Length is not unique across passes here: this strategy's own summary is
-        superseded by the next one, so a conversation can be compacted at the same length twice
-        and the second summary would claim the first one's id, silently pointing every
-        back-reference at the wrong message.
+        The token counts are re-annotated from the insertion as well, and not only the groups.
+        The next pass would do exactly this on entry -- the inserted summary is the first
+        untokenized message, and the framework's incremental annotation runs from there to the
+        end -- so the cost is moved rather than added; what it buys is that the observation this
+        ends with counts the summary just inserted, so the floor a run leaves is on the counters
+        whether or not a later pass reads it.
+
+        The counters a pass moves are the caller's business, because two callers share this: an
+        ordinary pass numbers its summary by compaction and reports the turns it replaced, and a
+        fold numbers by fold and reports nothing about turns. What both leave behind is one
+        message that :func:`_is_summary` recognises, which is the one property every mode reads.
 
         Args:
             messages: The conversation, mutated in place.
             band: The spans being replaced, oldest first.
             summary: The summarizer's text.
+
+        Keyword Args:
+            summary_id: The ``message_id`` the replacement carries and the superseded messages
+                point back to.
+            reason: Recorded on each superseded message with its exclusion.
         """
-        summary_id = f"{SUMMARY_ID_PREFIX}{self._compactions}"
         replaced = [messages[span["start_index"]] for span in band]
         summary_message = Message(
             role="user",
@@ -792,9 +1309,11 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
         )
         for message in replaced:
             _mark_summarized_by(message, summary_id)
-            set_excluded(message, excluded=True, reason=EXCLUDE_REASON)
+            set_excluded(message, excluded=True, reason=reason)
         insertion_index = int(band[0]["start_index"])
         messages.insert(insertion_index, summary_message)
+        # Groups first, then tokens: annotate_token_counts re-annotates the groups from the same
+        # index before it counts, so this is the framework's own order.
         annotate_message_groups(messages, from_index=insertion_index, force_reannotate=False)
-        self._compactions += 1
-        self._replaced = len(replaced)
+        annotate_token_counts(messages, tokenizer=self.tokenizer, from_index=insertion_index)
+        self._observe_summaries(messages)

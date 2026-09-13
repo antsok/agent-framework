@@ -1,6 +1,6 @@
 # How this package is tested
 
-452 test functions, 566 cases after parametrisation, about 12,800 lines of test against 15,800
+474 test functions, 588 cases after parametrisation, about 13,700 lines of test against 16,600
 lines of source. Everything runs offline in under a minute. This file says what is being
 defended and why the tests are shaped the way they are, because most of them exist to prevent a
 specific failure that already happened and cost either a paid-for run or a wrong number in a
@@ -12,14 +12,14 @@ pytest tests -q
 ```
 
 > `poe test-cachebench`, declared in `python/packages/lab`, runs the same suite from that
-> directory with coverage on, and all 566 pass there too. One did not until
+> directory with coverage on, and the whole suite passes there too. One did not until
 > `test_narration_probe_declares_every_flag_it_reads` was changed to load
 > `samples/probe_narration.py` by file path: `samples` only resolves by name when the package
 > directory is on the path, which it is from here and was not from there.
 
 | file | tests | what it defends |
 | --- | ---: | --- |
-| `tests/test_live.py` | 210 | the live runner: the agent pipeline, retries, probing, scoring, the table, the records file |
+| `tests/test_live.py` | 214 | the live runner: the agent pipeline, retries, probing, scoring, the table, the records file |
 | `tests/test_cachebench.py` | 51 | the replay harness, the prefix oracle, providers, cost |
 | `tests/test_recall.py` | 23 | the recall scenario and the scorer |
 | `tests/test_fill.py` | 14 | the fill solver and the payload sizing |
@@ -27,8 +27,8 @@ pytest tests -q
 | `tests/test_summary.py` | 7 | the summary CLI |
 | `tests/compaction/test_toolsummary.py` | 60 | the record strategy, its tool and its middleware |
 | `tests/compaction/test_anchored.py` | 28 | the anchored family |
-| `tests/compaction/test_composed.py` | 22 | the composed row: one line for both halves, the order, and what the starvation counter may and may not count |
-| `tests/compaction/test_usersummary.py` | 21 | the user-turn strategy: the band, the hysteresis that bounds its passes, and recompaction of its own output |
+| `tests/compaction/test_composed.py` | 23 | the composed row: one line for both halves, the order, what the starvation counter may and may not count, and that a fold in the user half leaves the record where it was |
+| `tests/compaction/test_usersummary.py` | 38 | the user-turn strategy: the band, the hysteresis that bounds its passes, and the three summary modes — recompaction of its own output, the boundary that is never re-read and keeps the prefix byte-identical, and the fold that bounds the accumulation |
 | `tests/compaction/test_boundary.py` | 4 | that `compaction/` never imports the lab |
 
 ## The split, and why `tests/compaction/` is separate
@@ -105,7 +105,7 @@ line rather than on a paid call. Each was written after the category bit.
 
 **Every argument the runner reads must be declared.**
 `test_every_argument_the_runner_reads_is_defined` parses a minimal command line and asserts the
-namespace carries all thirty-nine attributes the run function reads. A flag referenced but never
+namespace carries all forty attributes the run function reads. A flag referenced but never
 declared raises `AttributeError` only once a live run is under way; that happened twice, on an
 `add_argument` edit that silently failed to apply while the code using it did not.
 
@@ -262,6 +262,16 @@ assert included_token_count(messages) > int(_TWO_RECORD_CEILING * DEFAULT_TRIGGE
     "a fixture that falls below the trigger stops reaching the counter, and this stops testing it"
 )
 ```
+
+The summary-mode round applied ten mutations to `_usersummary.py` and `_live.py` -- the boundary
+rule removed, the boundary left unmarked, the fold allowed with one summary, the fold's threshold
+and its deduction removed, the folded summaries left preserved, the default flipped, the floor
+counters not read after a replace, the flags unwired, and every mode made to read as recompacting.
+Two survived on the first run and both were redundancy in the code rather than blindness in the
+tests: the preserved mark alone already keeps a boundary out of the band, and the fold's deduction
+alone already refuses a one-summary fold at any share above zero. Each got a test on the one case
+where the removed rule is load-bearing -- a head turn another strategy preserved, and a share of
+zero -- and the ten are now all caught.
 
 Two other tests assert their own premise the same way — `test_the_recorded_cells_on_disk_still_read`
 asserts the glob was non-empty, and `test_the_strategies_never_import_the_lab` asserts modules

@@ -24,10 +24,13 @@ What is here:
   :class:`ToolResultRecallMiddleware` is what asks.
 - :class:`UserTurnAnchoredSummarizationCompactionStrategy` is the mirror of that one on the
   other half of the conversation: it summarises the *user's* turns between a fixed head and
-  tail, and it recompacts its own earlier summary once the band is worth a pass again --
-  deliberately the opposite of ``_anchored``'s refusal to re-trim, for the reason its module
-  docstring gives, and bounded by a minimum band share because the threshold alone let it fire
-  once per turn. It touches nothing the other three touch, so the rows stay comparable.
+  tail. What it does with its own earlier summary is a mode: recompact it once the band is
+  worth a pass again -- the default, deliberately the opposite of ``_anchored``'s refusal to
+  re-trim, for the reason its module docstring gives -- or leave it standing as a boundary the
+  next pass compacts only behind, or do that and fold the standing summaries into one once they
+  are worth the break. All three are bounded by a minimum band share because the threshold
+  alone let it fire once per turn. It touches nothing the other three touch, so the rows stay
+  comparable.
 - :class:`ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy` runs those last two
   over one conversation, the record phase first. It is the only entry here that composes
   rather than compacts: it owns no selection rule and removes nothing itself. What it adds is
@@ -97,8 +100,16 @@ from ._usersummary import (
     DEFAULT_KEEP_HEAD_USER_TURNS,
     DEFAULT_KEEP_TAIL_USER_TURNS,
     DEFAULT_MIN_BAND_SHARE,
+    DEFAULT_SUMMARY_MODE,
+    DEFAULT_USER_FOLD_PROMPT,
     DEFAULT_USER_SUMMARY_PROMPT,
     DEFAULT_USER_TRIGGER_FRACTION,
+    FOLD_EXCLUDE_REASON,
+    FOLD_ID_PREFIX,
+    SUMMARY_MODE_BOUNDARY,
+    SUMMARY_MODE_FOLD,
+    SUMMARY_MODE_RECOMPACT,
+    SUMMARY_MODES,
     USER_SUMMARY_MARKER,
     UserTurnAnchoredSummarizationCompactionStrategy,
 )
@@ -114,15 +125,23 @@ __all__ = [
     "DEFAULT_MIN_GAIN_FRACTION",
     "DEFAULT_RECORD_MAX_TOKENS",
     "DEFAULT_RECORD_TARGET_TOKENS",
+    "DEFAULT_SUMMARY_MODE",
     "DEFAULT_TRIGGER_FRACTION",
+    "DEFAULT_USER_FOLD_PROMPT",
     "DEFAULT_USER_SUMMARY_PROMPT",
     "DEFAULT_USER_TRIGGER_FRACTION",
+    "FOLD_EXCLUDE_REASON",
+    "FOLD_ID_PREFIX",
     "MARKER_ID_PREFIX",
     "PRESERVED_KEY",
     "PRESERVE_REASON_KEY",
     "RECALL_TOOL_NAME",
     "RECORD_MARKER",
     "REMOVAL_MARKER",
+    "SUMMARY_MODES",
+    "SUMMARY_MODE_BOUNDARY",
+    "SUMMARY_MODE_FOLD",
+    "SUMMARY_MODE_RECOMPACT",
     "USER_SUMMARY_MARKER",
     "AnchoredCompactionStrategy",
     "MinimumGainAnchoredCompactionStrategy",
