@@ -1468,6 +1468,78 @@ So luna writes at great length about the first two lookups and never reaches the
 is a property of the model's writing, not of a setting, and no bound reachable from the CLI moved
 it.
 
+### Run 47 -- all twenty at 170,000/0.9, and the two user-turn rows measured
+
+`gpt-5.6-luna` through the harness agent, 170,000-token window, 0.9 fill, the scaled payload --
+six results of ~15,125 tokens at a 60% tool share -- every registered strategy, five seeds, 100
+records, one file per seed, two invocations at a time. No throttling, retries or errors; $18.22
+across the run. It is the first archived cell to carry `user_summary_anchored` and
+`tool_and_user_summary_anchored` as they now stand -- the band share on, the composed row on its
+shared line -- and run 47a beside it in `runs/` is the aborted attempt that measured neither.
+
+**Four rows keep every fact, and one of them compacts to 30% of the window.**
+
+| row | `msgs` | `tok` left/peak | `snap%` | `hit%` | `seed$` | `seed$+-` | `summ$` | `vs none$` | facts | `acc1` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `none` | 85/85 | 146,425/146,425 | 86% | 97% | $0.1113 | 19% | -- | -- | 53/53 | 100% |
+| `tool_summary_anchored` | 81/89 | 84,651/86,421 | 50% | 95% | $0.0908 | 22% | -- | -18% | 53/53 | 100% |
+| `user_summary_anchored` | 62/86 | 120,992/120,992 | 71% | 93% | $0.1471 | 24% | $0.0118 | +32% | 53/53 | 100% |
+| `tool_and_user_summary_anchored` | 49/90 | 51,923/81,784 | **30%** | **76%** | $0.1357 | 30% | $0.0169 | +22% | 53/53 | 100% |
+
+`acc2` is 100% on all four as well, on every attempt of every seed. The composition is the
+deepest-compacting row in the cell that loses nothing: the four rows below it in `snap%` --
+`context_window_aggressive` at 27%, `token_budget_window_first` at 24%, `sliding_window` and
+`summarization` at 11% -- lost 33 to 45 facts and landed between 17% and 38% on `acc1`. Seven of
+twenty rows cleared the correctness bar, the control among them; the three not in the table are
+`anchored`, `anchored_no_assistant` and `selective_tool_call`, at 49 to 50 facts and 91% to 94%.
+
+**The user half's hysteresis holds it back on almost every pass.** `user_summary_anchored` read
+`USERCOMPACT:2` on every seed against `USERHELD` 26 to 39 and `USERUNDER` 62 to 75, with
+`USERREPLACED:24` -- two passes a run, the second standing for twenty-four turns, and every other
+pass past the trigger refused because the band was not worth a tenth of the prompt. That is
+`--user-min-band-share` doing what it was written to do on a workload where the band is the
+minority of the prompt, and it is a finding about this cell's sizing under the scaled payload
+rather than about the row. `snap%` 71 against 86 is what two passes buy.
+
+**The composition's user half fires, and the price is the cache.** No `USERSTARVED` on any seed,
+which is the aligned trigger behaving as designed; `USERCOMPACT` 4 to 7 against `USERHELD` 2 to
+4, because the record half's removal leaves the band a larger share of what remains. Every one of
+those passes rewrites the summary just behind the head turn, and the hit rate tracks them:
+
+| seed | `USERCOMPACT` | `USERREPLACED` | `hit%` | `snap%` | `seed$` | `vs none$` |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| s0 | 5 | 16 | 73% | 30% | $0.1295 | +14% |
+| s1 | 4 | 8 | 89% | 34% | $0.1166 | +3% |
+| s2 | 6 | 16 | 70% | 31% | $0.1506 | +28% |
+| s3 | 5 | 14 | 75% | 28% | $0.1257 | +31% |
+| s4 | 7 | 14 | 70% | 29% | $0.1558 | +35% |
+
+76% against the record row's 95% and the control's 97% is the cost of rewriting the user summary
+in place on every pass, and it is the measurement behind the `boundary` and `fold` modes of
+`--user-summary-mode`, neither of which this run carried.
+
+**On money the cell resolves nothing, and this is the part to read carefully.** `seed$+-` runs
+19% to 30% across the four rows. The instrument's rule is that a gap is a result only when it is
+wider than the seed spread of either row it is taken between, and it printed `NOT SUPPORTED` on
+its own verdict: `tool_summary_anchored` at -18% against a 22% spread. The composition's +22% sits
+inside its 30%. The one figure that clears the rule is `user_summary_anchored` at +32% against 24%
+on the row and 19% on the control, with every seed dearer than its control, +23% to +45% -- so
+what the cell supports there is the direction, not the size. Paired by seed the record row is
+cheaper on all five, -8% to -30%, and the composition dearer on all five, +3% to +35%; those are
+signs, and five seeds do not put a number on either. Nothing in this cell separates the record
+row or the composition from not compacting on money, and no figure from that column is to be
+quoted as a result -- `REVIEW-2026-09-06.md` §3 is what happened the last time one was.
+
+**One seed is off target, and it is in the aggregate.** s3 seeded 137,396 tokens against the
+153,000 target, -10.2%, where the other four sit between -2.1% and -3.9%; the merged cell reads
+-4.6% and prints no `FILL OFF TARGET`, s3 rendered alone does. Its control is the cheapest of the
+five at $0.0962, 15% under the next, which is why it is also the record row's worst seed at -8%.
+Re-rendered over the other four files with `--from-jsonl`: facts, `acc1` and `acc2` unchanged on
+every row; the composition still at 76% hit and 31% snap; the control's spread falls from 19% to
+4% and the user row's from 24% to 15%; `tool_summary_anchored` reads -20% against a 21% spread
+and the instrument still prints `NOT SUPPORTED`; the composition +20% against 26%; the user row
++32% against 15%. Dropping it changes nothing the paragraphs above say.
+
 ### What runs 45 and 46 say about the benchmark itself
 
 **Turn count drives cost, not context size.** The two arms seed the same conversation size and cost

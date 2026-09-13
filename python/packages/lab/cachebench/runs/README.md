@@ -156,6 +156,22 @@ trust.
 
 Runs before 24 predate that format and exist only as captured stdout.
 
+Run 47 is all twenty strategies at a 170,000-token window and 0.9 fill with the scaled payload
+(`15,125x6 at share 60%`), `gpt-5.6-luna`, five seeds, 100 records, one file per seed, two
+invocations at a time -- `run-47-all20.sh`, one seed index per argument. **No throttling, retries
+or errors**, $18.22 across the run, and `--from-jsonl` over the five files rebuilds
+`run-47-luna-170k-fill90-all20.txt` exactly. It is the first archived cell to carry
+`user_summary_anchored` and `tool_and_user_summary_anchored` as they now stand -- the band share
+on, the composed row on its shared line -- which is what makes run 47a below evidence rather than
+data. Four rows keep 53/53 at `acc1` 100%: the control at 86% of the window, the record row at 50%,
+the user row at 71% and the composition at 30%, with the composition's cache hit rate at 76%
+against the record row's 95% and the control's 97%. **Its cost axis is inside the noise**:
+`seed$+-` of 19% to 30% on those four rows, `NOT SUPPORTED` on the verdict, and only the user
+row's +32% clears its own spread. Seed 3 (`-s3.jsonl`) seeded -10.2% against the target and prints
+`FILL OFF TARGET` rendered alone; the other four sit at -2.1% to -3.9% and the merged cell at
+-4.6%. Re-rendered without it the retention and hit rates are unchanged, the snapshots move by a
+point, and the cost picture is the same. `RESULTS.md` has the per-seed tables.
+
 Run 47a is the **aborted** first attempt at run 47, kept as evidence rather than as data. All
 twenty strategies at a 170,000-token window and 0.9 fill with the scaled payload, stopped after
 two of five seeds because both new rows were misbehaving: seed 0 holds 19 rows, seed 1 all 20,

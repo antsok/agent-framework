@@ -3,8 +3,8 @@
 Every name `--strategies` accepts, what it removes, when it fires, what it protects, and what
 it retained the one time every strategy then in existence — eighteen of the twenty — was
 measured in a single cell. The two that did not yet exist, `user_summary_anchored` and
-`tool_and_user_summary_anchored`, have no measured row anywhere in this package, and their
-sections below say so.
+`tool_and_user_summary_anchored`, were measured afterwards at a different cell — run 47, all
+twenty at 170,000 tokens and 0.9 fill on the scaled payload — and their sections below quote it.
 
 The registry is [`_strategies.py`](agent_framework_lab_cachebench/_strategies.py). It stays in
 the lab rather than in the strategy subpackage because it is benchmark configuration: its job
@@ -95,8 +95,9 @@ from, as a share of the window, and the uncompacted control sits at 81%.
 
 The table is eighteen rows because eighteen is what the registry held when the run was taken.
 `user_summary_anchored` and `tool_and_user_summary_anchored` were written afterwards and have
-not been run at this cell or at any other; they are absent here rather than at zero, and
-nothing below is a ranking of twenty.
+not been run at this cell; run 47 measured them at 170,000/0.9 with the scaled payload, which is
+a different operating point, so they are absent here rather than at zero, and nothing below is a
+ranking of twenty.
 
 **The cost column of this run is not usable** — 18 of 90 records were rate-limited, including
 the control in all five seeds, which is the baseline every `vs none$` is taken against. It is
@@ -366,9 +367,10 @@ mode a later pass summarises the summary together with whatever has arrived sinc
 stands for everything behind it — the opposite of the anchored family's refusal to re-trim a result
 it has already shortened, and the two are one rule read from opposite ends: a pass has to be worth
 what a pass costs. What that buys is a bounded prompt; what it costs was measured on the composed
-row, whose cache hit rate tracked how often its user half had rewritten that message — 89% at
-`USERREPLACED` 8, 75% at 14, 73% and 70% at 16 — because the summary sits just behind the head
-turn and a rewrite there re-bills very nearly the whole cached prefix. In the `boundary` mode the
+row in run 47, whose cache hit rate tracked how often its user half had rewritten that message —
+89% at `USERCOMPACT` 4, 73% and 75% at 5, 70% at 6 and at 7 — because the summary sits just
+behind the head turn and a rewrite there re-bills very nearly the whole cached prefix. In the
+`boundary` mode the
 summary is never re-read: it is preserved as a boundary, the next pass's band starts after the
 newest boundary and runs to the tail, and the prefix up to that boundary is byte-identical across
 passes — which makes the user half behave the way the record half already does, and costs exactly
@@ -395,13 +397,30 @@ uncompacted control under another name, and exactly one of three flags says why:
 partition every pass over a non-empty conversation, so a row whose user half did nothing always
 says which, and the three silences ask for three different changes.
 
-**It is unmeasured.** No archived run carries this row. The one live attempt that included it
-was aborted and predates the band share; the pass-per-turn behaviour it showed is what the share
-was written to stop, and the figures the source quotes from that attempt are not a measurement
-of the row as it now stands. A run of it would answer four things: how far a strategy confined
-to the user half moves `snap%` on a real conversation; whether `facts` and `acc1` stay at the
-control's, as the mechanism says they must; what the rewritten prefix costs in `hit%` against
-the control; and how many passes the share permits over a run of this benchmark's length.
+**Run 47 measured it: `gpt-5.6-luna`, 170,000-token window, 0.9 fill, scaled payload, five
+seeds.** The four questions the previous version of this paragraph said a run would answer, it
+answered. `facts` 53/53 and `acc1` 100% on every seed, level with the control — the mechanism
+holding, since the row touches nothing the facts live in. `snap%` 71 against the control's 86,
+and the flags say why it is not lower: `USERCOMPACT:2` on all five seeds against `USERHELD` 26
+to 39 and `USERUNDER` 62 to 75, `USERREPLACED:24` — two passes a run, the second standing for
+twenty-four turns, and every other pass past the trigger refused because the band was not worth
+a tenth of the prompt. That is the hysteresis doing what it was written to do on a workload
+where the band is the minority of the prompt, and it is a finding about this cell's sizing under
+the scaled payload rather than about the row. `hit%` 93 against 97 — four points for two
+rewrites of a message just behind the head. What it did not answer is money. `seed$` $0.1471
+against the control's $0.1113, `vs none$` +32%, of which the summarizer is $0.0118; the row's own
+seeds spread 24% and the control's 19%. That +32% is the one figure among the three compacting
+rows that keep every fact which clears the instrument's rule — a gap wider than either row's
+spread — and every seed is dearer than its control, +23% to +45%. So the direction is supported
+and the size is not: five seeds do not say whether the penalty is a quarter or a half, and it is
+not to be quoted as either. One seed of the five seeded 10.2% under target and is in the
+aggregate; without it the control's spread falls from 19% to 4% and this row's from 24% to 15%,
+`vs none$` stays at +32%, and the rest moves by a point or not at all. What a run would still
+answer: the size of that penalty, which wants more seeds than five; what the `boundary` and
+`fold` modes cost against this default, which no live run has carried; and how far the row
+reaches on a workload where the band is the majority of the prompt, which the scaled payload
+no longer seeds.
+`RESULTS.md` has the per-seed table.
 
 **When it will not help.** On a conversation whose bulk is tool output, which is the shape the
 record strategy was built for; on a short one, where the band is a turn or two and the
@@ -477,18 +496,27 @@ three readings as on the single row — `USERUNDER`, `USERHELD`, `USERSUMMFAIL` 
 half's `REC`, `RECORDS`, `FORCED`, `UNCOVERED`, `FALLBACK` and `RECFALLBACK` read off the
 composed row unchanged.
 
-**It is unmeasured.** No archived run carries this row. The one live attempt measured the
-two-line row the class first shipped as, was aborted, and is void for the row as it now stands:
-what it showed — the record half holding the prompt under the user half's line, no
-`USERCOMPACT`, and a starvation counter that could not see it — is the defect the shared line
-replaced, and the counter has been redefined since. On the package's eight-turn fixture —
-synthetic, character-estimator tokenizer, stub summarizer, not a measurement — the composed row
-leaves less behind than either half alone at both ceilings that fire it, and at the headline
-ceiling its user half fires where the `user_summary_anchored` row, reading its own 0.8, does
-not act at all; that is the price of aligning down, in tokens. A run of it would answer whether
-the two halves reach below either alone on a real conversation, what `facts` survive with an
-agent turn and a summarizer both in the loop, and whether two edit positions' worth of broken
-prefix is repaid by what they remove.
+**Run 47 measured it, on the shared line: `gpt-5.6-luna`, 170,000-token window, 0.9 fill,
+scaled payload, five seeds.** Both halves fired on every seed and `USERSTARVED` was absent from
+all five, which is the aligned trigger behaving as designed; run 47a beside it in `runs/` is the
+aborted attempt at the two-line row, kept as evidence of what the shared line replaced. `snap%`
+**30** against the record half's 50, the user half's 71 and the control's 86 — the two halves
+reach below either alone, and this is the deepest-compacting row in the cell that loses nothing:
+`facts` 53/53 and `acc1` 100% on every seed, with an agent turn and a summarizer both in the
+loop, where every row below it in `snap%` lost 33 to 45 facts and landed between 17% and 38%.
+The user half fired `USERCOMPACT` 4 to 7 times a run against `USERHELD` 2 to 4, the newest
+summary standing for 8 to 16 turns — the record half's removal leaves the band a larger share of
+what remains, so the share clears here where the single row's did not. What that costs is the
+cache: **`hit%` 76** against the record row's 95 and the control's 97, and per seed the rate
+tracked the passes — 89% at four rewrites, 73% and 75% at five, 70% at six and at seven. That is
+the measurement behind the `boundary` and `fold` modes, neither of which this run carried. What
+it did not answer is whether two edit positions' worth of broken prefix is repaid: `seed$`
+$0.1357 against the control's $0.1113, `vs none$` +22% with the summarizer at $0.0169, inside the
+row's own 30% seed spread, and per seed it runs +3% to +35%. Five seeds cannot separate this row
+from the control on money, in either direction, and no figure from that column is to be quoted
+as a result. Without the seed that seeded 10.2% under target it reads +20% inside 26%. What a
+run would still answer: that, with more seeds; and what the same row costs with its user half in
+the `boundary` or `fold` mode, which is the arm this measurement argues for.
 
 ## Summarization — `summarization`
 
@@ -551,11 +579,14 @@ conversation looks like, and is why the table is ranked on correctness first.
   alone the twenty.
 - **Accuracy is a distribution.** Several rows above have `seed+-` of 20 to 60 points. A gap
   smaller than a row's own spread is not a ranking, and this file quotes means.
-- **Two rows have no measurement at all.** `user_summary_anchored` and
-  `tool_and_user_summary_anchored` appear in no archived run. The one live attempt that included
-  them was aborted, predates `--user-min-band-share`, and ran the composed row with the two-line
-  design its shared line has since replaced, so nothing it showed describes either row as it now
-  stands. Their sections above state mechanism only, and say what a run would answer.
+- **Two rows have one cell each, and it is not run 42's.** `user_summary_anchored` and
+  `tool_and_user_summary_anchored` were measured once, in run 47 — `gpt-5.6-luna` at 170,000/0.9
+  with the scaled payload, five seeds — so nothing in their sections is comparable with the table
+  above, and one of those five seeds seeded 10.2% under target. Their retention, `snap%` and
+  `hit%` figures stand on all five seeds and on four; their cost figures sit inside 19% to 30%
+  seed spreads, and the sections say so. Run 47a, the aborted attempt, predates
+  `--user-min-band-share` and ran the two-line composed row; nothing it showed describes either
+  row as it now stands.
 - **`compaction/STRATEGIES.md` is behind on two numbers and one design.** It documents
   `trigger_fraction` 0.8 and `fallback_fraction` 0.95; both were reverted to 0.6 and 0.9 on
   6 September 2026, which is what the code, the CLI and every archived run use. Its section on
