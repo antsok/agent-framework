@@ -555,6 +555,68 @@ async def test_a_preserved_user_turn_is_never_summarised() -> None:
     assert strategy.user_messages_replaced == 5
 
 
+async def test_a_preserved_head_turn_stays_the_head_and_the_summary_is_still_recompacted() -> None:
+    """The anchors are positions in the prompt, and a mark another party sets does not move them.
+
+    Counting the head over the unprotected turns only, which is what ``_band`` used to do, lands
+    it on the head's neighbour once the head is preserved -- and after a first pass in the
+    recompacting mode that neighbour is the strategy's own summary. Measured on the old rule:
+    the summary was held as the head on every later pass and never re-read, a second summary
+    was written beside it and recompacted in its place from then on, and the conversation
+    carried two standing summaries for the rest of the run in the one mode whose point is that
+    it carries one. So the case is driven for two more passes, and what is asserted is the
+    mode's own promise: one standing summary, the earlier one superseded by it, with the head
+    turn verbatim and unexcluded throughout and the tail still the tail.
+    """
+    summarizer = _Summarizer()
+    strategy = _strategy(summarizer)
+    messages = _conversation(8)
+    assert await strategy(messages) is True
+    head = next(message for message in messages if message.message_id == "u0")
+    set_preserved(head, preserved=True, reason="another party")
+
+    for start in (8, 14):
+        messages += _conversation(6, first_turn=start)
+        (earlier,) = _standing(messages)
+        assert await strategy(messages) is True
+        asked = summarizer.requests[-1][-1].text or ""
+        (standing,) = _standing(messages)
+
+        assert standing is not earlier, "one summary stands, and it is the new one"
+        assert earlier.additional_properties[EXCLUDED_KEY] is True, (
+            "the earlier one was recompacted, not held as the head"
+        )
+        assert earlier.message_id in _summary_of_message_ids(standing)
+        assert USER_SUMMARY_MARKER in asked, "the earlier summary was re-read"
+        assert "Turn 0:" not in asked
+        assert head.additional_properties.get(EXCLUDED_KEY, False) is False
+        assert f"Turn {start + 5}:" not in asked, "the tail is still the tail"
+    assert _user_texts(messages)[0].startswith("Turn 0:")
+    assert strategy.user_messages_replaced == 7, "the summary and six new turns, exactly as with an unmarked head"
+
+
+async def test_a_preserved_last_turn_is_the_tail_and_the_turn_before_it_is_in_the_band() -> None:
+    """The same rule at the other anchor, where the old arithmetic protected a turn too many.
+
+    A preserved last turn is the live request, which the tail keeps whether or not it is marked;
+    dropping it from the count made the turn before it the tail instead, and that turn has
+    already been answered.
+    """
+    summarizer = _Summarizer()
+    strategy = _strategy(summarizer)
+    messages = _conversation(8)
+    last = next(message for message in messages if message.message_id == "u7")
+    set_preserved(last, preserved=True, reason="another party")
+
+    assert await strategy(messages) is True
+    asked = summarizer.requests[0][-1].text or ""
+
+    assert "Turn 6:" in asked, "the turn before a preserved tail is in the band"
+    assert "Turn 7:" not in asked
+    assert last.additional_properties.get(EXCLUDED_KEY, False) is False
+    assert strategy.user_messages_replaced == 6
+
+
 @pytest.mark.parametrize(
     ("kwargs", "match"),
     [
@@ -1426,6 +1488,72 @@ async def test_a_fold_whose_summarizer_fails_leaves_the_standing_summaries_as_th
     assert _standing(messages) == standing
     assert all(is_preserved(message) for message in standing), "still boundaries, still protected"
     assert (strategy.user_folds, strategy.user_summary_failures, strategy.user_passes_declined) == (0, 1, 0)
+
+
+@pytest.mark.parametrize("mode", SUMMARY_MODES)
+async def test_a_fresh_instance_numbers_its_summary_past_the_ones_the_conversation_carries(mode: str) -> None:
+    """An id is unique against the conversation, not against the instance that minted it.
+
+    A strategy is built per run and a conversation outlives one: restored from a store, or
+    handed to a new instance over the same list. Numbered from the instance's own count alone,
+    the new instance's first summary was ``user_summary_0`` again -- beside the
+    ``user_summary_0`` already there, standing in the boundary modes and superseded in the
+    recompacting one -- and every back-reference written under that id then named two messages.
+    So the number is read off the conversation, superseded summaries included, and the
+    assertion is on the conversation: no id names two messages, and every back-reference
+    resolves to exactly one.
+    """
+    first_instance = _strategy(summary_mode=mode)
+    messages = _conversation(8)
+    assert await first_instance(messages) is True
+    messages += _conversation(6, first_turn=8)
+
+    second_instance = _strategy(summary_mode=mode)
+    assert await second_instance(messages) is True
+
+    summaries = [message for message in messages if _is_summary(message)]
+    assert sorted(message.message_id or "" for message in summaries) == [
+        f"{SUMMARY_ID_PREFIX}0",
+        f"{SUMMARY_ID_PREFIX}1",
+    ]
+    all_ids = [message.message_id for message in messages]
+    assert len(all_ids) == len(set(all_ids)), "no id names two messages"
+    referenced = {_summarized_by(message) for message in messages} - {None}
+    assert referenced == {message.message_id for message in summaries}
+    for summary_id in referenced:
+        assert sum(1 for message in messages if message.message_id == summary_id) == 1
+    assert second_instance.user_compactions == 1, (
+        "the count stays the instance's; only the number is the conversation's"
+    )
+
+
+async def test_a_fresh_instance_numbers_its_fold_past_the_fold_the_conversation_carries() -> None:
+    """The fold's id follows the same rule under its own prefix, and the two prefixes stay apart.
+
+    The fold prefix sits under the summary prefix so that a fold's output is a boundary by the
+    ordinary test; the numbering has to keep the two apart, or ``user_summary_fold_0`` would be
+    read as a summary numbered nothing and an ordinary ``user_summary_1`` as a fold.
+    """
+    summarizer = _Summarizer("x" * _LARGE_SUMMARY_CHARS)
+    first_instance = _fold_scenario(summarizer, min_band_share=0.05)
+    messages = await _three_standing(first_instance)
+    messages += _conversation(1, first_turn=20)
+    assert await first_instance(messages) is True
+    assert first_instance.user_folds == 1
+    messages += _conversation(6, first_turn=21)
+    assert await first_instance(messages) is True
+    assert [m.message_id for m in _standing(messages)] == [f"{FOLD_ID_PREFIX}0", f"{SUMMARY_ID_PREFIX}3"]
+
+    # A share of zero, so the fresh instance folds on the first pass whose band is empty --
+    # which is this one: nothing newer than the newest boundary but the tail.
+    second_instance = _fold_scenario(summarizer, min_band_share=0.0)
+    assert await second_instance(messages) is True
+    (fold,) = _standing(messages)
+
+    assert fold.message_id == f"{FOLD_ID_PREFIX}1"
+    assert (second_instance.user_folds, second_instance.user_compactions) == (1, 0)
+    all_ids = [message.message_id for message in messages]
+    assert len(all_ids) == len(set(all_ids)), "no id names two messages"
 
 
 async def test_a_slowly_growing_conversation_does_not_fold_repeatedly() -> None:

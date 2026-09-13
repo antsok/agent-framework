@@ -575,6 +575,42 @@ def _summary_body(message: Message) -> str:
     return (message.text or "").removeprefix(USER_SUMMARY_MARKER).strip()
 
 
+def _next_summary_id(messages: list[Message], *, prefix: str, minimum: int) -> str:
+    """Return an id under ``prefix`` that no message in the conversation already carries.
+
+    Numbered by this instance's own count, and never below one past the highest number the
+    conversation already holds under the prefix. The count alone is not unique: a strategy is
+    built per run and a conversation outlives one -- restored from a store, or handed to a
+    fresh instance over the same list -- so an instance counting from zero over a conversation
+    that already holds ``user_summary_0`` would mint it again, and every back-reference written
+    under that id would then name two messages. The whole conversation is read, superseded
+    summaries included, because a superseded summary is still the message the turns it stood
+    for point back at; it matters more now that the boundary modes leave every summary standing
+    rather than replacing it. Conversation length, which the framework's own strategy numbers
+    by, is not unique either: see :meth:`UserTurnAnchoredSummarizationCompactionStrategy.compact_against`.
+
+    The suffix has to be all digits, so the fold prefix -- which sits under the summary prefix
+    -- is neither counted against ordinary summaries nor confused with them.
+
+    Args:
+        messages: The conversation, superseded messages included.
+
+    Keyword Args:
+        prefix: :data:`SUMMARY_ID_PREFIX` or :data:`FOLD_ID_PREFIX`.
+        minimum: The number this instance would use on its own count.
+
+    Returns:
+        The id.
+    """
+    highest = -1
+    for message in messages:
+        message_id = message.message_id or ""
+        suffix = message_id.removeprefix(prefix)
+        if suffix != message_id and suffix.isdigit():
+            highest = max(highest, int(suffix))
+    return f"{prefix}{max(minimum, highest + 1)}"
+
+
 def _format_turns(turns: list[Message], *, text: Callable[[Message], str | None] | None = None) -> str:
     """Return the user turns as the numbered transcript the summarizer reads.
 
@@ -1022,8 +1058,11 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
             # the framework uses. Length is not unique across passes here: in the recompacting
             # mode this strategy's own summary is superseded by the next one, so a conversation
             # can be compacted at the same length twice and the second summary would claim the
-            # first one's id, silently pointing every back-reference at the wrong message.
-            summary_id = f"{SUMMARY_ID_PREFIX}{self._compactions}"
+            # first one's id, silently pointing every back-reference at the wrong message. Nor
+            # is this instance's count unique on its own -- a conversation outlives the instance
+            # that first compacted it -- so the number is lifted past whatever the conversation
+            # already carries: see :func:`_next_summary_id`.
+            summary_id = _next_summary_id(messages, prefix=SUMMARY_ID_PREFIX, minimum=self._compactions)
             self._compactions += 1
             self._remembered = _Remembered(self.prompt, transcript, summary_id, summary)
         else:
@@ -1049,12 +1088,20 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
         and it would put a message that is not being sent into this pass's replaced count, where
         it would read as compaction this strategy performed.
 
-        **Preserved turns are not candidates either, and do not count towards the anchors.** The
+        **Preserved turns are not candidates either, but they do count towards the anchors.** The
         mark in :mod:`._preserve` means a message no strategy may shorten, drop or shed, and a
-        superseded message is dropped in every sense that matters. Leaving it out of the band
-        entirely -- rather than out of the head and tail arithmetic as well -- would be the
-        subtler bug: a preserved last turn would otherwise take the tail's place and let the
-        live request be summarised.
+        superseded message is dropped in every sense that matters, so a preserved turn is never
+        in the band. It stays in the count the anchors are taken over, because the anchors are
+        positions in the prompt and a preserved turn is in the prompt: the first user turn is
+        the head whether or not another party has marked it. This method used to count only the
+        unprotected turns, which moves an anchor onto the neighbour of any preserved turn -- and
+        after a first pass in the recompacting mode the head's neighbour is this strategy's own
+        summary. That summary was then held as the head on every later pass and never re-read,
+        while a second summary was written beside it and recompacted in its place from then on:
+        two summaries standing for the rest of the run, in the mode whose whole point is that
+        one does. By the same arithmetic a preserved last turn shifted the tail onto the turn
+        before it, protecting a turn that had already been answered; under the rule here the
+        last turn is the tail, marked or not, which is what it is anyway.
 
         **The boundary rule, which is the whole difference between the modes.** In the
         recompacting mode, and on any pass with no standing summary, the band is the turns
@@ -1069,8 +1116,8 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
         one list. On an ordinary conversation the two rules select the same band -- everything
         in front of the boundary is either a head turn or superseded -- and the explicit rule
         is what keeps that true when it stops being ordinary: a head turn another strategy has
-        preserved or excluded would otherwise shift the re-counted head onto the first turn
-        after the boundary and protect it for the rest of the run.
+        excluded would otherwise shift the re-counted head onto the first turn after the
+        boundary and protect it for the rest of the run.
 
         **Whether the band is worth replacing is not decided here.** This returns what a pass
         *may* touch; :meth:`_worth_compacting` decides whether a pass runs at all. The two were
@@ -1091,19 +1138,16 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
             for span in group_messages(messages)
             if span.get("kind") == "user"
             and not messages[span["start_index"]].additional_properties.get(EXCLUDED_KEY, False)
-            and not any_preserved(messages[span["start_index"] : span["end_index"] + 1])
         ]
         if self.recompacts_summaries or not standing:
             last = len(turns) - self.keep_tail_user_turns
-            if last <= self.keep_head_user_turns:
-                return []
-            return turns[self.keep_head_user_turns : last]
-        boundary = int(standing[-1]["start_index"])
-        newer = [span for span in turns if span["start_index"] > boundary]
-        last = len(newer) - self.keep_tail_user_turns
-        if last <= 0:
-            return []
-        return newer[:last]
+            between = turns[self.keep_head_user_turns : last] if last > self.keep_head_user_turns else []
+        else:
+            boundary = int(standing[-1]["start_index"])
+            newer = [span for span in turns if span["start_index"] > boundary]
+            last = len(newer) - self.keep_tail_user_turns
+            between = newer[:last] if last > 0 else []
+        return [span for span in between if not any_preserved(messages[span["start_index"] : span["end_index"] + 1])]
 
     def _worth_compacting(self, messages: list[Message], band: list[dict[str, Any]], prompt_tokens: int) -> bool:
         """Return whether this band is worth what a pass costs.
@@ -1113,8 +1157,8 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
         there to the end of the conversation at the uncached rate. Three refusals, which are one
         statement -- there is not enough here to pay for that:
 
-        - **An empty band.** The anchors cover the whole conversation, so there is nothing
-          between them to stand for.
+        - **An empty band.** The anchors cover the whole conversation, or every turn between
+          them is preserved, so there is nothing to stand for.
         - **A band holding only this strategy's own earlier summary.** Replacing it frees
           exactly nothing: one message is rewritten at one position and the prompt is the size
           it was. This is :meth:`~._toolsummary.ToolResultRecallMiddleware._record_due`'s rule,
@@ -1287,7 +1331,7 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
             summary = await self._summarize(transcript, prompt=self.fold_prompt)
             if summary is None:
                 return False
-            summary_id = f"{FOLD_ID_PREFIX}{self._folds}"
+            summary_id = _next_summary_id(messages, prefix=FOLD_ID_PREFIX, minimum=self._folds)
             self._folds += 1
             self._remembered = _Remembered(self.fold_prompt, transcript, summary_id, summary)
         else:
