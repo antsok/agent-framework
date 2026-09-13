@@ -21,6 +21,7 @@ excluded on the strength of a replacement that does not exist.
 
 from __future__ import annotations
 
+from copy import deepcopy
 from typing import Any
 
 import pytest
@@ -786,6 +787,7 @@ async def test_the_four_outcomes_of_a_pass_partition_the_passes() -> None:
             + subject.user_passes_declined
             + subject.user_passes_below_trigger
             + subject.user_summary_failures
+            + subject.user_summaries_replayed
             == count
         ), f"the {name} run's counters have to account for every pass, and account for it once"
 
@@ -1463,8 +1465,102 @@ async def test_the_five_outcomes_of_a_pass_partition_the_passes_in_the_fold_mode
         + strategy.user_passes_declined
         + strategy.user_passes_below_trigger
         + strategy.user_summary_failures
+        + strategy.user_summaries_replayed
         == len(events)
-    ), "every pass lands in exactly one of the five"
+    ), "every pass lands in exactly one of the six, and a list-driven run never replays"
+
+
+# region replay: the same band presented twice
+
+
+async def test_the_same_band_presented_twice_is_summarised_once_and_replayed_the_second_time() -> None:
+    """Live, one conversation reaches this strategy as two lists, and the second must cost nothing.
+
+    The harness runs a strategy inside the model call on the copies the history provider loaded
+    and again after the turn on what it stored, and the copies' flags never reach the store: the
+    after-turn pass finds the band the in-call pass already replaced. Run 48 measured the result
+    on every seed of every mode -- two summarizer calls and ``USERCOMPACT:2`` for one standing
+    summary, and two different summaries sent at one position on consecutive calls. Two views of
+    one list stand in for the two lists here, with a summarizer whose answers differ so that a
+    second call would show as different bytes rather than pass by coincidence.
+    """
+    summarizer = _NumberedSummarizer()
+    strategy = _strategy(summarizer, summary_mode=SUMMARY_MODE_BOUNDARY)
+    loaded = _conversation(8)
+    stored = deepcopy(loaded)
+
+    assert await strategy(loaded) is True
+    assert await strategy(stored) is True
+
+    assert len(summarizer.requests) == 1, "one band, one request"
+    (sent,) = _standing(loaded)
+    (kept,) = _standing(stored)
+    assert (kept.message_id, kept.text) == (sent.message_id, sent.text), "the store carries what the model was sent"
+    assert _rendered(stored) == _rendered(loaded)
+    assert is_preserved(kept), "and the replay is a boundary like any other"
+    assert (strategy.user_compactions, strategy.user_summaries_replayed) == (1, 1)
+    assert strategy.user_messages_replaced == 6
+    assert strategy.user_summaries_in_conversation == 1
+
+
+async def test_a_band_that_has_grown_is_a_new_request_and_not_a_replay() -> None:
+    """Byte-identical is the test: one more turn in the band is another request, with the next id.
+
+    The ids number the compactions and not the passes, which is what keeps the boundary mode's
+    standing summaries numbered consecutively in the store rather than skipping the ids the
+    in-call passes took.
+    """
+    summarizer = _NumberedSummarizer()
+    strategy = _strategy(summarizer, summary_mode=SUMMARY_MODE_BOUNDARY)
+    loaded = _conversation(8)
+    stored = deepcopy(loaded)
+    assert await strategy(loaded) is True
+    assert await strategy(stored) is True
+
+    stored += _conversation(6, first_turn=8)
+    assert await strategy(stored) is True
+
+    assert len(summarizer.requests) == 2, "the second crossing is a second request"
+    assert (strategy.user_compactions, strategy.user_summaries_replayed) == (2, 1)
+    assert [m.message_id for m in _standing(stored)] == [f"{SUMMARY_ID_PREFIX}0", f"{SUMMARY_ID_PREFIX}1"]
+
+
+async def test_a_failed_request_is_not_remembered_so_the_next_view_asks_again() -> None:
+    """A summarizer that did not answer left nothing to replay, and the second view must ask."""
+    strategy = _strategy(_FailingSummarizer(), summary_mode=SUMMARY_MODE_BOUNDARY)
+    loaded = _conversation(8)
+    stored = deepcopy(loaded)
+    assert await strategy(loaded) is False
+    strategy.client = _NumberedSummarizer()
+
+    assert await strategy(stored) is True
+
+    assert (strategy.user_summary_failures, strategy.user_compactions, strategy.user_summaries_replayed) == (1, 1, 0)
+    assert len(_standing(stored)) == 1 and not _standing(loaded)
+
+
+async def test_a_fold_presented_twice_is_folded_once_and_replayed_the_second_time() -> None:
+    """The fold is the other summarizer request, and the live path presents it twice as well."""
+    summarizer = _Summarizer("x" * _LARGE_SUMMARY_CHARS)
+    strategy = _fold_scenario(summarizer, min_band_share=0.05)
+    loaded = await _three_standing(strategy)
+    loaded += _conversation(1, first_turn=20)
+    stored = deepcopy(loaded)
+    requests_before = len(summarizer.requests)
+
+    assert await strategy(loaded) is True
+    assert await strategy(stored) is True
+
+    assert strategy.user_folds == 1, "one fold"
+    assert len(summarizer.requests) == requests_before + 1, "one request for it"
+    (sent,) = _standing(loaded)
+    (kept,) = _standing(stored)
+    assert (kept.message_id, kept.text) == (sent.message_id, sent.text)
+    assert (kept.message_id or "").startswith(FOLD_ID_PREFIX)
+    assert strategy.user_summaries_replayed == 1
+
+
+# endregion
 
 
 def _is_summary(message: Message) -> bool:

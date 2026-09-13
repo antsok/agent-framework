@@ -1031,3 +1031,50 @@ say, against the smoke above:
   row's from 24% to 15%, the record row -20% against 21% (still `NOT SUPPORTED`), the composition
   +20% against 26%, the user row +32% against 15%. Dropping it changes nothing above.
 
+
+## 3s. Run 48: the three modes measured alike, and the double pass behind it
+
+Run 48 (`gpt-5.6-luna`, 170,000 at 0.9 fill, scaled payload, five seeds per mode; the records sat
+in a temp directory at the time of writing) put `recompact`, `boundary` and `fold` side by side.
+The standalone `user_summary_anchored` row read `USERCOMPACT:2, USERREPLACED:24, USERSUMMARIES:1`
+and 93% hit on every seed of every mode. Diagnosed offline by driving
+`build_live_agent(kind="harness")` against a stub client; the reduced form is
+`tests/test_live.py::test_the_user_band_strategy_compacts_the_stored_conversation_once_per_crossing`.
+
+- **The boundary mode engages live.** Across three crossings offline it leaves three preserved
+  summaries in the store, each found again by its id on the next pass, each band the turns newer
+  than the newest; recompact leaves one. The store round trip loses nothing the boundary needs.
+- **Every crossing ran the strategy twice on one band.** The harness runs the strategy inside the
+  model call on the copies `SessionContext.extend_messages` hands out -- each with its own
+  `additional_properties`, so nothing written there reaches the store -- and again after the turn
+  on the stored list through `CompactionProvider.after_run`. Each pass called the summarizer; only
+  the second persisted. `USERCOMPACT:2` was one persistent compaction, `summ$` was double, and the
+  model was sent two different summaries at one position on consecutive calls: a second
+  whole-suffix break per crossing, in every mode. A tool turn's second call adds a third copy pass,
+  and a crossing the reply pushes over the line lands on the store pass alone, which is why the
+  composed row's `USERCOMPACT` reads 5, 7 and 9 against `USERSUMMARIES:3`.
+- **So the standalone row made one persistent pass per seed in all three modes**, and the modes
+  differ only from the second pass on. At trigger 0.8 and fill 0.9 the band cannot regrow to a
+  tenth of the prompt before the run ends -- `USERHELD` 29 to 40 is that refusal -- so this cell
+  cannot separate the arms on the standalone row at all. The composed row fires at 0.6 and reached
+  three standing summaries (`USERSUMMARIES:3` in boundary and fold against 1 in recompact).
+- **The composed row's hit rates do not rank the modes either.** Split by phase, seeding sits at
+  85.1% / 84.1% / 84.8% (recompact / boundary / fold), and the probe phase is bimodal per seed --
+  0.333 or about 0.99, independent of mode -- with boundary drawing 0.333 on five of five seeds
+  against two of five for recompact. The headline 89% against 72% is that draw. `hit%` mixes the
+  two phases; read the seed half when comparing modes.
+- **Fix, in the tree and uncommitted:** the strategy keeps its last summarizer request and replays
+  the answer, under the same id, when the identical request comes round -- no call, no counted
+  compaction, and the store carries the bytes the model already saw. `USERREPLAY:<n>` counts those
+  passes (`user_summaries_replayed`, proxied on the composed row). `USERCOMPACT` now counts
+  persistent compactions only, so archived `USERCOMPACT` from runs 47 and 48 is inflated by up to
+  2x against new rows, and summary ids in the store are consecutive again (`user_summary_0`, `_1`
+  rather than `_1`, `_3`, `_5`). Six tests added; 594 pass.
+- **`USERFOLD:0` is right**: standing summaries were 1.3% to 1.7% of the composed prompt against a
+  10% threshold, and the standalone row never had the two summaries a fold needs. The three
+  schema-11 counters are wired end to end; the records carry non-zero `USERSUMMARIES` and
+  `USERSUMMTOKENS`.
+- **What a run would need to measure the arms**: at least two persistent passes on the standalone
+  row, so a trigger low enough, or a fill high enough, that the user band regrows a tenth of the
+  prompt after the first pass -- the composed row's 0.6 does it on this workload. Until then the
+  arms cost the same and measure the same, and more seeds at this sizing buy nothing.

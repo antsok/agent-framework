@@ -33,6 +33,7 @@ from agent_framework import (
     Content,
     ContextWindowCompactionStrategy,
     FunctionInvocationLayer,
+    HistoryProvider,
     InMemoryHistoryProvider,
     Message,
     SlidingWindowStrategy,
@@ -41,6 +42,7 @@ from agent_framework import (
     TruncationStrategy,
     UsageDetails,
 )
+from agent_framework._compaction import EXCLUDED_KEY
 from agent_framework_lab_cachebench import (
     AGENT_KINDS,
     FillPlan,
@@ -138,6 +140,13 @@ from agent_framework_lab_cachebench.compaction import (
     ToolResultRecallMiddleware,
     UserTurnAnchoredSummarizationCompactionStrategy,
     make_recall_tool,
+)
+from agent_framework_lab_cachebench.compaction._preserve import is_preserved
+from agent_framework_lab_cachebench.compaction._usersummary import (
+    SUMMARY_ID_PREFIX,
+    SUMMARY_MODE_RECOMPACT,
+    SUMMARY_MODES,
+    USER_SUMMARY_MARKER,
 )
 
 TOKENIZER = CharacterEstimatorTokenizer()
@@ -1439,6 +1448,85 @@ async def test_a_user_band_summarizer_failure_is_flagged_rather_than_silent() ->
     assert strategy.user_summary_failures == 1
     assert "USERSUMMFAIL:1" in _strategy_notes(strategy)
     assert not [note for note in _strategy_notes(strategy) if note.startswith("USERCOMPACT")]
+
+
+class _NumberedSummarizer:
+    """A summarizer whose every answer differs, so a second request for one band shows as bytes."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def get_response(self, messages: Any, *, stream: bool = False, **kwargs: Any) -> Any:
+        self.calls += 1
+        return ChatResponse(messages=[Message(role="assistant", contents=[f"Summary number {self.calls}."])])
+
+
+def _user_summaries(messages: Sequence[Message]) -> list[Message]:
+    """Return every summary ``user_summary_anchored`` wrote, superseded ones included, in order."""
+    return [m for m in messages if m.role == "user" and USER_SUMMARY_MARKER in (m.text or "")]
+
+
+@pytest.mark.parametrize("mode", SUMMARY_MODES)
+async def test_the_user_band_strategy_compacts_the_stored_conversation_once_per_crossing(mode: str) -> None:
+    """The store round trip, which every list-driven test in ``tests/compaction`` skips.
+
+    Wired the way the harness wires it, one strategy runs twice per crossing: inside the model
+    call on the copies the history provider loaded, and after the turn on what it stored. The
+    copies' flags never reach the store, so before this was fixed the after-turn pass found the
+    same band and summarised it again -- run 48 reported ``USERCOMPACT:2`` with one standing
+    summary on every seed of every mode, and the model was sent two different summaries at one
+    position on consecutive calls. What the strategy owes the store is one summary per crossing,
+    the bytes the model already saw, and in the boundary modes one *more* of them per crossing
+    rather than a replacement -- which is the claim no test on a bare list can make.
+    """
+    summarizer = _NumberedSummarizer()
+    strategy = UserTurnAnchoredSummarizationCompactionStrategy(
+        max_input_tokens=16_000 - 2_048, tokenizer=TOKENIZER, client=summarizer, summary_mode=mode
+    )
+    recorder = UsageRecorder()
+    agent = build_live_agent(
+        ProviderRuntime(client=StubChatClient(reply="a reply " * 50), model="stub"),
+        kind="harness",
+        strategy=strategy,
+        tokenizer=TOKENIZER,
+        tools=[],
+        recorder=recorder,
+        max_context_window_tokens=16_000,
+        max_output_tokens=2_048,
+    )
+    session = agent.create_session()
+    history = next(provider for provider in agent.context_providers if isinstance(provider, HistoryProvider))
+
+    def stored() -> list[Message]:
+        return list(session.state.get(history.source_id, {}).get("messages", []))
+
+    turn = 0
+    while len(_user_summaries(stored())) < 2 and turn < 40:
+        await agent.run(f"Turn {turn}: " + "u" * 4_000, session=session)
+        turn += 1
+    for _ in range(2):
+        await agent.run(f"Turn {turn}: " + "u" * 4_000, session=session)
+        turn += 1
+
+    summaries = _user_summaries(stored())
+    standing = [m for m in summaries if not m.additional_properties.get(EXCLUDED_KEY, False)]
+    assert len(summaries) == 2, "the fixture has to cross twice or the mode assertions are vacuous"
+    assert summarizer.calls == 2, "one summarizer call per crossing: the after-turn pass replays rather than re-asks"
+    assert (strategy.user_compactions, strategy.user_summaries_replayed) == (2, 2)
+    assert len(standing) == (1 if mode == SUMMARY_MODE_RECOMPACT else 2), (
+        "two crossings leave two boundaries, or one summary when recompacting"
+    )
+    assert all(is_preserved(m) for m in standing) is (mode != SUMMARY_MODE_RECOMPACT)
+    assert strategy.user_summaries_in_conversation == len(standing), "the counter is the store"
+    # The crossing call -- the first whose prompt lost messages -- was sent the summary the
+    # store holds for that crossing, and so was the call after it: one summary, one break. Found
+    # by id rather than position, because the recompacting mode inserts its second summary in
+    # front of the first.
+    crossing = next(i for i, call in enumerate(recorder.calls) if call.messages_sent < call.messages_before_compaction)
+    first = next(m for m in summaries if m.message_id == f"{SUMMARY_ID_PREFIX}0")
+    body = (first.text or "").removeprefix(USER_SUMMARY_MARKER).strip()
+    assert body in recorder.calls[crossing].prompt_text, "the crossing call carried the summary the store now holds"
+    assert body in recorder.calls[crossing + 1].prompt_text, "and so did the next one, so its prefix survived"
 
 
 def _composed_strategy(options: StrategyOptions) -> Any:

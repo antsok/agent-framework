@@ -1115,6 +1115,7 @@ async def test_every_counter_of_both_halves_is_readable_off_the_composed_row() -
     assert strategy.user_summaries_in_conversation == strategy.user_turns.user_summaries_in_conversation == 1
     assert strategy.user_summary_tokens == strategy.user_turns.user_summary_tokens > 0
     assert strategy.user_folds == strategy.user_turns.user_folds == 0
+    assert strategy.user_summaries_replayed == strategy.user_turns.user_summaries_replayed == 0
 
 
 def test_two_halves_measuring_against_two_ceilings_are_refused() -> None:

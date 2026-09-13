@@ -175,6 +175,26 @@ it to every record. In the recompacting mode the summary is deliberately *not* m
 :meth:`UserTurnAnchoredSummarizationCompactionStrategy._band` skips preserved turns, so a
 marked summary could never be recompacted, and that mode would silently become this one.
 
+**Live, every pass runs twice, and the second time has to be free.** The framework runs one
+strategy at two sites on one conversation: inside the model call, on the messages the history
+provider has just loaded (``Agent.compaction_strategy``, which is where the harness puts its
+before phase), and after the turn, on the messages the provider stored
+(``CompactionProvider.after_strategy``). The loaded messages are copies --
+``SessionContext.extend_messages`` gives each one its own ``additional_properties`` -- so nothing
+the in-call pass excludes or inserts reaches the store, and the after-turn pass finds the same
+band and, left to itself, summarises it again. Measured in run 48 on every seed of the standalone
+row, in all three modes: ``USERCOMPACT:2`` and two summarizer calls for one standing summary, and
+the model sent two different summaries at one position on consecutive calls -- a second
+whole-suffix cache break per crossing that no mode is designed around, paid by all three alike.
+The strategy cannot tell which list it is on and does not try; what it can do is never send one
+request twice. The last summarizer request and its answer are kept, and a pass whose request is
+byte-identical replays the answer under the same id: no summarizer call, no counted compaction,
+and the store ends up carrying exactly the message the model was already sent, so the crossing
+call's prefix survives into the call after it.
+:attr:`UserTurnAnchoredSummarizationCompactionStrategy.user_summaries_replayed` counts those
+passes. The same memory serves a turn re-sent after a throttled attempt, which is the same
+request from a restored state, and a tool turn's second model call, which loads the store afresh.
+
 **How it marks what it replaced is the framework's mechanism and not a new one.**
 ``SummarizationStrategy`` inserts its summary at the first index it superseded, annotates the
 summary with :data:`~agent_framework._compaction.SUMMARY_OF_MESSAGE_IDS_KEY` and
@@ -205,7 +225,7 @@ the instrument declining to look.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Final
+from typing import TYPE_CHECKING, Any, Final, NamedTuple
 
 from agent_framework import Message
 from agent_framework._compaction import (
@@ -570,6 +590,21 @@ def _format_turns(turns: list[Message], *, text: Callable[[Message], str | None]
     return "\n".join(lines)
 
 
+class _Remembered(NamedTuple):
+    """The last summarizer request and its answer, kept so a repeat of the request is not sent.
+
+    One entry, because the repeat always follows at once: the after-turn pass over the store
+    comes straight after the in-call pass over the copies, and a tool turn's second call comes
+    between them. Nothing else this strategy asks for can intervene -- a fold is reached only
+    through a declined band, which is a pass that asks for nothing.
+    """
+
+    prompt: str
+    transcript: str
+    summary_id: str
+    text: str
+
+
 class UserTurnAnchoredSummarizationCompactionStrategy:
     """Replace the user turns between a fixed head and tail with one summary of them.
 
@@ -667,6 +702,8 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
         self._folds = 0
         self._summaries_in_conversation = 0
         self._summary_tokens = 0
+        self._replayed = 0
+        self._remembered: _Remembered | None = None
 
     @property
     def recompacts_summaries(self) -> bool:
@@ -691,6 +728,11 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
         replaced seventy turns and seven that replaced ten each cost very different amounts of
         cache: every pass re-bills the prompt from its own edit to the end, so the number of
         passes is the number of times that was paid.
+
+        A pass that replaced the band with a summary already in hand is not counted here but
+        under :attr:`user_summaries_replayed`: it produced no summary and paid no new break.
+        Live, every crossing is one of each, and rows archived before that counter existed
+        report both here -- run 48's ``USERCOMPACT:2`` is one compaction.
         """
         return self._compactions
 
@@ -776,9 +818,31 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
         summaries were, so it is counted here and *not* under :attr:`user_passes_declined`, and
         the five still partition every pass over a non-empty conversation. A fold whose
         summarizer did not answer is a :attr:`user_summary_failures`, exactly as an ordinary
-        pass's is.
+        pass's is. With :attr:`user_summaries_replayed` the six still partition every pass over
+        a non-empty conversation.
         """
         return self._folds
+
+    @property
+    def user_summaries_replayed(self) -> int:
+        """Passes that replaced a band with a summary already in hand, asking the summarizer nothing.
+
+        The live path runs one strategy at two sites on one conversation -- inside the model
+        call on loaded copies, and after the turn on the store; see the module docstring -- so
+        every crossing presents the same band twice, and a fold the same summaries twice. The
+        first presentation is summarised and counted under :attr:`user_compactions` or
+        :attr:`user_folds`; this counts the rest, which paid nothing: no summarizer call, and no
+        cache break beyond the one the first presentation already paid, because the replay puts
+        the identical message, under the identical id, at the identical position.
+
+        A sixth outcome of a pass, and the one that is not a decision: the band was worth a
+        pass and the pass had already been made. On a conversation driven from a list it is
+        zero, because a list is one view; live it is one per crossing on the plain path and two
+        on a turn that called a tool, whose second model call loads the store afresh. Read it
+        beside :attr:`user_compactions`: their sum is what rows archived before this counter
+        existed reported as ``USERCOMPACT``.
+        """
+        return self._replayed
 
     @property
     def user_summary_failures(self) -> int:
@@ -810,8 +874,10 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
         band was not worth a pass; :attr:`user_summary_failures` says the band was and the
         summarizer was not. Together with :attr:`user_compactions` the four partition every
         pass over a non-empty conversation -- five with :attr:`user_folds`, which is a pass the
-        band declined and the standing summaries did not -- so a row where the user half did
-        nothing always has exactly one non-zero number saying why.
+        band declined and the standing summaries did not, and six with
+        :attr:`user_summaries_replayed`, which is a pass already made on the other view of the
+        same conversation -- so a row where the user half did nothing always has exactly one
+        non-zero number saying why.
 
         On a composed row this number is the one
         :attr:`~._composed.ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy.user_passes_starved`
@@ -852,9 +918,9 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
 
         Two conditions, and the second one is why this is not once per turn: the trigger says
         the prompt is large enough to act on, and :meth:`_worth_compacting` says this band is
-        worth the pass. Each refusal increments the counter that names it, so the five outcomes
-        -- under the line, declined, summarizer failed, compacted, folded -- partition the
-        passes and a row that did nothing says which. The fold is reached only through a
+        worth the pass. Each refusal increments the counter that names it, so the six outcomes
+        -- under the line, declined, summarizer failed, compacted, folded, replayed -- partition
+        the passes and a row that did nothing says which. The fold is reached only through a
         declined band, and only in the fold mode: see :meth:`_fold_due`.
 
         Nothing is mutated until the summary is in hand. That ordering is the whole of the
@@ -937,17 +1003,26 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
             self._declined += 1
             return False
 
-        summary = await self._summarize([messages[span["start_index"]] for span in band])
-        if summary is None:
-            return False
-
-        # The id is numbered by compaction rather than by conversation length, which is what
-        # the framework uses. Length is not unique across passes here: in the recompacting mode
-        # this strategy's own summary is superseded by the next one, so a conversation can be
-        # compacted at the same length twice and the second summary would claim the first
-        # one's id, silently pointing every back-reference at the wrong message.
-        self._replace(messages, band, summary, summary_id=f"{SUMMARY_ID_PREFIX}{self._compactions}")
-        self._compactions += 1
+        transcript = _format_turns([messages[span["start_index"]] for span in band])
+        remembered = self._recall(self.prompt, transcript)
+        if remembered is None:
+            summary = await self._summarize(transcript, prompt=self.prompt)
+            if summary is None:
+                return False
+            # The id is numbered by compaction rather than by conversation length, which is what
+            # the framework uses. Length is not unique across passes here: in the recompacting
+            # mode this strategy's own summary is superseded by the next one, so a conversation
+            # can be compacted at the same length twice and the second summary would claim the
+            # first one's id, silently pointing every back-reference at the wrong message.
+            summary_id = f"{SUMMARY_ID_PREFIX}{self._compactions}"
+            self._compactions += 1
+            self._remembered = _Remembered(self.prompt, transcript, summary_id, summary)
+        else:
+            # The same band, seen again on the other list the live path runs this on. The answer
+            # and the id are the ones the model has already been sent.
+            summary_id, summary = remembered.summary_id, remembered.text
+            self._replayed += 1
+        self._replace(messages, band, summary, summary_id=summary_id)
         self._replaced = len(band)
         return True
 
@@ -1185,7 +1260,9 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
 
         Nothing is mutated until the summary is in hand, on the same contract as an ordinary
         pass: a summarizer that raises or answers with nothing leaves the conversation as it
-        was and is counted under :attr:`user_summary_failures`.
+        was and is counted under :attr:`user_summary_failures`. And a fold presented again on
+        the other list the live path runs this on is replayed, as an ordinary pass is: see
+        :meth:`_recall`.
 
         Args:
             messages: The conversation, mutated in place.
@@ -1195,33 +1272,50 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
             True if the outgoing messages changed.
         """
         summaries = [messages[span["start_index"]] for span in standing]
-        summary = await self._summarize(summaries, prompt=self.fold_prompt, text=_summary_body)
-        if summary is None:
-            return False
+        transcript = _format_turns(summaries, text=_summary_body)
+        remembered = self._recall(self.fold_prompt, transcript)
+        if remembered is None:
+            summary = await self._summarize(transcript, prompt=self.fold_prompt)
+            if summary is None:
+                return False
+            summary_id = f"{FOLD_ID_PREFIX}{self._folds}"
+            self._folds += 1
+            self._remembered = _Remembered(self.fold_prompt, transcript, summary_id, summary)
+        else:
+            summary_id, summary = remembered.summary_id, remembered.text
+            self._replayed += 1
         for message in summaries:
             set_preserved(message, preserved=False)
-        self._replace(
-            messages, standing, summary, summary_id=f"{FOLD_ID_PREFIX}{self._folds}", reason=FOLD_EXCLUDE_REASON
-        )
-        self._folds += 1
+        self._replace(messages, standing, summary, summary_id=summary_id, reason=FOLD_EXCLUDE_REASON)
         return True
 
-    async def _summarize(
-        self,
-        turns: list[Message],
-        *,
-        prompt: str | None = None,
-        text: Callable[[Message], str | None] | None = None,
-    ) -> str | None:
-        """Return the summary of ``turns``, or None when the summarizer did not produce one.
+    def _recall(self, prompt: str, transcript: str) -> _Remembered | None:
+        """Return the remembered answer to exactly this request, or None if it was never asked.
+
+        Byte-identical is the test, on the prompt and the transcript both: a fold's request
+        differs from a band's in the prompt alone, a band that has gained one turn differs in
+        the transcript alone, and neither may borrow the other's answer.
 
         Args:
-            turns: The user messages about to be replaced, in conversation order.
+            prompt: The system prompt the request would carry.
+            transcript: The numbered turns it would carry.
+
+        Returns:
+            The remembered request when it matches, else None.
+        """
+        remembered = self._remembered
+        if remembered is not None and remembered.prompt == prompt and remembered.transcript == transcript:
+            return remembered
+        return None
+
+    async def _summarize(self, transcript: str, *, prompt: str) -> str | None:
+        """Return the summary of ``transcript``, or None when the summarizer did not produce one.
+
+        Args:
+            transcript: The numbered turns, as :func:`_format_turns` renders them.
 
         Keyword Args:
-            prompt: What to ask for. None asks for :attr:`prompt`; a fold asks for
-                :attr:`fold_prompt`.
-            text: How each message is read into the transcript. See :func:`_format_turns`.
+            prompt: What to ask for: :attr:`prompt` for a band, :attr:`fold_prompt` for a fold.
 
         Returns:
             The summary text, stripped, or None on either failure.
@@ -1229,8 +1323,8 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
         try:
             response = await self.client.get_response(
                 [
-                    Message(role="system", contents=[prompt or self.prompt]),
-                    Message(role="user", contents=[_format_turns(turns, text=text)]),
+                    Message(role="system", contents=[prompt]),
+                    Message(role="user", contents=[transcript]),
                 ],
                 stream=False,
             )

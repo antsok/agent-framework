@@ -622,8 +622,8 @@ row that neither single row can make.
 
 **Counters.** Both parts' counters are readable off the composed object, so one row's flags say
 which half did what: `REC`, `RECORDS`, `FALLBACK`, `RECFALLBACK` and `UNCOVERED` are the record
-half, `USERCOMPACT`, `USERREPLACED`, `USERUNDER`, `USERHELD` and `USERSUMMFAIL` the user half,
-and `USERSTARVED` is the composition's own.
+half, `USERCOMPACT`, `USERREPLACED`, `USERREPLAY`, `USERUNDER`, `USERHELD` and `USERSUMMFAIL`
+the user half, and `USERSTARVED` is the composition's own.
 
 **A silent user half has four readings and the flags separate all four,** which is the whole
 point of the row being readable at all: `USERUNDER` is never considered, `USERSTARVED` is the
