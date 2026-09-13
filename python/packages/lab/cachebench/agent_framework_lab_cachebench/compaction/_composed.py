@@ -300,6 +300,11 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
         return self.user_turns.user_folds
 
     @property
+    def user_summaries_replayed(self) -> int:
+        """:attr:`~._usersummary.UserTurnAnchoredSummarizationCompactionStrategy.user_summaries_replayed`."""
+        return self.user_turns.user_summaries_replayed
+
+    @property
     def user_summary_failures(self) -> int:
         """:attr:`~._usersummary.UserTurnAnchoredSummarizationCompactionStrategy.user_summary_failures`."""
         return self.user_turns.user_summary_failures

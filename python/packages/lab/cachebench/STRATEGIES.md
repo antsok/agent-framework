@@ -389,7 +389,15 @@ nothing in this benchmark can see what that loses: the planted facts live in too
 `facts` and `acc1` are blind to the user half by construction.
 
 **What the counters say.** `USERCOMPACT:<n>` is the passes that replaced a band, read together
-with `USERREPLACED:<n>`, the turns the most recent of them stands for. `USERCOMPACT:0` is the
+with `USERREPLACED:<n>`, the turns the most recent of them stands for. `USERREPLAY:<n>` is the
+passes that replaced the same band with the summary already in hand: live, the strategy runs
+twice per crossing — inside the model call on the copies the history provider loaded, and after
+the turn on the store, which the copies' flags never reach — and the second pass replays the
+first's answer under the same id instead of asking again. Before that counter existed both
+passes counted as `USERCOMPACT` and each asked the summarizer, so run 47's and run 48's
+`USERCOMPACT:2` is one compaction, and the two different summaries those passes sent at one
+position were a second cache break per crossing that none of the modes was designed around.
+`USERCOMPACT:0` is the
 uncompacted control under another name, and exactly one of three flags says why:
 `USERUNDER:<n>` — the prompt never reached the trigger, so the band was not read;
 `USERHELD:<n>` — it did, and the band was not worth a pass under the share; `USERSUMMFAIL:<n>`
