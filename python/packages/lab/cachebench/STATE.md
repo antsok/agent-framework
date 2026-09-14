@@ -1292,3 +1292,133 @@ every record at zero sits below the line; mini's clean records sit above it at z
 uncounted no-op pass would also give. That fits a gate at the trigger rather than at the
 ceiling, but no such code has been found. What those counts measured is not established; the
 mechanism above is read off the source and the loss arithmetic, not off an observed pass.
+
+## 3v. The reasoning stamp survives the harness store, proven by a test
+
+Resolved 13 September, the same day the counter fix landed. Commit 434a77da5's last paragraph
+left one thing unverified: the stamp is proven on the plain `Agent` path, and every live run
+drives `build_live_agent(kind="harness")`, where the recorder stamps `context.result.messages`
+*after* the history provider has already stored that response. The stamp only reaches the
+replayed message if the store held the same objects rather than copies, and nothing in the
+harness's assembly said so -- `ToolApprovalMiddleware`, `MessageInjectionMiddleware` and the
+per-service-call persisting middleware all sit between the store and the recorder, any one of
+which could have been cloning.
+
+**Settled by `test_the_harness_store_keeps_the_reasoning_stamp_the_replay_is_charged_for` in
+`tests/test_live.py`.** A stub client answering as a reasoning model -- a `text_reasoning`
+content carrying a 2,728-character base64 `protected_data` blob, plus `reasoning_output_token_count
+= 300` in its usage -- drives two turns through `build_live_agent(kind="harness")`, its real
+session, and the wrapped tokenizer a live run selects. A probe strategy reads
+`included_token_count` on exactly the history the second model call was about to send, which is
+the number every threshold label reads. On this fixture the second call charges 417 tokens: the
+stamped count. The two numbers it must not be are 117, the stripped count without the stamp (the
+~19% under-count the commit warned about -- and note the counter's cached per-message
+annotations make that residual permanent once written, not merely a first-pass miss), and 814,
+the unwrapped count of the base64 as prompt text (the ~45% over-count the fix replaced). The
+after-turn pass charges 388 for `[user, assistant]`, so the stamp is on the stored content
+before the second turn starts, and the test asserts that directly as well.
+
+**The test bites.** With the stamp removed from `_live.py` the test fails on the stored content
+first (no `REASONING_TOKENS_KEY` on it); restored, it passes. The charge assertions are what the
+stored-content check exists to localize -- on this fixture the stamped, stripped and raw counts
+are 417, 117 and 814, so no two of them can mask as each other.
+
+**What this resolves.** The stamp is on the message the harness replays, so post-fix luna rows
+count the replayed reasoning at what the provider bills for it, and the threshold labels on a
+reasoning model mean what they say within the framing residual. **What it does not resolve:**
+whether a reasoning model's thresholds now *fire* where labelled -- that is step 3 of the next
+live run, and no archived run can answer it because per-call local counts were never recorded.
+Luna rows before the fix remain comparable with each other and not with post-fix rows, exactly
+as the commit said; nothing in this changes the archive.
+
+**The next run's shape, decided 13 September and executed the same evening as run 49**
+(approved at ~$13.9, spent $11.91): the 170K/0.9 cell of runs 47/48, five seeds, strategies
+`none,truncation,tool_summary_anchored,user_summary_anchored,
+tool_and_user_summary_anchored`, one invocation per `--user-summary-mode` (the flag is
+run-level) -- and `--user-trigger-fraction 0.6`, not run 48's 0.8, because at 0.8 with 0.9 fill
+the standalone user row crossed only once per seed and the three modes were identical by
+construction. Read `USERCOMPACT` off each record before drawing any conclusion about the modes:
+only `USERCOMPACT > 1` means the mode had two boundaries to differ on. Three open questions the
+run was for: the record strategy's re-force/preserve layers (`REFORCED`/`PRESERVED`, never
+measured live), the three user-summary modes at a fraction that actually crosses twice, and
+whether the fixed counter puts a reasoning model's thresholds where they are labelled. All three
+are answered in §3w; nothing in this section needs re-reading for them.
+
+## 3w. Run 49: the modes measured where they can differ, and the layers measured live
+
+Executed 13 September, `runs/run-49-luna-170k-fill90-usermodes60-*`, written up in `RESULTS.md`
+("Run 49") and `runs/README.md`. The three questions §3v sent it for, answered:
+
+**1. The record strategy's re-force/preserve layers, live for the first time.** The standalone
+record row read `UNCOVERED:0` and `REFORCED:0` on all fifteen records -- at the corrected counter
+the record was asked before the prompt degraded, and it covered every group on the first ask, so
+the new layers had nothing to do. They acted only on the composed row, four records of fifteen:
+three where the second record covered none of the uncovered groups and layer 2 preserved them
+(`UNCOVERED` 4/5/5 = `PRESERVED`), one still pending at the run's end. `dq` 0 everywhere, 53/53 on
+every seed of every arm but one (fold `-s3`'s record row, 52/53, no flag -- the record's own text,
+not a group shed). **The layers work; the mechanism's frequency on the standalone row is now
+"never fired here", which retires §3u's arithmetic as a live risk at this cell while leaving its
+offline 60K result standing.** The archived losses (21/53, 44/53 twice, 37/53) did not recur in
+fifteen draws.
+
+**2. The three modes, measured where they can differ.** `USERCOMPACT:2` on fourteen of fifteen
+standalone records (one 3), counted once each by the post-`8c463f0e7` counter: two genuine
+boundaries per seed, where run 48 had one and its arms were identical by construction. The
+structural difference is visible -- recompact ends with one standing summary, boundary and fold
+with two -- and the cost difference is not: mode gaps 1-5% on `seed$` against seed spreads
+15-36%, the cross-cell section refusing every ranking, the fold arm's verdict printing NOT
+SUPPORTED. **The fold made zero folds on all fifteen fold records**: at two crossings a standing
+summary was never worth its prefix break, so fold ran as boundary mechanically and its apparent
++21% against boundary's +30% is noise. What §3s owed its reader is now paid: the modes are
+measured, not paired by construction, and at this cell five seeds cannot rank them.
+
+**3. Thresholds fire where they are labelled.** The record trigger is 0.6 of 167,952 -- 100,771
+-- and the record row's billed peaks read 98,490-102,024 on thirteen of fifteen records (two at
+109,938 and 113,524, the growth between crossing and the forced call). `RECFALLBACK` zero on all
+75 records; the 0.9 gate (151,157) never approached. Pre-fix, luna tripped the same label at
+0.61-0.64 of the billed ceiling. **The label is back on the number**, which is the measurement
+§3v could not make offline.
+
+Also carried in the run: no probe drew the low value anywhere (every seed 99%+ -- the settled-row
+case of §3t), no throttling or reconnects or errors, $11.91 total, and two recompact seeds off
+target on fill (-7.0%, -7.9%, the low side as always on luna -- `--assumed-reply-tokens 602`
+over-estimates its replies). **Nothing here is a cost result**: the record row's -1%/-6%/-7%
+against the control sit inside its own spreads (32%/6%/17%), so no saving is claimed; and the
+user row remains dearer than the control on every arm (+21% to +30%).
+
+**Open after this run.** Whether the fold mode can ever repay a break -- a cell with more
+crossings (a lower trigger, a fill the band regrows under) or longer summaries is where to look,
+and none has been measured. Whether the record row is genuinely cheaper than the control: three
+arms now read -1%/-6%/-7% and the boundary arm's -6% is the closest to resolvable (6% spread, and
+the fold arm printed NOT SUPPORTED at -7%); more seeds at the boundary mode's operating point is
+the cheapest way to answer it. And `--assumed-reply-tokens` still wants re-measuring per model:
+every luna seed here seeded low.
+
+## 3x. Run 50: all twenty strategies at 120K/0.8, and the verdict is the control
+
+Executed 13 September on request, `runs/run-50-luna-120k-fill80-all20-*`, written up in
+`RESULTS.md` ("Run 50") and `runs/README.md`. Run 47's all-strategies measurement at a smaller
+window, on the corrected counter, 100 records, $10.45, four invocations concurrent against the
+4M TPM the account allows (mild throttling, 1-21 retries, all re-sent).
+
+**The finding is the control's.** At 0.8 fill of 120K nothing overflows -- the uncompacted
+conversation peaks at 91,117 billed, 76% of the window -- and compaction has nothing to buy: every
+strategy that keeps the answer intact costs 2-48% more than `none` ($0.0562 a seed), the only
+cheaper row deletes to 21/53, and the instrument names **`none`**. First cell in the archive
+whose verdict is the control. The natural next cell is 120K at 0.95-1.0 fill, where the control
+disqualifies and the comparison inverts; that is where a payoff could first appear on this
+window and it has not been measured.
+
+Carried by the run: the record row held 53/53 on all five seeds (`UNCOVERED:0`, `RECFALLBACK`
+zero) but its peaks ran +6-10% over the 70,771 trigger label -- a wider gap than run 49's 0-2%
+at the same code, unexplained; the composed row fired the re-force chain once and the re-forced
+record was `TRUNCATED:1` -- it hit the 2,048-token cap and covered none of the five groups, so
+layer 2 preserved them at 53/53, which points the flags at the cap rather than the design;
+`user_summary_anchored` crossed once per seed at the default 0.8 trigger (the §3s single-crossing
+caveat applies to that row here); and the probe-phase cold draw showed a 0% value on this cell's
+`token_budget` rows where 100K-up cells drew 33.3% -- §3t's instrument, a new value at a new
+size, nothing more.
+
+`--assumed-reply-tokens` 602 over-estimates luna at every cell tried (fill -5.5% here, -0.2 to
+-7.9% in run 49): re-measuring it per model is the cheapest remaining calibration, and until
+then every luna cell sits below its labelled fill.
