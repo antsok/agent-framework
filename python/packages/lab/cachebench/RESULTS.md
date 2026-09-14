@@ -1615,6 +1615,147 @@ every row; the composition still at 76% hit and 31% snap; the control's spread f
 and the instrument still prints `NOT SUPPORTED`; the composition +20% against 26%; the user row
 +32% against 15%. Dropping it changes nothing the paragraphs above say.
 
+### Run 50 -- all twenty strategies at 120K/0.8: the verdict is the control
+
+Run 47's measurement moved to a smaller window and the first all-strategies cell on the corrected
+reasoning counter (`434a77da5`): `gpt-5.6-luna`, 120,000 tokens, 0.8 fill, scaled payload, five
+seeds, one invocation per seed, 100 records, four concurrent ($10.45, `runs/run-50-120k-*`, one
+report over the five files). Fill -5.5% and tool share +5.8%, both just outside tolerance and on
+the usual side; every row shares the one operating point. Mild throttling on ten rows (1-21
+retries) from the four-way schedule; `dq` 0; every invocation exited 0.
+
+**Test results overview** -- all twenty rows, pooled over the five seeds, sorted by `usd`.
+
+| strategy | cmp% | hit% | usd | +-$ | fct | acc1 | acc2 |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `token_budget_window_first` | 35% | 91.8% | $0.0489 | **-13%** | **21/53** | 21.6/53 | 21.0/53 |
+| `none` (control) | 76% | 96.2% | $0.0562 | ±0% | 53/53 | 53.0/53 | 53.0/53 |
+| `truncation` | 63% | 86.3% | $0.0574 | +2% | 43/53 | 43.6/53 | 43.4/53 |
+| `anchored_min_gain` | 77% | 96.1% | $0.0575 | +2% | 53/53 | 53.0/53 | 53.0/53 |
+| `anchored_no_assistant` | 73% | 95.2% | $0.0622 | +11% | 53/53 | 52.6/53 | 52.2/53 |
+| `token_budget_summarize` | 35% | 76.5% | $0.0625 | +11% | 28/53 | 26.3/53 | 27.8/53 |
+| `anchored` | 73% | 95.2% | $0.0625 | +11% | 52/53 | 52.0/53 | 51.9/53 |
+| `tool_summary_anchored` | 41% | 92.8% | $0.0636 | +13% | 53/53 | 53.0/53 | 53.0/53 |
+| `sliding_window` | 10% | 11.7% | $0.0639 | +14% | 8/53 | 8.8/53 | 8.0/53 |
+| `user_summary_anchored` | 65% | 94.2% | $0.0660 | +17% | 53/53 | 53.0/53 | 53.0/53 |
+| `context_window_aggressive` | 35% | 87.7% | $0.0672 | +20% | 20/53 | 20.2/53 | 19.6/53 |
+| `token_budget_tools_first` | 40% | 86.8% | $0.0723 | +29% | 28/53 | 28.3/53 | 27.8/53 |
+| `tool_result` | 60% | 90.5% | $0.0725 | +29% | 50/53 | 48.9/53 | 46.3/53 |
+| `context_window` | 61% | 90.6% | $0.0757 | +35% | 45/53 | 43.8/53 | 42.4/53 |
+| `selective_tool_call` | 62% | 90.4% | $0.0790 | +41% | 44/53 | 43.6/53 | 44.0/53 |
+| `tool_and_user_summary_anchored` | 59% | 90.4% | $0.0812 | +44% | 53/53 | 53.0/53 | 53.0/53 |
+| `context_window_lazy` | 63% | 89.8% | $0.0833 | +48% | 52/53 | 48.9/53 | 45.7/53 |
+| `token_budget_truncate_first` | 39% | 70.4% | $0.0867 | +54% | 24/53 | 24.1/53 | 23.6/53 |
+| `token_budget_fallback` | 46% | 70.0% | $0.1025 | +82% | 28/53 | 28.9/53 | 28.4/53 |
+| `summarization` | 10% | 12.3% | $0.1030 | +83% | 22/53 | 19.0/53 | 21.3/53 |
+
+`cmp%` is the snapshot after all compaction as a share of the 120,000 window; `hit%` is `run hit%`
+(cached over total input, seeding and probes together); `usd` is mean `seed$` per seed (the
+conversation and summarizer, probes left out -- the half every verdict ranks on); `+-$` is that
+against the control; `fct` is the mean facts in the snapshot per seed, `acc1`/`acc2` the recall
+share converted to facts (scoped questions / the single combined question). Per-seed detail,
+spreads and flags are in the report beside the records.
+
+Six rows hold every fact on every seed (`none`, `anchored_min_gain`, `anchored_no_assistant`,
+`tool_summary_anchored`, `user_summary_anchored` and the composed row; `anchored_min_gain` is a
+measured no-op -- `NOGAIN` on every pass, 77% snap), three more lose facts on single seeds
+(`anchored`, `context_window_lazy`, `tool_result`), and the eleven below the bar delete.
+
+**Nothing overflows, and nothing pays.** The uncompacted conversation peaked at 91,117 billed
+tokens -- 76% of the window -- so at 0.8 fill of 120K compaction is solving a problem the workload
+does not have: every strategy that keeps the answer intact costs 2-48% more than `none`, the only
+cheaper row (`token_budget_window_first`, -13%) deletes to 21/53, and the verdict is **`none`**.
+This is the first cell in the archive whose verdict is the control; run 47's at 170K/0.9 named
+`tool_summary_anchored` at -7%. The comparison across the two cells is not a strategy comparison
+(workloads differ, and run 47 is pre-counter-fix), but the shape is consistent: as the window
+grows past the conversation, the record row goes from parity to a saving, and below it there is
+nothing to save.
+
+**The cache-rate column, read once more.** `run hit%` (cached ÷ total input) is 96.2% on the
+control, 90-96% on the retainers, and collapses with the prefix: 11.7% on `sliding_window`, 12.3%
+on `summarization`, 70% on the two `token_budget` rows that drew the cold probe. At a cached-read
+price of a tenth of fresh input, losing the cache is what makes the deleters dear, not the tokens
+they saved.
+
+**The layers again.** `tool_summary_anchored`: `UNCOVERED:0`, `RECFALLBACK` zero, 53/53 on all
+five seeds, peaks 75,106-77,878 against the 70,771 trigger (+6-10% -- a wider gap than run 49's
+0-2%, unexplained). The composed row fired the chain once: `UNCOVERED:5`, `REFORCED:1`, the
+re-forced record `TRUNCATED:1` -- it hit the 2,048-token cap and covered none of the groups --
+and layer 2 held them `PRESERVED:5` at 53/53. `user_summary_anchored` crossed once per seed
+(`USERCOMPACT:1`) at the default 0.8 trigger: the run-48 single-crossing caveat applies to this
+row here.
+
+**Not resolved.** The next cell up -- 120K at 0.95-1.0 fill, where the control disqualifies -- is
+where a compaction payoff could first appear on this window, and nothing here measures it; the
++6-10% peak-over-label on the record row; and `--assumed-reply-tokens` is wrong for luna at every
+cell tried (every seed here and in run 49 seeded low).
+
+### Run 49 -- the three modes at a trigger that crosses twice, and the re-force measured live
+
+Run 48's measurement redone where the arms can differ: the same three `--user-summary-mode`
+(`recompact`, `boundary`, `fold`), the same cell (`gpt-5.6-luna`, 170,000/0.9, scaled payload),
+five seeds an arm, one invocation per seed and mode, 75 records, $11.91
+(`runs/run-49-luna-170k-fill90-usermodes60-*`, one report per arm plus the cross-cell render over
+all fifteen). Two changes from run 48: `--user-trigger-fraction 0.6` instead of 0.8, and the full
+five strategies in every arm so each arm carries its own reference record row. No throttling, no
+reconnects, no errors, `dq` 0 everywhere; fills -0.2% to -4.7% on thirteen of fifteen seeds with
+recompact `-s0` and `-s2` at -7.0% and -7.9% (the recompact arm is the least exact operating point
+of the three). First live run on the reasoning-counter fix of `434a77da5`, whose stamp was proven to
+survive the harness store the same day (`STATE.md` 3v). Seeds are not paired across arms; every
+comparison below is an arm against its own control.
+
+| arm | row | `snap%` | seed hit | `seed$` | `seed$+-` | `vs none$` | facts | user-half flags |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | --- | --- |
+| recompact | `user_summary_anchored` | 66% | 89.5% | $0.1440 | 18% | +30% | 53/53 | `USERCOMPACT:2`, `USERSUMMARIES:1` (rewritten) |
+| boundary | `user_summary_anchored` | 69% | 88.8% | $0.1549 | 36% | +30% | 53/53 | `USERCOMPACT:2` (one seed 3), `USERSUMMARIES:2` |
+| fold | `user_summary_anchored` | 65% | 89.6% | $0.1411 | 23% | +21% | 53/53 | `USERCOMPACT:2`, `USERSUMMARIES:2`, **`USERFOLD:0` on all five** |
+| recompact | `tool_and_user_summary_anchored` | 40% | 90.1% | $0.1308 | 23% | +18% | 53/53 | one record `UNCOVERED:4 PRESERVED:4`, one `UNCOVERED:1` pending |
+| boundary | `tool_and_user_summary_anchored` | 34% | 90.2% | $0.1300 | 27% | +9% | 53/53 | one record `UNCOVERED:5 PRESERVED:5` |
+| fold | `tool_and_user_summary_anchored` | 34% | 89.5% | $0.1323 | 22% | +13% | 53/53 | one record `UNCOVERED:5 PRESERVED:5` |
+| recompact | `tool_summary_anchored` | 51% | 92.8% | $0.1101 | 32% | -1% | 53/53 | `UNCOVERED:0`, `REFORCED:0` on all five |
+| boundary | `tool_summary_anchored` | 53% | 92.9% | $0.1121 | 6% | -6% | 53/53 | `UNCOVERED:0` on all five |
+| fold | `tool_summary_anchored` | 50% | 92.8% | $0.1082 | 17% | -7% | **52/53** | one seed 52, no flag; `UNCOVERED:0` on all five |
+
+The controls read 95.5-95.6% seed hit at $0.1110-$0.1193; `truncation` sits below the correctness bar
+in all three arms (acc1 68% / 66% / 57%, per-seed facts bimodal as ever: 37/37/37/30/37,
+37/37/37/37/26, 37/26/21/29/37). No probe drew the low value anywhere in the run -- every seed of
+every row read 99% or better on the probes, the settled-row case of `STATE.md` §3t.
+
+**The crossing premise held.** The standalone user row read `USERCOMPACT:2` on fourteen of fifteen
+records (one 3) under the post-`8c463f0e7` counter, which counts a crossing once: two genuine
+boundaries per seed where run 48 had one and the modes were identical by construction. Recompact
+ends with one standing summary, boundary and fold with two, and the modes are now *measured* rather
+than structurally equal -- and **still not separable**: the mode gaps on `seed$` are 1-5% against
+seed spreads of 15-36%, the cross-cell section refuses every ranking, and the fold arm's own verdict
+prints NOT SUPPORTED (17% spread against a 7% gap). The fold made **zero** folds on all fifteen fold
+records, so at two crossings a standing summary was never worth its prefix break and fold ran as
+boundary mechanically; its +21% against boundary's +30% is noise, not a saving.
+
+**The re-force and preserve layers acted, and nothing was lost.** The standalone record row reads
+`UNCOVERED:0` and `REFORCED:0` on all fifteen records -- its record covered every group on the first
+ask, so the new layers never needed to act; run 48's fifth seed lost 37/53 at `UNCOVERED:4
+RECFALLBACK:3`, and every archived loss on that row carries that pair (§3u). The composed row did
+find groups its record could not cover, on four of fifteen records: three re-forced, wrote a second
+record (`REFORCED:1`, `RECORDS:2`), and it covered none of the targets -- `UNCOVERED:4`/`:5` with
+`PRESERVED` equal to it, layer 2 holding the groups in the prompt rather than shedding them; the
+fourth (recompact `-s0`) ended `UNCOVERED:1`, `REFORCED:1`, `PRESERVED:0`, an ask still pending when
+the run ended. Either way `dq` is 0 and facts 53/53 on every seed of every arm but one (fold `-s3`'s
+record row, 52/53 at `acc1` 98% with no flag: a fact the record's own text dropped, not a group the
+strategy shed).
+
+**Thresholds fire where they are labelled.** The record trigger is 0.6 of the 167,952-token input
+budget -- 100,771 -- and the record row's billed peaks read 98,490-102,024 on thirteen of fifteen
+records, with two at 109,938 and 113,524 (the growth between the crossing and the call the record
+was forced on). `RECFALLBACK` is zero on all 75 records and the 0.9 fallback gate, 151,157, was never
+approached. Pre-fix, luna tripped the same labelled trigger at 0.61-0.64 of the billed ceiling
+(`STATE.md` 3v's commit); post-fix the label sits on the number.
+
+**Not resolved.** The three modes' cost ranking; the fold mode's value on any cell measured (zero
+folds here); whether the record row is cheaper than the control (-1% / -6% / -7% against spreads of
+32% / 6% / 17% -- the boundary arm's -6% is the closest and still inside its own spread, so no
+saving is claimed); and the standalone user row remains dearer than the control on every arm, +21%
+to +30%.
+
 ### Run 48 -- the three user-summary modes, and why it cannot rank them
 
 The three `--user-summary-mode` arms on run 47's cell: `gpt-5.6-luna`, 170,000/0.9, scaled

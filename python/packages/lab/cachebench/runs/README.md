@@ -207,6 +207,124 @@ What it shows, and what it is void for:
 No `.sh` is kept: the script that produced it is the same one run 47 uses, and re-running it
 against this tree produces the repaired rows rather than these.
 
+Run 50 is all twenty strategies at 120,000 tokens and 0.8 fill -- run 47's measurement moved to a
+smaller window and the first all-strategies cell on the corrected reasoning counter
+(`434a77da5`), so its luna rows are comparable with each other and with runs 49's, not with run
+47's at the same labels. `gpt-5.6-luna`, scaled payload, five seeds, one invocation per seed, 100
+records, four invocations concurrent against the 4M TPM the account allows. $10.45 across the
+run; every invocation exited 0; `dq` 0 everywhere. One file per seed
+(`run-50-luna-120k-fill80-all20-s{0..4}.jsonl`), one report over all five
+(`run-50-luna-120k-fill80-all20.txt`), `run-50-all20-120k.sh`. Fill landed -5.5% (just outside
+tolerance, the usual low side: luna's replies run short of the 602-token assumption) and tool
+share +5.8%, so the cell is closer to 120K at 0.755 fill than its label; all twenty rows share
+the one operating point. Mild throttling on ten rows (1-21 retries, 0-21 s waiting) from the
+four-way schedule -- re-sent by the instrument, nothing lost, but a cached prefix that expired
+during a wait is a miss the hit column charges to the row.
+
+**The verdict is the control.** At this cell nothing overflows: the uncompacted run peaked at
+91,117 billed tokens against the 120,000 window (76% of it), and every strategy that keeps the
+answer intact costs more than not compacting -- `none` $0.0562 a seed against $0.0575-$0.0812 for
+the nine rows that cleared 90% of its acc1. Only `token_budget_window_first` is cheaper (-13%),
+by deleting: 21/53 facts. The instrument's line is "leave compaction off unless the conversation
+would overflow the window", and at 0.8 fill of 120K it would not.
+
+- Of the nine rows above the bar, six hold 53/53 on every seed (`none`, `anchored_min_gain`,
+  `anchored_no_assistant`, `tool_summary_anchored`, `user_summary_anchored` and the composed row;
+  `anchored_min_gain` found nothing to gain at 61 messages -- `NOGAIN` on every pass, 77% snap,
+  a no-op by its own counter). `anchored` lost one fact on one seed (49/53),
+  `context_window_lazy` similar single-seed losses, `tool_result` one seed at 39/53.
+- `tool_summary_anchored` is the cheapest of the full retainers (+13% against `none`, 7% seed
+  spread) and held 53/53 on all five seeds, `UNCOVERED:0`, `RECFALLBACK` zero, peaks 75,106-77,878
+  against the 70,771 trigger line (+6-10%, the growth between the crossing and the forced call).
+  The +13% is inside the row's spread read strictly, and is the same direction run 49 read three
+  times.
+- The composed row fired the re-force/preserve chain on one seed: `UNCOVERED:5`, `REFORCED:1`,
+  the re-forced record `TRUNCATED:1` -- it hit the 2,048-token record cap and covered none of the
+  five groups -- and layer 2 held them `PRESERVED:5`. `dq` 0, 53/53: disqualified on nothing,
+  lost nothing. The cap, not the design, is what the flags point at.
+- `user_summary_anchored` crossed **once** per seed (`USERCOMPACT:1`) at the default 0.8 trigger
+  and 0.8 fill -- the run-48 caveat applies to this row at this cell -- while the composed row's
+  user half crossed twice. Its +17% sits on a single-crossing draw.
+- `sliding_window` and `summarization` collapse the conversation to 11% and pay 1-2% seed hit:
+  the cache is gone with the prefix, and they lose 45 and 31 facts. The token_budget family is
+  bimodal as ever (21-37 facts a seed), and `token_budget_fallback`/`token_budget_truncate_first`
+  drew 0% on the first eight probes of four seeds -- the probe-phase cold draw of §3t, now with a
+  0% value at this cell.
+- The cache-rate reading the run was asked for: `run hit%` (cached over total input, seeding and
+  probes together) is 96.2% on the control, 89-96% on the retainers, 90-95% on the deleters, and
+  11-12% on the two collapsers. The split columns (`seed hit%` / `probe hit%`) say which phase
+  paid for what.
+
+**Not resolved here.** Whether any strategy pays at this window once the conversation grows past
+it (the natural next cell is 120K at 0.95-1.0 fill, where the control disqualifies and the
+comparison inverts); whether the record row's +6-10% peak-over-label at this cell is a property
+of the smaller filler turns or of the forced call's timing; and `--assumed-reply-tokens` still
+wants re-measuring per model -- every seed here seeded low again.
+
+Run 49 is run 48's measurement redone at a trigger where the user band crosses twice: the same
+three `--user-summary-mode` arms on the same cell (170,000 tokens, 0.9 fill, scaled payload,
+`gpt-5.6-luna`), but `--user-trigger-fraction 0.6` rather than 0.8, and the full five strategies
+in every arm -- `none`, `truncation`, `tool_summary_anchored`, `user_summary_anchored` and
+`tool_and_user_summary_anchored` -- so each arm carries its own reference record row. Five seeds
+an arm, one invocation per seed and mode, 75 records, run as a canary arm plus two workers with
+at most two invocations live. $11.91 across the run; no throttling, no reconnects, no errors,
+`dq` 0 everywhere. One file per seed and mode --
+`run-49-luna-170k-fill90-usermodes60-<mode>-s{0..4}.jsonl` -- one report per arm
+(`run-49-...-<mode>.txt`, rendered with `--from-jsonl` over that arm's five files) and one over
+all fifteen (`run-49-luna-170k-fill90-usermodes60-all.txt`, which prints the three cells and the
+cross-cell section that refuses to rank them). `run-49-usermodes60.sh`, one seed index per
+argument. First live run on the reasoning-counter fix (`434a77da5`), whose stamp the harness store
+was proven to keep the same day (`STATE.md` 3v). Seeded -0.2% to -4.7% on thirteen of the fifteen
+seeds; recompact `-s0` and `-s2` at -7.0% and -7.9% are outside the 5% tolerance, and all five
+recompact seeds sit low, so that arm's operating point is the least exact of the three.
+
+**What it resolves.**
+
+- **The crossing premise.** On the standalone user row every record of every arm reads
+  `USERCOMPACT:2` (one boundary seed read 3) -- two genuine crossings, counted once each by the
+  post-`8c463f0e7` counter -- where run 48's arms had one crossing per seed and the modes were
+  identical by construction. The modes are now measured against two boundaries, not zero:
+  recompact ends with one standing summary (`USERSUMMARIES:1`, rewritten each crossing), boundary
+  and fold with two (one per crossing).
+- **The mode ranking is still not resolved, now for the honest reason.** The standalone user row
+  costs +30% / +30% / +21% against its own control (recompact / boundary / fold), the composed row
+  +18% / +9% / +13%, and the cross-cell section refuses every one: the per-strategy mode gaps are
+  1-5% against seed spreads of 15-36%, and the fold arm's own verdict prints NOT SUPPORTED (17%
+  spread against a 7% gap). What the run does establish: **the fold mode made zero folds** --
+  `user_folds` 0 on all fifteen fold records -- so at two crossings a standing summary was never
+  worth its cached-prefix break and fold ran as boundary mechanically. Its +21% against boundary's
+  +30% is seed noise, not a saving.
+- **The re-force and preserve layers, measured live for the first time** (`434a77da5`). The
+  standalone record row reads `UNCOVERED:0` and `REFORCED:0` on all fifteen records -- its record
+  covered every group on the first ask, so the new layers never needed to act; run 48's fifth seed
+  lost 37/53 at `UNCOVERED:4 RECFALLBACK:3`, and every archived loss on that row carries that pair.
+  The composed row did find groups its record could not cover, on four of fifteen records: three
+  re-forced, wrote a second record (`REFORCED:1`, `RECORDS:2`), and it covered none of the targets
+  -- `UNCOVERED:4`/`:5` with `PRESERVED` equal to it, layer 2 holding the groups in the prompt
+  rather than shedding them, so the row answers for them on size; the fourth (recompact `-s0`) ended
+  `UNCOVERED:1`, `REFORCED:1`, `PRESERVED:0`, an ask still pending when the run ended. `dq` 0 and
+  53/53 on every seed of every arm but one. Layer 1 asked, layer 2 held, nothing was lost quietly.
+  (`RECFORCED:1`, which every record row carries, is the ordinary record-writing force, not the
+  re-force layer.)
+- **Thresholds fire where they are labelled.** The record trigger is 0.6 of the 167,952-token
+  input budget -- 100,771 -- and the record row's billed peaks read 98,490-102,024 on thirteen of
+  fifteen records (two at 109,938 and 113,524, the growth between the crossing and the call the
+  record was forced on). `RECFALLBACK` is **zero on all 75 records**; the 0.9 fallback gate
+  (151,157) was never approached. Pre-fix, luna tripped the same labelled trigger at 0.61-0.64 of
+  the billed ceiling and carried `RECFALLBACK` on the record row; the fix moved the label back onto
+  the number.
+- **The record row held 53/53 on 14 of 15 seeds.** The fifteenth (fold `-s3`) ended 52/53 at
+  `acc1` 98% with no flag at all -- a fact the record's own text dropped, not a group the strategy
+  shed. The historical losses (21/53, 44/53 twice, 37/53) did not recur.
+
+**What it does not resolve.** The three modes' cost ranking; the fold mode's value on any cell
+(zero folds here, and a cell with more crossings or longer summaries is where its threshold could
+repay, which this run did not reach); whether the record row is cheaper than the control (-1% /
+-6% / -7% on seed$ against spreads of 32% / 6% / 17% -- the boundary arm's -6% is the closest and
+still inside its own spread); and the standalone user row remains dearer than the control on every
+arm (+21% to +30%). `truncation` is bimodal as ever -- per-seed facts 37/37/37/30/37,
+37/37/37/37/26 and 37/26/21/29/37 -- and sits below the correctness bar in all three arms.
+
 Run 48 is the three `--user-summary-mode` arms -- `recompact`, `boundary` and `fold` -- on the same
 cell as run 47 (170,000 tokens, 0.9 fill, scaled payload, `gpt-5.6-luna`), five seeds an arm, one
 invocation per seed and mode, 65 records: `none`, `truncation`, `user_summary_anchored` and

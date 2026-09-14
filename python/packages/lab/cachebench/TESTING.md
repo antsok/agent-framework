@@ -280,6 +280,14 @@ alone already refuses a one-summary fold at any share above zero. Each got a tes
 where the removed rule is load-bearing -- a head turn another strategy preserved, and a share of
 zero -- and the ten are now all caught.
 
+The reasoning-stamp round (13 September) was mutation-tested the same way: the stamp removed from
+`_live.py`, the test red, the stamp restored. That test
+(`test_the_harness_store_keeps_the_reasoning_stamp_the_replay_is_charged_for`) is the load-bearing
+one for every post-fix live count on a reasoning model, and its fixture asserts its own premise
+twice over -- the stored content must carry the stamp, and the second call's charge must equal the
+stamped history to the token while sitting strictly between the stripped (stamp-less) count and
+the raw base64 count, so no single wrong number can satisfy it by coincidence.
+
 Two other tests assert their own premise the same way — `test_the_recorded_cells_on_disk_still_read`
 asserts the glob was non-empty, and `test_the_strategies_never_import_the_lab` asserts modules
 were found — because "found nothing, therefore passed" is the commonest way a suite quietly stops

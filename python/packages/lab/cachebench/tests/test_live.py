@@ -11,10 +11,12 @@ between those layers, and a hand-rolled mock that skipped them would answer none
 
 from __future__ import annotations
 
+import base64
 import contextlib
 import json
 import re
 from collections.abc import Mapping, Sequence
+from copy import deepcopy
 from dataclasses import fields, replace
 from inspect import signature
 from pathlib import Path
@@ -42,7 +44,7 @@ from agent_framework import (
     TruncationStrategy,
     UsageDetails,
 )
-from agent_framework._compaction import EXCLUDED_KEY, included_token_count
+from agent_framework._compaction import EXCLUDED_KEY, _serialize_message, included_token_count
 from agent_framework_lab_cachebench import (
     AGENT_KINDS,
     FillPlan,
@@ -129,6 +131,7 @@ from agent_framework_lab_cachebench._records import (
     read_seed_records,
 )
 from agent_framework_lab_cachebench._strategies import needs_summarizer
+from agent_framework_lab_cachebench._tokenizers import REASONING_TOKENS_KEY, build_tokenizer
 from agent_framework_lab_cachebench.compaction import (
     DEFAULT_RECORD_MAX_TOKENS,
     DEFAULT_RECORD_TARGET_TOKENS,
@@ -276,7 +279,7 @@ class StubChatClient(FunctionInvocationLayer[Any], ChatMiddlewareLayer[Any], Bas
                     )
                 ]
             else:
-                contents = [f"{self.reply} #{stamp}"]
+                contents = self._reply_contents(stamp)
             return ChatResponse(
                 messages=Message(role="assistant", contents=contents),
                 usage_details=self.usage,
@@ -284,6 +287,10 @@ class StubChatClient(FunctionInvocationLayer[Any], ChatMiddlewareLayer[Any], Bas
             )
 
         return _go()
+
+    def _reply_contents(self, stamp: str) -> list[Any]:
+        """Return the contents of a text answer, so a subclass can answer as a reasoning model."""
+        return [f"{self.reply} #{stamp}"]
 
     def _stamp(self, index: int, messages: Sequence[Message]) -> str:
         """Return what makes this call's output distinguishable from every other call's.
@@ -1528,6 +1535,127 @@ async def test_the_user_band_strategy_compacts_the_stored_conversation_once_per_
     body = (first.text or "").removeprefix(USER_SUMMARY_MARKER).strip()
     assert body in recorder.calls[crossing].prompt_text, "the crossing call carried the summary the store now holds"
     assert body in recorder.calls[crossing + 1].prompt_text, "and so did the next one, so its prefix survived"
+
+
+class _ReasoningStubChatClient(StubChatClient):
+    """Answer the way a reasoning model does: an encrypted reasoning content, then visible text.
+
+    The payload is the same base64 on every call, because what varies between the calls is not
+    the payload but whether the stamp recorded for it survived the store; identical bytes make
+    the second call's history a strict superset of the first's. The content id carries the call
+    index so the two replies stay distinguishable where the history provider checks for that.
+    """
+
+    def __init__(self, *, payload: str, **kwargs: Any) -> None:
+        """Create the stub.
+
+        Keyword Args:
+            payload: The encrypted reasoning payload every reply carries.
+            kwargs: Passed through to :class:`StubChatClient`, which is where the usage
+                carrying ``reasoning_output_token_count`` is set.
+        """
+        super().__init__(**kwargs)
+        self.payload = payload
+
+    def _reply_contents(self, stamp: str) -> list[Any]:
+        return [
+            Content.from_text_reasoning(id=f"rs_{stamp}", text="", protected_data=self.payload),
+            f"{self.reply} #{stamp}",
+        ]
+
+
+class _ChargingProbe:
+    """A compaction strategy that never compacts, and records what the counter charged.
+
+    It runs in both phases the harness wires a strategy into: inside the model call, on the
+    history the provider loaded from the store -- which is the replayed prompt, the thing a
+    live run's thresholds read -- and after the turn, on what the store holds. Each pass is
+    recorded as its message count and its ``included_token_count``, computed after the
+    framework has annotated the messages with the wrapped tokenizer, so the number is the one
+    the strategy itself would act on.
+    """
+
+    def __init__(self, tokenizer: Any) -> None:
+        self.tokenizer = tokenizer
+        self.sizes: list[int] = []
+        self.charges: list[int] = []
+
+    async def __call__(self, messages: list[Message]) -> bool:
+        self.sizes.append(len(messages))
+        self.charges.append(included_token_count(messages))
+        return False
+
+
+async def test_the_harness_store_keeps_the_reasoning_stamp_the_replay_is_charged_for() -> None:
+    """The stamp has to cross the harness's store round trip, or every live count is 19% low.
+
+    ``UsageRecorder`` stamps the response's reasoning token count on the ``Content`` carrying
+    the encrypted payload, after the call and from the outside of the pipeline -- and on the
+    harness path the history provider has already stored that response by the time the recorder
+    sees it. The stamp only reaches the message the next call replays if the store held the
+    same objects rather than copies of them, which is what this test drives end to end:
+    two turns against ``build_live_agent(kind="harness")`` and its real session, a stub that
+    answers as a reasoning model, and a probe strategy reading ``included_token_count`` on
+    exactly the history the second model call was about to send.
+
+    The second call's pass is the one handed three messages -- the first question, the stamped
+    reply and the second question -- and its charge is compared against all three numbers the
+    instrument could have produced: the stamped count (what the provider bills), the stripped
+    count without the stamp (zero for the payload, the ~19% under-count), and the unwrapped
+    count of the base64 as prompt text (the ~45% over-count the fix replaced). Only the first
+    is a measurement; the other two are what the label would have lied by.
+    """
+    payload = base64.b64encode(bytes(range(256)) * 8).decode()  # 2728 chars of base64
+    reasoning = 300
+    wrapped = build_tokenizer("estimator")
+    client = _ReasoningStubChatClient(
+        payload=payload,
+        usage=UsageDetails(input_token_count=1_234, output_token_count=50, reasoning_output_token_count=reasoning),
+    )
+    probe = _ChargingProbe(wrapped)
+    agent = build_live_agent(
+        ProviderRuntime(client=client, model="stub"),
+        kind="harness",
+        strategy=probe,
+        tokenizer=wrapped,
+        tools=[],
+        recorder=UsageRecorder(),
+        max_context_window_tokens=16_000,
+        max_output_tokens=2_048,
+    )
+    session = agent.create_session()
+    history = next(provider for provider in agent.context_providers if isinstance(provider, HistoryProvider))
+
+    def stored() -> list[Message]:
+        return list(session.state.get(history.source_id, {}).get("messages", []))
+
+    await agent.run("Turn 0: a question worth answering.", session=session)
+    await agent.run("Turn 1: another question.", session=session)
+
+    # The stamp is on the stored content, not only on the response it arrived on.
+    assistant = next(message for message in stored() if message.role == "assistant")
+    encrypted = next(content for content in assistant.contents if content.protected_data is not None)
+    assert encrypted.additional_properties[REASONING_TOKENS_KEY] == reasoning
+
+    assert probe.sizes.count(3) == 1, f"exactly one pass replays three messages, saw {probe.sizes}"
+    index = probe.sizes.index(3)
+    second_call = probe.charges[index]
+
+    def charge(messages: Sequence[Message], counter: Any) -> int:
+        """Return what ``counter`` charges for the messages, the way the framework counts them."""
+        return sum(counter.count_tokens(_serialize_message(message)) for message in messages)
+
+    unstamped = deepcopy(list(stored()[:3]))
+    for message in unstamped:
+        for content in message.contents:
+            content.additional_properties.pop(REASONING_TOKENS_KEY, None)
+
+    # Not zero: without the stamp the payload is stripped and never repaid, the under-count.
+    assert second_call == charge(unstamped, wrapped) + reasoning, "the payload is charged what it costs"
+    # Exactly the stamped history, byte for byte: no annotation or framing moved the number.
+    assert second_call == charge(stored()[:3], wrapped), "the replay is charged the history the store holds"
+    # Not the base64 rate: the unwrapped counter charges the encrypted payload as prompt text.
+    assert second_call < charge(stored()[:3], TOKENIZER), "the payload is not charged at its base64 length"
 
 
 def _composed_strategy(options: StrategyOptions) -> Any:
