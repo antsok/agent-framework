@@ -39,7 +39,7 @@ if TYPE_CHECKING:
 
     from agent_framework import TokenizerProtocol
 
-__all__ = ["ASSUMED_REPLY_TOKENS", "FillPlan", "plan_fill"]
+__all__ = ["ASSUMED_REPLY_TOKENS", "MAX_FILL_FRACTION", "FillPlan", "plan_fill"]
 
 ASSUMED_REPLY_TOKENS: Final[int] = 150
 """Tokens assumed for each reply the model writes during seeding.
@@ -49,6 +49,13 @@ The one term in the estimate that cannot be computed, because the replies are th
 40-turn seed it is about 6,000 tokens, so a reply that is half or double this moves the
 achieved fill by a few points -- which is exactly why :func:`plan_fill` records the target and
 the runner reports the deviation instead of assuming the target was hit.
+"""
+
+MAX_FILL_FRACTION: Final[float] = 2.0
+"""Largest share of the context limit a seeded conversation may be sized to.
+
+Above 1.0 on purpose: a cell whose control overflows the window is the one compaction exists
+for. See :func:`plan_fill` for what such a fill means and why it stops at 2.0.
 """
 
 _FUNCTION_CALL_TOKENS: Final[int] = 20
@@ -293,10 +300,20 @@ def plan_fill(
     Given a share, the per-result size is solved for first and the filler then fills whatever
     is left, exactly as before.
 
+    A ``fill_fraction`` above 1.0 sizes the uncompacted conversation larger than the window the
+    cell stands in for. That is the regime compaction exists for, and every cell measured below
+    it was one where not compacting simply worked: the control is expected to disqualify, and
+    the comparison becomes which compacting row keeps the run under the limit, and at what
+    cost. The target is still ``context_limit * fill_fraction``, so nothing in the solve changes.
+    The cap is 2.0 rather than none because the replies the solver cannot compute are the one
+    term that can land a fill short, and a cell twice the size of its window has cleared the
+    limit by far more than that; a larger fraction is a typo far more often than a design.
+
     Keyword Args:
         tokenizer: Token counter, the same one the strategies budget with.
         context_limit: The limit this cell stands in for.
-        fill_fraction: Share of that limit the seeded conversation should reach.
+        fill_fraction: Share of that limit the seeded conversation should reach, in
+            ``(0.0, 2.0]``. Above 1.0 the control is sized to overflow the limit on purpose.
         salt: Cell-unique string for the probe scenarios built while solving. Immaterial to
             the answer, since markers are fixed-width whatever the salt.
         tool_turns: Tool-call groups to plant.
@@ -327,8 +344,8 @@ def plan_fill(
             the target -- in which case this cell cannot be built at all and no amount of
             adjusting the filler will change that.
     """
-    if not 0.0 < fill_fraction <= 1.0:
-        raise ValueError(f"fill_fraction must be in (0.0, 1.0]; got {fill_fraction}.")
+    if not 0.0 < fill_fraction <= MAX_FILL_FRACTION:
+        raise ValueError(f"fill_fraction must be in (0.0, {MAX_FILL_FRACTION}]; got {fill_fraction}.")
     # A share of 1.0 is excluded rather than clamped: it asks for a conversation that is
     # nothing but tool results, which cannot be built because the calls that produce them are
     # not tool results themselves.

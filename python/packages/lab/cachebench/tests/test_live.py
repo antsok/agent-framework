@@ -4556,6 +4556,70 @@ async def test_the_split_holds_when_every_row_clears_and_when_none_does() -> Non
     assert "Ranking: 0 of 3 rows kept at least 90%" in nothing
 
 
+def _column(table: str, name: str, width: int, row: str) -> str:
+    """Return one right-aligned cell of the table, by the header it sits under."""
+    lines = table.splitlines()
+    header = next(line for line in lines if line.startswith("strategy"))
+    end = header.rindex(name) + len(name)
+    line = next(line for line in lines if line.startswith(f"{row} "))
+    return line[end - width : end].strip()
+
+
+async def test_a_control_over_the_limit_is_a_reference_and_not_a_baseline(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    """The cell compaction exists for: the uncompacted control did not fit.
+
+    Rendered before this, a control over the limit was named in the exclusions and flagged DQ,
+    and then printed at the top of the ranked rows, priced every other row in vs none$, and was
+    still the reason the verdict could not be taken -- the table contradicting its own legend.
+    Its money is a run no model of this size could have made, so it prices nothing; its acc1 is
+    the only reading of what the whole conversation held, so it still sets the bar, and the
+    line above the table says what that reading was taken on.
+
+    The row that keeps the answer here costs more than the control did, which is the case the
+    ordinary verdict answers with "leave it off" -- an answer that does not exist at this size.
+    """
+    outcome, scenario = await _probed(
+        StubChatClient(usage=UsageDetails(input_token_count=1_000, output_token_count=20)), repeats=1
+    )
+    record = _record(outcome, scenario)
+    over = replace(record, strategy="none", cost=0.05, correctness_samples=(1.0,), disqualified=True)
+    kept = replace(record, strategy="kept_it", cost=0.08, correctness_samples=(0.95,))
+    lossy = replace(record, strategy="threw_it_away", cost=0.01, correctness_samples=(0.2,))
+
+    printed = await _rebuilt(capsys, _written(tmp_path / "over.jsonl", [over, kept, lossy]))
+    table = printed[printed.index("Ranking:") :]
+    body = _body(table)
+
+    assert "exceeded the 60,000-token limit this run stands in for): none" in printed
+    # Ranked rows first, then the control apart from them and below them.
+    assert [line.split()[0] for line in body if line[0].isalpha()] == ["kept_it", "threw_it_away", "none"]
+    assert body[-2].startswith("=") and "reference, not ranked" in body[-2]
+    assert body[-1].startswith("none ") and "DQ" in body[-1]
+    # No row is priced against a run that could not happen...
+    assert _column(table, "vs none$", 10, "kept_it") == "?"
+    assert _column(table, "vs none$", 10, "threw_it_away") == "?"
+    assert "or the control exceeded the tried limit (DQ)" in table
+    # ...while accuracy is still judged against it, and the ranking line says on what.
+    assert _column(table, "vs none", 9, "kept_it") == "95%"
+    assert "Ranking: 1 of 2 rows kept at least 90% of the control's acc1" in table
+    assert "measured on a prompt no model of this size would accept" in table.splitlines()[0]
+
+    verdict = [line for line in printed.splitlines() if line.startswith(("VERDICT", "NO VERDICT"))]
+    assert verdict == ["VERDICT: kept_it"], "the cheapest row that kept the answer, dearer than the control or not"
+    assert "none" not in verdict[0]
+
+    # And when nothing under the limit kept the answer, the verdict still prints and says so.
+    dropped = replace(kept, correctness_samples=(0.5,))
+    printed = await _rebuilt(capsys, _written(tmp_path / "nothing.jsonl", [over, dropped, lossy]))
+    verdict = [line for line in printed.splitlines() if line.startswith(("VERDICT", "NO VERDICT"))]
+
+    assert verdict == ["VERDICT: no row qualifies"]
+    assert "none" not in verdict[0]
+    assert "No row that stayed under the limit kept 90% of the control's accuracy" in printed
+
+
 async def test_the_two_spreads_are_reported_apart() -> None:
     """Between-seed and within-seed disagreement must not arrive as one number.
 
@@ -4933,6 +4997,23 @@ def _shared_plan(**overrides: Any) -> FillPlan:
         "tool_share": 0.6,
     }
     return FillPlan(**{**defaults, **overrides})
+
+
+def test_a_fill_past_the_window_says_when_the_control_still_fit() -> None:
+    """A cell sized to overflow is only that cell if the control actually overflowed.
+
+    Within the fill tolerance is not enough: 1.04 of the window landing 5% short is on target
+    by the ordinary check and is still a control that fit, which is the regime the cell was
+    sized to leave.
+    """
+    past = _shared_plan(fill_fraction=1.15, target_tokens=138_000, predicted_tokens=138_000)
+    fit = _fill_note(_control_cell(119_000), past, "none")
+    overflowed = _control_cell(138_000)
+    overflowed["none"] = replace(overflowed["none"], disqualified=1.0)
+
+    assert any("FILL PAST WINDOW NOT REACHED" in line and "0 of 1 seeds" in line for line in fit)
+    assert not any("FILL PAST WINDOW" in line for line in _fill_note(overflowed, past, "none"))
+    assert not any("FILL PAST WINDOW" in line for line in _fill_note(_control_cell(100_000), _shared_plan(), "none"))
 
 
 def test_the_achieved_tool_share_is_reported_beside_the_achieved_fill() -> None:
@@ -6672,9 +6753,9 @@ async def test_a_rebuilt_verdict_applies_the_bar_the_run_applied(
     capsys.readouterr()
     seen: list[float] = []
 
-    def capturing(outcomes: Any, *, min_correctness: float) -> Any:
+    def capturing(outcomes: Any, *, min_correctness: float, baseline_admissible: bool = True) -> Any:
         seen.append(min_correctness)
-        return recommend(outcomes, min_correctness=min_correctness)
+        return recommend(outcomes, min_correctness=min_correctness, baseline_admissible=baseline_admissible)
 
     monkeypatch.setattr("agent_framework_lab_cachebench._live_cli.recommend", capturing)
     await run_live_comparison(build_parser().parse_args(["--from-jsonl", str(path)]))
