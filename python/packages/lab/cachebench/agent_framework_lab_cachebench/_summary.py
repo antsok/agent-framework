@@ -73,12 +73,19 @@ class JointOutcome:
 class JointVerdict:
     """The recommendation across both axes."""
 
-    recommended: str
+    recommended: str | None
+    """The strategy to use, or None when the control was inadmissible and no row qualified.
+
+    Never the control's name when :attr:`baseline_admissible` is False: not compacting is then
+    not an option the model allows, so recommending it would recommend the one row that failed.
+    """
     baseline: JointOutcome
     chosen: JointOutcome
     outcomes: tuple[JointOutcome, ...]
     min_correctness: float
     rationale: str
+    baseline_admissible: bool = True
+    """Whether the control is itself an option, rather than only the accuracy it anchors."""
 
     @property
     def saving_fraction(self) -> float:
@@ -114,6 +121,7 @@ def recommend(
     *,
     baseline: str = "none",
     min_correctness: float = DEFAULT_MIN_CORRECTNESS,
+    baseline_admissible: bool = True,
 ) -> JointVerdict:
     """Recommend the cheapest strategy that keeps the answer intact.
 
@@ -129,6 +137,11 @@ def recommend(
         baseline: The uncompacted control strategy.
         min_correctness: Fraction of the control's correctness a strategy must retain to
             be eligible.
+        baseline_admissible: False when the control overflowed the window it stands in for.
+            It then still anchors the correctness bar -- it is the only measurement of what
+            the whole conversation held -- but it is no longer an option or a price: the
+            verdict is the cheapest eligible strategy whatever the control cost, and None when
+            nothing is eligible. See :func:`_recommend_without_baseline`.
 
     Returns:
         The verdict.
@@ -143,6 +156,8 @@ def recommend(
         raise ValueError(f"Baseline strategy {baseline!r} is missing; measured: {sorted(by_name)}")
 
     base = by_name[baseline]
+    if not baseline_admissible:
+        return _recommend_without_baseline(outcomes, base, min_correctness)
     if base.correctness < MEANINGFUL_BASELINE:
         return JointVerdict(
             recommended=baseline,
@@ -195,4 +210,76 @@ def recommend(
         outcomes=tuple(sorted(outcomes, key=lambda outcome: outcome.cost)),
         min_correctness=min_correctness,
         rationale=rationale,
+    )
+
+
+def _recommend_without_baseline(
+    outcomes: list[JointOutcome], base: JointOutcome, min_correctness: float
+) -> JointVerdict:
+    """Recommend when the control overflowed the window and so is not an option.
+
+    The regime compaction exists for. Not compacting is not a choice a model of this size
+    allows, so there is nothing to save against and no "leave it off" to fall back to: the
+    answer is the cheapest strategy that kept enough of what the conversation held, or nothing.
+
+    The bar stays anchored on the control's correctness, deliberately. It is the only reading of
+    what the whole conversation contained; re-basing it on the best compacting row would judge
+    every row against one that may itself have lost facts, and would make the bar move with
+    whichever strategies happened to be measured.
+
+    Args:
+        outcomes: The admissible strategies, and the control.
+        base: The control.
+        min_correctness: Fraction of the control's correctness a strategy must retain.
+
+    Returns:
+        The verdict, recommending None when no strategy qualifies.
+    """
+    others = [outcome for outcome in outcomes if outcome.strategy != base.strategy]
+    ordered = tuple(sorted(outcomes, key=lambda outcome: outcome.cost))
+    overflow = (
+        f"The uncompacted control {base.strategy!r} exceeded the context limit, so not compacting is not "
+        "an option at this size and no row is priced against it. "
+    )
+
+    def nothing(reason: str) -> JointVerdict:
+        return JointVerdict(
+            recommended=None,
+            baseline=base,
+            chosen=base,
+            outcomes=ordered,
+            min_correctness=min_correctness,
+            rationale=overflow + reason,
+            baseline_admissible=False,
+        )
+
+    if not others:
+        return nothing("No compacting row stayed under the limit either, so nothing can be recommended.")
+    if base.correctness < MEANINGFUL_BASELINE:
+        return nothing(
+            f"Its accuracy, {base.correctness:.0%}, is too low to judge what any row kept, so nothing "
+            "can be recommended. Fix the workload or the model before reading this cell."
+        )
+    eligible = [outcome for outcome in others if relative_correctness(outcome, base) >= min_correctness]
+    if not eligible:
+        closest = max(others, key=lambda outcome: outcome.correctness)
+        return nothing(
+            f"No row that stayed under the limit kept {min_correctness:.0%} of the control's accuracy, so "
+            f"nothing can be recommended. The closest, {closest.strategy!r}, answered at "
+            f"{relative_correctness(closest, base):.0%} of it."
+        )
+    chosen = min(eligible, key=lambda outcome: outcome.cost)
+    return JointVerdict(
+        recommended=chosen.strategy,
+        baseline=base,
+        chosen=chosen,
+        outcomes=ordered,
+        min_correctness=min_correctness,
+        rationale=(
+            overflow + f"{chosen.strategy!r} is the cheapest row that stayed under it while answering at "
+            f"{relative_correctness(chosen, base):.0%} of the control's accuracy, measured on a prompt no "
+            f"model of this size would accept. {len(eligible)} of {len(others)} rows under the limit "
+            "cleared the bar."
+        ),
+        baseline_admissible=False,
     )

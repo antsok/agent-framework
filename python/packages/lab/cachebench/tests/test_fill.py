@@ -189,10 +189,25 @@ def test_the_plan_leaves_room_for_every_tool_group_it_planted() -> None:
     assert len(scenario.tool_lookups) == 16
 
 
-def test_an_impossible_fill_fraction_is_refused() -> None:
-    """A fraction outside (0, 1] describes no cell, and would silently size to nonsense."""
+@pytest.mark.parametrize("fill", [0.0, -0.5, 2.5])
+def test_an_impossible_fill_fraction_is_refused(fill: float) -> None:
+    """A fraction outside (0, 2] describes no cell, and would silently size to nonsense."""
     with pytest.raises(ValueError, match="fill_fraction"):
-        _plan(1.5)
+        _plan(fill)
+
+
+def test_a_fill_past_the_window_sizes_the_control_to_overflow_it() -> None:
+    """Above 1.0 is the cell compaction exists for, and the solve does not change for it.
+
+    The cap at 1.0 had no stated reason and made the one regime every archived verdict was
+    missing unreachable: at a capped 1.0 a luna control, whose replies run shorter than assumed,
+    seeded around 113,000 tokens against a 120,000 limit and never disqualified.
+    """
+    plan = _plan(1.15)
+
+    assert plan.target_tokens == round(40_000 * 1.15)
+    assert plan.predicted_tokens > plan.context_limit
+    assert abs(plan.deviation) <= FILL_TOLERANCE
 
 
 @pytest.mark.parametrize("context_limit", [40_000, 120_000, 272_000])

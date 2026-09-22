@@ -191,8 +191,11 @@ def build_parser() -> argparse.ArgumentParser:
             "an uncompacted run. Solved analytically from the payload and filler sizes, so the "
             "user-side turn list is identical across strategies without having to run one "
             "first. The filler is the dial and the payload is held fixed, which is what makes "
-            "this 'how much irrelevant context surrounds a fixed set of facts'. Pass 0 to size "
-            "manually from --filler-turns and --filler-tokens instead. Default %(default)s."
+            "this 'how much irrelevant context surrounds a fixed set of facts'. Up to 2.0: above "
+            "1.0 the uncompacted conversation is sized past the window on purpose, so the control "
+            "is expected to disqualify and the cell asks which compacting row keeps the run under "
+            "the limit, and at what cost. Pass 0 to size manually from --filler-turns and "
+            "--filler-tokens instead. Default %(default)s."
         ),
     )
     parser.add_argument(
@@ -1349,6 +1352,45 @@ def _excluded_cells(cells: Sequence[CellStats], control: str = "none") -> tuple[
     return incomplete, oversized, diverged
 
 
+def _verdict_outcomes(
+    cells: Sequence[CellStats],
+    incomplete: set[str],
+    oversized: set[str],
+    diverged: set[str],
+    *,
+    split: bool,
+    control: str = "none",
+) -> tuple[list[JointOutcome], bool]:
+    """Return the rows the verdict is taken over, and whether the control is one of the options.
+
+    Every row out of the ranking is out of the verdict, with one exception: a control that
+    overflowed the limit but otherwise ran the strategies' whole conversation. It is no longer
+    an option -- a model of this size would have refused it -- but its accuracy is still the only
+    reading of what that conversation held, so it goes to the verdict as the anchor of the
+    retention bar and nothing else. A control that did not finish, or that ran a different
+    conversation, anchors nothing and stays out.
+
+    Args:
+        cells: Every aggregated cell.
+        incomplete: What :func:`_excluded_cells` found did not finish.
+        oversized: What it found overran the tried limit.
+        diverged: The control, when its conversation diverged.
+
+    Keyword Args:
+        split: What :func:`_split_measured` said about the cell.
+        control: Name of the uncompacted baseline.
+
+    Returns:
+        The outcomes to hand :func:`recommend`, and its ``baseline_admissible``.
+    """
+    excluded = incomplete | oversized | diverged
+    ranked = [_to_joint(cell, split=split) for cell in cells if cell.strategy not in excluded]
+    if control in oversized and control not in incomplete | diverged:
+        ranked += [_to_joint(cell, split=split) for cell in cells if cell.strategy == control]
+        return ranked, False
+    return ranked, True
+
+
 def _split_measured(cells: Sequence[CellStats]) -> bool:
     """Return whether this cell can say what its probing cost, and so be ranked on its workload.
 
@@ -1508,6 +1550,17 @@ def _fill_note(stats: dict[str, CellStats], plan: FillPlan | None, control: str)
             "the others. The replies are the one term the sizing cannot compute; adjust "
             "--filler-tokens or re-solve against a measured reply size."
         )
+    # A fill past the window is sized so that the control overflows it, and every other reading
+    # of this cell depends on that having happened on every seed: a seed that stayed under the
+    # limit is an ordinary cell's control mixed into one that is not.
+    if plan.target_tokens > plan.context_limit and stats[control].disqualified < 1.0:
+        overflowed = round(stats[control].disqualified * len(stats[control].records))
+        lines.append(
+            f"FILL PAST WINDOW NOT REACHED: this cell was sized to overflow the {plan.context_limit:,}-token "
+            f"limit, and the control exceeded it on {overflowed} of {len(stats[control].records)} seeds. "
+            "The seeds that fit ran the regime the cell was sized to leave, so it is not the cell it is "
+            "labelled with; raise --fill or re-solve against a measured reply size."
+        )
     if plan.tool_share <= 0:
         return lines
     achieved_share = plan.tool_payload_tokens / achieved
@@ -1658,6 +1711,48 @@ def _reconnect_note(cells: Sequence[CellStats]) -> list[str]:
     ]
 
 
+def _runner_up_note(verdict: JointVerdict, spread: dict[str, float]) -> list[str]:
+    """Return the noise warning for a verdict whose control overflowed the limit.
+
+    With no affordable control there is no saving to test, so the margin a recommendation rests
+    on is the one to the next cheapest row that also cleared the bar -- the alternative a reader
+    would actually pick instead. The same guard the cross-cell ranking applies.
+
+    Args:
+        verdict: The recommendation, taken with an inadmissible baseline.
+        spread: Seed spread on the ranked cost, per strategy.
+
+    Returns:
+        Zero or two lines.
+    """
+    chosen, base = verdict.chosen, verdict.baseline
+    if verdict.recommended is None:
+        return []
+    runner_up = next(
+        (
+            outcome
+            for outcome in verdict.outcomes
+            if outcome.strategy not in {chosen.strategy, base.strategy}
+            and relative_correctness(outcome, base) >= verdict.min_correctness
+        ),
+        None,
+    )
+    if runner_up is None or runner_up.cost <= 0:
+        return []
+    margin = (runner_up.cost - chosen.cost) / runner_up.cost
+    worst = max(spread.get(chosen.strategy, 0.0), spread.get(runner_up.strategy, 0.0))
+    if worst <= margin:
+        return []
+    return [
+        "",
+        (
+            f"NOT SUPPORTED: repeats of one strategy varied by {worst:.0%}, wider than the {margin:.0%} "
+            f"gap between {chosen.strategy!r} and the next cheapest row that cleared the bar, "
+            f"{runner_up.strategy!r}. Treat the choice between them as unresolved."
+        ),
+    ]
+
+
 def _stability_note(verdict: JointVerdict, spread: dict[str, float], repeats: int) -> list[str]:
     """Return a warning when the recommendation's margin is inside the measured noise.
 
@@ -1668,6 +1763,8 @@ def _stability_note(verdict: JointVerdict, spread: dict[str, float], repeats: in
     """
     if repeats < 2:
         return ["", "Single seed: nothing here measures compaction's own reliability. Re-run with --repeats 3."]
+    if not verdict.baseline_admissible:
+        return _runner_up_note(verdict, spread)
     chosen, base = verdict.chosen, verdict.baseline
     if chosen.strategy == base.strategy or base.cost <= 0:
         return []
@@ -1869,6 +1966,11 @@ def _row(
     ranked, control_ranked = stats.seeding_cost, None if control is None else control.seeding_cost
     if control is None or stats.strategy == control.strategy or message_gap is not None:
         cost_delta = "-" if message_gap is None else "?"
+    elif control.disqualified > 0:
+        # A control over the limit is a conversation no model of this size would have run, so
+        # not compacting is not an option and there is no affordable baseline to price against.
+        # Its accuracy still anchors ``vs none``; its money anchors nothing.
+        cost_delta = "?"
     elif ranked is None or control_ranked is None:
         # One of the two rows cannot say what its probing cost, so the only comparison
         # available is between two invoices, and that is the comparison being withdrawn.
@@ -1987,7 +2089,10 @@ _LEGEND: Final[tuple[str, ...]] = (
     "vs none$  = seed$ against the uncompacted control's seed$: what compaction moved on the",
     "            workload. '?' means the comparison is unavailable -- either a row could not",
     "            separate its probing from its seeding (NOSPLIT), or the control did not run",
-    "            the strategies' conversation (MSGS) and there is nothing to compare against",
+    "            the strategies' conversation (MSGS) and there is nothing to compare against,",
+    "            or the control exceeded the tried limit (DQ). Then not compacting is not an",
+    "            option a model of this size allows, so there is no affordable baseline and",
+    "            every row reads '?': a saving against a run that could not happen is not one",
     "'?'       = in any money or cache column, the records behind this row never measured",
     "            that quantity. Records written before schema 4 counted their calls in one",
     "            total, and no arithmetic over what they stored can separate the phases --",
@@ -2013,7 +2118,9 @@ _LEGEND: Final[tuple[str, ...]] = (
     "            checks passed across every probe repeat of every seed, each reply scored only",
     "            against the values its own question asked for. A star marks the uncompacted",
     "            control, which is ordered by the same rule as every other row and can",
-    "            therefore land below the line",
+    "            therefore land below the line -- unless it exceeded the tried limit, when it",
+    "            is not ranked at all and is printed apart, under the ranked rows, as a",
+    "            reference for what the whole conversation cost and retained",
     "seed+-    = points between the least and most correct seed, on acc1. Different",
     "            conversations, so this is compaction's own reliability: whether it cleared a",
     "            retention boundary this time and not last time",
@@ -2034,11 +2141,15 @@ _LEGEND: Final[tuple[str, ...]] = (
     "            is the only within-seed variance the cell measures",
     "vs none   = acc1 against the uncompacted control's acc1, which is also what the ranking",
     "            and the verdict are judged on. Read it together with vs none$ on the left or",
-    "            not at all -- cheaper and less correct is not a saving",
+    "            not at all -- cheaper and less correct is not a saving. Still computed when",
+    "            the control exceeded the tried limit: its acc1 is the only reading of what the",
+    "            whole conversation held, so the bar stays anchored on it, though it was",
+    "            measured on a prompt no model of this size would accept",
     "dq        = share of this cell's seeds that sent a prompt larger than the tried limit.",
     "            The limit is simulated, so it is enforced here or not at all. A cell that",
     "            disqualifies at all is excluded from the ranking rather than starred: a row",
-    "            a model that size would have refused is not a baseline for anything",
+    "            a model that size would have refused is not an option and not a price for",
+    "            anything. A disqualified control keeps one role, the acc1 anchor above",
     "flags     = DQ the dq column above is not zero, so this row sent a prompt a model of",
     "            this size would have refused. EXCL out of the ranking for the other reason:",
     "            it did not finish its turns. The two used to share the name DQ, which is how",
@@ -2255,7 +2366,15 @@ def _table_order(
     return ordered, len(cleared)
 
 
-def _ranking_note(cleared: int, total: int, control: CellStats | None, min_correctness: float, *, split: bool) -> str:
+def _ranking_note(
+    cleared: int,
+    total: int,
+    control: CellStats | None,
+    min_correctness: float,
+    *,
+    split: bool,
+    overflowed_limit: int | None = None,
+) -> str:
     """Return the line that says what the table's order means.
 
     Printed whether or not the split line appears below it: a cell where every row clears the
@@ -2272,11 +2391,21 @@ def _ranking_note(cleared: int, total: int, control: CellStats | None, min_corre
         split: What :func:`_split_measured` said about this cell. Named in the line rather
             than left to the legend, because the two orders are different rankings and a
             reader comparing this table with another has to know which one they have.
+        overflowed_limit: The limit the control exceeded, when it did. The bar is still its
+            acc1, and the line says what that acc1 was measured on rather than re-basing it.
 
     Returns:
         One line.
     """
     basis = "seed$" if split else "run$, probes and all"
+    if control is not None and overflowed_limit is not None:
+        return (
+            f"Ranking: {cleared} of {total} rows kept at least {min_correctness:.0%} of the control's "
+            f"acc1 and are ranked first, cheapest {basis} first; the rest follow below the line. The "
+            f"control exceeded the {overflowed_limit:,}-token limit, so it is not ranked and is printed "
+            "apart as a reference; the bar stays on its acc1, the only reading of what the whole "
+            "conversation held, which was measured on a prompt no model of this size would accept."
+        )
     if control is None:
         return (
             f"Ranking: {basis} ascending. These records hold no uncompacted control, so no row "
@@ -2321,9 +2450,17 @@ def _render(
         The rendered table.
     """
     baseline = next((cell for cell in cells if cell.strategy == control), None)
-    ordered, cleared = _table_order(cells, baseline, min_correctness)
-    split = _split_measured(cells)
     message_gap = _control_message_gap(cells, control)
+    # A control over the limit is out of the ranking like any disqualified row, but it is not
+    # printed among the ranked rows: at the top of them it read as the row to beat. It is set
+    # apart as a reference instead -- what the conversation cost and kept with nothing removed
+    # -- while its acc1 still sets the bar. One that also diverged stays where it was, because
+    # the divergence already withdraws everything it anchors.
+    reference = baseline if baseline is not None and baseline.disqualified > 0 and message_gap is None else None
+    ranked_rows, cleared = _table_order([cell for cell in cells if cell is not reference], baseline, min_correctness)
+    # Every block under the table still reads the control, at the end where it is printed.
+    ordered = [*ranked_rows, *([reference] if reference is not None else [])]
+    split = _split_measured(cells)
     cell_params = cells[0].records[0].cell
     pricing = cell_params.pricing
     header = (
@@ -2344,17 +2481,30 @@ def _render(
             f"Pricing: ${pricing.input_per_million:.2f}/M in, "
             f"${pricing.cached_read_per_million:.3f}/M cached, ${pricing.output_per_million:.2f}/M out"
         ),
-        _ranking_note(cleared, len(ordered), baseline, min_correctness, split=split),
+        _ranking_note(
+            cleared,
+            len(ranked_rows),
+            baseline,
+            min_correctness,
+            split=split,
+            overflowed_limit=None if reference is None else cell_params.context_window,
+        ),
         "",
         header,
         "-" * len(header),
     ]
-    for index, cell in enumerate(ordered):
+    for index, cell in enumerate(ranked_rows):
         if index == cleared:
             lines.append(f" below {min_correctness:.0%} of the control's acc1 ".center(len(header), "-"))
         lines.append(
             _row(cell, baseline, cell.strategy in excluded, cell_params.context_window, message_gap=message_gap)
         )
+    if reference is not None:
+        rule = f" reference, not ranked: the control, over the {cell_params.context_window:,}-token limit "
+        lines += [
+            rule.center(len(header), "="),
+            _row(reference, baseline, True, cell_params.context_window, message_gap=message_gap),
+        ]
     lines += ["", *_LEGEND, "", "per-sample acc1, one group per seed:"]
     for cell in ordered:
         lines.append(f"  {cell.strategy:<28}{_sample_groups(cell.samples)}")
@@ -2414,7 +2564,7 @@ def _render(
     else:
         lines += [
             "",
-            f"VERDICT: {verdict.recommended}",
+            f"VERDICT: {'no row qualifies' if verdict.recommended is None else verdict.recommended}",
             verdict.rationale,
             *_stability_note(
                 verdict,
@@ -3307,7 +3457,7 @@ def _render_from_records(args: argparse.Namespace) -> int:
         for line in _exclusion_notes(incomplete, oversized, diverged, cell_params.context_window):
             print(line)
         split = _split_measured(cells)
-        ranked = [_to_joint(cell, split=split) for cell in cells if cell.strategy not in excluded]
+        ranked, admissible = _verdict_outcomes(cells, incomplete, oversized, diverged, split=split)
         # The bar the run set, unless this invocation names one: a rebuilt verdict that
         # silently applied a different threshold would rank rows the original never ranked,
         # while every column above it stayed identical.
@@ -3315,7 +3465,7 @@ def _render_from_records(args: argparse.Namespace) -> int:
         verdict: JointVerdict | None = None
         if any(outcome.strategy == "none" for outcome in ranked):
             try:
-                verdict = recommend(ranked, min_correctness=bar)
+                verdict = recommend(ranked, min_correctness=bar, baseline_admissible=admissible)
             except ValueError as error:
                 print(f"Cannot summarize: {error}")
         print(_render(verdict, cells, excluded, show_answers=args.show_answers, min_correctness=bar))
@@ -3366,7 +3516,20 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
     # reproducible: at 60,000 and 0.86 the seeded prompt aims at 51,600 tokens and a 12,000
     # answer does not fit beside it.
     answer_headroom = args.context_window - args.answer_max_tokens
-    if plan is not None and plan.target_tokens > answer_headroom:
+    if plan is not None and plan.target_tokens > args.context_window:
+        # Past the window on purpose, so "lower --fill" would undo the cell. The control cannot
+        # answer from its snapshot in any model this size and is out of the verdict anyway; the
+        # rows that are judged compact to their own ceiling, which is where the reservation bites.
+        print(
+            f"NOTE: this cell is sized to {plan.target_tokens:,} tokens, past the "
+            f"{args.context_window:,}-token window, so the uncompacted control is expected to "
+            "disqualify. Its accuracy is still measured and still anchors the retention bar. "
+            f"--answer-max-tokens {args.answer_max_tokens:,} reserves the window down to "
+            f"{answer_headroom:,} on the closing calls, which the compacting rows' snapshots have "
+            "to sit under to be answerable in a model of this size.",
+            flush=True,
+        )
+    elif plan is not None and plan.target_tokens > answer_headroom:
         print(
             f"WARNING: --answer-max-tokens {args.answer_max_tokens:,} reserves the window down to "
             f"{answer_headroom:,} tokens on the closing calls, and this cell is sized to reach "
@@ -3673,7 +3836,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
     for line in _exclusion_notes(incomplete, oversized, diverged, args.context_window):
         print(line)
     split = _split_measured(cells)
-    ranked = [_to_joint(cell, split=split) for cell in cells if cell.strategy not in excluded]
+    ranked, admissible = _verdict_outcomes(cells, incomplete, oversized, diverged, split=split)
 
     verdict: JointVerdict | None = None
     if diverged:
@@ -3687,16 +3850,23 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
             "for, so this cell has no ranking. See CONTROL DIVERGED below."
         )
     elif not any(outcome.strategy == "none" for outcome in ranked):
-        reason = "exceeded the tried limit" if "none" in oversized else "did not finish"
+        # Only a control that did not finish reaches this. One that overflowed the limit and
+        # finished is the cell compaction exists for, and anchors the verdict below; one that
+        # overflowed and did *not* finish was most likely refused by the model's real window,
+        # which is a fill past what the model accepts rather than past what the cell stands in for.
+        advice = (
+            "It also exceeded the tried limit, so the model most likely refused the prompt itself: "
+            "lower --fill to a size the model accepts, even if that is past --context-window."
+            if "none" in oversized
+            else "Re-run the cell."
+        )
         raise SystemExit(
-            f"The uncompacted control {reason}, so there is no admissible baseline at "
-            f"{args.context_window:,} tokens and nothing can be compared against it. That is itself "
-            "the finding for this cell: lower --fill, or raise --context-window to a size the "
-            "conversation fits in."
+            f"The uncompacted control did not finish, so at {args.context_window:,} tokens there is no "
+            f"measurement of what the whole conversation held and nothing can be judged against it. {advice}"
         )
     else:
         try:
-            verdict = recommend(ranked, min_correctness=min_correctness)
+            verdict = recommend(ranked, min_correctness=min_correctness, baseline_admissible=admissible)
         except ValueError as error:
             raise SystemExit(f"Cannot summarize: {error}") from error
     if tool_strategies_inert:
