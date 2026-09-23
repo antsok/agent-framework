@@ -61,6 +61,7 @@ from agent_framework_lab_cachebench.compaction._preserve import PRESERVE_REASON_
 from agent_framework_lab_cachebench.compaction._toolsummary import (
     DEFAULT_TRIGGER_FRACTION,
     PRESERVE_REASON_UNCOVERED,
+    PRESERVE_REASON_UNRECORDED,
     RECALL_TOOL_NAME,
     RECORD_MARKER,
     ToolResultAnchoredSummarizationCompactionStrategy,
@@ -1163,6 +1164,34 @@ async def test_the_composed_row_holds_what_its_record_missed_asks_again_and_then
     preserved = {message.message_id for message in messages if is_preserved(message)}
     assert preserved >= {"rec_call", "rec_res", "rec2_call", "rec2_res"}, "both records stay preserved"
     assert "code_1=CODE-3 " in _rendered(messages) and "code_1=CODE-4 " in _rendered(messages), "still whole"
+
+
+async def test_the_composed_row_holds_the_tool_groups_behind_its_record_when_its_fallback_runs() -> None:
+    """The post-record hold runs inside the composed row too, and the user half still acts.
+
+    Run 51's shape through ``compact_against``: tool groups sitting after the record, covered
+    by no record, and a ceiling the record phase cannot reach, so its fallback runs. Those
+    groups are held under the record half's third reason and come through whole; the user half,
+    which reads user groups alone, compacts its own band on the same pass exactly as before.
+    """
+    strategy = _composed(500, tool_results=_record_phase(500, trigger_fraction=0.1, fallback_fraction=0.9))
+    messages = _conversation(record=_covering_record(4))
+    for index in range(5, 8):
+        messages += _tool_group(index)
+
+    assert await strategy(messages) is True
+
+    held = {
+        message.message_id
+        for message in messages
+        if is_preserved(message)
+        and message.additional_properties.get(PRESERVE_REASON_KEY) == PRESERVE_REASON_UNRECORDED
+    }
+    assert held == {"c5", "r5", "c6", "r6", "c7", "r7"}, "every tool group behind the record, and only those"
+    for index in range(5, 8):
+        assert f"code_1=CODE-{index} " + "x" * _PAYLOAD_CHARS in _rendered(messages), f"lookup_{index} is whole"
+    assert strategy.fallbacks_held_after_record == strategy.tool_results.fallbacks_held_after_record == 1
+    assert strategy.user_compactions == 1, "while the user half compacted its own half of the same pass"
 
 
 def test_two_halves_measuring_against_two_ceilings_are_refused() -> None:

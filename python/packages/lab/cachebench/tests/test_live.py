@@ -4759,6 +4759,7 @@ def test_the_two_accuracy_measures_are_named_acc1_and_acc2() -> None:
         fallbacks_after_record=0,
         reforced_calls=0,
         groups_preserved_uncovered=0,
+        fallbacks_held_after_record=0,
         records_in_conversation=0,
         user_compactions=0,
         user_messages_replaced=0,
@@ -4969,6 +4970,7 @@ def _control_cell(seeded: int) -> dict[str, CellStats]:
         fallbacks_after_record=0,
         reforced_calls=0,
         groups_preserved_uncovered=0,
+        fallbacks_held_after_record=0,
         records_in_conversation=0,
         user_compactions=0,
         user_messages_replaced=0,
@@ -5293,7 +5295,7 @@ async def test_a_run_that_was_not_cut_short_says_nothing() -> None:
 _RECORD_CEILING = 22_000
 
 
-def _tool_conversation(tool_turns: int, *, covered: int, trailing: int = 0) -> list[Message]:
+def _tool_conversation(tool_turns: int, *, covered: int, trailing: int = 0, narration: int = 0) -> list[Message]:
     """Return a conversation whose recall record names only the first ``covered`` tools.
 
     The live benchmark's own shape: one no-argument tool per scope, named ``lookup_<n>``, so a
@@ -5310,6 +5312,10 @@ def _tool_conversation(tool_turns: int, *, covered: int, trailing: int = 0) -> l
         trailing: Lookup turns appended *after* the record, numbered on from the last. Material
             no record was asked to cover, and so the only material the fallback may still work
             on now that the groups a record failed to cover are held out of its reach.
+        narration: Characters of assistant narration following each trailing turn, or 0 for
+            none. Since the fallback behind a record may take no tool group a record does not
+            cover -- trailing ones included -- narration is the only thing left it may remove,
+            and a fixture that wants the fallback to act has to give it some.
 
     Returns:
         The messages, the record after the first ``tool_turns`` of them.
@@ -5363,6 +5369,8 @@ def _tool_conversation(tool_turns: int, *, covered: int, trailing: int = 0) -> l
     ]
     for index in range(tool_turns, tool_turns + trailing):
         messages += _turn(index)
+        if narration:
+            messages.append(Message(role="assistant", contents=["n" * narration], message_id=f"n_{index}"))
     return messages
 
 
@@ -5435,40 +5443,57 @@ async def test_a_fallback_taken_behind_a_record_reaches_the_seed_record_and_the_
     four places to lose it.
 
     The groups the coverage check declines to delete are now held out of the fallback's reach,
-    so the material the fallback works on here trails the record: with nothing but held groups
-    in front of it the fallback takes nothing and the count, rightly, stays at zero.
+    and so, since schema 15, is every tool group after the record: the only thing the fallback
+    may still take behind a record is narration, so the fixture trails the record with some.
+    The rule that held the tool groups back is counted too, as ``RECHELD``, and makes the same
+    four handoffs.
     """
     strategy = ToolResultAnchoredSummarizationCompactionStrategy(
         max_input_tokens=500, tokenizer=TOKENIZER, trigger_fraction=0.1, fallback_fraction=0.9
     )
-    messages = _tool_conversation(4, covered=2, trailing=4)
+    messages = _tool_conversation(4, covered=2, trailing=4, narration=4_000)
 
     assert await strategy(messages) is True
     assert strategy.fallbacks_after_record == 1
+    assert strategy.fallbacks_held_after_record == 1
     assert strategy.groups_kept_uncovered == 2
     assert all(
         f"CODE-{index}" in "".join(str(content.result) for content in message.contents)
-        for index in (2, 3)
+        for index in range(2, 8)
         for message in messages
         if message.message_id == f"t_res_{index}"
-    ), "the fallback ran behind the record and left the two held groups whole"
+    ), "the fallback ran behind the record and left every uncovered tool group whole"
     assert strategy.fallbacks_used == 0, "the give-up path is a different event and must stay at zero"
 
     notes = _strategy_notes(strategy)
     assert "RECFALLBACK:1" in notes
+    assert "RECHELD:1" in notes
     assert "FALLBACK:1" not in notes, "the two counts must not be readable as one another"
 
     outcome, scenario = await _probed(StubChatClient(usage=UsageDetails(input_token_count=1_000)), repeats=1)
     record = _record(
-        replace(outcome, strategy_notes=notes, fallbacks_after_record=strategy.fallbacks_after_record),
+        replace(
+            outcome,
+            strategy_notes=notes,
+            fallbacks_after_record=strategy.fallbacks_after_record,
+            fallbacks_held_after_record=strategy.fallbacks_held_after_record,
+        ),
         scenario,
         strategy="tool_summary_anchored",
     )
 
     assert record.fallbacks_after_record == 1, "the count must survive scoring, not only the flag string"
+    assert record.fallbacks_held_after_record == 1, "and so must the rule that held the tool groups back"
+    read_back = SeedRecord.from_dict(record.to_dict())
+    assert read_back.fallbacks_held_after_record == 1
+    older = record.to_dict()
+    older["schema"] = 14
+    del older["fallbacks_held_after_record"]
+    assert SeedRecord.from_dict(older).fallbacks_held_after_record == 0, "a run with no such rule held nothing"
     cell = _aggregate("tool_summary_anchored", [record])
 
     assert "RECFALLBACK:1" in _flags(cell, None)
+    assert "RECHELD:1" in _flags(cell, None)
     assert "RECFALLBACK:1" in _render(None, [cell], set(), show_answers=False)
 
 
@@ -5614,7 +5639,7 @@ async def test_a_run_whose_records_were_complete_carries_neither_layers_flag() -
 
     assert await strategy(_tool_conversation(8, covered=8)) is True
     assert strategy.take_reforce() is False, "a complete record asks for nothing"
-    assert not [note for note in _strategy_notes(strategy) if note.startswith(("PRESERVED", "REFORCED"))]
+    assert not [note for note in _strategy_notes(strategy) if note.startswith(("PRESERVED", "REFORCED", "RECHELD"))]
 
     outcome, scenario = await _probed(StubChatClient(usage=UsageDetails(input_token_count=1_000)), repeats=1)
     record = _record(outcome, scenario, strategy="tool_summary_anchored")
@@ -6501,6 +6526,7 @@ def test_a_progress_line_shows_what_a_watcher_needs() -> None:
         fallbacks_after_record=0,
         reforced_calls=0,
         groups_preserved_uncovered=0,
+        fallbacks_held_after_record=0,
         records_in_conversation=0,
         user_compactions=0,
         user_messages_replaced=0,

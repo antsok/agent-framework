@@ -49,7 +49,9 @@ What is here:
   record strategy puts the same mark, under :data:`PRESERVE_REASON_UNCOVERED`, on a tool group
   its record failed to cover: first while it asks for another record to cover it, then for
   good if asking stops helping, so the fallback can shorten neither and the row overflows
-  loudly rather than losing the group's values quietly.
+  loudly rather than losing the group's values quietly. Under :data:`PRESERVE_REASON_UNRECORDED`
+  it marks every other tool group no record covers -- those after the newest record above all
+  -- before its fallback runs, so that fallback may remove narration and nothing else.
 
 **This depends on ``agent_framework._compaction``, which is private API.** Grouping, token
 annotation and the exclusion flags all come from there; nothing public exposes them. That
@@ -93,6 +95,7 @@ from ._toolsummary import (
     DEFAULT_RECORD_TARGET_TOKENS,
     DEFAULT_TRIGGER_FRACTION,
     PRESERVE_REASON_UNCOVERED,
+    PRESERVE_REASON_UNRECORDED,
     RECALL_TOOL_NAME,
     RECORD_MARKER,
     RecallGate,
@@ -141,6 +144,7 @@ __all__ = [
     "PRESERVED_KEY",
     "PRESERVE_REASON_KEY",
     "PRESERVE_REASON_UNCOVERED",
+    "PRESERVE_REASON_UNRECORDED",
     "RECALL_TOOL_NAME",
     "RECORD_MARKER",
     "REMOVAL_MARKER",

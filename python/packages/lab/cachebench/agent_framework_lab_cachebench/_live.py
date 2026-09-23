@@ -583,6 +583,20 @@ class LiveOutcome:
     Zero on every strategy that keeps no such count, which is all of them but
     ``tool_summary_anchored`` and the composed row that runs it as a phase.
     """
+    fallbacks_held_after_record: int = 0
+    """Post-record fallback passes that ran with tool groups no record covers held out of reach.
+
+    The rule that closes what ``fallbacks_after_record`` beside ``groups_preserved_uncovered``
+    still left open: a tool group *after* the record is covered by no record, and before this
+    the fallback could shorten it until its facts were gone while the preserved groups in front
+    kept the prompt near the ceiling -- run 51, eight facts lost, no ``DQ``. Now every such
+    group is held before the fallback runs, so it may take narration and nothing else. Counts
+    attempts: non-zero says the fallback was needed and held back, zero says it never had to
+    act. ``RECHELD:<n>`` on ``strategy_notes`` carries the same number.
+
+    Zero on every strategy that keeps no such count, which is all of them but
+    ``tool_summary_anchored`` and the composed row that runs it as a phase.
+    """
     reforced_calls: int = 0
     """Forced calls the recall middleware made at the strategy's request, for uncovered groups.
 
@@ -967,6 +981,7 @@ def _strategy_notes(strategy: Any) -> tuple[str, ...]:
         ("records_in_conversation", "RECORDS"),
         ("fallbacks_used", "FALLBACK"),
         ("fallbacks_after_record", "RECFALLBACK"),
+        ("fallbacks_held_after_record", "RECHELD"),
         ("forced_calls", "FORCED"),
         ("reforced_calls", "REFORCED"),
         ("records_forced", "RECFORCED"),
@@ -2067,6 +2082,7 @@ async def run_live(
         strategy_notes=_strategy_notes(strategy) + _strategy_notes(recall_middleware),
         groups_kept_uncovered=recording.groups_kept_uncovered if recording is not None else 0,
         fallbacks_after_record=recording.fallbacks_after_record if recording is not None else 0,
+        fallbacks_held_after_record=recording.fallbacks_held_after_record if recording is not None else 0,
         reforced_calls=recall_middleware.reforced_calls if recall_middleware is not None else 0,
         groups_preserved_uncovered=recording.groups_preserved_uncovered if recording is not None else 0,
         records_in_conversation=recording.records_in_conversation if recording is not None else 0,
