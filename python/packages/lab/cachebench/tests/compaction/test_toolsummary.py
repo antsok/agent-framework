@@ -29,6 +29,7 @@ from agent_framework_lab_cachebench.compaction._toolsummary import (
     DEFAULT_RECORD_TARGET_TOKENS,
     DEFAULT_TRIGGER_FRACTION,
     PRESERVE_REASON_UNCOVERED,
+    PRESERVE_REASON_UNRECORDED,
     RECALL_TOOL_NAME,
     RECORD_MARKER,
     RecallGate,
@@ -174,6 +175,33 @@ def _conversation(
     return messages
 
 
+def _trailing(tool_turns: int, *, first_turn: int, narration: int = 0) -> list[Message]:
+    """Return lookup turns to append behind a record, each optionally followed by narration.
+
+    Since the fallback behind a record may shorten or shed no tool group a record does not
+    cover -- the ones after it included -- assistant narration is the only thing it may still
+    remove there. A fixture that needs the fallback to act has to give it some, and one that
+    needs it to find nothing has to give it none; this is where that choice is made visibly.
+
+    Args:
+        tool_turns: How many lookup turns to generate.
+
+    Keyword Args:
+        first_turn: Index the turns are numbered from, continuing the stretch in front.
+        narration: Characters of assistant narration after each turn, or 0 for none. Each
+            reply's message id is ``n_<index>``.
+
+    Returns:
+        The messages, without the system prompt and opening exchange ``_conversation`` adds.
+    """
+    messages: list[Message] = []
+    for index in range(first_turn, first_turn + tool_turns):
+        messages += _conversation(tool_turns=1, first_turn=index)[3:]
+        if narration:
+            messages.append(Message(role="assistant", contents=["n" * narration], message_id=f"n_{index}"))
+    return messages
+
+
 def _covering_record(tool_turns: int, *, first_turn: int = 0) -> str:
     """Return a record that names every tool it covers, as the tool's own guidance asks.
 
@@ -195,6 +223,11 @@ def _covering_record(tool_turns: int, *, first_turn: int = 0) -> str:
         The record's text.
     """
     return " ".join(f"lookup_{index}: CODE-{index}." for index in range(first_turn, first_turn + tool_turns))
+
+
+def _sent(messages: list[Message]) -> set[str]:
+    """Return the ids of the messages the model would receive."""
+    return {message.message_id or "" for message in project_included_messages(messages)}
 
 
 def _rendered(messages: list[Message]) -> str:
@@ -327,7 +360,12 @@ async def test_thresholds_the_wrong_way_around_are_rejected(trigger: float, fall
 
 
 async def test_a_record_that_does_not_free_enough_still_falls_back() -> None:
-    """The groups after the record are untouched by design and can exceed the ceiling alone."""
+    """The groups after the record are untouched by design and can exceed the ceiling alone.
+
+    The fallback still runs there. What it may take has narrowed to narration -- the tool
+    groups behind the record are covered by no record and are held -- so the stretch behind
+    the record carries some, or the fallback would have nothing and this would count zero.
+    """
     strategy = ToolResultAnchoredSummarizationCompactionStrategy(
         max_input_tokens=500, tokenizer=TOKENIZER, trigger_fraction=0.1, fallback_fraction=0.9
     )
@@ -335,11 +373,12 @@ async def test_a_record_that_does_not_free_enough_still_falls_back() -> None:
     # stretch is numbered on from the first: reusing the numbers would give two groups the same
     # message ids, and the grouper derives its group ids from those.
     messages = _conversation(tool_turns=2, record=_covering_record(2))
-    messages += _conversation(tool_turns=6, first_turn=2)[3:]
+    messages += _trailing(6, first_turn=2, narration=2_000)
 
     assert await strategy(messages) is True
     assert strategy.records_found == 1
     assert strategy.fallbacks_after_record == 1
+    assert strategy.fallbacks_held_after_record == 1
     assert strategy.fallbacks_used == 0, "the give-up path is the one the record made unnecessary"
 
 
@@ -362,11 +401,13 @@ async def test_a_fallback_taken_behind_a_record_is_counted_apart_from_one_taken_
     conversation whose only removable material was those groups gives the fallback nothing and
     the count stays at zero -- which is the fix, not a regression. The bulk here therefore sits
     *after* the record, where no record was ever asked to cover it, and the two uncovered groups
-    in front of the record are asserted intact.
+    in front of the record are asserted intact. Since then the tool groups behind the record
+    are held too -- no record covers them either -- so what the fallback takes there is the
+    narration between them, and every tool result is asserted intact.
     """
     strategy = _strategy(max_input_tokens=500, trigger_fraction=0.1, fallback_fraction=0.9)
     messages = _conversation(tool_turns=4, record=_covering_record(2))
-    messages += _conversation(tool_turns=4, first_turn=4)[3:]
+    messages += _trailing(4, first_turn=4, narration=2_000)
 
     assert await strategy(messages) is True
 
@@ -375,7 +416,9 @@ async def test_a_fallback_taken_behind_a_record_is_counted_apart_from_one_taken_
     assert strategy.groups_kept_uncovered == 2, "two groups the record never quoted, and they are held"
     rendered = _rendered(messages)
     assert "CODE-2 x" in rendered and "CODE-3 x" in rendered, "the fallback may not touch what the check kept"
-    assert "CODE-4 x" not in rendered, "it shed the material behind the record instead, which is what it counts"
+    for index in range(4, 8):
+        assert f"CODE-{index} x" in rendered, f"nor lookup_{index}, which no record covers"
+    assert "n_4" not in _sent(messages), "it shed the narration behind the record instead"
 
 
 async def test_a_fallback_that_changed_nothing_is_not_counted_as_one() -> None:
@@ -888,7 +931,7 @@ async def test_the_record_survives_a_fallback_that_shortens_and_sheds_everything
     strategy = _strategy(max_input_tokens=500, trigger_fraction=0.1, fallback_fraction=0.9)
     record = f"{_covering_record(2)} {_RECORD_PADDING}"
     messages = _conversation(tool_turns=2, record=record)
-    messages += _conversation(tool_turns=6, first_turn=2)[3:]
+    messages += _trailing(6, first_turn=2, narration=2_000)
 
     assert await strategy(messages) is True
     rendered = _rendered(messages)
@@ -896,7 +939,7 @@ async def test_the_record_survives_a_fallback_that_shortens_and_sheds_everything
     assert strategy.fallbacks_after_record == 1, "the fixture only means anything if the fallback ran"
     assert f"{RECORD_MARKER} {record}" in rendered, "the record is intact to its last character"
     assert REMOVAL_MARKER not in rendered.split(RECORD_MARKER)[1], "and carries no trim marker of its own"
-    assert "CODE-4 x" not in rendered, "while the fallback took the groups around it apart"
+    assert "n_2" not in _sent(messages), "while the fallback shed what it could still reach"
 
 
 async def test_every_record_is_marked_protected_including_the_ones_a_newer_record_supersedes() -> None:
@@ -1090,6 +1133,11 @@ async def test_a_re_force_that_fails_leads_to_preservation_and_the_fallback_cann
     take, so the test can show it ran -- ``fallbacks_after_record`` moves -- while the four held
     results stay intact to the last character. What is left is a prompt over the ceiling,
     which is the accepted consequence: the row reads ``DQ`` instead of losing a fact.
+
+    That material is narration. It used to be the tool groups behind the records, and this test
+    asserted the first of them shed -- which was run 51's loss written down as the expected
+    behaviour: a group after the record is covered by no record, and shedding it loses its
+    facts as surely as shedding a held one. The fallback now finds those groups held too.
     """
     strategy = _strategy(max_input_tokens=500, trigger_fraction=0.1, fallback_fraction=0.9)
     messages = _conversation(tool_turns=6, record=_covering_record(2))
@@ -1104,18 +1152,157 @@ async def test_a_re_force_that_fails_leads_to_preservation_and_the_fallback_cann
     assert strategy.take_reforce() is False, "asking stopped helping, so it stopped"
     assert strategy.fallbacks_after_record == 0, "so far the fallback has had nothing it may take"
 
-    messages += _conversation(tool_turns=4, first_turn=6)[3:]
+    messages += _trailing(4, first_turn=6, narration=2_000)
 
     assert await strategy(messages) is True
 
     rendered = _rendered(messages)
-    assert strategy.fallbacks_after_record == 1, "the fallback ran behind the record and found the new material"
-    for index in range(2, 6):
-        assert f"CODE-{index} x" in rendered, f"lookup_{index} is preserved, so it is still whole"
+    assert strategy.fallbacks_after_record == 1, "the fallback ran behind the record and found the new narration"
+    for index in range(2, 10):
+        assert f"CODE-{index} x" in rendered, f"lookup_{index} is held, so it is still whole"
         assert REMOVAL_MARKER not in _result_text(messages, f"t_res_{index}"), "and carries no trim marker"
-    assert "CODE-6 x" not in rendered, "while a group nothing protected was shed"
+    assert "n_6" not in _sent(messages), "while narration nothing protected was shed"
     assert strategy.groups_preserved_uncovered == 4
     assert included_token_count(messages) > 500, "the prompt is left over the ceiling, for the caller to see"
+
+
+def _held_unrecorded(messages: list[Message]) -> set[str]:
+    """Return the ids of every message held because no record covered it when the fallback ran."""
+    return {
+        message.message_id or ""
+        for message in messages
+        if is_preserved(message)
+        and message.additional_properties.get(PRESERVE_REASON_KEY) == PRESERVE_REASON_UNRECORDED
+    }
+
+
+async def _settled_behind_two_records(
+    max_input_tokens: int,
+) -> tuple[ToolResultAnchoredSummarizationCompactionStrategy, list[Message]]:
+    """Return a strategy and conversation in run 51's state: four uncovered groups preserved for good.
+
+    The first record covers two of six lookups, the re-forced one covers none, and layer two
+    has settled the four it left. What a test appends behind that is what the post-record
+    fallback then meets.
+    """
+    strategy = _strategy(max_input_tokens=max_input_tokens, trigger_fraction=0.1, fallback_fraction=0.9)
+    messages = _conversation(tool_turns=6, record=_covering_record(2))
+    await strategy(messages)
+    assert strategy.take_reforce() is True
+    await strategy(messages)
+    messages += _record_messages("nothing further to record.", call_id="rec2")
+    await strategy(messages)
+    assert strategy.groups_preserved_uncovered == 4
+    return strategy, messages
+
+
+async def test_the_fallback_behind_a_record_may_not_shorten_a_tool_group_after_it() -> None:
+    """Run 51: layer two held, and the group after the record was eroded instead.
+
+    gpt-5.6-luna, 120,000-token window, seed 1: four uncovered lookups in front of the record
+    were preserved and survived, and that kept the prompt near the ceiling, so the fallback
+    fired thirty-three times and shortened the one tool group after the record that sat inside
+    its band -- Mid -- until its eight codes were gone. Late survived only because the fallback
+    keeps a fixed tail. No record covers a group after the newest one, and nothing protected
+    it. The row finished under the limit: no ``DQ``, eight facts lost, no flag.
+
+    This is that shape: four preserved groups, three lookups behind the records, and a prompt
+    over the ceiling. The anchored fallback's tail is four groups, so lookup 6 sits just behind
+    it -- the group that used to be shortened, then shed. With nothing but tool groups behind
+    the records there is nothing the fallback may take, so it takes nothing: every result keeps
+    every character, the prompt stays over the ceiling where the caller can see it, and the
+    rule that held the fallback back says so. Repeated passes change nothing and end, because
+    the fallback's shed loop stops on "nothing moved" rather than on "it fits".
+    """
+    strategy, messages = await _settled_behind_two_records(500)
+    messages += _trailing(3, first_turn=6)
+    whole = {index: _result_text(messages, f"t_res_{index}") for index in range(6, 9)}
+
+    assert await strategy(messages) is False, "nothing it may take, so nothing is taken"
+
+    for index, text in whole.items():
+        assert _result_text(messages, f"t_res_{index}") == text, f"lookup_{index} keeps every character"
+        assert f"t_res_{index}" in _sent(messages), f"and lookup_{index} is still sent"
+    assert _held_unrecorded(messages) == {f"a_call_{index}" for index in range(6, 9)} | {
+        f"t_res_{index}" for index in range(6, 9)
+    }, "held under a reason of its own, apart from layer two's"
+    assert _held(messages) == {f"a_call_{index}" for index in range(2, 6)} | {f"t_res_{index}" for index in range(2, 6)}
+    assert strategy.fallbacks_held_after_record == 1, "the fallback was needed, and was held back"
+    assert strategy.fallbacks_after_record == 0, "and took nothing, which is not counted as a fallback"
+    assert included_token_count(messages) > 500, "over the limit rather than a shortened result: the row reads DQ"
+
+    before = _rendered(messages)
+    for _ in range(3):
+        assert await strategy(messages) is False, "the shed loop ends when everything left is held"
+    assert _rendered(messages) == before
+    assert strategy.fallbacks_held_after_record == 4, "each pass that needed the fallback and held it is counted"
+    assert included_token_count(messages) > 500
+
+
+async def test_narration_is_all_the_fallback_behind_a_record_may_take_and_can_be_enough() -> None:
+    """The fallback still runs behind a record, and a row it brings under the ceiling keeps every fact.
+
+    Two uncovered groups in front of the record, four lookups behind it, and narration after
+    two of those inside the fallback's band. The ceiling sits between the prompt with that
+    narration and the prompt without it, so shedding narration alone fits the row: no tool
+    result is shortened -- the fallback used to collapse results before shedding anything --
+    and no tool group is shed.
+    """
+    strategy = _strategy(max_input_tokens=14_000, trigger_fraction=0.1, fallback_fraction=0.9)
+    messages = _conversation(tool_turns=4, record=_covering_record(2))
+    messages += _trailing(2, first_turn=4, narration=8_000) + _trailing(2, first_turn=6)
+    whole = {index: _result_text(messages, f"t_res_{index}") for index in range(2, 8)}
+
+    assert await strategy(messages) is True
+
+    sent = _sent(messages)
+    assert {"n_4", "n_5"}.isdisjoint(sent), "the narration went"
+    for index, text in whole.items():
+        assert _result_text(messages, f"t_res_{index}") == text, f"lookup_{index} keeps every character"
+        assert f"t_res_{index}" in sent, f"and lookup_{index} is still sent"
+    assert (strategy.fallbacks_after_record, strategy.fallbacks_held_after_record) == (1, 1)
+    assert included_token_count(messages) <= 14_000, "and that was enough: the row fits"
+
+
+async def test_a_later_record_that_covers_a_group_held_behind_the_last_one_releases_it() -> None:
+    """The hold is this strategy's own, and coverage lifts it exactly as it lifts layer two's.
+
+    Behind the second record, lookups 6 to 8 are held because the fallback ran while no record
+    covered them. A third record quoting lookups 6 and 7 licenses their deletion: they are
+    released and dropped like any covered group. Lookup 8 it does not quote, so it is still
+    uncovered -- now in front of a record, so the coverage check holds it under its own reason
+    and asks for another record on its behalf, which is layer one starting over.
+    """
+    strategy, messages = await _settled_behind_two_records(500)
+    messages += _trailing(3, first_turn=6)
+    await strategy(messages)
+    assert len(_held_unrecorded(messages)) == 6
+    messages += _record_messages(_covering_record(2, first_turn=6), call_id="rec3")
+
+    assert await strategy(messages) is True
+
+    sent = _sent(messages)
+    for index in (6, 7):
+        assert f"t_res_{index}" not in sent, f"lookup_{index} was covered, so it was dropped"
+        (result,) = (message for message in messages if message.message_id == f"t_res_{index}")
+        assert not is_preserved(result), f"with no hold left on lookup_{index}"
+    assert not _held_unrecorded(messages), "nothing is left behind the newest record to hold"
+    assert {"a_call_8", "t_res_8"} <= _held(messages), "lookup_8 is uncovered in front of it, and held as such"
+    assert strategy.take_reforce() is True, "and asked for"
+    assert strategy.groups_kept_uncovered == 5
+
+
+async def test_a_record_that_covers_everything_leaves_no_hold_and_no_held_fallback() -> None:
+    """The normal path is untouched: nothing uncovered, no fallback, nothing held, nothing counted."""
+    strategy = _strategy()
+    messages = _conversation(tool_turns=8, record=_covering_record(8))
+
+    assert await strategy(messages) is True
+
+    assert "x" * 100 not in _rendered(messages), "every covered group was dropped"
+    assert not _held_unrecorded(messages)
+    assert not _held(messages)
+    assert (strategy.fallbacks_after_record, strategy.fallbacks_held_after_record) == (0, 0)
 
 
 async def test_an_ask_that_brings_no_record_ends_the_chain_on_the_pass_that_could_have_seen_it() -> None:

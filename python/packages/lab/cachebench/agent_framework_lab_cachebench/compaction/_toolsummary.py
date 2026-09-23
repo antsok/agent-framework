@@ -131,6 +131,19 @@ A preserved group still counts against the ceiling, so the accepted consequence 
 that cannot be brought under it and a row that reads ``DQ``: loud, and preferable to the quiet
 loss it replaces. ``REFORCED`` and ``PRESERVED`` in the flags say which layer acted.
 
+**The two layers were not enough on their own, because they only see what is in front of the
+record.** Run 51 reached the gap on gpt-5.6-luna at a 120,000-token window: four uncovered
+groups in front of the record were preserved and survived, and that kept the prompt near the
+ceiling, so the fallback fired thirty-three times and shortened the one tool group after the
+record inside its band until its eight codes were gone -- no record covers a group after the
+newest one, and nothing protected it. The row finished under the limit, not ``DQ``, eight
+facts short. So the fallback that runs behind a record now runs with every tool group no record
+covers held under :data:`PRESERVE_REASON_UNRECORDED`, wherever it sits, and may remove only
+what is not a tool group. That frees enough or it does not; the row keeps every fact or reads
+``DQ``, and a quiet loss is not one of the outcomes. ``RECHELD`` says the rule was in force.
+The give-up fallback taken when no record ever arrives is left as it was: that row is
+documented as measuring the fallback strategy rather than this one, and ``FALLBACK`` says so.
+
 **The evidence the two layers were commissioned on has been withdrawn, and they stand on the
 mechanism alone.** The brief was the archive: across the 58 records of ``tool_summary_anchored``
 in runs 41 to 48, the four that lost a fact all carried ``UNCOVERED`` beside ``RECFALLBACK``,
@@ -168,7 +181,7 @@ from agent_framework._compaction import (
 )
 
 from ._anchored import AnchoredCompactionStrategy
-from ._preserve import PRESERVE_REASON_KEY, is_preserved, set_preserved
+from ._preserve import PRESERVE_REASON_KEY, any_preserved, is_preserved, set_preserved
 
 if TYPE_CHECKING:
     from agent_framework import CompactionStrategy, TokenizerProtocol
@@ -180,6 +193,7 @@ __all__ = [
     "DEFAULT_RECORD_TARGET_TOKENS",
     "DEFAULT_TRIGGER_FRACTION",
     "PRESERVE_REASON_UNCOVERED",
+    "PRESERVE_REASON_UNRECORDED",
     "RECALL_TOOL_NAME",
     "RECORD_MARKER",
     "RecallGate",
@@ -230,6 +244,25 @@ PRESERVE_REASON: Final[str] = "tool_summary_record"
 #: then -- which is the whole point of asking for that record. ``_drop_before`` tells the two
 #: apart by this string, and skips a group only when something *else* has claimed it.
 PRESERVE_REASON_UNCOVERED: Final[str] = "tool_summary_uncovered"
+
+#: Reason recorded on a tool group no record covers, held out of the fallback's reach because
+#: the fallback is about to run behind a record.
+#:
+#: The case :data:`PRESERVE_REASON_UNCOVERED` cannot reach: a group *after* the newest record,
+#: which no record was asked to cover, or one in front of it that the coverage check never
+#: weighed, such as the head. Shortening such a group destroys its facts exactly as
+#: shortening an uncovered one does, and once the fallback is running behind a record there is
+#: no case where that is the right trade -- the row either fits on what else may go, or
+#: overflows and reads ``DQ``. Its own string so a conversation read back tells this rule from
+#: the coverage check's hold, and so ``fallbacks_held_after_record`` counts what it says.
+#: Released the way that hold is: ``_drop_before`` treats both as this strategy's own, so a
+#: later record that quotes the group licenses its deletion.
+PRESERVE_REASON_UNRECORDED: Final[str] = "tool_summary_unrecorded"
+
+#: The preservation reasons this strategy puts on ordinary tool groups, and so may lift again.
+#: Every other reason -- the record's own mark, or one another strategy left -- is not this
+#: strategy's to decide about. See :func:`_claimed_elsewhere`.
+_OWN_HOLDS: Final[frozenset[str]] = frozenset({PRESERVE_REASON_UNCOVERED, PRESERVE_REASON_UNRECORDED})
 
 #: Compaction passes a re-forced record is given to reach the history before the ask is judged
 #: to have failed.
@@ -642,19 +675,64 @@ def _claimed_elsewhere(messages: Sequence[Message]) -> bool:
     The hold this strategy puts on an uncovered group is the one preservation that must *not*
     take the group out of the running: it is there so the fallback cannot shorten the group
     while another record is asked for, and the record that then quotes the group's values has
-    to be able to release it and drop it. Every other reason -- a record's own mark, or one
-    another strategy left -- means the group is not this strategy's to decide about.
+    to be able to release it and drop it. The hold put on an unrecorded group before a
+    post-record fallback, :data:`PRESERVE_REASON_UNRECORDED`, is the same kind of hold and is
+    released the same way. Every other reason -- a record's own mark, or one another strategy
+    left -- means the group is not this strategy's to decide about.
 
     Args:
         messages: One group's span.
 
     Returns:
-        True when a member is preserved under any reason but :data:`PRESERVE_REASON_UNCOVERED`.
+        True when a member is preserved under any reason outside :data:`_OWN_HOLDS`.
     """
     return any(
-        is_preserved(message) and message.additional_properties.get(PRESERVE_REASON_KEY) != PRESERVE_REASON_UNCOVERED
+        is_preserved(message) and message.additional_properties.get(PRESERVE_REASON_KEY) not in _OWN_HOLDS
         for message in messages
     )
+
+
+def _hold_unrecorded(messages: list[Message]) -> int:
+    """Hold every tool group no record covers out of the fallback's reach, and count the holds.
+
+    Run immediately before the fallback that follows a record, on every pass that reaches it.
+    Any tool group still in the prompt then is one no record covers: a covered group was
+    excluded by ``_drop_before``, and a record is a record. The coverage check has already held
+    the uncovered groups it weighed, under :data:`PRESERVE_REASON_UNCOVERED`; what it never
+    weighs is every group after the newest record and the head, and those are what this marks.
+    The fallback may then remove only what is not a tool group -- assistant narration, in the
+    default -- and either that frees enough or the prompt stays over the ceiling. A shortened
+    tool group is the one outcome ruled out, because it is the one nobody sees.
+
+    A group something already protects is left under its mark: a layer-one or layer-two hold
+    keeps the reason that says which layer holds it, and a record or another strategy's claim
+    is not this strategy's to relabel. A group the fallback has already shed whole is skipped,
+    since it is not in the prompt to protect.
+
+    Args:
+        messages: The conversation, whose messages are annotated in place.
+
+    Returns:
+        How many tool groups carry this hold after the call, whether put on now or on an
+        earlier pass. Zero means the rule held nothing back this time.
+    """
+    held = 0
+    for group in group_messages(messages):
+        if group.get("kind") != "tool_call" or _is_recall_group(messages, group):
+            continue
+        members = messages[group["start_index"] : group["end_index"] + 1]
+        if all(message.additional_properties.get(EXCLUDED_KEY, False) for message in members):
+            continue
+        if any_preserved(members):
+            held += any(
+                message.additional_properties.get(PRESERVE_REASON_KEY) == PRESERVE_REASON_UNRECORDED
+                for message in members
+            )
+            continue
+        for message in members:
+            set_preserved(message, preserved=True, reason=PRESERVE_REASON_UNRECORDED)
+        held += 1
+    return held
 
 
 @dataclass(slots=True)
@@ -873,6 +951,7 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
         self._records_in_conversation = 0
         self._fallbacks = 0
         self._fallbacks_after_record = 0
+        self._fallbacks_held_after_record = 0
         # The group ids the most recent pass declined to drop, replaced rather than added to.
         # See :attr:`groups_kept_uncovered`.
         self._uncovered: set[str] = set()
@@ -934,8 +1013,40 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
         counting the call rather than its answer made ``RECFALLBACK:5`` mean anything between
         five losses and none -- an unreadable number on a flag whose entire purpose is to say
         that part of a row was measured by another strategy.
+
+        **What it can take is now narrower than the paragraphs above describe.** Every tool
+        group no record covers is held before this fallback runs -- see
+        :attr:`fallbacks_held_after_record` -- so on the default fallback a counted pass is one
+        that shed assistant narration, not one that shortened a tool result.
         """
         return self._fallbacks_after_record
+
+    @property
+    def fallbacks_held_after_record(self) -> int:
+        """Passes whose post-record fallback ran with tool groups held out of its reach.
+
+        The rule behind it: once a record exists, the fallback may not shorten or shed a tool
+        group no record covers -- whether it sits in front of the record, where the coverage
+        check already holds it, or after it, where nothing did. It was reached on a live seed.
+        With four uncovered groups preserved in front of the record the prompt stayed near the
+        ceiling, the fallback fired thirty-three times, and it shortened the one tool group
+        after the record that sat inside its band until all eight of its codes were gone; the
+        row finished 5,000 tokens under the limit, not ``DQ``, eight facts short, and reported
+        nothing. :data:`PRESERVE_REASON_UNRECORDED` is the hold that closes it.
+
+        Counts attempts, where :attr:`fallbacks_after_record` counts effects, because the two
+        answer different questions. This one says the fallback was needed and was held back;
+        that one says it then found something it was still allowed to take. Zero here with
+        records in the conversation is a row whose fallback never had to act. Non-zero beside
+        ``DQ`` is the rule standing between the fallback and a quiet loss, which is its intended
+        reading; non-zero without ``DQ`` is the narration the fallback may still shed having
+        been enough.
+
+        Counted per pass, like ``fallbacks_after_record``, and only on a pass where the rule
+        actually held a group -- which, since the fallback keeps a tail, is nearly every pass
+        that reaches it.
+        """
+        return self._fallbacks_held_after_record
 
     @property
     def records_found(self) -> int:
@@ -1124,6 +1235,13 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
                 # the attempt, and a fallback with nothing left to shorten returns False and
                 # touches nothing: ``RECFALLBACK:5`` could be five no-ops, which is the
                 # opposite of what the flag is read as meaning.
+                #
+                # Every tool group no record covers is held first, so what the fallback may
+                # take here is narration and nothing else. Its False then means "held back",
+                # never "it fits": the prompt is left as it is, over the ceiling, and the row
+                # reads DQ rather than a shortened result. See ``fallbacks_held_after_record``.
+                if _hold_unrecorded(messages):
+                    self._fallbacks_held_after_record += 1
                 shortened = await self.fallback(messages)
                 if shortened:
                     self._fallbacks_after_record += 1
@@ -1223,6 +1341,10 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
         on its behalf can cover it, at which point the mark comes off and the group is dropped
         like any other. What becomes of a group no record ever covers is
         :meth:`_reforce_or_settle`'s question, and it is answered after this method returns.
+        A group held under :data:`PRESERVE_REASON_UNRECORDED` -- one that sat after the record
+        when a post-record fallback ran -- is read here the same way once a newer record puts it
+        in front: covered, it is released and dropped; not, it is re-held as uncovered and
+        joins the ask.
 
         Returns:
             True if anything was excluded.

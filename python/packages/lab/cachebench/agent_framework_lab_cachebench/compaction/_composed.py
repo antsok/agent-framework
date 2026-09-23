@@ -142,8 +142,9 @@ every mode; a fold excludes only the standing summaries and inserts one message 
 oldest of them stood; and the record -- a tool result, marked preserved under the record half's
 own reason -- is neither read, excluded, nor moved relative to anything but that one insertion,
 exactly as it is not by an ordinary pass. The same holds for a tool group the record half is
-holding out of its fallback's reach for want of coverage: a tool group, marked under the record
-half's other reason, and so invisible to a phase that reads user groups alone. Nor does any of
+holding out of its fallback's reach for want of coverage, or because no record covers it when
+that fallback runs: a tool group, marked under one of the record half's other reasons, and so
+invisible to a phase that reads user groups alone. Nor does any of
 it touch the shared line: the fold sits
 inside :meth:`~._usersummary.UserTurnAnchoredSummarizationCompactionStrategy.compact_against`,
 behind the same trigger check :meth:`ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy.__call__`
@@ -273,6 +274,11 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
     def fallbacks_after_record(self) -> int:
         """:attr:`~._toolsummary.ToolResultAnchoredSummarizationCompactionStrategy.fallbacks_after_record`."""
         return self.tool_results.fallbacks_after_record
+
+    @property
+    def fallbacks_held_after_record(self) -> int:
+        """:attr:`~._toolsummary.ToolResultAnchoredSummarizationCompactionStrategy.fallbacks_held_after_record`."""
+        return self.tool_results.fallbacks_held_after_record
 
     @property
     def groups_kept_uncovered(self) -> int:

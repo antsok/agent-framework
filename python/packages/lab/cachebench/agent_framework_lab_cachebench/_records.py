@@ -207,7 +207,19 @@ __all__ = [
 #: fallback on prompts that were under the ceiling. They date the gap's discovery; they do not
 #: measure how often a genuine firing reaches it, and nothing yet does. See the
 #: ``_toolsummary`` module docstring.
-SCHEMA_VERSION: Final[int] = 14
+#:
+#: 15 adds ``fallbacks_held_after_record``, on the version 13 argument one gap further on. The
+#: two layers 13 introduced protect only what is in front of the record; a tool group after it
+#: is covered by no record, and the fallback behind the record could still shorten it. Run 51
+#: measured that happening -- four groups preserved in front of the record kept the prompt near
+#: the ceiling, the fallback fired thirty-three times, and the one tool group after the record
+#: inside its band lost all eight codes on a row that finished under the limit and read no
+#: ``DQ``. From 15 the fallback behind a record runs with every tool group no record covers
+#: held, and the field counts the passes it ran that way. It reads back as zero on an older
+#: record, because zero is what those runs did: no group was held for this reason. The version
+#: is what tells that zero -- a fallback free to shorten -- from a schema 15 zero, a fallback
+#: that never had to act.
+SCHEMA_VERSION: Final[int] = 15
 
 #: Versions this reader accepts, which is not only the current one.
 #:
@@ -275,7 +287,11 @@ SCHEMA_VERSION: Final[int] = 14
 #: Version 12 joins on the version 5 argument: what its runs did about an uncovered tool group
 #: is not in doubt, because their code could neither ask for another record on its account nor
 #: preserve it, and the two counters read back as the zero those runs produced.
-_READABLE_SCHEMAS: Final[frozenset[int]] = frozenset({2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, SCHEMA_VERSION})
+#:
+#: Version 14 joins on that argument one version along: its code could not hold a tool group
+#: after the record out of the fallback's reach, so ``fallbacks_held_after_record`` reads back
+#: as the zero those runs produced.
+_READABLE_SCHEMAS: Final[frozenset[int]] = frozenset({2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, SCHEMA_VERSION})
 
 #: The parameters that make two records the same cell, and so aggregable into one row.
 #:
@@ -1082,6 +1098,23 @@ class SeedRecord:
 
     Zero for every strategy that keeps no such count, and zero on a record written before
     schema 13, on the reading the field above gives.
+
+    It is not by itself a guarantee that nothing was lost: layer two protects only what is in
+    front of the record, and until schema 15 the fallback could still shorten a group after it.
+    See the field below.
+    """
+    fallbacks_held_after_record: int
+    """Post-record fallback passes that ran with every tool group no record covers held back.
+
+    The rule schema 15 adds: behind a record the fallback may not shorten or shed a tool group
+    no record covers, wherever it sits, so it may remove narration and nothing else -- and the
+    row keeps every fact or reads ``DQ``. Counts attempts, where ``fallbacks_after_record``
+    counts effects: non-zero says the fallback was needed and held back, zero on a record row
+    says it never had to act. ``strategy_notes`` carries it as ``RECHELD:<n>``; the number is
+    here so a cell can be meaned on it.
+
+    Zero for every strategy that keeps no such count, and zero on a record written before
+    schema 15 -- see :data:`SCHEMA_VERSION` for why that zero is a measurement rather than a gap.
     """
     records_in_conversation: int | None
     """Recall records the conversation ended up carrying, at the strategy's highest reading.
@@ -1400,6 +1433,10 @@ class SeedRecord:
         # cannot inherit the zero by forgetting to record it.
         values.setdefault("reforced_calls", 0)
         values.setdefault("groups_preserved_uncovered", 0)
+        # Zero, on the same reading one schema along: a record written before schema 15 ran
+        # under a fallback that nothing held back from an unrecorded tool group, so no pass was
+        # held -- zero is what those runs did. Required with no default on the class, as above.
+        values.setdefault("fallbacks_held_after_record", 0)
         # None again, and for a third reason worth stating apart from the two above. A record
         # written before schema 6 comes from a run whose size trigger fired once per
         # conversation, so it took one record or none -- but which of the two is on the record
