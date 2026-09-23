@@ -207,6 +207,38 @@ What it shows, and what it is void for:
 No `.sh` is kept: the script that produced it is the same one run 47 uses, and re-running it
 against this tree produces the repaired rows rather than these.
 
+Run 51 is all twenty strategies at 120,000 tokens with the uncompacted conversation sized to
+**115% of the window** -- the first cell in this archive where not compacting fails. No control
+row before it had ever disqualified (the closest luna came was 0.964 of its budget), so every
+earlier verdict was taken in a cell where the full conversation simply fit. Five seeds, three
+streams against the endpoint's 7M TPM limit, `--assumed-reply-tokens 384` (luna's measured
+median seeding reply, where 602 had undershot every luna cell by 2-9%), everything else as run
+50. It needed `8b7e90a3c` to run at all: `--fill` was capped at 1.0, the report ranked an
+overflowed control and used it as the baseline, and the live path exited with no table when the
+control overflowed.
+
+- **The control disqualified on all five seeds** (peaks 141-146K against 120K), and every one
+  of the nineteen compacting rows stayed under the limit on every seed. **Fill landed at
+  +1.0%**, the first luna cell on target.
+- **`tool_and_user_summary_anchored` is the only row that never failed**: 53/53 and acc1 100%
+  on every seed, compacted to 42% of the window where every other full retainer sat at 79-91%.
+  Seed$ 0.105-0.136, about 19% above the unlimited control's 0.1004 (a reference, not a
+  baseline -- it disqualified). Zero post-record fallbacks on every seed, including the one
+  where its record re-forced.
+- **`tool_summary_anchored` is the cheapest when it works and the verdict the report prints,
+  which the report itself marks NOT SUPPORTED**: seed$ about 0.087 on four seeds, 13% under the
+  unlimited control, and 0.204 with 45/53 on the fifth -- a 135% spread against a 3% gap to
+  the next row.
+- **That fifth seed is a defect, not variance.** Both layers of `434a77da5` fired: the re-force
+  did not cover the four lookups ahead of the record, so layer 2 preserved them and they
+  survived. But tool groups *behind* the record were covered by nothing and protected by
+  nothing. With four groups pinned, the prompt stayed near the ceiling, the post-record
+  fallback fired 33 times, and it shortened the one unprotected lookup inside its band (Mid,
+  0 of 8 codes in every repeat of the answer) while the newest (Late) survived only inside the
+  fallback's fixed tail. The row finished at 115,029 -- under the limit, so the loud `DQ` that
+  layer 2 promised never happened. Fixed in the commit that follows this archive; every
+  `tool_summary_anchored` reading here predates the fix.
+
 Run 50 is all twenty strategies at 120,000 tokens and 0.8 fill -- run 47's measurement moved to a
 smaller window and the first all-strategies cell on the corrected reasoning counter
 (`434a77da5`), so its luna rows are comparable with each other and with runs 49's, not with run
