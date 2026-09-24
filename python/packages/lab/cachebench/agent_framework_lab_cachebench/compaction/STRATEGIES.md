@@ -543,8 +543,8 @@ The benchmark's `RESULTS.md` carries the run; everything below is mechanism.
 
 **Run 47 measured a design this section no longer describes.** Its composed row judged both
 halves at pass entry, recompacted its user summary, had no last-resort chain and ran the record
-strategy's fallback straight behind the record. Schema 16 changed all four; nothing below has
-been measured live yet.
+strategy's fallback straight behind the record. Schema 16 changed all four, and schema 17 made the
+user half wait for a record that is due; nothing below has been measured live yet.
 
 **The design, in three parts.**
 
@@ -557,6 +557,7 @@ been measured live yet.
    trigger, against the prompt as the record half left it, and runs in the `boundary` mode, so a
    summary it wrote stands rather than being re-summarised. User compaction rewrites a message just
    behind the head and so breaks nearly the whole cached prefix; it is the second line of defence.
+   While a record is due and still has time to arrive it is not judged at all -- see below.
 3. *A last-resort chain, only while the prompt is over the input budget,* re-read before every
    step: (a) merge the active records into one, when there are at least two; (b) fold the standing
    user summaries into one, when there are at least two, through the user strategy's own fold
@@ -575,6 +576,30 @@ summarizer call and a rewritten prefix to free tokens a strategy reading the liv
 left alone". That argument was made on the benchmark's short, bounded conversation, where a user
 half that never acts looks like a row measuring one half. In the intended design that idleness is
 correct, and the cost the argument accepted is the cost the design exists to avoid.
+
+**Judged after the record half was not enough: the user half also waits for a record that is
+due.** The record half compacts in two steps and the user half in one. On the pass where the prompt
+crosses the line the record half can only ask -- the recall middleware pins a *later* call, the
+model writes the record there, and only the pass after that drops what it covers -- so a user half
+judged on that pass sees a prompt the record half has not yet touched. It acted at once, and when
+summarising the user turns alone got back under the line, the middleware, reading the prompt on
+each call's way out, never saw it over the line again and never asked. Measured live on
+`gpt-5.6-luna` at 200,000 tokens, 0.9 fill and a 0.8 trigger: no record and one user compaction on
+five seeds of five. So the user half now holds on a pass over the line where the record half has
+work pending -- `record_pending`, which is the middleware's own count of tool groups no record
+covers, or an outstanding re-force ask -- and acts either on the pass that sees the record arrive,
+judged on what the record's drops left, or once two model responses have passed without one: the
+deciding call's own, and the pinned call's. That is the re-force layer's bound and reasoning (the
+pinned call's own pass cannot see a record; the follow-up's can), counted in responses read off the
+conversation rather than in passes, because the live path runs one pass over a call's copies and
+another over the store, and a pass count would expire the wait before the pinned call answered.
+Four guards keep the wait from doing harm: none is begun again behind a newest record a wait has
+already run out behind, so a model that never records costs one wait and not one in every three
+responses; none at or past the record half's give-up line, where that half has itself stopped
+waiting; none within one response of a record arriving, so the store pass replays the summary the
+copies were given instead of holding it back; and none while the prompt is under the record half's
+own trigger, where no record is coming. With nothing pending the user half acts exactly as before,
+and neither part run as its own row waits. `user_passes_waited` counts the passes held.
 
 **`USERSTARVED` and `tokens_removed_out_of_user_reach` are retired, not redefined.** Both existed
 to report the user half being kept idle by the record half as a defect. That idleness is now the

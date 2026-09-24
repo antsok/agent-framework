@@ -911,20 +911,175 @@ async def test_an_idle_pass_touches_nothing_and_asks_nothing() -> None:
     assert (strategy.user_compactions, strategy.last_resort_fallbacks, summarizer.calls) == (0, 0, 0)
 
 
-async def test_the_user_half_still_fires_while_the_record_half_is_waiting_for_a_record() -> None:
-    """A phase that waits must not make the phase behind it wait.
+def _later_reply(index: int) -> Message:
+    """Return one more model response, which is how far the user half's wait has run."""
+    return Message(role="assistant", contents=[f"Later reply {index}."], message_id=f"later{index}")
 
-    Before a record exists the record phase removes nothing, so the size it leaves is the size
-    the pass began with, and the user half is judged against that.
+
+async def test_the_user_half_waits_for_a_record_that_is_due_and_acts_once_the_wait_runs_out() -> None:
+    """The record half compacts in two steps and the user half in one, so the user half waits.
+
+    Before a record exists the record phase removes nothing: it asks, and the record arrives on a
+    later call. A user half judged on that first pass would act at once, and if its summary took
+    the prompt under the line the middleware would never ask -- the defect a live run measured
+    on five seeds of five. So it holds, and the hold is bounded in model responses: two, the
+    deciding call's own and the pinned call's. A second pass over the same point in the
+    conversation -- the store after the copies -- is not a response and does not move the bound.
+    The live-path tests in ``test_live`` drive the same rule through the middleware; this one
+    pins the count.
+    """
+    summarizer = _Summarizer()
+    strategy = _composed(_NARROW_CEILING, user_turns=_user_phase(_NARROW_CEILING, summarizer=summarizer))
+    messages = _conversation(record=None)
+
+    assert await strategy(messages) is False, "held, and the record phase has nothing to remove yet"
+    assert await strategy(messages) is False, "the same point read twice is one point"
+    messages.append(_later_reply(1))
+    assert await strategy(messages) is False, "the deciding call's own response cannot be the record"
+
+    assert (strategy.user_passes_waited, strategy.user_compactions, summarizer.calls) == (3, 0, 0)
+    assert "x" * 100 in _rendered(messages), "so the tool payload is untouched"
+
+    messages.append(_later_reply(2))
+
+    assert await strategy(messages) is True, "the pinned call answered without a record, so the wait is over"
+    assert (strategy.user_passes_waited, strategy.user_compactions) == (3, 1)
+    assert (strategy.records_found, strategy.fallbacks_used) == (0, 0), "waiting, not fallen back"
+
+
+async def test_a_wait_that_ran_out_is_not_begun_again_behind_the_same_record() -> None:
+    """A model that never records must not leave the user half idle one bound in every three.
+
+    The summarizer fails here so the prompt stays over the line after the user half acts, which
+    is the case where a fresh wait could begin on the very next pass.
+    """
+    summarizer = _FailingSummarizer()
+    strategy = _composed(_NARROW_CEILING, user_turns=_user_phase(_NARROW_CEILING, summarizer=summarizer))
+    messages = _conversation(record=None)
+
+    await strategy(messages)
+    messages += [_later_reply(1), _later_reply(2)]
+    await strategy(messages)
+
+    assert (strategy.user_passes_waited, summarizer.calls) == (1, 1), "the wait ran out and the user half acted"
+
+    messages.append(_later_reply(3))
+    await strategy(messages)
+
+    assert (strategy.user_passes_waited, summarizer.calls) == (1, 2), "and acted again, with no second wait"
+
+
+async def test_the_record_arriving_ends_the_wait_and_the_user_half_acts_only_on_what_it_left() -> None:
+    """A completed cycle: the record dropped what it covers, and the user half is judged after it.
+
+    On the narrow ceiling the post-record prompt is still over the shared line, so the user half
+    acts on the pass that saw the record; on the shared-line ceiling it is under, so the user
+    half stays idle and the cache prefix it would have broken survives.
+    """
+    for ceiling, acts in ((_NARROW_CEILING, True), (_SHARED_LINE_CEILING, False)):
+        strategy = _composed(ceiling)
+        messages = _conversation(record=None)
+
+        await strategy(messages)
+        assert (strategy.user_passes_waited, strategy.user_compactions) == (1, 0), ceiling
+
+        messages += _record_messages(_covering_record(4))
+        await strategy(messages)
+
+        assert strategy.user_passes_waited == 1, "the record ended the wait"
+        assert "x" * 100 not in _rendered(messages), "and dropped every tool result it covers"
+        assert strategy.user_compactions == (1 if acts else 0), ceiling
+
+
+async def test_a_conversation_restored_behind_the_wait_begins_it_again() -> None:
+    """Restoring a snapshot for a probe moves the conversation backwards past the wait's start.
+
+    A wait begun on the longer conversation must not be read against the shorter one as a
+    negative count, which would stretch it past its bound; it begins again from where the
+    restored conversation stands.
     """
     strategy = _composed(_NARROW_CEILING)
-    messages = _conversation(record=None)
+    restored = _conversation(record=None)
+
+    await strategy([*copy.deepcopy(restored), _later_reply(1)])
+    await strategy(copy.deepcopy(restored))
+    assert (strategy.user_passes_waited, strategy.user_compactions) == (2, 0)
+
+    await strategy([*restored, _later_reply(1), _later_reply(2)])
+
+    assert strategy.user_compactions == 1, "two responses from the restored point, and the wait is over"
+
+
+async def test_with_no_tool_work_pending_the_user_half_does_not_wait() -> None:
+    """A record half with nothing to record cannot help, so the user half acts on the first pass."""
+    strategy = _composed(_NARROW_CEILING)
+    messages = _conversation(tool_turns=0, record=None)
 
     assert await strategy(messages) is True
 
-    assert (strategy.records_found, strategy.fallbacks_used) == (0, 0), "waiting, not fallen back"
-    assert "x" * 100 in _rendered(messages), "so the tool payload is untouched"
+    assert (strategy.user_passes_waited, strategy.user_compactions) == (0, 1)
+
+
+async def test_under_the_record_halfs_own_trigger_the_user_half_does_not_wait() -> None:
+    """A user line set below the record half's trigger is a prompt the middleware will not ask at.
+
+    0.6 of the narrow ceiling is 13,200 and 0.87 is 19,140, so the 18,937-token fixture is over
+    the user half's line and under the record half's: no record is coming, and a wait would be
+    for nothing.
+    """
+    strategy = _composed(
+        _NARROW_CEILING,
+        tool_results=_record_phase(_NARROW_CEILING, trigger_fraction=0.87, fallback_fraction=0.95),
+        user_trigger_fraction=0.6,
+    )
+
+    assert await strategy(_conversation(record=None)) is True
+
+    assert (strategy.user_passes_waited, strategy.user_compactions) == (0, 1)
+
+
+async def test_the_user_half_does_not_wait_past_the_record_halfs_own_give_up_line() -> None:
+    """Past that line the record half has stopped waiting, so the user half must not wait longer.
+
+    The fixture starts at 18,937 tokens, over 0.9 of the 20,000 ceiling: the record half sheds
+    tool results without a record, and the user half is judged on what that left.
+    """
+    strategy = _composed(_COMPACTING_CEILING)
+
+    await strategy(_conversation(record=None))
+
+    assert strategy.fallbacks_used == 1, "the premise: the record half gave up on this pass"
+    assert strategy.user_passes_waited == 0
+
+
+async def test_the_store_pass_after_a_record_arrives_replays_the_user_summary_rather_than_waiting() -> None:
+    """The live path runs a pass over a call's copies and then one over the store.
+
+    The record here covers two of four groups, so the arrival pass leaves an ask for another
+    record outstanding -- work pending, by the rule the wait reads. The user half acted on the
+    copies; if the store pass, one response later, began a wait, the store would keep the band
+    the model was just sent without and the next call would be sent it again. So no wait begins
+    within one response of a record arriving, and the store gets the same summary, replayed.
+    """
+    summarizer = _Summarizer()
+    strategy = _composed(
+        tool_results=_record_phase(_NARROW_CEILING, trigger_fraction=0.1),
+        user_turns=_user_phase(_NARROW_CEILING, summarizer=summarizer),
+    )
+    stored = _conversation(record=_covering_record(2))
+    copies = copy.deepcopy(stored)
+
+    await strategy(copies)
+
     assert strategy.user_compactions == 1
+    assert strategy.tool_results.record_pending(copies), "the premise: an ask for another record is outstanding"
+
+    stored.append(_later_reply(1))
+    await strategy(stored)
+
+    assert strategy.user_passes_waited == 0
+    assert (strategy.user_summaries_replayed, summarizer.calls) == (1, 1), "the same summary, not a second one"
+    assert _user_texts(stored)[1] == _user_texts(copies)[1]
 
 
 async def test_configuration_reaches_each_half_without_reaching_the_other() -> None:

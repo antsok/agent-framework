@@ -709,6 +709,18 @@ class LiveOutcome:
     Counts the fallback being run, where ``fallbacks_after_record`` counts it changing something.
     ``LASTFALLBACK`` in ``strategy_notes``; beside ``DQ`` it is step e, the intended loud failure.
     """
+    user_passes_waited: int = 0
+    """Passes where ``tool_and_user_summary_anchored`` held its user half back for a record that was due.
+
+    The composed row's user half does not act while the record half has tool work a record is
+    due for and the record still has time to arrive, because the record half compacts in two
+    steps and the user half in one: judged on the pass that only *asked* for the record, the
+    user half would act first and, by taking the prompt under the line, stop the record ever
+    being asked for. Per pass, as ``USERUNDER`` is, so one wait on the live path reads several.
+    Read it beside ``RECORDS``, which grows when the wait ended in a record, and beside
+    ``USERCOMPACT``, which moves when it ran out or the record was not enough. ``USERWAIT`` in
+    ``strategy_notes``; zero on every other strategy.
+    """
     record_text: str = ""
     """The recall record the run produced, exactly as the model wrote it.
 
@@ -1018,6 +1030,7 @@ def _strategy_notes(strategy: Any) -> tuple[str, ...]:
         ("user_summaries_replayed", "USERREPLAY"),
         ("user_passes_below_trigger", "USERUNDER"),
         ("user_passes_declined", "USERHELD"),
+        ("user_passes_waited", "USERWAIT"),
         ("user_summary_failures", "USERSUMMFAIL"),
         ("user_summaries_in_conversation", "USERSUMMARIES"),
         ("user_summary_tokens", "USERSUMMTOKENS"),
@@ -2153,6 +2166,7 @@ async def run_live(
         record_rewrites=_count(strategy, "record_rewrites"),
         record_rewrites_rejected=_count(strategy, "record_rewrites_rejected"),
         last_resort_fallbacks=_count(strategy, "last_resort_fallbacks"),
+        user_passes_waited=_count(strategy, "user_passes_waited"),
         # Taken from the snapshot rather than from the live session, so it is the record the
         # probes were answered from and not one a probe's own compaction pass moved.
         record_text=recall_record_text(agent, snapshot),

@@ -15,7 +15,7 @@ import base64
 import contextlib
 import json
 import re
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import fields, replace
 from inspect import signature
@@ -90,6 +90,7 @@ from agent_framework_lab_cachebench._live import (
     snapshot_state,
 )
 from agent_framework_lab_cachebench._live_cli import (
+    _LEGEND,
     DEFAULT_TOOL_SHARE,
     CellStats,
     _accuracy_note,
@@ -140,10 +141,12 @@ from agent_framework_lab_cachebench.compaction import (
     RECORD_MARKER,
     AnchoredCompactionStrategy,
     MinimumGainAnchoredCompactionStrategy,
+    RecallGate,
     ToolResultAnchoredSummarizationCompactionStrategy,
     ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy,
     ToolResultRecallMiddleware,
     UserTurnAnchoredSummarizationCompactionStrategy,
+    find_record_index,
     make_recall_tool,
 )
 from agent_framework_lab_cachebench.compaction._preserve import is_preserved
@@ -1987,6 +1990,337 @@ async def test_both_halves_counters_reach_the_seed_record_and_the_flags_column()
     assert "USERCOMPACT:1" in flags and "USERREPLACED:6" in flags, "the user half"
     assert "RECORDS:1" in flags and "UNCOVERED:2" in flags, "and the tool half, on one row"
     assert "USERCOMPACT:1" in _render(None, [cell], set(), show_answers=False)
+
+
+#: The window the user-half wait is driven at. 0.6 of its 18,000-token input budget is the
+#: shared line, 10,800; 0.9 is the record half's give-up line, 16,200. With 1,200-token lookups
+#: the fixture first crosses the line on its last but one turn, at about 11,300 tokens, with
+#: about 3,900 of them in the three lookup results and about 5,800 in user turns the user half
+#: could summarise -- each alone enough to get back under.
+_WAIT_WINDOW = 20_000
+
+#: What a turn says to make the stub call a lookup tool rather than answer.
+_LOOKUP = "LOOKUP"
+
+
+class _LookupAndRecordStub(StubChatClient):
+    """A model that looks up what a turn names, writes a record when pinned, and answers otherwise.
+
+    The record quotes every code in every tool result it was sent, verbatim, so it covers every
+    lookup and the record half may drop them all. With ``writes`` off it ignores the pin and
+    answers in text, which is the model that never records.
+    """
+
+    def __init__(self, *, writes: bool = True) -> None:
+        """Create the stub.
+
+        Keyword Args:
+            writes: Answer a call pinned to the recall tool with a record.
+        """
+        super().__init__(reply="a reply " * 20)
+        self.writes = writes
+        self.pinned_calls = 0
+        self.records_written = 0
+
+    def _inner_get_response(
+        self,
+        *,
+        messages: Sequence[Message],
+        stream: bool,
+        options: Mapping[str, Any],
+        **kwargs: Any,
+    ) -> Any:
+        choice = options.get("tool_choice")
+        pinned = choice.get("required_function_name") if isinstance(choice, Mapping) else None
+        if pinned == RECALL_TOOL_NAME:
+            self.pinned_calls += 1
+        last = messages[-1]
+        if pinned == RECALL_TOOL_NAME and self.writes:
+            results = " ".join(
+                str(content.result)
+                for message in messages
+                for content in message.contents
+                if content.type == "function_result"
+            )
+            codes = " ".join(sorted(set(re.findall(r"CODE-\w+", results))))
+            name, arguments = RECALL_TOOL_NAME, json.dumps({"values": codes})
+            self.records_written += 1
+        elif last.role == "user" and (last.text or "").startswith(_LOOKUP):
+            name, arguments = f"lookup_{(last.text or '').split()[1]}", "{}"
+        else:
+            return super()._inner_get_response(messages=messages, stream=stream, options=options, **kwargs)
+        self.seen.append(len(messages))
+        self.options_seen.append(dict(options))
+        call = Content.from_function_call(call_id=f"call_{len(self.seen)}", name=name, arguments=arguments)
+
+        async def _go() -> ChatResponse[Any]:
+            return ChatResponse(messages=Message(role="assistant", contents=[call]))
+
+        return _go()
+
+
+def _coded_lookup(scope: str, tokens: int) -> Callable[[], str]:
+    """Return a no-argument lookup tool whose result carries eight codes and ``tokens`` of filler."""
+
+    def lookup() -> str:
+        codes = " ".join(f"CODE-{scope.upper()}{index}" for index in range(8))
+        return f"{scope} results: {codes}. " + "filler text " * (tokens // 3)
+
+    lookup.__name__ = f"lookup_{scope}"
+    lookup.__doc__ = f"Look up the {scope} deployment."
+    return lookup
+
+
+async def _run_wait_fixture(
+    strategy_name: str = "tool_and_user_summary_anchored",
+    *,
+    writes: bool = True,
+    tool_tokens: int = 1_200,
+    filler_turns: int = 7,
+    lookups: Sequence[str] = ("a", "b", "c"),
+    user_trigger_fraction: float | None = None,
+) -> SimpleNamespace:
+    """Drive a strategy through the harness's real session, wired the way ``run_live`` wires it.
+
+    Two filler turns of about 830 tokens, the lookups, then ``filler_turns`` more. The user
+    half's ``compact_against`` is wrapped on the instance, so every pass that reached it is
+    logged as whether a record stood in the conversation at that moment and whether the pass
+    compacted.
+
+    Returns:
+        The strategy, its record and user halves (either may be None), the middleware, the stub,
+        the stored conversation, the log and the line.
+    """
+    options = StrategyOptions(
+        tokenizer=TOKENIZER,
+        max_context_window_tokens=_WAIT_WINDOW,
+        max_output_tokens=2_000,
+        summarizer=_StubSummarizer(),
+        **({} if user_trigger_fraction is None else {"user_trigger_fraction": user_trigger_fraction}),
+    )
+    strategy = build_strategy(strategy_name, options)
+    recording = find_nested_strategy(strategy, ToolResultAnchoredSummarizationCompactionStrategy)
+    user = find_nested_strategy(strategy, UserTurnAnchoredSummarizationCompactionStrategy)
+    tools: list[Callable[..., str]] = [_coded_lookup(scope, tool_tokens) for scope in lookups]
+    middleware: ToolResultRecallMiddleware | None = None
+    if recording is not None:
+        gate = RecallGate()
+        tools.append(make_recall_tool(gate))
+        middleware = ToolResultRecallMiddleware(
+            max_input_tokens=recording.max_input_tokens,
+            tokenizer=TOKENIZER,
+            arm=gate.arm,
+            trigger_fraction=recording.trigger_fraction,
+            repeat_records=bool(getattr(strategy, "repeat_records", False)),
+            reforce=recording.take_reforce,
+        )
+    log: list[tuple[bool, bool]] = []
+    if user is not None:
+        judged = user.compact_against
+
+        async def logged(messages: list[Message], *, prompt_tokens: int, trigger_tokens: int) -> bool:
+            standing = find_record_index(messages) is not None
+            compacted = await judged(messages, prompt_tokens=prompt_tokens, trigger_tokens=trigger_tokens)
+            if prompt_tokens > trigger_tokens:
+                log.append((standing, compacted))
+            return compacted
+
+        user.compact_against = logged  # type: ignore[method-assign]
+    client = _LookupAndRecordStub(writes=writes)
+    agent = build_live_agent(
+        ProviderRuntime(client=client, model="stub"),
+        kind="harness",
+        strategy=strategy,
+        tokenizer=TOKENIZER,
+        tools=tools,
+        recorder=UsageRecorder(),
+        extra_middleware=[middleware] if middleware is not None else [],
+        max_context_window_tokens=_WAIT_WINDOW,
+        max_output_tokens=2_000,
+    )
+    session = agent.create_session()
+    turns = [f"Turn {index}: " + "u" * 3_200 for index in range(2)]
+    turns += [f"{_LOOKUP} {scope}" for scope in lookups]
+    turns += [f"Turn {index}: " + "u" * 3_200 for index in range(2, 2 + filler_turns)]
+    for text in turns:
+        await agent.run(text, session=session)
+    history = next(provider for provider in agent.context_providers if isinstance(provider, HistoryProvider))
+    return SimpleNamespace(
+        strategy=strategy,
+        recording=recording,
+        user=user,
+        middleware=middleware,
+        client=client,
+        stored=list(session.state.get(history.source_id, {}).get("messages", [])),
+        log=log,
+        line=int(options.input_budget_tokens * options.trigger_fraction),
+    )
+
+
+def _lookup_results(messages: Sequence[Message]) -> list[Message]:
+    """Return every message carrying a lookup's result, excluded or not."""
+    return [
+        message
+        for message in messages
+        for content in message.contents
+        if content.type == "function_result"
+        and "CODE-" in str(content.result)
+        and RECORD_MARKER not in str(content.result)
+    ]
+
+
+async def test_the_composed_rows_user_half_waits_for_the_record_through_the_live_path() -> None:
+    """The layering the composed row was designed for, which a live run measured inverted.
+
+    On gpt-5.6-luna at 200,000 tokens, 0.9 fill and a 0.8 trigger, five seeds of five read no
+    record and one user compaction. The record half compacts in two steps: on the pass where the
+    prompt crosses the line it can only ask, and the recall middleware pins a *later* call for
+    the record. The user half, judged on that pass, saw a prompt nothing had touched, summarised
+    the user turns and took the prompt under the line -- and the middleware, reading the prompt
+    on the call's way out, never asked. Only the live path shows that: it is a question of timing
+    across model calls and the middleware, which a list-driven test does not have.
+
+    Here each half alone would get the prompt back under the line. With the wait, the user half
+    holds on the crossing turn's two passes and on the pinned call's own pass; the middleware
+    pins the next call; the model writes the record; the follow-up call's pass drops every
+    lookup it covers; the prompt is under the line, so the user half never acts and the cached
+    prefix it would have broken survives. On the code before the wait this read no pinned call,
+    no record and one user compaction.
+    """
+    run = await _run_wait_fixture()
+    strategy = run.strategy
+
+    assert (run.client.pinned_calls, run.client.records_written) == (1, 1), "the record was asked for, once"
+    assert strategy.records_in_conversation == 1, "and arrived"
+    lookups = _lookup_results(run.stored)
+    assert len(lookups) == 3, "the premise: three lookups in the store"
+    assert all(message.additional_properties.get(EXCLUDED_KEY) for message in lookups), "all dropped behind it"
+    assert strategy.user_compactions == 0, "the record half was enough, so the user half never acted"
+    assert not run.log, "no pass reached the user half over the line"
+    assert included_token_count(run.stored) <= run.line, "under the line on the record alone"
+    assert strategy.user_passes_waited == 3, "the crossing turn's copies and store, and the pinned call's pass"
+    assert "USERWAIT:3" in _strategy_notes(strategy)
+
+
+async def test_when_the_record_is_not_enough_the_user_half_acts_on_what_it_left() -> None:
+    """The other half of the layering: the user half acts, and only behind the record.
+
+    Smaller lookups, so dropping them leaves the prompt over the line. Here the crossing is first
+    seen on a store pass -- the middleware, reading the call's own prompt, had not yet seen it
+    over -- and the wait, counted in responses, still lasts until the pinned call's record is in.
+    """
+    run = await _run_wait_fixture(tool_tokens=400, filler_turns=11)
+    strategy = run.strategy
+
+    assert (run.client.pinned_calls, strategy.records_in_conversation) == (1, 1)
+    assert all(message.additional_properties.get(EXCLUDED_KEY) for message in _lookup_results(run.stored))
+    assert strategy.user_compactions == 1, "the record was not enough, so the user half acted"
+    compacting = [standing for standing, compacted in run.log if compacted]
+    assert compacting == [True, True], "once the record stood: the copies, then the store replaying them"
+    assert strategy.user_passes_waited == 4
+
+
+async def test_a_model_that_never_records_leaves_the_user_half_waiting_only_two_responses() -> None:
+    """The wait is bounded: a record that never comes cannot leave the conversation uncompacted.
+
+    The model ignores the pin and answers in text. The crossing call's response and the pinned
+    call's are the two the wait allows, and on the pass after the second the user half acts.
+    """
+    run = await _run_wait_fixture(writes=False)
+    strategy = run.strategy
+
+    assert (run.client.pinned_calls, run.client.records_written) == (1, 0), "asked, and not answered"
+    assert strategy.records_in_conversation == 0
+    assert strategy.user_compactions == 1, "the user half acted once the wait ran out"
+    assert strategy.user_passes_waited == 3
+    assert included_token_count(run.stored) <= run.line
+
+
+async def test_with_no_tool_work_the_composed_rows_user_half_acts_on_the_crossing_pass() -> None:
+    """Nothing for the record half to record, so nothing to wait for."""
+    run = await _run_wait_fixture(lookups=(), filler_turns=11)
+    strategy = run.strategy
+
+    assert run.client.pinned_calls == 0
+    assert (strategy.user_compactions, strategy.user_passes_waited) == (1, 0)
+    assert run.log[0] == (False, True), "it compacted on the first pass over the line"
+    assert not [note for note in _strategy_notes(strategy) if note.startswith("USERWAIT")]
+
+
+@pytest.mark.parametrize("strategy_name", ["tool_summary_anchored", "user_summary_anchored"])
+async def test_the_standalone_rows_do_not_wait(strategy_name: str) -> None:
+    """The wait is the composed row's ordering, and neither half run as its own row has it.
+
+    The record row asks on the crossing call and drops on the pass that sees the record, as it
+    always did. The user row, judged at the same line, compacts on the first pass over it with
+    the lookups still pending -- the very pass the composed row holds.
+    """
+    run = await _run_wait_fixture(strategy_name, user_trigger_fraction=0.6)
+
+    assert not hasattr(run.strategy, "user_passes_waited")
+    if run.recording is not None:
+        assert (run.client.pinned_calls, run.recording.records_in_conversation) == (1, 1)
+        assert all(message.additional_properties.get(EXCLUDED_KEY) for message in _lookup_results(run.stored))
+    else:
+        assert run.client.pinned_calls == 0
+        assert run.user.user_compactions == 1
+        assert run.log[0] == (False, True), "it compacted on the first pass over the line"
+
+
+async def test_the_wait_count_reaches_the_seed_record_and_the_flags_column() -> None:
+    """``USERWAIT`` through the four handoffs, and a record written before schema 17 reads it as zero."""
+    strategy = _composed_over()
+    strategy._user_passes_waited = 4
+
+    notes = _strategy_notes(strategy)
+    assert "USERWAIT:4" in notes
+
+    outcome, scenario = await _probed(StubChatClient(usage=UsageDetails(input_token_count=1_000)), repeats=1)
+    record = _record(
+        replace(outcome, strategy_notes=notes, user_passes_waited=strategy.user_passes_waited),
+        scenario,
+        strategy="tool_and_user_summary_anchored",
+    )
+
+    assert record.user_passes_waited == 4
+    assert SeedRecord.from_dict(record.to_dict()).user_passes_waited == 4
+    older = record.to_dict()
+    older["schema"] = 16
+    del older["user_passes_waited"]
+    assert SeedRecord.from_dict(older).user_passes_waited == 0, "the user half never waited before 17"
+    cell = _aggregate("tool_and_user_summary_anchored", [record])
+    assert "USERWAIT:4" in _flags(cell, None)
+    assert "USERWAIT:4" in _render(None, [cell], set(), show_answers=False)
+    assert any("USERWAIT:<n>" in line for line in _LEGEND), "and the legend says what it means"
+
+
+async def test_run_live_reads_the_wait_count_off_the_composed_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``run_live`` reads the count off the outermost strategy, where the wait lives."""
+
+    class _Waited(ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy):
+        @property
+        def user_passes_waited(self) -> int:
+            return 5
+
+    composed = _Waited(
+        tokenizer=TOKENIZER,
+        tool_results=ToolResultAnchoredSummarizationCompactionStrategy(max_input_tokens=29_952, tokenizer=TOKENIZER),
+        user_turns=UserTurnAnchoredSummarizationCompactionStrategy(
+            max_input_tokens=29_952, tokenizer=TOKENIZER, client=_StubSummarizer()
+        ),
+    )
+    monkeypatch.setattr("agent_framework_lab_cachebench._live.build_strategy", lambda name, options: composed)
+    scenario = build_live_scenario(salt="wait", filler_turns=2, filler_tokens=50, tool_turns=2)
+
+    outcome = await run_live(
+        ProviderRuntime(client=StubChatClient(), model="stub"),
+        strategy_name="tool_and_user_summary_anchored",
+        options=_options(summarizer=_StubSummarizer()),
+        scenario=scenario,
+    )
+
+    assert outcome.user_passes_waited == 5
+    assert "USERWAIT:5" in outcome.strategy_notes
 
 
 async def test_every_reason_the_user_half_did_nothing_reaches_the_flags_column() -> None:
@@ -4935,6 +5269,7 @@ def test_the_two_accuracy_measures_are_named_acc1_and_acc2() -> None:
         record_rewrites=0,
         record_rewrites_rejected=0,
         last_resort_fallbacks=0,
+        user_passes_waited=0,
         strategy_notes=(),
         dropped_options=(),
         answer="",
@@ -5153,6 +5488,7 @@ def _control_cell(seeded: int) -> dict[str, CellStats]:
         record_rewrites=0,
         record_rewrites_rejected=0,
         last_resort_fallbacks=0,
+        user_passes_waited=0,
         strategy_notes=(),
         dropped_options=(),
         answer="",
@@ -6716,6 +7052,7 @@ def test_a_progress_line_shows_what_a_watcher_needs() -> None:
         record_rewrites=0,
         record_rewrites_rejected=0,
         last_resort_fallbacks=0,
+        user_passes_waited=0,
         strategy_notes=(),
         dropped_options=(),
         answer="",
