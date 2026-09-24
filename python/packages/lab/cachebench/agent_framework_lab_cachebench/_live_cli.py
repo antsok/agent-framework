@@ -8,7 +8,7 @@ import argparse
 import asyncio
 import time
 from collections.abc import Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from statistics import fmean
 from typing import TYPE_CHECKING, Any, Final, cast
@@ -2871,6 +2871,20 @@ def _workload_settings(args: argparse.Namespace) -> WorkloadSettings:
     )
 
 
+class _PreflightSummarizer:
+    """The client a summarizer-needing strategy is built against when the run configured none.
+
+    It exists so :func:`_build_or_exit` can run a strategy's constructor, and with it every
+    parameter check that constructor makes, before a summarizer has been chosen. Constructors
+    store a client and do not call it, so this is never asked anything; if it ever is, that is
+    a pre-flight doing work it must not do, and it says so.
+    """
+
+    async def get_response(self, *args: Any, **kwargs: Any) -> Any:
+        """Refuse: nothing built for a pre-flight is ever run."""
+        raise RuntimeError("the pre-flight summarizer stand-in was called; a pre-flight must not run a strategy")
+
+
 def _build_or_exit(strategies: Sequence[str], options: StrategyOptions) -> None:
     """Build every selected strategy once, before the run spends anything.
 
@@ -2883,9 +2897,13 @@ def _build_or_exit(strategies: Sequence[str], options: StrategyOptions) -> None:
     ``--dry-run`` surfaced not at all, because the dry run built from defaults rather than
     from the flags it was printing a plan for.
 
-    Strategies needing a summarizer are skipped when there is none. Their own missing-client
-    error is raised separately and says what to do about it; reaching it here would report a
-    missing ``--summarizer-provider`` as a bad configuration value.
+    A strategy needing a summarizer is built against a stand-in client when the run configured
+    none, rather than skipped. Skipping it left its parameters unchecked in exactly the case a
+    dry run is most often used -- planning a cell before choosing a provider -- and it hid more
+    than ranges: on ``tool_and_user_summary_anchored`` a ``--trigger-fraction`` at or above the
+    record half's ``--fallback-fraction`` is refused by the constructor, and a dry run without
+    ``--summarizer-provider`` printed a clean plan for it. The stand-in is never called; the
+    missing client is still reported separately, where the run needs it, and says what to do.
 
     Args:
         strategies: The selected strategy names.
@@ -2895,10 +2913,11 @@ def _build_or_exit(strategies: Sequence[str], options: StrategyOptions) -> None:
         SystemExit: If any strategy rejects the configuration.
     """
     for name in strategies:
+        built_from = options
         if name in STRATEGIES_NEEDING_SUMMARIZER and options.summarizer is None:
-            continue
+            built_from = replace(options, summarizer=cast("SupportsChatGetResponse[Any]", _PreflightSummarizer()))
         try:
-            build_strategy(name, options)
+            build_strategy(name, built_from)
         except ValueError as error:
             raise SystemExit(
                 f"{name} rejects this configuration: {error} Each parameter named there is the "

@@ -1372,9 +1372,9 @@ def test_the_two_trigger_flags_stay_apart() -> None:
 def test_a_user_band_value_outside_its_range_is_refused_before_anything_is_spent(argv: list[str], match: str) -> None:
     """The same "fail at the command line" contract, on the strategy that needs a client.
 
-    Worth its own test because the pre-flight skips a summarizer-needing strategy when the run
-    configured no client, so these ranges are only checked for a run that actually selected a
-    summarizer -- a real gap, and one a reader of the other parametrized test would not guess.
+    Worth its own test because the pre-flight used to skip a summarizer-needing strategy when the
+    run configured no client, so these ranges were only checked for a run that had selected a
+    summarizer. It now builds against a stand-in; the test below covers that case.
     """
     options = _strategy_options(build_parser().parse_args(["azure", *argv]), TOKENIZER, _StubSummarizer())
 
@@ -1382,6 +1382,44 @@ def test_a_user_band_value_outside_its_range_is_refused_before_anything_is_spent
         _build_or_exit(["user_summary_anchored"], options)
 
     assert match in str(error.value)
+
+
+@pytest.mark.parametrize(
+    ("strategy", "argv", "match"),
+    [
+        pytest.param(
+            "tool_and_user_summary_anchored",
+            ["--trigger-fraction", "0.9"],
+            "fallback_fraction must be greater than trigger_fraction",
+            id="composed-trigger-at-give-up-line",
+        ),
+        pytest.param("user_summary_anchored", ["--user-min-band-share", "1.5"], "min_band_share", id="user-band-share"),
+    ],
+)
+def test_the_pre_flight_checks_a_summarizer_strategy_even_with_no_summarizer(
+    strategy: str, argv: list[str], match: str
+) -> None:
+    """A dry run planned before choosing a provider still refuses a configuration the run would.
+
+    The pre-flight used to skip these strategies when no client was configured. The case that
+    exposed it: ``--trigger-fraction 0.9`` puts the composed row's record half on its own give-up
+    line, which the constructor refuses, and a dry run without ``--summarizer-provider`` printed
+    a clean plan for it.
+    """
+    options = _strategy_options(build_parser().parse_args(["azure", *argv]), TOKENIZER)
+    assert options.summarizer is None, "the case under test is a run with no summarizer configured"
+
+    with pytest.raises(SystemExit) as error:
+        _build_or_exit([strategy], options)
+
+    assert match in str(error.value)
+
+
+def test_the_pre_flight_stand_in_summarizer_is_never_called() -> None:
+    """Building for a pre-flight must not run anything, so a clean configuration passes quietly."""
+    options = _strategy_options(build_parser().parse_args(["azure"]), TOKENIZER)
+
+    _build_or_exit(["user_summary_anchored", "tool_and_user_summary_anchored", "summarization"], options)
 
 
 def test_the_user_band_strategy_says_it_needs_a_summarizer() -> None:
