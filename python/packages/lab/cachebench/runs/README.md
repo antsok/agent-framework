@@ -230,8 +230,22 @@ Seed$ means, with the best row that kept 53/53 on every seed:
   earlier below-window verdicts of `none` survive the corrected counter and sizing.
 - **Past the window the saving is resolved** (run 53), and the series shows its source: from 0.9
   to 1.15 the uncompacted conversation grows from 110K to 142K seeded tokens and its seed$ rises
-  44%, while the record row holds its snapshot at 79-86K and its seed$ moves 2%. Once engaged it
-  caps the prompt. The crossover lies between 0.9 and 1.15 and has not been located.
+  44%, while the record row's snapshot sits at 79-86K and its seed$ moves 2%. The crossover lies
+  between 0.9 and 1.15 and has not been located.
+- **Withdrawn, 24 September: "once engaged it caps the prompt".** There is no cap. With
+  `--record-repeats` off, the default in every run here, the record half writes one record (22 of
+  the 25 record-row seeds in runs 51-55; the other three are re-forces) and compacts exactly once,
+  at a fixed absolute size -- 70,771 tokens, 0.6 of the 117,952 budget, the same in every cell.
+  Everything after it, new tool results included, stays in the prompt, and since `00061004b` those
+  results are also held from the fallback. The snapshots agree at 0.9 and 1.15 because the cut
+  falls at the same token count in both and the conversations end soon after. In a conversation
+  that kept going the prompt would grow until it passed the window and the row disqualified.
+  With repeats on, raw tool results stay bounded but records accumulate: each is preserved and
+  none is ever folded, so the floor grows linearly -- the problem the user half's fold mode
+  answers, with no counterpart on the record side. **Run 53's -24% therefore describes a
+  conversation that ends about 15% past its window, not a long-running agent.** This benchmark
+  has six tool calls and a fixed end, so it cannot see the difference; a long cell -- many tool
+  turns, fill well above 1.0, repeats on against off -- would.
 - Rows keeping 53/53 on every seed: 7 at 0.7, 6 at 0.9, 4 at 1.15.
 - The composed row's premium over not compacting falls as pressure rises -- +37%, +30%, +11% --
   consistent with a strategy whose headroom is only worth its price when the window is tight.
