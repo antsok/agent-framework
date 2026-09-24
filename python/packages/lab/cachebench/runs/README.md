@@ -207,6 +207,19 @@ What it shows, and what it is void for:
 No `.sh` is kept: the script that produced it is the same one run 47 uses, and re-running it
 against this tree produces the repaired rows rather than these.
 
+Run 59a is the **aborted** first attempt at the long cell, kept as evidence. A 30,000-token window
+under a conversation sized to 6.5x it (195K), 24 tool turns (197 facts), tool share 0.4, trigger
+0.7, output and answer reservation 6,000 -- settings chosen by an offline simulation through
+`run_live` so that the composed row's last-resort chain would fire, which it had not in any live
+cell before. It fired, and broke: on both completed seeds the composed row reached `RECMERGE:1`
+and then **crashed at turn 22** with Foundry's `400 invalid_payload` ("the provided data does not
+match the expected schema"), 21 of 101 turns done, 83/197 facts. A merged record was written as a
+synthetic function call with a client-minted call id, and a provider that validates the function
+calls in a request refuses one the model never made. The earlier note that luna would not be
+affected was wrong. Stopped after two seeds, since the rest would crash the same way and the three
+rows have to be re-run together after the fix. The control disqualified on both (peak over the
+30K limit, 197/197); `truncation` kept 8 of 197.
+
 Run 58 is the composed row against `none` at 200,000 tokens, **1.0 fill** and `--trigger-fraction
 0.9`, five seeds, $3.73. `--fallback-fraction` was raised from its default 0.9 to 1.0, because the
 record half's give-up line has to sit above its trigger. *Corrected 25 September:* the reason
