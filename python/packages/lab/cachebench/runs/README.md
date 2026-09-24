@@ -207,6 +207,38 @@ What it shows, and what it is void for:
 No `.sh` is kept: the script that produced it is the same one run 47 uses, and re-running it
 against this tree produces the repaired rows rather than these.
 
+Run 53 is run 51 repeated in full on `00061004b`, where the post-record fallback may no longer
+shorten a tool group no record covers. Same cell -- all twenty strategies, 120,000 tokens, the
+uncompacted conversation sized to 115% of the window -- five seeds, $15.21. The control
+disqualified on all five; fill landed at +3.1%.
+
+- **`tool_summary_anchored` kept 53/53 on every seed at seed$ 0.070-0.090, against the
+  unlimited control's 0.100-0.109: every one of its seeds cheaper than every one of the
+  control's, -24% on the means.** The per-seed spread that has swamped every earlier cost
+  comparison in this archive does not reach here, because the two ranges do not overlap. The
+  control is a reference, not a baseline -- it disqualified -- so the reading is that a
+  120K model could not run this conversation uncompacted at all, and this row runs it for less
+  than a model with no limit would.
+- **That is a reading on good draws.** No `tool_summary_anchored` seed here had an uncovered
+  group, a re-force or a post-record fallback, so this run does not exercise the fix. Run 52
+  did. Across runs 51-53 the failure condition occurred on 2 of 15 seeds.
+- `tool_and_user_summary_anchored`: 53/53 on every seed, zero fallback activity, peak at 58% of
+  the window, seed$ +11% on the reference. Across runs 51-53, 15 of 15 seeds at 53/53.
+- The printed verdict, `tool_summary_anchored`, is again NOT SUPPORTED, narrowly: a 31% spread
+  against a 28% gap to `anchored_min_gain`, one of whose seeds came in at 0.084. The margin
+  over the control is resolved; the margin over `anchored_min_gain` is not.
+- `selective_tool_call` disqualified on one seed. Every row that compacts below 50% of the
+  window keeps 8-34 facts.
+
+Run 52 is the confirmation that ran first: the two record rows plus `none` and `truncation`,
+the same cell, five seeds, $3.03. It is the run that exercised the fix. On
+`tool_summary_anchored` seed 4 the run-51 failure recurred almost exactly -- four uncovered
+lookups, all four preserved, one re-force, 33 post-record fallback passes -- and this time the
+fallback was held off the unprotected tool groups (`RECHELD:34`) and shed narration only, which
+was not enough, so the row went over the limit at 129,096 and **disqualified with all 53 facts
+intact**. That is the outcome the fix exists for: a loud failure rather than a quiet loss. Every
+other record row held 53/53 under the limit.
+
 Run 51 is all twenty strategies at 120,000 tokens with the uncompacted conversation sized to
 **115% of the window** -- the first cell in this archive where not compacting fails. No control
 row before it had ever disqualified (the closest luna came was 0.964 of its budget), so every
