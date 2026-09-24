@@ -133,6 +133,7 @@ from agent_framework_lab_cachebench._records import (
 from agent_framework_lab_cachebench._strategies import needs_summarizer
 from agent_framework_lab_cachebench._tokenizers import REASONING_TOKENS_KEY, build_tokenizer
 from agent_framework_lab_cachebench.compaction import (
+    DEFAULT_HARDER_ATTEMPTS,
     DEFAULT_RECORD_MAX_TOKENS,
     DEFAULT_RECORD_TARGET_TOKENS,
     RECALL_TOOL_NAME,
@@ -811,6 +812,7 @@ def test_every_argument_the_runner_reads_is_defined() -> None:
         "user_trigger_fraction",
         "user_min_band_share",
         "user_summary_mode",
+        "record_harder_attempts",
         "record_repeats",
         "min_correctness",
         "summarizer_provider",
@@ -1789,6 +1791,46 @@ async def test_the_recall_middleware_is_wired_for_the_composed_strategy(monkeypa
     )
 
 
+@pytest.mark.parametrize(
+    ("strategy_name", "repeat_flag", "expected"),
+    [
+        ("tool_and_user_summary_anchored", False, True),
+        ("tool_summary_anchored", False, False),
+        ("tool_summary_anchored", True, True),
+    ],
+)
+async def test_the_composed_row_records_every_new_batch_of_tool_work_and_the_record_row_only_when_asked(
+    monkeypatch: pytest.MonkeyPatch, strategy_name: str, repeat_flag: bool, expected: bool
+) -> None:
+    """Part one of the composed row's design, asserted where it is wired.
+
+    The composed row's record half has to ask again whenever tool work no record covers has
+    accumulated past the trigger, and the setting that does that lives on the recall middleware
+    the run builds. So the composed row turns it on whatever ``--record-repeats`` says, and the
+    standalone ``tool_summary_anchored`` row keeps its default: off, unless the flag asks.
+    """
+    built: list[dict[str, Any]] = []
+    real = build_live_agent
+
+    def capture(*args: Any, **kwargs: Any) -> Any:
+        built.append(kwargs)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr("agent_framework_lab_cachebench._live.build_live_agent", capture)
+    scenario = build_live_scenario(salt="repeats", filler_turns=2, filler_tokens=50, tool_turns=2)
+
+    await run_live(
+        ProviderRuntime(client=StubChatClient(), model="stub"),
+        strategy_name=strategy_name,
+        options=_options(summarizer=_StubSummarizer()),
+        scenario=scenario,
+        repeat_records=repeat_flag,
+    )
+
+    (middleware,) = (item for item in built[0]["extra_middleware"] if isinstance(item, ToolResultRecallMiddleware))
+    assert middleware.repeat_records is expected
+
+
 async def test_a_row_with_no_record_strategy_in_it_still_gets_no_middleware(monkeypatch: pytest.MonkeyPatch) -> None:
     """The other half of the wiring test, without which it passes on a run that wires always.
 
@@ -1948,36 +1990,36 @@ async def test_both_halves_counters_reach_the_seed_record_and_the_flags_column()
 
 
 async def test_every_reason_the_user_half_did_nothing_reaches_the_flags_column() -> None:
-    """USERCOMPACT:0 has four readings, and the flags column has to carry all four.
+    """USERCOMPACT:0 has three readings, and the flags column has to carry all three.
 
-    A pass whose record half took the prompt under the user half's own trigger, a pass whose
-    band was not worth compacting, a pass that never reached the trigger at all and a summarizer
-    that did not answer are four different findings: the first is an argument about the order of
-    the phases, the second about ``--user-min-band-share``, the third about the workload and the
-    fourth about the summarizer. A column that shows only some of them sends a reader to the
-    wrong knob. They travel by the same duck-typed route every other strategy counter does,
-    which is the route a new one is most easily left off.
+    A pass that never reached the line, a pass whose band was not worth compacting and a
+    summarizer that did not answer are three different findings: the first is about the workload
+    -- or, on the composed row, about the record half having been enough, which is that row
+    working -- the second about ``--user-min-band-share`` and the third about the summarizer.
+    They travel by the same duck-typed route every other strategy counter does, which is the
+    route a new one is most easily left off.
 
-    An idle pass is no longer silent, and that is the change: it reports ``USERUNDER``, because
-    "the user half was never consulted" is the reading that most needs a number beside it -- it
-    is what ``USERSTARVED`` is a subset of, and without the total there is nothing to read that
-    subset against.
+    **This test used to carry a fourth, ``USERSTARVED``, and now asserts it is gone.** It read
+    the composed row's user half being kept idle by the record half as a defect; the row now
+    judges its user half after the record half on purpose, and that idleness is ``USERUNDER``.
+    A flag that survived the retirement would report the design working as a failure.
     """
     strategy = _composed_over(ceiling=100_000)
 
     assert await strategy(_user_band_conversation(8)) is False, "neither trigger is near this ceiling"
     assert _strategy_notes(strategy) == ("USERUNDER:1",), "an idle pass reports being idle and nothing else"
 
-    starved = _composed_over()
-    starved._starved = 2
-    starved.user_turns._declined = 3
-    starved.user_turns._below_trigger = 7
+    quiet = _composed_over()
+    quiet.user_turns._declined = 3
+    quiet.user_turns._below_trigger = 7
 
-    notes = _strategy_notes(starved)
+    notes = _strategy_notes(quiet)
 
-    assert "USERSTARVED:2" in notes
-    assert "USERHELD:3" in notes, "held back by the band share, which is not the same as starved"
+    assert "USERHELD:3" in notes, "held back by the band share"
     assert "USERUNDER:7" in notes, "and the passes it was never consulted on at all"
+    assert not [note for note in notes if note.startswith("USERSTARVED")], "retired, and not reported"
+    assert not hasattr(quiet, "user_passes_starved")
+    assert not hasattr(quiet, "tokens_removed_out_of_user_reach")
 
 
 async def test_a_record_cap_above_the_reservation_is_named_for_the_composed_row_too(
@@ -2089,15 +2131,19 @@ def test_two_cells_differing_only_in_a_user_band_setting_do_not_merge() -> None:
     )
 
 
-def test_the_summary_mode_flag_reaches_the_user_band_strategy_and_the_composed_rows_half() -> None:
+def test_the_summary_mode_flag_reaches_the_user_band_strategy_and_not_the_composed_rows_half() -> None:
     """The fifth user-band knob, checked the way the other four are, and on both rows at once.
 
     The mode is the whole difference between three arms of one measurement, so a flag that
     parsed and reached nothing would leave a sweep of it producing three identical rows with no
-    way to tell that from a null result. The composed row's half is checked beside the single
-    row because the two are built by one builder and must not be in different modes under one
-    command line -- and its shared line is asserted untouched, because the fold sits behind the
-    trigger check rather than beside it.
+    way to tell that from a null result.
+
+    **The composed row's half used to be asserted to follow the flag, and now asserts the
+    opposite.** That row keeps its user summaries standing rather than re-summarising them, so
+    its builder runs the half in ``boundary`` under every value of the flag -- and remembers two
+    summarizer requests where the single row remembers one, because its last-resort chain may
+    ask for a fold on the pass that summarised a band. Both are that row's configuration, and
+    the single row's defaults are asserted unmoved beside it.
     """
     summarizer = _StubSummarizer()
     default = _strategy_options(build_parser().parse_args(["azure"]), TOKENIZER, summarizer)
@@ -2108,14 +2154,17 @@ def test_the_summary_mode_flag_reaches_the_user_band_strategy_and_the_composed_r
     single = build_strategy("user_summary_anchored", default)
     assert isinstance(single, UserTurnAnchoredSummarizationCompactionStrategy)
     assert single.summary_mode == "recompact", "the default is the arm every archived row ran"
+    assert single.remembered_requests == 1
 
     folded = build_strategy("user_summary_anchored", folding)
     assert isinstance(folded, UserTurnAnchoredSummarizationCompactionStrategy)
     assert folded.summary_mode == "fold"
 
-    composed = _composed_strategy(folding)
-    assert composed.user_turns.summary_mode == "fold", "the same builder, so the same mode"
-    assert composed.user_trigger_fraction == composed.tool_results.trigger_fraction, "and the shared line is untouched"
+    for options in (default, folding):
+        composed = _composed_strategy(options)
+        assert composed.user_turns.summary_mode == "boundary", "the composed row's own mode, whatever the flag"
+        assert composed.user_turns.remembered_requests == 2
+        assert composed.user_trigger_fraction == composed.tool_results.trigger_fraction, "and the shared line"
 
     with pytest.raises(SystemExit):
         build_parser().parse_args(["azure", "--user-summary-mode", "sometimes"])
@@ -2140,6 +2189,119 @@ def test_the_summary_mode_is_recorded_from_the_built_options_and_keys_cells_apar
         _cell_params(settings=_settings(user_summary_mode="fold")).key
         != _cell_params(settings=_settings(user_summary_mode="boundary")).key
     )
+
+
+def test_the_harder_attempts_flag_reaches_the_composed_row_and_the_settings_block() -> None:
+    """The new setting on the composed row, checked the way the user-band knobs are.
+
+    It reaches the composed object's chain, is recorded on the settings block so two runs apart
+    in it are two cells, and reads back as zero on a block written before it existed -- which is
+    what those runs could do, since the row had no chain.
+    """
+    summarizer = _StubSummarizer()
+    default = _strategy_options(build_parser().parse_args(["azure"]), TOKENIZER, summarizer)
+    swept = _strategy_options(
+        build_parser().parse_args(["azure", "--record-harder-attempts", "5"]), TOKENIZER, summarizer
+    )
+
+    assert _composed_strategy(default).harder_attempts == DEFAULT_HARDER_ATTEMPTS
+    assert _composed_strategy(swept).harder_attempts == 5
+    assert _cell_params(settings=_settings(record_harder_attempts=5)).key != _cell_params(settings=_settings()).key
+
+    written = _cell_params(settings=_settings()).to_dict()
+    del written["settings"]["record_harder_attempts"]
+    settings = CellParams.from_dict(written).settings
+    assert settings is not None
+    assert settings.record_harder_attempts == 0, "an older composed row had no chain to rewrite with"
+
+
+async def test_the_chain_counters_reach_the_seed_record_and_the_flags_column() -> None:
+    """Seven counts saying how far down the chain a row went, through the four handoffs.
+
+    Strategy notes, outcome, seed record and flags column -- the route every other counter takes
+    and the one a new one is most easily left off. And a record written before schema 16 reads
+    them back as zero, because the row had no chain.
+    """
+    strategy = _composed_over()
+    strategy._records_merged = 1
+    strategy._record_merges_rejected = 2
+    strategy._user_summaries_merged = 3
+    strategy._user_merges_rejected = 4
+    strategy._record_rewrites = 5
+    strategy._record_rewrites_rejected = 6
+    strategy._record_summary_failures = 8
+    strategy._last_resort_fallbacks = 7
+
+    notes = _strategy_notes(strategy)
+    for flag in (
+        "RECMERGE:1",
+        "RECMERGEREJ:2",
+        "USERMERGE:3",
+        "USERMERGEREJ:4",
+        "RECHARDER:5",
+        "RECHARDERREJ:6",
+        "RECSUMMFAIL:8",
+        "LASTFALLBACK:7",
+    ):
+        assert flag in notes
+
+    counts = {
+        "records_merged": 1,
+        "record_merges_rejected": 2,
+        "user_summaries_merged": 3,
+        "user_merges_rejected": 4,
+        "record_rewrites": 5,
+        "record_rewrites_rejected": 6,
+        "last_resort_fallbacks": 7,
+    }
+    outcome, scenario = await _probed(StubChatClient(usage=UsageDetails(input_token_count=1_000)), repeats=1)
+    record = _record(
+        replace(outcome, strategy_notes=notes, **counts), scenario, strategy="tool_and_user_summary_anchored"
+    )
+
+    assert {name: getattr(record, name) for name in counts} == counts
+    read_back = SeedRecord.from_dict(record.to_dict())
+    assert {name: getattr(read_back, name) for name in counts} == counts
+    older = record.to_dict()
+    older["schema"] = 15
+    for name in counts:
+        del older[name]
+    assert {name: getattr(SeedRecord.from_dict(older), name) for name in counts} == dict.fromkeys(counts, 0)
+    flags = _flags(_aggregate("tool_and_user_summary_anchored", [record]), None)
+    assert "RECMERGE:1" in flags and "LASTFALLBACK:7" in flags
+
+
+async def test_the_chain_counters_are_read_off_the_composed_row_by_run_live(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``run_live`` reads the chain's counts off the outermost strategy, not off either half."""
+
+    class _Chained(ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy):
+        @property
+        def records_merged(self) -> int:
+            return 2
+
+        @property
+        def last_resort_fallbacks(self) -> int:
+            return 3
+
+    composed = _Chained(
+        tokenizer=TOKENIZER,
+        tool_results=ToolResultAnchoredSummarizationCompactionStrategy(max_input_tokens=29_952, tokenizer=TOKENIZER),
+        user_turns=UserTurnAnchoredSummarizationCompactionStrategy(
+            max_input_tokens=29_952, tokenizer=TOKENIZER, client=_StubSummarizer()
+        ),
+    )
+    monkeypatch.setattr("agent_framework_lab_cachebench._live.build_strategy", lambda name, options: composed)
+    scenario = build_live_scenario(salt="chain", filler_turns=2, filler_tokens=50, tool_turns=2)
+
+    outcome = await run_live(
+        ProviderRuntime(client=StubChatClient(), model="stub"),
+        strategy_name="tool_and_user_summary_anchored",
+        options=_options(summarizer=_StubSummarizer()),
+        scenario=scenario,
+    )
+
+    assert (outcome.records_merged, outcome.last_resort_fallbacks) == (2, 3)
+    assert outcome.user_merges_rejected == 0
 
 
 def test_a_settings_block_written_before_the_summary_mode_reads_it_as_recompacting() -> None:
@@ -4766,6 +4928,13 @@ def test_the_two_accuracy_measures_are_named_acc1_and_acc2() -> None:
         user_summaries_in_conversation=0,
         user_summary_tokens=0,
         user_folds=0,
+        records_merged=0,
+        record_merges_rejected=0,
+        user_summaries_merged=0,
+        user_merges_rejected=0,
+        record_rewrites=0,
+        record_rewrites_rejected=0,
+        last_resort_fallbacks=0,
         strategy_notes=(),
         dropped_options=(),
         answer="",
@@ -4977,6 +5146,13 @@ def _control_cell(seeded: int) -> dict[str, CellStats]:
         user_summaries_in_conversation=0,
         user_summary_tokens=0,
         user_folds=0,
+        records_merged=0,
+        record_merges_rejected=0,
+        user_summaries_merged=0,
+        user_merges_rejected=0,
+        record_rewrites=0,
+        record_rewrites_rejected=0,
+        last_resort_fallbacks=0,
         strategy_notes=(),
         dropped_options=(),
         answer="",
@@ -6533,6 +6709,13 @@ def test_a_progress_line_shows_what_a_watcher_needs() -> None:
         user_summaries_in_conversation=0,
         user_summary_tokens=0,
         user_folds=0,
+        records_merged=0,
+        record_merges_rejected=0,
+        user_summaries_merged=0,
+        user_merges_rejected=0,
+        record_rewrites=0,
+        record_rewrites_rejected=0,
+        last_resort_fallbacks=0,
         strategy_notes=(),
         dropped_options=(),
         answer="",
@@ -6826,6 +7009,7 @@ def _settings(**overrides: Any) -> StrategySettings:
         "user_trigger_fraction": 0.8,
         "user_min_band_share": 0.1,
         "user_summary_mode": "recompact",
+        "record_harder_attempts": 2,
         "token_budget_fraction": 0.5,
         "max_output_tokens": 2_048,
         "answer_max_tokens": 12_000,

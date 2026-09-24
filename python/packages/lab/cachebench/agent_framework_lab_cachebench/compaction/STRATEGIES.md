@@ -215,7 +215,9 @@ Without them, every group gathered later is uncoverable for the rest of the run,
 prompt to the end and the row reports `UNCOVERED` for work no record was ever asked to account
 for. The price is accumulation: every record is preserved — unshrinkable, undroppable, counted
 against the ceiling in full — and nothing merges them, because an older record is the sole account
-of the groups behind *it* and a merge rewrites the evidence rather than the bulk. So each record
+of the groups behind *it* and a merge rewrites the evidence rather than the bulk. (That holds for
+this row; the composed row below merges them as a last resort, once the prompt is over the budget
+with both of its halves spent, and says why.) So each record
 raises a floor under the prompt that no later pass can lower, and `records_in_conversation` is what
 says so. It is a different question from `records_found`, which saturates at 1 and answers only
 whether the model ever complied. `repeat_records=True` turns repeats on; the default is the
@@ -529,7 +531,8 @@ than compacts: it owns no selection rule and removes nothing itself.
 touch, and both say so. The record strategy works on the tool half — a seventh of run 43's
 prompt — and the user-turn strategy's offline replay bottomed out at 41% of the window, a floor
 that is exactly "the assistant replies and the tool payload it may not touch". The section above
-names composing the two as the obvious next measurement. **Run 47 made it**: five seeds of
+names composing the two as the obvious next measurement. **Run 47 made it**, on the design this
+section describes below as reversed: five seeds of
 `gpt-5.6-luna` at a 170,000-token window and 0.9 fill on the scaled payload, both halves firing on
 every seed, 53 of 53 facts, a 30% snapshot against 50% for the record half alone and 71% for the
 user half alone, and a 76% whole-run cache hit rate against their 95% and 93% — 84% against 92%
@@ -538,111 +541,108 @@ inside the seed
 spread — +22% against the control with a 30% spread of its own — so the money question is open.
 The benchmark's `RESULTS.md` carries the run; everything below is mechanism.
 
-**Mechanism.** One pass runs the record strategy, re-reads the conversation, and runs the
-user-turn strategy. It returns True when either did. The two select disjoint messages —
-`group_messages` gives a user message a group of kind `user` and a call-and-result pair a group of
-kind `tool_call`, and each part's rule names exactly one kind — so there is no message both could
-claim and nothing either could supersede twice.
+**Run 47 measured a design this section no longer describes.** Its composed row judged both
+halves at pass entry, recompacted its user summary, had no last-resort chain and ran the record
+strategy's fallback straight behind the record. Schema 16 changed all four; nothing below has
+been measured live yet.
 
-**Order: the record strategy first.** Three reasons, the first of which is the expensive one.
+**The design, in three parts.**
 
-- *The record has to be asked for early.* Its trigger is 0.6 against the user band's 0.8, and the
-  two constants document why they differ: the record degrades with the bulk it is given to read,
-  so it fires early, while the user band pays only in a broken cached prefix and fires as late as
-  it can. `ToolResultRecallMiddleware` reads the same size the strategy does. A user phase running
-  first would shrink the prompt below the line that asks for a record at all, so the row would not
-  have a late record — it would have none, and would report a model that never complied.
-- *The phase that can remove less goes first.* The record phase is capped at the tool share and
-  the user phase at the user share, and on this benchmark's sizing those are a seventh and most of
-  the prompt. The other order takes the prompt from above the user line to below the record line
-  in one step, every pass.
-- *The record strategy's fallback counts group positions.* Running it behind the user phase would
-  have it count a band containing this pass's summary message rather than the turns it replaced,
-  so the fallback's geometry — and what the `tool_summary_anchored` row means — would differ
-  between the composed row and the row it is meant to be read against.
+1. *The record half records every new batch of tool results and never re-summarises a record.*
+   The composed object reports `repeat_records`, and the benchmark turns the recall middleware's
+   repeats on for any strategy that does, so a further record is asked for whenever tool work no
+   record covers has accumulated past the trigger. The standalone record row's default is
+   untouched: its middleware repeats only when `--record-repeats` asks.
+2. *The user half acts only if the record half was not enough.* It is judged at the record half's
+   trigger, against the prompt as the record half left it, and runs in the `boundary` mode, so a
+   summary it wrote stands rather than being re-summarised. User compaction rewrites a message just
+   behind the head and so breaks nearly the whole cached prefix; it is the second line of defence.
+3. *A last-resort chain, only while the prompt is over the input budget,* re-read before every
+   step: (a) merge the active records into one, when there are at least two; (b) fold the standing
+   user summaries into one, when there are at least two, through the user strategy's own fold
+   machinery; (c) rewrite the record harder, up to `harder_attempts` (default 2) times on the
+   pass, each attempt asking for more compression; (d) the record strategy's fallback, with every
+   tool group no record covers held, so it may drop narration only; (e) nothing more -- the prompt
+   goes out over the limit and the row reads `DQ`, the intended loud failure. The give-up fallback
+   taken when no record ever arrived is not part of the chain.
 
-**The two ceilings stay separate; the trigger does not.** `TokenBudgetComposedStrategy` gives
-every variant one ceiling precisely so that size is held fixed and only the ordering of deletion
-varies, and this row deliberately does the opposite: the sizes the two phases reach *are* the
-measurement. But the two *triggers* are now one, taken from the record half
-(`--trigger-fraction`), because the alternative was measured and it was not a row at all.
-
-**Two lines made the row inert, and it said nothing.** The record phase fires at 0.6 and the user
-phase at 0.8, the record phase goes first, and on a workload whose bulk is tool payload it removes
-that payload while the prompt is still in the 60s of the ceiling and holds it there for the rest
-of the run. The prompt then never reaches 0.8, so the user half is never consulted. Measured:
-gpt-5.6-luna at a 170,000-token window, 0.9 fill, seed 2 reported `snap 63%`, `REC:1, RECORDS:1,
-FORCED:1, RECFORCED:1`, a 94.6% cache hit rate and `USERCOMPACT:0` — `tool_summary_anchored`
-under a longer name, which is exactly the failure this composition exists to avoid. Its own
-starvation diagnostic, then a within-pass transition test, reported zero: the transition it looked
-for never happened, because the prompt was under the user line before the run began rather than
-taken under it during a pass.
-
-**Giving both halves the same fraction does not on its own fix it.** With the phases still judged
-one after the other, the record phase acts first, takes the prompt below the shared line, and the
-user phase declines on its own re-test — the same inertness with a different number on it. What
-makes a shared line mean anything is that **both halves are judged against the size the prompt had
-when the pass began**: `__call__` reads the included token count once, before either phase runs,
-and hands that one number to both through each part's `compact_against`. A half that would have
-fired on the pass-entry size fires, whatever the other half has already removed.
-
-That is safe because the two selection rules name disjoint group kinds, so a phase acting on a
-number a moment out of date still reads its own half of the conversation and nothing else. What it
-costs is that the second half may act when the prompt is already under the line, spending a
+**Judging the user half at pass entry is reversed, and the reversal is stated.** This section used
+to argue that "giving both halves the same fraction does not on its own fix it": judged one after
+the other, the record phase takes the prompt below the shared line and the user phase "declines on
+its own re-test", so both halves had to be judged against the size the pass began with, at the
+accepted cost that "the second half may act when the prompt is already under the line, spending a
 summarizer call and a rewritten prefix to free tokens a strategy reading the live size would have
-left alone. A pass that removes slightly more than it had to is the cheaper defect.
+left alone". That argument was made on the benchmark's short, bounded conversation, where a user
+half that never acts looks like a row measuring one half. In the intended design that idleness is
+correct, and the cost the argument accepted is the cost the design exists to avoid.
+
+**`USERSTARVED` and `tokens_removed_out_of_user_reach` are retired, not redefined.** Both existed
+to report the user half being kept idle by the record half as a defect. That idleness is now the
+row working, and it is counted where it belongs -- `USERUNDER`, the same as a conversation that has
+not grown. A redefinition would have had to count "the record half was enough" under a name that
+says something went wrong. `tokens_removed_by_record_phase` stays.
+
+**Acceptance is generic, and deliberately so.** A merged or rewritten record, or a folded user
+summary, is kept if it is non-empty and smaller, in tokens, than what it replaces; otherwise the
+old material stands and the chain moves to the next step. Nothing is checked against the old
+records, the tool results or anything the benchmark plants. A real deployment has no planted facts,
+and an overlap check fitted to this benchmark's codes would either reject correct paraphrase on real
+content or pass a lossy summary that kept the codes; what a merge loses is the benchmark's to
+measure, through `facts` and `acc1`. The record strategy's coverage check is untouched and is a
+different question -- what a record licenses *deleting* -- from whether a rewrite of records already
+standing is worth keeping.
+
+**A merged record is a record to everything that reads records.** It is written by
+`consolidate_records` as a recall call and its marked result, shaped byte for byte as the recall
+tool shapes one, and inserted directly behind the newest record it replaces, which are released and
+excluded call and result together. Being the newest record, it is what the newest-record lookup and
+the middleware anchor on and count pending work from; every group the replaced records stood in
+front of is in front of it, so the coverage check reads the same conversation against its text;
+and being a recall group, the hold the fallback runs behind skips it and the preservation walk
+protects and counts it. An excluded record, conversely, is no record to any of them -- the lookup,
+the coverage text and the count all skip it. `records_in_conversation` stays a peak, so `RECORDS:3`
+beside `RECMERGE:1` held three and merged them.
+
+**The records are merged by the user half's summarizer client, not by an agent turn.** The first
+record must come from the agent's model, the only one with the tool payload in context. A merge
+needs only the records, and the moment it is wanted is the moment the prompt is over the budget --
+so an agent turn pinned to the recall tool would itself be a call made with that prompt. The price
+is a client-minted call id on the merged record, which is safe wherever this compaction can run:
+a service that tracks tool calls holds the conversation itself, and there is then no client-side
+prompt to compact. A provider that signs its function calls may refuse an unsigned one; unmeasured.
+
+**`harder_attempts` defaults to 2.** Each attempt is a summarizer call and, if kept, a rewrite of a
+preserved message the cached prefix runs through. The first is the one that pays most; the second
+asks for markedly less in case the first was kept and not enough (60%, then 36% of the length). A
+third would ask a record of values to fall to about a fifth of its length while keeping every value
+verbatim, which is below the floor the values themselves set.
+
+**Order: the record strategy, the user strategy, then the chain.** The record has to be asked for
+early -- its trigger is 0.6, and a user phase running first would shrink the prompt below the line
+that asks for a record at all -- and the user strategy goes second because its action is the one
+that breaks the cache. The fallback's old placement argument, that it counts group positions and
+must run before the user phase so its geometry matches the `tool_summary_anchored` row's, is given
+up: in this row the fallback is the last resort, and behind a record it may take narration only, so
+the difference is which assistant replies it sheds. The standalone record row keeps its fallback
+straight behind its record, and never merges.
 
 **The alignment runs down to the record half's line, never up.** The record is written by a
-*model* asked to read the tool payload, it is measured degrading with the bulk it is given, and
-the middleware that does the asking reads the same prompt — so a record asked for late is asked
-for on more material, and one asked for after the prompt has been cut is never asked for. Aligning
-down costs the user half an earlier first compaction than its own row takes. The honest price of
-this is that the composed row's user half fires at a line no `user_summary_anchored` row was
-measured at, so on that axis the two are not the same configuration; a row that is measurably one
-of its halves is the worse of the two failures, and a caller who wants the two lines back passes
-an explicit `user_trigger_fraction`.
+*model* asked to read the tool payload, it degrades with the bulk it is given, and the middleware
+that asks reads the same prompt -- so a record asked for late is asked for on more material. A
+caller who wants two lines passes an explicit `user_trigger_fraction`.
 
-**The conversation is still re-annotated between the phases, and now for one reason rather than
-two.** It used to be re-read because the user phase thresholded against the result; it no longer
-does. It is re-read because the record strategy's fallback rewrites tool results in place and the
-counts are cached per message, so the band the user phase weighs would otherwise be measured
-against text no longer in the conversation. The band's share, unlike the trigger, is deliberately
-weighed against the prompt as it now stands: feeding it the stale entry size would shrink every
-band's apparent share and decline worthwhile passes by the other route.
+**The other list.** The live path compacts the copies sent on a call and then the store, and a
+request answered on the first is replayed on the second under the same call id: the chain keeps its
+record answers for one pass beyond the one they were asked on, and this row's user half remembers
+two requests where the single row remembers one, because a pass over the budget may ask it for a
+band and a fold.
 
-**`USERSTARVED` is now zero by construction on a default row, and that is the point.** The record
-phase can only act on a pass whose entry size is above the shared line, and a pass above the line
-is a pass the user half is consulted on, so nothing the record phase removes is ever removed out
-of the user half's reach. A non-zero value on a default row is a defect report rather than a
-configuration note, and run 47 read zero on all five seeds. On a row whose halves were
-deliberately set apart it still counts what it was written for: a pass is starved when the size
-it was judged against is at or below the user line and would have been above it with the record
-phase's earlier out-of-reach removals still in the conversation. It is a statement across passes
-and never within one — a pass is judged by the size
-it began with, so this pass's removal cannot explain this pass's reading — and the quantity it is
-decided against is exposed as `tokens_removed_out_of_user_reach` so the counter can be checked.
-On the package's growing fixture the aligned row reports `USERCOMPACT:4, USERHELD:1,
-USERSTARVED:0` and ends at 9,235 tokens; the split row reports `USERCOMPACT:0, USERSTARVED:15`
-and ends at 11,961 — exactly the size `tool_summary_anchored` alone reaches, which is the defect
-in one number.
-
-**It has no ceiling and no fallback of its own,** and returning False does not mean the prompt
-fits — the same as for both its parts. A third shed step here would put a removal in the composed
-row that neither single row can make.
-
-**Counters.** Both parts' counters are readable off the composed object, so one row's flags say
-which half did what: `REC`, `RECORDS`, `FALLBACK`, `RECFALLBACK` and `UNCOVERED` are the record
-half, `USERCOMPACT`, `USERREPLACED`, `USERREPLAY`, `USERUNDER`, `USERHELD` and `USERSUMMFAIL`
-the user half, and `USERSTARVED` is the composition's own.
-
-**A silent user half has four readings and the flags separate all four,** which is the whole
-point of the row being readable at all: `USERUNDER` is never considered, `USERSTARVED` is the
-subset of those the record phase caused, `USERHELD` is considered and held back by the band
-share, and `USERSUMMFAIL` is a summarizer that did not answer. They partition the passes — over
-a non-empty conversation every pass lands in exactly one of those four or in `USERCOMPACT` — so
-a reader with only the flags column can tell "the order of the phases is wrong" from "the share
-is set too high for this workload" from "the conversation never got big enough", and those ask
-for three different changes.
+**Counters.** Both parts' counters are readable off the composed object, and the chain adds one per
+step so a row says how far down it went: `RECMERGE`/`RECMERGEREJ` (step a kept / refused as no
+smaller), `USERMERGE`/`USERMERGEREJ` (step b), `RECHARDER`/`RECHARDERREJ` (step c attempts /
+refused), `RECSUMMFAIL` (merge or rewrite unanswered) and `LASTFALLBACK` (step d reached). A silent
+user half has the single row's three readings -- `USERUNDER`, `USERHELD`, `USERSUMMFAIL` -- which with
+`USERCOMPACT` partition the passes.
 
 **The wiring the row needs, and the one that was missing.** The record half is a strategy *and* a
 middleware, and the benchmark installs that middleware for the strategy it finds inside whatever
@@ -653,8 +653,9 @@ which is what a model that refused to comply looks like. Anything embedding thes
 the same check.
 
 **When it will not help.** Wherever either part is already inert: a conversation with no tool work
-for a record to carry, or one short enough that the band between the user anchors is a turn or
-two. It also spends both parts' costs — an agent turn for the record and a summarizer call for the
+for a record to carry, or one where the record half keeps the prompt under the line, in which case
+the user half stays idle by design and the row is the record row plus repeats. It also spends both
+parts' costs — an agent turn for the record and a summarizer call for the
 summary — so a cell running it beside the uncompacted control is comparing a row with two extra
 call types against a row with none.
 

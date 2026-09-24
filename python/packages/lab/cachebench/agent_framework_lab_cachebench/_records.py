@@ -219,7 +219,21 @@ __all__ = [
 #: record, because zero is what those runs did: no group was held for this reason. The version
 #: is what tells that zero -- a fallback free to shorten -- from a schema 15 zero, a fallback
 #: that never had to act.
-SCHEMA_VERSION: Final[int] = 15
+#:
+#: 16 adds seven counts for ``tool_and_user_summary_anchored``'s last-resort chain --
+#: ``records_merged``, ``record_merges_rejected``, ``user_summaries_merged``,
+#: ``user_merges_rejected``, ``record_rewrites``, ``record_rewrites_rejected`` and
+#: ``last_resort_fallbacks`` -- and ``record_harder_attempts`` to the settings block, and the bump
+#: is the version 5 argument again. Before it that row had no chain: it merged nothing, rewrote
+#: nothing, and ran its fallback straight behind the record rather than last, so every count
+#: reads back as the zero those runs produced and the setting as the zero rewrites they could
+#: make. The version is what tells that zero from a schema 16 zero, a chain that was never
+#: needed. The same change moved that row's user half from being judged at pass entry to being
+#: judged after the record phase, which no field records: the schema is the only mark of it, and
+#: a composed row before 16 is a different design from one after it, not an earlier run of the
+#: same one. It also retired ``USERSTARVED``, which was only ever a flag; notes already on disk
+#: keep it.
+SCHEMA_VERSION: Final[int] = 16
 
 #: Versions this reader accepts, which is not only the current one.
 #:
@@ -291,7 +305,11 @@ SCHEMA_VERSION: Final[int] = 15
 #: Version 14 joins on that argument one version along: its code could not hold a tool group
 #: after the record out of the fallback's reach, so ``fallbacks_held_after_record`` reads back
 #: as the zero those runs produced.
-_READABLE_SCHEMAS: Final[frozenset[int]] = frozenset({2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, SCHEMA_VERSION})
+#:
+#: Version 15 joins on the same argument: its composed row had no last-resort chain, so the
+#: chain's seven counts read back as the zeroes those runs produced and ``record_harder_attempts``
+#: as zero.
+_READABLE_SCHEMAS: Final[frozenset[int]] = frozenset({2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, SCHEMA_VERSION})
 
 #: The parameters that make two records the same cell, and so aggregable into one row.
 #:
@@ -542,11 +560,11 @@ class StrategySettings:
 
     **It describes the single row only, and a reader of a composed row must not take it from
     here.** ``tool_and_user_summary_anchored`` judges both of its halves at
-    ``trigger_fraction`` above, against one reading of the prompt taken before either acts, so a
-    record whose row is that one is a record whose user half fired at ``trigger_fraction`` while
-    this field says something else about a row that was not being run. Two lines there was
-    measured to be the record half holding the prompt below the user half's for a whole run;
-    ``compaction/_composed`` carries the argument.
+    ``trigger_fraction`` above -- the record half against the prompt the pass began with, the
+    user half against the prompt the record half left, from schema 16; before it, both against
+    the prompt the pass began with -- so a record whose row is that one is a record whose user
+    half was judged at ``trigger_fraction`` while this field says something else about a row that
+    was not being run. ``compaction/_composed`` carries the argument.
     """
     user_min_band_share: float
     """Share of the prompt the band had to be worth before ``user_summary_anchored`` acted.
@@ -576,6 +594,15 @@ class StrategySettings:
     default: no other mode existed, so recompacting is what those runs did. Read as the literal
     rather than as the strategy's default, so that the default moving cannot relabel them. See
     :data:`SCHEMA_VERSION`.
+
+    It describes the single row only from schema 16: ``tool_and_user_summary_anchored`` runs its
+    user half in ``boundary`` whatever this says. Before 16 this field reached that row too.
+    """
+    record_harder_attempts: int
+    """Harder rewrites of the record ``tool_and_user_summary_anchored``'s chain could try per pass.
+
+    Read by that row alone. Zero on a record written before schema 16, and that is what those runs
+    could do: the row had no chain.
     """
     token_budget_fraction: float
     max_output_tokens: int
@@ -669,6 +696,9 @@ def _settings_from_dict(data: Mapping[str, Any]) -> StrategySettings:
         # not DEFAULT_SUMMARY_MODE on purpose -- the default is allowed to move once the arms
         # have been measured, and an archived cell must not move with it.
         user_summary_mode=str(data.get("user_summary_mode", SUMMARY_MODE_RECOMPACT)),
+        # The band-share licence once more, schema 16 along: an older composed row had no chain,
+        # which is a harder-attempt count of zero, and the single rows never read it.
+        record_harder_attempts=int(data.get("record_harder_attempts", 0)),
         token_budget_fraction=float(data["token_budget_fraction"]),
         max_output_tokens=int(data["max_output_tokens"]),
         answer_max_tokens=int(data["answer_max_tokens"]),
@@ -1197,6 +1227,32 @@ class SeedRecord:
     ``user_compactions`` reading: no strategy those runs could select could fold, so zero is
     what they did.
     """
+    records_merged: int
+    """Passes where ``tool_and_user_summary_anchored``'s last-resort chain merged its records.
+
+    Step a of the chain: the prompt was over the input budget after both halves had run, the
+    conversation held at least two records, and the merged record came back smaller than they
+    were. This and the six fields after it say how far down that chain a row went, which no
+    other column can: a row that fitted after merging and a row that needed its fallback read
+    the same everywhere else until one of them reads ``DQ``. ``strategy_notes`` carries each as
+    its flag -- ``RECMERGE``, ``RECMERGEREJ``, ``USERMERGE``, ``USERMERGEREJ``, ``RECHARDER``,
+    ``RECHARDERREJ`` and ``LASTFALLBACK``.
+
+    Zero for every strategy that keeps no such count, and zero on a record written before schema
+    16 -- see :data:`SCHEMA_VERSION` for why that zero is a measurement rather than a gap.
+    """
+    record_merges_rejected: int
+    """Record merges the chain discarded because they came back no smaller than the records."""
+    user_summaries_merged: int
+    """Passes where the chain folded the standing user summaries into one: step b."""
+    user_merges_rejected: int
+    """User-summary folds the chain discarded because they came back no smaller."""
+    record_rewrites: int
+    """Harder rewrites of the record the chain tried, kept or not: step c, per attempt."""
+    record_rewrites_rejected: int
+    """Of those, the rewrites discarded because they came back no smaller."""
+    last_resort_fallbacks: int
+    """Passes on which the chain reached its fallback, step d, with everything above it tried."""
     strategy_notes: tuple[str, ...]
     dropped_options: tuple[str, ...]
     answer: str
@@ -1452,6 +1508,18 @@ class SeedRecord:
         # Zero on the same reading, one schema along: no strategy a record written before
         # schema 11 could select could fold.
         values.setdefault("user_folds", 0)
+        # Zero on the ``groups_kept_uncovered`` reading, schema 16 along: the composed row had no
+        # last-resort chain before it, so nothing was merged, rewritten or run last.
+        for name in (
+            "records_merged",
+            "record_merges_rejected",
+            "user_summaries_merged",
+            "user_merges_rejected",
+            "record_rewrites",
+            "record_rewrites_rejected",
+            "last_resort_fallbacks",
+        ):
+            values.setdefault(name, 0)
         # None, on the probe-token reading. A record written before schema 11 carried one
         # standing summary or none, and which is a deduction from ``user_compactions`` rather
         # than a number anybody took; the tokens are not recoverable at all.

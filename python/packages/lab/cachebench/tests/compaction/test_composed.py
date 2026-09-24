@@ -1,74 +1,92 @@
 # Copyright (c) Microsoft. All rights reserved.
 
-"""Tests for running the record strategy and the user-turn strategy over one conversation.
+"""Tests for the record strategy, the user-turn strategy and the last-resort chain over one conversation.
 
-The composition owns no selection rule, so almost nothing here is about which messages get
-removed -- that is tested beside each part. What is tested here is the four things composing
-adds, each of which fails silently rather than loudly.
+The composition owns no selection rule of its own for either half -- that is tested beside
+each part. What is tested here is what composing adds, most of which fails silently rather
+than loudly.
 
-**Both halves act, on one pass, judged by one number.** The point of the row is that the two
-reach material neither can reach alone, and the failure mode is a pass where one half quietly
-did nothing: the conversation is smaller, the row looks like it worked, and it is one of the
-single rows under a new name. That is not hypothetical -- it is what the row first shipped as,
-because the record phase's removals held the prompt below the line the user phase read. So the
-headline test runs on a ceiling whose shared line sits *between* the size the conversation
-starts at and the size the record phase leaves: both halves fire when both are judged against
-the size the pass began with, and the user half declines the moment anything judges it against
-what the record phase left. Reverting the pass to sequential judging is what that test is
-written to fail on.
+**The user half is judged after the record half, and stays idle when the record half was
+enough.** This reverses what this file used to pin. It used to assert that both halves are
+judged against the size the pass *began* with, so the user half fired even when the record
+phase had already taken the prompt under the shared line. The row's design now makes the user
+half the second line of defence -- its edits break the cached prefix -- so the headline test
+is the opposite one: on a ceiling whose shared line sits between the conversation's size and
+the size the record phase leaves, the user half stays idle, and handing it the pass-entry size
+is what that test is written to fail on. A second test pins the size it *is* handed.
 
-**One line for both halves, and the single rows keep their own.** The composition judges the
-user half at the record half's trigger, so a test that is about the shipped row builds it with
-that default and a test that is about the row this class used to be passes
-``user_trigger_fraction`` explicitly. Both are here, next to each other, because the pair is
-the argument: the aligned row fires both halves and the split row starves one. And what is
-asserted of the single rows is that neither of them moved -- the same instance, run as its own
-row, still reads its own trigger before and after a composition has run it.
+**The starvation counter is gone, and the tests that read it now read ``USERUNDER``.** They
+used to assert that a user half held under its line by the record half was a defect worth its
+own number. Under this design it is the row working, and it is counted as the ordinary "under
+the line" it is.
 
-**The order is the record phase first, and one of its three reasons is now moot.** The record
-strategy's trigger is the lower of the two and the middleware that asks the model for a record
-reads the conversation on the next call, so a pass that let the user half shrink the prompt
-first would not delay the record -- it would stop it being asked for. That reason is asserted
-directly. The reason that is gone is "the phase that removes less goes first, so the user line
-survives it": the user line now survives either order by construction, which is what the
-headline test pins.
+**The chain runs in order, only while over the budget, and keeps a replacement only if it is
+smaller.** Each step is driven on a fixture sized so that step is the one that brings the
+prompt under the budget, and the steps after it are asserted not to have run. A replacement
+that comes back no smaller is refused and the old material asserted still standing; the bound
+on harder rewrites is asserted at several values; and the exhausted chain is asserted to end in
+the fallback, over the budget -- the ``DQ`` the design intends. None of it checks content, and
+neither do the tests: the scripted summarizer answers by length, which is all the strategy
+may look at.
 
-**The starvation counter says which silence is the composition's doing.** A record phase that
-removes enough to take the prompt under the user phase's own trigger leaves a row reporting no
-user compactions, which is indistinguishable from a band that held nothing. That reading is the
-counter's whole job. On the aligned row it must read zero -- the record phase never acts below
-the line the user half is consulted at -- and on the split row it must read the run it was
-written for, so both are tested.
+**A merged record is a record to everything downstream, and an excluded one is not.** The
+coverage check, the record count, the newest-record lookup the middleware uses, and the hold
+the fallback runs behind are each asserted against a merged record.
+
+**The single rows are unchanged.** ``tool_summary_anchored`` still falls back straight behind
+its record, never merges, and reports no repeat request; ``user_summary_anchored`` still
+defaults to recompacting and remembers one request.
 """
 
 from __future__ import annotations
 
+import copy
+from collections.abc import Callable
 from typing import Any
 
 import pytest
 from agent_framework import CharacterEstimatorTokenizer, ChatResponse, Message
 from agent_framework._compaction import (
+    EXCLUDE_REASON_KEY,
     EXCLUDED_KEY,
     annotate_message_groups,
     annotate_token_counts,
     included_token_count,
     project_included_messages,
 )
+from agent_framework_lab_cachebench.compaction._anchored import AnchoredCompactionStrategy
 from agent_framework_lab_cachebench.compaction._composed import (
+    DEFAULT_HARDER_ATTEMPTS,
+    DEFAULT_RECORD_MERGE_PROMPT,
     ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy,
+    harder_record_prompt,
 )
 from agent_framework_lab_cachebench.compaction._preserve import PRESERVE_REASON_KEY, is_preserved
 from agent_framework_lab_cachebench.compaction._toolsummary import (
+    CONSOLIDATE_EXCLUDE_REASON,
     DEFAULT_TRIGGER_FRACTION,
     PRESERVE_REASON_UNCOVERED,
     PRESERVE_REASON_UNRECORDED,
     RECALL_TOOL_NAME,
     RECORD_MARKER,
     ToolResultAnchoredSummarizationCompactionStrategy,
+    ToolResultRecallMiddleware,
+    _droppable_groups_after,
+    _hold_unrecorded,
+    _preserve_records,
+    _record_text,
+    active_record_groups,
+    build_record_messages,
     find_record_index,
+    record_body,
 )
 from agent_framework_lab_cachebench.compaction._usersummary import (
+    DEFAULT_SUMMARY_MODE,
+    DEFAULT_USER_FOLD_PROMPT,
+    DEFAULT_USER_SUMMARY_PROMPT,
     DEFAULT_USER_TRIGGER_FRACTION,
+    FOLD_ID_PREFIX,
+    SUMMARY_MODE_BOUNDARY,
     SUMMARY_MODE_FOLD,
     USER_SUMMARY_MARKER,
     UserTurnAnchoredSummarizationCompactionStrategy,
@@ -93,8 +111,7 @@ _PAYLOAD_CHARS = 2_000
 #: composed row's shared line is 0.6 of this, 12,000, and the ``user_summary_anchored`` row's
 #: own line is 0.8 of it, 16,000: both sizes are above both, so a half that declines here
 #: declined for a reason of its own rather than for want of a trigger. The ceiling itself is
-#: above the post-record size, so the record phase does not reach for its fallback and no
-#: assertion here is about the anchored strategy.
+#: above the post-record size, so the chain never runs and no assertion here is about it.
 #:
 #: **Recompute the sizes whenever a default moves, and check the margins rather than the
 #: signs.** A fixture that slips under a trigger does not fail; it asserts against a phase that
@@ -105,20 +122,18 @@ _COMPACTING_CEILING = 20_000
 #: A ceiling whose *split* user line sits between the fixture's two sizes.
 #:
 #: 0.8 of 22,000 is 17,600: above the 16,613 the record phase leaves and below the 18,937 the
-#: conversation starts at. It is the line the record phase's removals used to take the prompt
-#: under within a single pass, and the test on it is that they no longer can -- at either
-#: fraction, because the size that decides is read before the record phase runs. The shared line
-#: here is 0.6 of it, 13,200, which both sizes clear. 0.9 of it is 19,800, so a record-less pass
-#: is still waiting rather than falling back, which is what makes the still-waiting test about
-#: the composition and not about the anchored strategy.
+#: conversation starts at, so a split row's user half, judged after the record phase, stays idle
+#: here. The shared line is 0.6 of it, 13,200, which both sizes clear. 0.9 of it is 19,800, so a
+#: record-less pass is still waiting rather than falling back, which is what makes the
+#: still-waiting test about the composition and not about the anchored strategy.
 _NARROW_CEILING = 22_000
 
 #: A ceiling whose *shared* line sits between the fixture's two sizes, which is the headline.
 #:
 #: 0.6 of 28,000 is 16,800: above the 16,613 the record phase leaves and below the 18,937 the
-#: conversation starts at. A user half judged against the size its pass began with fires here
-#: and a user half judged against what the record phase left declines, so this one ceiling is
-#: the difference between the composition and a sequential one wearing a shared fraction. 0.8 of
+#: conversation starts at. A user half judged against what the record phase left stays idle here,
+#: and one judged against the size its pass began with would fire, so this one ceiling is the
+#: difference between the design and the pass-entry judging it reverses. 0.8 of
 #: it is 22,400, above the whole fixture, which is what lets the same number stand for "and the
 #: ``user_summary_anchored`` row, reading its own trigger, does not fire at all".
 _SHARED_LINE_CEILING = 28_000
@@ -132,11 +147,8 @@ _IDLE_CEILING = 100_000
 #: The ceiling the growing fixture is run against, and the one the live composed row had.
 #:
 #: Sized so the record phase's trigger (0.6 of it, 12,000) is crossed part-way through a
-#: twenty-turn run and its removals then hold the prompt below a *split* user line (0.8 of it,
-#: 16,000) for the whole of the rest. That relationship is what the starvation tests are about,
-#: and they assert it of the fixture before they assert anything of the strategy. The same
-#: fixture run at the shared line is the opposite reading: the user half is consulted on every
-#: pass the record phase acts on, and the counter reads zero.
+#: twenty-turn run and its removals then hold the prompt below both the shared line and a split
+#: user line (0.8 of it, 16,000) after every pass: the run where the user half is never needed.
 _GROWING_CEILING = 20_000
 
 
@@ -318,6 +330,7 @@ def _composed(
     tool_results: ToolResultAnchoredSummarizationCompactionStrategy | None = None,
     user_turns: UserTurnAnchoredSummarizationCompactionStrategy | None = None,
     user_trigger_fraction: float | None = None,
+    harder_attempts: int = DEFAULT_HARDER_ATTEMPTS,
 ) -> ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
     """Return both halves composed, each defaulted to its own row's configuration.
 
@@ -330,6 +343,7 @@ def _composed(
         tool_results=tool_results or _record_phase(ceiling),
         user_turns=user_turns or _user_phase(ceiling),
         user_trigger_fraction=user_trigger_fraction,
+        harder_attempts=harder_attempts,
     )
 
 
@@ -338,9 +352,7 @@ def _split_composed(
 ) -> ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
     """Return the composition with its two halves deliberately set apart, 0.6 against 0.8.
 
-    The row this class shipped as, reachable now only by asking for it. Every test of the
-    starvation counter builds this, because on the aligned row that counter is zero by
-    construction -- and a counter that can only be zero is a counter nothing checks.
+    The row this class shipped as, reachable now only by asking for it.
     """
     return _composed(ceiling, user_trigger_fraction=DEFAULT_USER_TRIGGER_FRACTION)
 
@@ -458,72 +470,55 @@ async def _grow_composed(
     return passes
 
 
-async def test_two_lines_still_let_the_record_phase_hold_the_prompt_under_the_user_one() -> None:
-    """Defect 2, kept as a test of the configuration it belongs to now that it is opt-in.
+#: A ceiling whose shared line sits *below* the size the record phase leaves, and whose user
+#: row's own line sits above the whole fixture.
+#:
+#: 0.6 of 25,000 is 15,000, under the 16,613 the record phase leaves, so the composed row's user
+#: half is judged over its line after the record phase; 0.8 of it is 20,000, above the 18,937
+#: the conversation starts at, so the same object run as its own row does not fire. The two
+#: readings give opposite answers here, which is what the test on it needs. The ceiling is above
+#: every size, so the chain never runs.
+_OWN_LINE_CEILING = 25_000
 
-    Measured live: seed 1 of the composed row reported ``REC:1, RECORDS:1, FORCED:1,
-    RECFORCED:1`` with a 63% snapshot, no ``USERCOMPACT`` **and no ``USERSTARVED``**. The user
-    half had done nothing and the row's own diagnostic was silent about why.
 
-    The cause is the two triggers rather than anything about the band. The record phase fires at
-    0.6 and the user phase at 0.8, so on a workload whose bulk is tool payload the record phase
-    removes it while the prompt is still in the 60s and holds it there for the rest of the run.
-    The prompt is then never above the user line when a pass *starts*, which is what the first
-    version of the counter required: it tested ``before > user_line >= after`` within one pass,
-    and that transition never happens.
+async def test_a_split_row_whose_record_half_holds_the_prompt_down_reports_the_user_half_as_under() -> None:
+    """The run this file used to call starvation, now read as what it is.
 
-    The shipped row no longer has two lines, so this builds the split one deliberately -- and
-    that is the point of keeping the test. The fix is not that the counter now reads zero; it is
-    that the configuration which starves a half is the one a caller has to ask for. A run that
-    asks for it still gets the row, and still gets a number saying so.
+    Measured live on the row as it first shipped: the record phase fires at 0.6, the user phase
+    at 0.8, the record phase removes the tool payload while the prompt is in the 60s and holds
+    it there, and the user half never acts. This file used to count that as a defect with a
+    number of its own, ``USERSTARVED``. The row now judges its user half after the record half
+    on purpose -- user compaction breaks the cached prefix, and a record half that was enough is
+    a record half that spared it -- so the same run is asserted to report the user half as under
+    its line on every pass, and nothing more.
 
-    So the fixture is asserted to be the live case before anything else: no pass over it ever
-    starts above the user line, which is a proof that the first definition could not have counted
-    one -- and the counter, which asks whether the prompt would be over the line with what the
-    record phase removed out of the user half's reach still in it, counts nearly all of them.
+    Changed from ``test_two_lines_still_let_the_record_phase_hold_the_prompt_under_the_user_one``,
+    which asserted the starvation count.
     """
     strategy = _split_composed(_GROWING_CEILING)
 
     passes = await _grow_composed(strategy, 20)
     user_line = int(_GROWING_CEILING * strategy.user_trigger_fraction)
 
-    assert max(before for _, before in passes) <= user_line, (
-        "the fixture has to be the live case: no pass starts above the user line, so the "
-        "within-pass transition the counter used to test for cannot happen on any of them"
-    )
+    assert max(before for _, before in passes) <= user_line, "no pass starts above the split user line"
     assert strategy.records_found == 1, "the record phase is acting, which is what does the holding"
-    assert strategy.user_compactions == 0, "and the user half never gets a turn"
-    assert strategy.user_passes_starved >= 10, (
-        "which is the record phase's doing on most of the run, and has to be said in a number"
-    )
-    assert strategy.user_passes_below_trigger == len(passes), "every pass ended under the user line"
-    assert strategy.tokens_removed_out_of_user_reach > user_line - min(before for _, before in passes[-5:]), (
-        "the counterfactual rests on this quantity, so it is checked rather than trusted"
-    )
-    assert strategy.tokens_removed_out_of_user_reach <= strategy.tokens_removed_by_record_phase, (
-        "and it is a part of what the record phase removed rather than a second count beside it"
-    )
+    assert strategy.user_compactions == 0, "and the user half never needs a turn"
+    assert strategy.user_passes_below_trigger == len(passes), "which is counted as under its line, every pass"
+    assert not hasattr(strategy, "user_passes_starved"), "and not as starvation, which is retired"
 
 
 async def test_a_composed_row_whose_user_half_did_nothing_always_says_why() -> None:
-    """The failure the composition exists to avoid, asserted as a property of every pass.
+    """Every pass in which the user half did not compact is accounted for by exactly one counter.
 
-    A composed row that silently degrades to one half is worse than either single row: it is
-    smaller than the control, returns True, and reads as a working measurement. The wiring test
-    beside this one cannot catch it -- it checks the middleware is attached, and it passed
-    throughout the run where this happened.
+    A composed row whose user half is silent is now often the design working -- the record half
+    was enough -- but it has to *say* that, and the only way a reader of the flags column can
+    tell it from a band too small or a summarizer that failed is that each pass lands in exactly
+    one of the user half's outcomes. Asserted on the aligned row over the growing run, where the
+    record half keeps the prompt under the shared line throughout.
 
-    So what is asserted is the invariant rather than one outcome: over a run of twenty passes,
-    every pass in which the user half did not compact is accounted for by exactly one counter,
-    and on the split row the account is not merely "it was under its line" but *why* it was --
-    the phase in front of it. A composition that reverted to reporting nothing would leave the
-    starvation count at zero and fail here, not in a table six weeks later.
-
-    Built split on purpose. The aligned row has no silent user half to account for on this
-    fixture, which is the test one below; this one holds the partition open for the row where
-    the silence is real.
+    Changed: the starvation assertions this test carried are gone with the counter.
     """
-    strategy = _split_composed(_GROWING_CEILING)
+    strategy = _composed(_GROWING_CEILING)
 
     passes = await _grow_composed(strategy, 20)
 
@@ -534,54 +529,46 @@ async def test_a_composed_row_whose_user_half_did_nothing_always_says_why() -> N
         + strategy.user_summary_failures
     )
     assert accounted == len(passes), "every pass lands in exactly one of the user half's four outcomes"
-    assert strategy.user_compactions == 0, "the user half did nothing on this fixture"
-    assert strategy.user_passes_starved > 0, (
-        "so something other than 'the conversation was small' has to be saying why, and the "
-        "only candidate is the phase in front of it"
-    )
-    assert strategy.user_passes_starved <= strategy.user_passes_below_trigger, (
-        "starvation is a subset of the passes the user half was never consulted on, not a second count beside them"
-    )
+    assert strategy.records_found == 1
+    assert strategy.user_compactions == 0, "the record half kept the prompt under the shared line"
+    assert strategy.user_passes_below_trigger == len(passes), "and the flags say so"
 
 
-async def test_the_three_reasons_a_composed_user_half_is_silent_read_differently() -> None:
-    """Declined by hysteresis, starved by the record phase, never considered -- from the flags.
+async def test_the_reasons_a_composed_user_half_is_silent_read_differently() -> None:
+    """Never over the line, held back by the band share, and a summarizer that failed.
 
-    They ask for three different responses: lower ``min_band_share``, align the two triggers (or
-    accept that a row asked for two lines is a row whose halves fire apart), or run a longer
-    conversation. A row that reported one number for all three would send a reader to the wrong
-    knob, and the run that produced this counter reported *no* number for any of them.
-
-    The three are still three after the alignment, which is what this pins. A reader of the
-    aligned row who sees ``USERHELD`` must not be able to confuse it with the record phase having
-    eaten the prompt, and a reader of a split row who sees ``USERSTARVED`` must not read it as a
-    band that was too small.
+    They ask for different responses -- nothing, lower ``min_band_share``, look at the
+    summarizer -- and a row that reported one number for all of them would send a reader to the
+    wrong knob. Changed: this used to be four reasons, and the fourth, starvation, is retired.
     """
     never = _composed(_IDLE_CEILING)
-    starved = _split_composed(_GROWING_CEILING)
     declined = _composed(
         tool_results=_record_phase(_COMPACTING_CEILING),
         user_turns=_user_phase(_COMPACTING_CEILING, keep_head_user_turns=3, keep_tail_user_turns=4),
     )
+    failing = _composed(user_turns=_user_phase(summarizer=_FailingSummarizer()))
 
     assert await never(_conversation()) is False
-    await _grow_composed(starved, 20)
     assert await declined(_conversation()) is True, "the record phase acted; the user half is what did not"
+    assert await failing(_conversation()) is True
 
-    assert (never.user_passes_below_trigger, never.user_passes_starved, never.user_passes_declined) == (1, 0, 0)
-    assert starved.user_passes_starved > 0 and starved.user_passes_declined == 0
-    assert declined.user_passes_declined == 1, "over its line, and the band between those anchors is one turn"
-    assert (declined.user_passes_starved, declined.user_passes_below_trigger) == (0, 0), (
-        "which is not starvation: the prompt was over the user line when the user half read it"
+    assert (never.user_passes_below_trigger, never.user_passes_declined, never.user_summary_failures) == (1, 0, 0)
+    assert (declined.user_passes_below_trigger, declined.user_passes_declined) == (0, 1), (
+        "over its line after the record phase, and the band between those anchors is one turn"
+    )
+    assert (failing.user_passes_below_trigger, failing.user_passes_declined, failing.user_summary_failures) == (
+        0,
+        0,
+        1,
     )
 
 
-async def test_the_fixture_sits_where_the_four_ceilings_assume_it_does() -> None:
+async def test_the_fixture_sits_where_the_ceilings_assume_it_does() -> None:
     """A fixture that drifts across a trigger asserts against a phase that did nothing.
 
     Every test here rests on two sizes -- the conversation's, and the conversation's once the
-    record phase has dropped what the record covers -- and on where each ceiling's two lines
-    fall relative to them. A drift in any of that turns an assertion about composing into an
+    record phase has dropped what the record covers -- and on where each ceiling's lines fall
+    relative to them. A drift in any of that turns an assertion about composing into an
     assertion about an early return, which passes. So the arithmetic is checked once, here,
     rather than trusted to the comments on the constants.
     """
@@ -591,27 +578,22 @@ async def test_the_fixture_sits_where_the_four_ceilings_assume_it_does() -> None
     after = _size(compacted)
 
     assert after < before, "the record phase has to remove something or half of this is vacuous"
-    assert after > 0.6 * _COMPACTING_CEILING, "the record line stays crossed on the compacting ceiling"
-    assert after > 0.8 * _COMPACTING_CEILING, "and so does the user line, which is what lets both halves act"
-    assert after <= _COMPACTING_CEILING, "and the record phase never reaches for its fallback there"
+    assert after > 0.6 * _COMPACTING_CEILING, "the shared line stays crossed on the compacting ceiling"
+    assert after > 0.8 * _COMPACTING_CEILING, "and so does the user row's own line"
+    assert after <= _COMPACTING_CEILING, "and the chain never runs there"
     assert after < 0.8 * _NARROW_CEILING < before, "the narrow ceiling's split user line sits between the two sizes"
+    assert after > 0.6 * _NARROW_CEILING, "while its shared line sits under both"
     assert 0.9 * _NARROW_CEILING > before > 0.6 * _NARROW_CEILING, "where a record-less pass is still waiting"
     assert after <= 0.6 * _SHARED_LINE_CEILING < before, (
-        "the headline ceiling's *shared* line sits between them, which is the whole of what "
-        "makes that test bite: a user half judged against the size the pass began with fires "
-        "there and one judged against what the record phase left does not"
+        "the headline ceiling's *shared* line sits between them, which is the whole of what makes "
+        "that test bite: a user half judged against what the record phase left stays idle there, "
+        "and one judged against the size the pass began with would fire"
     )
-    assert before < 0.8 * _SHARED_LINE_CEILING, (
-        "and the user row's own line is above the fixture entirely, so the same ceiling says "
-        "'the composed row's user half fires where its own row's would not'"
+    assert before < 0.8 * _SHARED_LINE_CEILING, "and the user row's own line is above the fixture entirely"
+    assert after > 0.6 * _OWN_LINE_CEILING and before < 0.8 * _OWN_LINE_CEILING, (
+        "the own-line ceiling's shared line is under the post-record size and its user row's line over the whole"
     )
-    assert after <= _SHARED_LINE_CEILING, "no fallback there either"
     assert before < 0.6 * _IDLE_CEILING, "and neither line is anywhere near on the idle one"
-    assert before < 0.95 * _COMPACTING_CEILING, (
-        "the 0.95 line one test below sets has to sit above the fixture's *uncompacted* size, "
-        "because that is the size the user half is judged against: below it the half declines "
-        "at its trigger, which is what that test reads"
-    )
 
 
 async def _sizes_at(ceiling: int) -> tuple[int, int, int]:
@@ -632,19 +614,19 @@ async def _sizes_at(ceiling: int) -> tuple[int, int, int]:
     return _size(both), _size(tool_only), _size(user_only)
 
 
-async def test_both_halves_act_when_only_the_size_the_pass_began_with_clears_the_shared_line() -> None:
-    """The headline, on the one ceiling where sequential judging and this pass disagree.
+async def test_the_user_half_stays_idle_when_the_record_phase_alone_brings_the_prompt_under_the_line() -> None:
+    """The headline, on the one ceiling where judging after the record phase and at entry disagree.
 
     The shared line here is 16,800. The conversation is 18,937 and the record phase leaves
     16,613, so a user half asked "is the prompt over the line?" *after* the record phase has
-    acted is being asked about 16,613 and answers no -- and the composed row is then the record
-    row with a summarizer attached, which is what it shipped as, first at two fractions and then
-    at one shared fraction judged sequentially. Asked about the size the pass began with it
-    answers yes, and that is this test.
+    acted answers no, and stays idle: tool compaction was enough, and a user pass would have
+    broken the cached prefix for nothing. That is the design.
 
-    Written to fail on the regression rather than to describe the feature: hand the user phase a
-    freshly read count in ``__call__`` and this is a row with ``USERCOMPACT`` at zero and
-    ``USERUNDER`` at one, on a conversation whose band is a third of the prompt.
+    **This test used to assert the opposite**, as
+    ``test_both_halves_act_when_only_the_size_the_pass_began_with_clears_the_shared_line``: that
+    the user half fires here because it is judged against the size the pass began with. Written
+    now to fail on that: hand the user phase the entry size and it compacts a band on a prompt
+    already under the line.
     """
     strategy = _composed(_SHARED_LINE_CEILING)
     messages = _conversation()
@@ -652,124 +634,89 @@ async def test_both_halves_act_when_only_the_size_the_pass_began_with_clears_the
     entry = _size(_conversation())
     post_record = _conversation()
     assert await _record_phase(_SHARED_LINE_CEILING)(post_record) is True
-    assert _size(post_record) <= shared_line < entry, (
-        "the fixture has to straddle the line or this proves nothing: the record phase's "
-        "removals must be what would take the prompt under the line the user half reads"
-    )
+    assert _size(post_record) <= shared_line < entry, "the fixture has to straddle the line or this proves nothing"
 
     assert await strategy(messages) is True
 
     assert strategy.records_found == 1, "the record phase acted"
     assert "x" * 100 not in _rendered(messages), "and dropped the tool payload"
-    assert strategy.user_compactions == 1, "and the user half acted on the same pass, not the next one"
-    assert "Turn 4:" not in _rendered(messages), "and replaced the band"
-    assert (strategy.user_passes_below_trigger, strategy.user_passes_declined) == (0, 0), (
-        "neither under its line nor holding back: it was consulted, and it acted"
-    )
-    assert strategy.user_passes_starved == 0, "nothing was taken out of its reach to report"
-    assert _size(messages) < _size(post_record), "and the pass removed what the record phase alone does not"
+    assert strategy.user_compactions == 0, "and the user half, judged on what that left, stayed idle"
+    assert "Turn 4:" in _rendered(messages), "so the band is untouched"
+    assert (strategy.user_passes_below_trigger, strategy.user_passes_declined) == (1, 0)
+    assert _size(messages) == _size(post_record), "the pass removed exactly what the record phase alone does"
 
 
-async def test_the_band_is_weighed_against_the_prompt_as_it_now_stands() -> None:
-    """The number the pass-entry reading deliberately does *not* decide, and why it matters.
+async def test_the_user_half_is_judged_against_the_size_the_record_phase_left() -> None:
+    """The number the user half is handed, asserted directly and on every pass of a run.
 
-    One reading of the prompt decides whether each half acts. It does not decide what a pass
-    costs: ``min_band_share`` weighs the band against the prompt the pass would rewrite, and that
-    prompt is the one in front of the user half, after the record phase. Handing the stale entry
-    size to that check as well would make every band look like a smaller share than it is and
-    decline passes worth running -- the same suppression the pass-entry trigger exists to remove,
-    arriving through the hysteresis instead of through the trigger.
-
-    The fixture is sized so the two denominators disagree: the band is 6,174 tokens, which is
-    37.2% of the 16,613 the record phase leaves and 32.6% of the 18,937 the conversation starts
-    at. At a share of 0.35 the composed row's user half fires and the same strategy alone, on the
-    same conversation, declines. That pair is also the replacement for an order argument that
-    went stale -- "the phase that removes less goes first" used to be about protecting the user
-    half's trigger, and what running the record phase first actually buys now is a band that is a
-    larger share of a smaller prompt.
-
-    Self-guarding against fixture drift: a band that fell under 0.35 of the post-record size
-    fails the first half of this, and one that rose over 0.35 of the entry size fails the second.
+    The outcome tests above and below read what the user half did; this reads what it was
+    asked. A spy records the size each pass hands it and compares it with the size of the
+    conversation at that moment, which is after the record phase: equal on every pass, and on
+    the passes where the record phase removed something, smaller than the size the pass began
+    with. Over the growing run and on the one-pass fixture, so both a pass that compacts and
+    passes that do not are covered.
     """
-    share = 0.35
-    composed_messages = _conversation()
-    composed = _composed(user_turns=_user_phase(min_band_share=share))
-    alone_messages = _conversation()
-    alone = _user_phase(min_band_share=share)
+    handed: list[tuple[int, int]] = []
 
-    assert await composed(composed_messages) is True
-    assert await alone(alone_messages) is False
+    class _UserSpy(UserTurnAnchoredSummarizationCompactionStrategy):
+        async def compact_against(self, messages: list[Message], *, prompt_tokens: int, trigger_tokens: int) -> bool:
+            handed.append((prompt_tokens, included_token_count(messages)))
+            return await super().compact_against(messages, prompt_tokens=prompt_tokens, trigger_tokens=trigger_tokens)
 
-    assert composed.user_compactions == 1, "the band clears the share against the prompt the pass would rewrite"
-    assert "Turn 4:" not in _rendered(composed_messages)
-    assert (alone.user_compactions, alone.user_passes_declined) == (0, 1), (
-        "and does not clear it against the larger prompt the same conversation starts at, which "
-        "is what the stale reading would have weighed it against"
+    growing = _composed(
+        _GROWING_CEILING,
+        user_turns=_UserSpy(max_input_tokens=_GROWING_CEILING, tokenizer=TOKENIZER, client=_Summarizer()),
     )
-    assert "Turn 4:" in _rendered(alone_messages)
+    passes = await _grow_composed(growing, 20)
+    one = _composed(
+        user_turns=_UserSpy(max_input_tokens=_COMPACTING_CEILING, tokenizer=TOKENIZER, client=_Summarizer())
+    )
+    assert await one(_conversation()) is True
+
+    assert len(handed) == len(passes) + 1
+    assert all(given == live for given, live in handed), "the live size after the record phase, every time"
+    assert any(given < before for (given, _), (_, before) in zip(handed, passes, strict=False)), (
+        "and on some pass that is smaller than the size the pass began with, or the equality is vacuous"
+    )
+    assert one.user_compactions == 1
 
 
-async def test_the_composed_row_leaves_less_behind_than_either_half_alone() -> None:
-    """The claim the row exists to make, in tokens, at both ceilings that fire it.
+async def test_the_user_half_acts_when_the_record_phase_leaves_the_prompt_over_the_line() -> None:
+    """The second line of defence, engaging when the first was not enough.
 
-    A composition that quietly ran one half would still return True and still shrink the
-    conversation; what it could not do is beat the row that reaches that half. Asserted at two
-    ceilings because they fail differently: at the compacting one all three rows act and the
-    composed row has to beat two working rows, and at the headline one the user row does not act
-    at all -- which is the cost of aligning downward, stated in tokens rather than in prose.
+    On the compacting ceiling the record phase leaves 16,613 against a shared line of 12,000, so
+    the user half is over its line after the record phase and compacts its band on the same pass.
+    """
+    strategy = _composed(_COMPACTING_CEILING)
+    messages = _conversation()
+
+    assert await strategy(messages) is True
+
+    assert strategy.records_found == 1
+    assert strategy.user_compactions == 1
+    assert "Turn 4:" not in _rendered(messages)
+    assert strategy.last_resort_fallbacks == 0, "under the budget afterwards, so the chain never ran"
+
+
+async def test_the_composed_row_leaves_less_behind_than_either_half_alone_only_when_it_needs_to() -> None:
+    """The claim the row makes, in tokens, at both ceilings.
+
+    At the compacting ceiling all three rows act and the composed row beats both. At the
+    headline ceiling the record half alone brings the prompt under the shared line, so the
+    composed row leaves exactly what the record row leaves: it declined to spend a user pass it
+    did not need. Changed: this used to assert the composed row beat both rows at the headline
+    ceiling too, which was pass-entry judging buying a smaller prompt with a broken prefix.
     """
     composed_low, tool_low, user_low = await _sizes_at(_COMPACTING_CEILING)
     composed_high, tool_high, user_high = await _sizes_at(_SHARED_LINE_CEILING)
     entry = _size(_conversation())
 
     assert tool_low < entry and user_low < entry, "both single rows act at the compacting ceiling"
-    assert composed_low < min(tool_low, user_low), (
-        "so the composed row there is beating two rows that each did their own half's work"
-    )
+    assert composed_low < min(tool_low, user_low), "so the composed row there is beating two working rows"
 
     assert tool_high < entry, "the record row acts at the headline ceiling"
-    assert user_high == entry, (
-        "and the user row does not: its own 0.8 line is above the whole fixture. That is the "
-        "price of aligning down -- the composed row's user half fires where its own row's does "
-        "not, and the two rows are that much less alike"
-    )
-    assert composed_high < min(tool_high, user_high)
-
-
-async def test_the_aligned_row_reports_no_starvation_on_the_run_that_starves_the_split_one() -> None:
-    """``USERSTARVED`` reads zero when both halves fire, and it reads zero for a reason.
-
-    The same twenty-pass fixture under both configurations. The split row is the measured defect:
-    the record phase acts at 0.6, the prompt never reaches 0.8, and the user half is never
-    consulted. The aligned row consults it on every pass the record phase acts on, because that
-    is what one line means -- so there is no pass on which the record phase removes anything the
-    user half was not offered, the quantity the counter is decided against stays at zero, and so
-    does the counter.
-
-    The zero is asserted together with the quantity underneath it on purpose. A counter that
-    reads zero because the row worked and a counter that reads zero because it stopped counting
-    are the same number, and this package has shipped the second one twice.
-    """
-    aligned = _composed(_GROWING_CEILING)
-    split = _split_composed(_GROWING_CEILING)
-
-    passes = await _grow_composed(aligned, 20)
-    await _grow_composed(split, 20)
-
-    assert aligned.records_found == 1, "the record phase acted on the aligned row"
-    assert aligned.user_compactions > 0, "and so did the user half, which is the whole claim"
-    assert aligned.tokens_removed_by_record_phase > 0, (
-        "the record phase removed something, or the zero below is vacuous"
-    )
-    assert aligned.tokens_removed_out_of_user_reach == 0, (
-        "and none of it on a pass the user half was not consulted on, which is why the zero is "
-        "structural rather than a property of this fixture"
-    )
-    assert aligned.user_passes_starved == 0
-    assert len(passes) == 20
-
-    assert (split.user_compactions, split.records_found) == (0, 1), "the same run with two lines is the old row"
-    assert split.user_passes_starved > 0, "and it still says so"
+    assert user_high == entry, "and the user row does not: its own 0.8 line is above the whole fixture"
+    assert composed_high == tool_high, "and the composed row stops where the record row did, because that was enough"
 
 
 async def test_a_half_run_as_its_own_row_reads_its_own_trigger_before_and_after_composing() -> None:
@@ -777,16 +724,13 @@ async def test_a_half_run_as_its_own_row_reads_its_own_trigger_before_and_after_
 
     ``tool_summary_anchored`` and ``user_summary_anchored`` are rows in the same table as the
     composed one, and every archived number for them was produced by a strategy reading its own
-    ``trigger_fraction`` off the conversation in front of it. A composition that reconfigured the
-    objects it was handed -- or a shared line implemented by assigning one -- would change those
-    rows too, silently, and only in runs that happened to select all three.
-
-    So the same instance is run as its own row, then as a phase, then as its own row again. The
-    ceiling is the headline one, where its own line is above the fixture and the shared line is
-    below it, so the two readings give opposite answers and a leak would be loud.
+    ``trigger_fraction`` off the conversation in front of it. So the same instance is run as its
+    own row, then as a phase, then as its own row again, on a ceiling where the two readings give
+    opposite answers. Changed: the ceiling moved from the headline one, where the composed row's
+    user half now stays idle as well and the test would no longer distinguish anything.
     """
-    user_phase = _user_phase(_SHARED_LINE_CEILING)
-    record_phase = _record_phase(_SHARED_LINE_CEILING)
+    user_phase = _user_phase(_OWN_LINE_CEILING)
+    record_phase = _record_phase(_OWN_LINE_CEILING)
     standalone_first = _conversation()
 
     assert await user_phase(standalone_first) is False, "0.8 of this ceiling is above the fixture"
@@ -802,6 +746,7 @@ async def test_a_half_run_as_its_own_row_reads_its_own_trigger_before_and_after_
     assert user_phase.user_passes_below_trigger == 2
     assert "Turn 4:" in _rendered(standalone_again)
     assert user_phase.trigger_fraction == DEFAULT_USER_TRIGGER_FRACTION, "nothing wrote to the object"
+    assert user_phase.summary_mode == DEFAULT_SUMMARY_MODE and user_phase.remembered_requests == 1
 
     standalone_record = _conversation()
     assert await record_phase(standalone_record) is True, "and the row the line was borrowed from is itself"
@@ -813,10 +758,7 @@ def test_the_composed_row_takes_its_one_line_from_the_record_half() -> None:
 
     Aligning to the record half rather than to the user half is the direction that keeps the
     record askable: the model writes it, it degrades with the bulk it is given, and the
-    middleware that asks reads the same prompt -- so the alignment can only go down. Reading it
-    off the record half rather than storing a constant is what keeps a ``--trigger-fraction``
-    sweep moving both halves of this row together instead of splitting them apart again at every
-    value but the default.
+    middleware that asks reads the same prompt -- so the alignment can only go down.
     """
     default = _composed()
     swept = _composed(tool_results=_record_phase(trigger_fraction=0.35), user_turns=_user_phase())
@@ -830,29 +772,39 @@ def test_the_composed_row_takes_its_one_line_from_the_record_half() -> None:
 
 
 def test_a_user_trigger_fraction_outside_the_unit_interval_is_refused() -> None:
-    """The bounds the user half sets on its own trigger, kept where the line is overridden.
-
-    Zero would judge the user half over on an empty conversation, where the band is empty and
-    the only thing a pass can produce is a summarizer call; above one it can never fire, which is
-    a composed row whose user half is off with nothing saying so. Refused here for the same two
-    reasons the strategy refuses them, because a line supplied from outside is still that line.
-    """
+    """The bounds the user half sets on its own trigger, kept where the line is overridden."""
     with pytest.raises(ValueError, match="user_trigger_fraction"):
         _composed(user_trigger_fraction=0.0)
     with pytest.raises(ValueError, match="user_trigger_fraction"):
         _composed(user_trigger_fraction=1.5)
 
 
-async def test_the_two_halves_compact_two_halves_of_one_conversation() -> None:
-    """The whole claim, and the only test that puts the three rows side by side.
+def test_a_negative_number_of_harder_attempts_is_refused() -> None:
+    """Zero switches step c off; below zero is not a number of attempts."""
+    assert _composed(harder_attempts=0).harder_attempts == 0
+    assert _composed().harder_attempts == DEFAULT_HARDER_ATTEMPTS
+    with pytest.raises(ValueError, match="harder_attempts"):
+        _composed(harder_attempts=-1)
 
-    Each part alone moves only what it owns: the record phase deletes tool groups and leaves
-    every user turn verbatim, and the user-band phase replaces user turns and leaves every tool
-    result where it found them. A composition that silently ran only one of them would still
-    shrink the conversation, still return True, and still look like a working row -- so what is
-    asserted is that the composed pass does *both* things the two single passes each do half
-    of.
+
+def test_the_composed_row_asks_its_middleware_to_repeat_and_the_record_row_does_not() -> None:
+    """Part one of the design: every new batch of tool work is recorded, on this row only.
+
+    The setting belongs to the recall middleware, which the run builds; the composed object
+    reports ``repeat_records`` and ``run_live`` reads it -- the wiring is asserted in
+    ``test_live``. What is asserted here is that the request is the composed row's and not the
+    record strategy's: a record strategy reporting it would switch repeats on for the standalone
+    ``tool_summary_anchored`` row, whose default is off.
     """
+    strategy = _composed()
+
+    assert strategy.repeat_records is True
+    assert getattr(strategy.tool_results, "repeat_records", None) is None, "the standalone record row asks nothing"
+    assert getattr(strategy.user_turns, "repeat_records", None) is None
+
+
+async def test_the_two_halves_compact_two_halves_of_one_conversation() -> None:
+    """Each part alone moves only what it owns, and the composed pass does both where both are needed."""
     tool_only = _conversation()
     user_only = _conversation()
     both = _conversation()
@@ -870,31 +822,37 @@ async def test_the_two_halves_compact_two_halves_of_one_conversation() -> None:
     assert "x" * 100 not in rendered, "composed, the tool payload is gone"
     assert "Turn 4:" not in rendered, "and so is the user band"
     assert "lookup_1: CODE-1." in rendered, "the record the deletion was licensed against survives"
-    assert _size(both) < min(_size(tool_only), _size(user_only)), (
-        "a composition that reached only one half cannot beat the row that reached that half"
-    )
+    assert _size(both) < min(_size(tool_only), _size(user_only))
 
 
-async def test_the_record_phase_runs_before_the_user_phase() -> None:
+async def test_the_record_phase_runs_before_the_user_phase_and_without_its_fallback() -> None:
     """The order, asserted where it is decided rather than inferred from an outcome.
 
-    It is not arbitrary, and the reason that survives the shared line is the one about the next
-    call rather than this one. Both phases' removals are permanent, so a user phase that ran
-    first and removed the majority share of the prompt would hand the middleware -- which reads
-    the conversation on the next call, not this pass's entry size -- a prompt already below the
-    line that asks for a record at all, and the row's tool half would report a model that never
-    complied.
-
-    Spied on ``compact_against`` rather than on ``__call__``, because that is what a pass calls
-    now: the composition reads the size and the line once and hands both to each half, and a spy
-    on the entry point a *row* uses would record nothing at all.
+    The record phase first, because a user phase that ran first would hand the middleware a
+    prompt already below the line that asks for a record at all. And it is asked *not* to run
+    its fallback: on this row the fallback is the end of the chain. Changed: the spy now also
+    records the ``fallback_after_record`` it was handed.
     """
     order: list[str] = []
+    fallback_flags: list[bool] = []
 
     class _RecordSpy(ToolResultAnchoredSummarizationCompactionStrategy):
-        async def compact_against(self, messages: list[Message], *, prompt_tokens: int, trigger_tokens: int) -> bool:
+        async def compact_against(
+            self,
+            messages: list[Message],
+            *,
+            prompt_tokens: int,
+            trigger_tokens: int,
+            fallback_after_record: bool = True,
+        ) -> bool:
             order.append("record")
-            return await super().compact_against(messages, prompt_tokens=prompt_tokens, trigger_tokens=trigger_tokens)
+            fallback_flags.append(fallback_after_record)
+            return await super().compact_against(
+                messages,
+                prompt_tokens=prompt_tokens,
+                trigger_tokens=trigger_tokens,
+                fallback_after_record=fallback_after_record,
+            )
 
     class _UserSpy(UserTurnAnchoredSummarizationCompactionStrategy):
         async def compact_against(self, messages: list[Message], *, prompt_tokens: int, trigger_tokens: int) -> bool:
@@ -909,27 +867,18 @@ async def test_the_record_phase_runs_before_the_user_phase() -> None:
     assert await strategy(_conversation()) is True
 
     assert order == ["record", "user"]
-    assert strategy.strategies == (strategy.tool_results, strategy.user_turns), (
-        "the advertised order is what the pass runs, or a caller walking the parts reads a lie"
-    )
+    assert fallback_flags == [False], "the composed row keeps the fallback for the end of its chain"
+    assert strategy.strategies == (strategy.tool_results, strategy.user_turns)
 
 
-async def test_even_two_lines_do_not_starve_a_half_within_one_pass() -> None:
-    """The ceiling the old order argument was made on, where the argument has stopped applying.
+async def test_a_split_rows_user_half_is_judged_after_the_record_phase_too() -> None:
+    """The ceiling the old order argument was made on, read under the new judging.
 
     0.8 of this ceiling, 17,600, sits between the conversation's 18,937 and the 16,613 the record
-    phase leaves. On the row this class shipped as that was the whole story: the record phase
-    spent the pass, the prompt dropped under 17,600, the user half re-read the size and declined,
-    and the pass was reported starved. It is what "the order decides which half acts" meant.
-
-    Pass-entry judging removes that from the split row as well as from the aligned one, and that
-    is worth a test of its own rather than a line in a docstring: 18,937 is over both lines when
-    the pass begins, so both halves act at either fraction. What is left of starvation is a
-    statement across passes -- a record phase whose earlier removals are missing from a later
-    pass's entry reading -- and the growing fixture is where that is tested.
-
-    The two rows are asserted to reach the same place here, which is the point: the fraction a
-    half is read at stops mattering once every half is read at the same size.
+    phase leaves; 0.6 of it, 13,200, sits under both. A split row's user half, judged after the
+    record phase against 17,600, stays idle; the aligned row's, against 13,200, compacts. Changed
+    from ``test_even_two_lines_do_not_starve_a_half_within_one_pass``, which asserted that both
+    rows' user halves fired here because both were judged against the entry size.
     """
     split = _split_composed(_NARROW_CEILING)
     split_messages = _conversation()
@@ -939,45 +888,34 @@ async def test_even_two_lines_do_not_starve_a_half_within_one_pass() -> None:
     assert await split(split_messages) is True
     assert await aligned(aligned_messages) is True
 
-    assert (split.groups_kept_uncovered, aligned.groups_kept_uncovered) == (0, 0), "the record phase acted on both"
-    assert "x" * 100 not in _rendered(split_messages)
+    assert "x" * 100 not in _rendered(split_messages), "the record phase acted on both"
     assert "x" * 100 not in _rendered(aligned_messages)
-
-    assert split.user_compactions == 1, "the higher line was over the prompt when the pass began"
-    assert aligned.user_compactions == 1
-    assert (split.user_passes_starved, aligned.user_passes_starved) == (0, 0), (
-        "and nothing was taken out from under either, because the size that decided was read first"
-    )
-    assert "Turn 4:" not in _rendered(split_messages)
+    assert (split.user_compactions, split.user_passes_below_trigger) == (0, 1), "under the split line afterwards"
+    assert aligned.user_compactions == 1, "over the shared line afterwards"
+    assert "Turn 4:" in _rendered(split_messages)
     assert "Turn 4:" not in _rendered(aligned_messages)
-    assert _size(split_messages) == _size(aligned_messages), (
-        "same conversation, same two halves, same result: the fraction each half was read at "
-        "stopped deciding anything the moment both were read at one size"
-    )
 
 
-async def test_a_user_half_that_would_not_have_fired_anyway_is_not_counted_as_starved() -> None:
-    """The counter has to mean one thing, or it is a second way of saying "did not compact".
+async def test_an_idle_pass_touches_nothing_and_asks_nothing() -> None:
+    """On a ceiling nothing crosses, neither half acts and the chain does not run.
 
-    On a ceiling nothing crosses, the user half declines for its own reasons and the record
-    phase removed nothing that could have changed that. Counting it here would put a number on
-    every idle pass and leave the flag saying nothing about the order at all.
+    Changed from ``test_a_user_half_that_would_not_have_fired_anyway_is_not_counted_as_starved``:
+    the starvation half of it is retired, and what is left worth asserting is that an idle pass
+    spends no summarizer call.
     """
-    strategy = _composed(_IDLE_CEILING)
+    summarizer = _Summarizer()
+    strategy = _composed(_IDLE_CEILING, user_turns=_user_phase(_IDLE_CEILING, summarizer=summarizer))
     messages = _conversation()
 
     assert await strategy(messages) is False
-    assert (strategy.user_compactions, strategy.user_passes_starved) == (0, 0)
+    assert (strategy.user_compactions, strategy.last_resort_fallbacks, summarizer.calls) == (0, 0, 0)
 
 
 async def test_the_user_half_still_fires_while_the_record_half_is_waiting_for_a_record() -> None:
-    """A phase that declines must not decline for the phase behind it.
+    """A phase that waits must not make the phase behind it wait.
 
-    Before a record exists the record phase's contract is to wait: it is past its trigger,
-    under its give-up line, and the only thing that could replace the tool groups has not been
-    written yet. That is the ordinary state of the first turns of a run, and a composition that
-    treated the first phase's False as the pass's answer would make the user half unreachable
-    for exactly as long as the model took to comply.
+    Before a record exists the record phase removes nothing, so the size it leaves is the size
+    the pass began with, and the user half is judged against that.
     """
     strategy = _composed(_NARROW_CEILING)
     messages = _conversation(record=None)
@@ -987,23 +925,10 @@ async def test_the_user_half_still_fires_while_the_record_half_is_waiting_for_a_
     assert (strategy.records_found, strategy.fallbacks_used) == (0, 0), "waiting, not fallen back"
     assert "x" * 100 in _rendered(messages), "so the tool payload is untouched"
     assert strategy.user_compactions == 1
-    assert strategy.user_passes_starved == 0, "nothing was removed, so nothing could have starved it"
 
 
 async def test_configuration_reaches_each_half_without_reaching_the_other() -> None:
-    """Two rows' worth of knobs on one object, and the trigger is the only one they share.
-
-    The composed row is only readable beside the two single rows if a sweep of either row's
-    flags moves this row's matching half and nothing else. The trigger is the documented
-    exception and is tested as such elsewhere; everything else has to stay separate. The two
-    settings chosen here are the ones that would be most tempting to unify with it -- a coverage
-    share and a pair of user anchors -- and they are asserted on behaviour rather than on
-    attributes, because a constructor that stored them and a pass that read one number for both
-    would pass an attribute check.
-    """
-    # A record naming three of the four tool groups, so the fourth is covered at a share of 0
-    # and not at the default -- which is what makes the coverage assertion below about the
-    # knob rather than about the fixture.
+    """Two rows' worth of knobs on one object, and the trigger is the only one they share."""
     lenient = _composed(
         tool_results=_record_phase(coverage_share=0.0),
         user_turns=_user_phase(keep_head_user_turns=2, keep_tail_user_turns=3),
@@ -1026,28 +951,17 @@ async def test_configuration_reaches_each_half_without_reaching_the_other() -> N
         "Turn 6:",
         "Turn 7:",
     ], "and the user phase read its own two anchors rather than the tool half's head count"
-    assert (lenient.user_messages_replaced, default.user_messages_replaced) == (3, 6), (
-        "the anchors moved one row's half and left the other row's alone"
-    )
+    assert (lenient.user_messages_replaced, default.user_messages_replaced) == (3, 6)
 
 
 async def test_a_caller_can_set_the_two_halves_apart_again_and_then_they_fire_apart() -> None:
-    """The escape hatch, and the behaviour it restores.
-
-    One line is the default rather than the only option. A caller sweeping the two triggers
-    against each other -- which is what produced the finding this class was rewritten for -- has
-    to be able to ask for two, and what they then get is a row whose halves fire at their own
-    lines. Asserted on behaviour rather than on attributes, because a constructor that stored the
-    fraction and a pass that ignored it would satisfy an attribute check.
-    """
+    """The escape hatch, and the behaviour it restores."""
     strategy = _composed(
         tool_results=_record_phase(trigger_fraction=0.2, fallback_fraction=0.99),
         user_turns=_user_phase(trigger_fraction=0.95),
         user_trigger_fraction=0.95,
     )
 
-    assert strategy.tool_results.trigger_fraction == 0.2
-    assert strategy.user_turns.trigger_fraction == 0.95
     assert strategy.user_trigger_fraction == 0.95, "the composition was told to read the higher line"
 
     messages = _conversation()
@@ -1055,18 +969,10 @@ async def test_a_caller_can_set_the_two_halves_apart_again_and_then_they_fire_ap
 
     assert "x" * 100 not in _rendered(messages), "the low trigger fired the record phase"
     assert strategy.user_compactions == 0, "while the high one left the user phase alone"
-    assert strategy.user_passes_starved == 0, "and the user line was never crossed to begin with"
 
 
 async def test_a_summarizer_that_raises_leaves_the_user_band_and_the_pass_alone() -> None:
-    """Degrading safely is each part's contract, and composing must not weaken it.
-
-    The user-band strategy writes nothing until it has a summary in hand, so a summarizer that
-    raises leaves a conversation byte-identical to the one it was given. What composing adds is
-    a way to lose that: a pass that reported the failure as its own answer, or one whose
-    re-annotation between the phases mutated something on the way through, would turn a phase
-    that did nothing into a conversation that changed.
-    """
+    """Degrading safely is each part's contract, and composing must not weaken it."""
     summarizer = _FailingSummarizer()
     strategy = _composed(user_turns=_user_phase(summarizer=summarizer))
     messages = _conversation()
@@ -1075,9 +981,7 @@ async def test_a_summarizer_that_raises_leaves_the_user_band_and_the_pass_alone(
 
     assert summarizer.calls == 1, "the user phase was reached rather than skipped"
     assert (strategy.user_summary_failures, strategy.user_compactions) == (1, 0)
-    assert [text[:7] for text in _user_texts(messages)] == [f"Turn {index}:"[:7] for index in range(8)], (
-        "every user turn is still being sent, and none is marked as superseded"
-    )
+    assert [text[:7] for text in _user_texts(messages)] == [f"Turn {index}:"[:7] for index in range(8)]
     assert not [
         message
         for message in messages
@@ -1086,12 +990,7 @@ async def test_a_summarizer_that_raises_leaves_the_user_band_and_the_pass_alone(
 
 
 async def test_an_empty_conversation_is_not_handed_to_either_half() -> None:
-    """The cheapest pass there is, and the one a composition is most likely to get wrong.
-
-    Each part returns False on an empty list before reading anything; a composition that
-    skipped that check would annotate an empty conversation twice and take a token count of
-    nothing to compare against a trigger.
-    """
+    """The cheapest pass there is, and the one a composition is most likely to get wrong."""
     strategy = _composed()
 
     assert await strategy([]) is False
@@ -1099,12 +998,7 @@ async def test_an_empty_conversation_is_not_handed_to_either_half() -> None:
 
 
 async def test_every_counter_of_both_halves_is_readable_off_the_composed_row() -> None:
-    """A composed row that reports only half its counters is a row nobody can attribute.
-
-    The flags column is built by reading named attributes off whatever strategy the run
-    installed, so a counter that stops at a part is a counter that leaves the table -- and the
-    one question a composed row raises above all others is which of its two halves did what.
-    """
+    """A composed row that reports only half its counters is a row nobody can attribute."""
     strategy = _composed()
     messages = _conversation()
 
@@ -1123,21 +1017,11 @@ async def test_every_counter_of_both_halves_is_readable_off_the_composed_row() -
     assert strategy.user_summary_tokens == strategy.user_turns.user_summary_tokens > 0
     assert strategy.user_folds == strategy.user_turns.user_folds == 0
     assert strategy.user_summaries_replayed == strategy.user_turns.user_summaries_replayed == 0
+    assert strategy.tokens_removed_by_record_phase > 0
 
 
 async def test_the_composed_row_holds_what_its_record_missed_asks_again_and_then_preserves() -> None:
-    """Both layers run inside the composed row, through the same seam its own row uses.
-
-    The record phase is called through ``compact_against`` here rather than ``__call__``, so a
-    layer wired into the wrong one of the two would work on the single row and vanish on this
-    one. The trigger is set low so every pass reaches the chain: the user half fires on the
-    first pass and takes the prompt well under the shared line, and a chain that is judged by
-    the passes after its ask cannot be judged by passes that return at the trigger.
-
-    The held groups are tool groups marked under the record half's other reason, which the
-    user half neither reads nor moves, and the records stay where they were: what asking
-    needs -- the ask reaching the middleware -- is the wiring test in ``test_live``.
-    """
+    """Both layers run inside the composed row, through the same seam its own row uses."""
     strategy = _composed(tool_results=_record_phase(trigger_fraction=0.1))
     messages = _conversation(record=_covering_record(2))
 
@@ -1167,12 +1051,11 @@ async def test_the_composed_row_holds_what_its_record_missed_asks_again_and_then
 
 
 async def test_the_composed_row_holds_the_tool_groups_behind_its_record_when_its_fallback_runs() -> None:
-    """The post-record hold runs inside the composed row too, and the user half still acts.
+    """The post-record hold runs inside the composed row too, now at the end of the chain.
 
-    Run 51's shape through ``compact_against``: tool groups sitting after the record, covered
-    by no record, and a ceiling the record phase cannot reach, so its fallback runs. Those
-    groups are held under the record half's third reason and come through whole; the user half,
-    which reads user groups alone, compacts its own band on the same pass exactly as before.
+    Run 51's shape: tool groups sitting after the record, covered by no record, and a ceiling
+    the record phase cannot reach, so the chain gets to its fallback. Those groups are held
+    under the record half's third reason and come through whole.
     """
     strategy = _composed(500, tool_results=_record_phase(500, trigger_fraction=0.1, fallback_fraction=0.9))
     messages = _conversation(record=_covering_record(4))
@@ -1191,17 +1074,12 @@ async def test_the_composed_row_holds_the_tool_groups_behind_its_record_when_its
     for index in range(5, 8):
         assert f"code_1=CODE-{index} " + "x" * _PAYLOAD_CHARS in _rendered(messages), f"lookup_{index} is whole"
     assert strategy.fallbacks_held_after_record == strategy.tool_results.fallbacks_held_after_record == 1
+    assert strategy.last_resort_fallbacks == 1, "reached at the end of the chain"
     assert strategy.user_compactions == 1, "while the user half compacted its own half of the same pass"
 
 
 def test_two_halves_measuring_against_two_ceilings_are_refused() -> None:
-    """The order argument is about which fraction is crossed first, which needs one ceiling.
-
-    Two ceilings make "0.6 fires before 0.8" false as often as it is true, and they make the
-    starvation counter compare a token count against a line taken from the other half's
-    arithmetic. Refused in the constructor rather than documented, because a run built from one
-    ``StrategyOptions`` can only reach this by a caller assembling the parts by hand.
-    """
+    """One shared line, and one budget for the chain, need one ceiling."""
     with pytest.raises(ValueError, match="one max_input_tokens"):
         ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy(
             tokenizer=TOKENIZER,
@@ -1238,15 +1116,9 @@ class _RatioSummarizer:
 async def test_a_fold_in_the_user_half_leaves_the_record_where_it_was() -> None:
     """A fold rewrites the prefix at the oldest summary's position, and the record sits behind it.
 
-    The record half has one preserved message in the same conversation, and the fold is the one
-    thing the user half does that reaches back past its newest boundary. So the whole of what
-    composing has to guarantee is asserted here: the record is not excluded, not shortened, not
-    moved relative to anything but the one inserted message, still found by ``find_record_index``
-    and still preserved under the record half's own reason -- and the shared line is still the
-    record half's, judged at pass entry, because the fold sits behind the same trigger check.
-
-    The fixture is driven to a fold and asserts that it got there, since a composed row whose
-    user half never folded would pass every invariant here for nothing.
+    A hand-assembled composition in the fold mode, which the builder no longer produces -- the
+    row runs in ``boundary`` and folds only through its chain -- but which a caller may still
+    assemble, and whose fold must not disturb the record half's preserved message.
     """
     strategy = _composed(
         user_turns=_user_phase(summarizer=_RatioSummarizer(0.5), summary_mode=SUMMARY_MODE_FOLD),
@@ -1270,10 +1142,689 @@ async def test_a_fold_in_the_user_half_leaves_the_record_where_it_was() -> None:
     assert record.additional_properties.get(EXCLUDED_KEY, False) is False
     assert is_preserved(record) and record.additional_properties[PRESERVE_REASON_KEY] == "tool_summary_record"
     assert "lookup_1: CODE-1." in _rendered(messages), "and unshortened"
-    assert [m.message_id for m in messages if m.role != "user"] == before, (
-        "every message that is not a user turn is where it was, in the order it was"
-    )
+    assert [m.message_id for m in messages if m.role != "user"] == before
     assert strategy.records_in_conversation == 1
-    assert strategy.fallbacks_after_record == 0, "the prompt stayed under the ceiling, so this is about the fold alone"
+    assert strategy.last_resort_fallbacks == 0, "the prompt stayed under the ceiling, so this is about the fold alone"
     assert strategy.user_trigger_fraction == DEFAULT_TRIGGER_FRACTION, "the alignment is untouched"
-    assert strategy.user_passes_starved == 0
+
+
+# -- The last-resort chain ---------------------------------------------------------------------
+
+#: Characters of padding in each record and each user summary of the chain fixture.
+#:
+#: The chain fixture is built so that, once the record phase has dropped the tool payload,
+#: almost all of what is left is two records and two standing user summaries -- the four things
+#: the chain can rewrite -- and the budget each test sets decides which step is the one that
+#: brings the prompt under it.
+_CHAIN_PADDING_CHARS = 4_000
+
+#: The ceiling the chain fixture's triggers are taken from when a test does not set one.
+_CHAIN_CEILING = 500
+
+#: A merged record that is plainly smaller than the two it replaces, and carries their values.
+_SHORT_RECORD = "lookup_1: CODE-1. lookup_2: CODE-2."
+
+
+def _longer(body: str) -> str:
+    """Answer with more than was sent, which the chain must refuse as no smaller."""
+    return body + " " + body
+
+
+def _short_record(body: str) -> str:
+    """Answer with :data:`_SHORT_RECORD`, whatever was sent."""
+    return _SHORT_RECORD
+
+
+def _short_summary(body: str) -> str:
+    """Answer a fold with one short line, whatever was sent."""
+    return "The user set a task and then asked two follow-ups."
+
+
+class _RoutingSummarizer:
+    """A summarizer that answers each kind of request by its own rule, and logs the kinds in order.
+
+    The kind is read off the system prompt, which is the only thing that tells the four requests
+    the composed row can make apart: a band summary, a fold, a record merge and a harder
+    rewrite. The rules answer by length and nothing else, because length is all the chain may
+    judge a replacement by.
+    """
+
+    def __init__(
+        self,
+        *,
+        merge: Callable[[str], str] = _longer,
+        fold: Callable[[str], str] = _longer,
+        harder: Callable[[int, str], str] | None = None,
+        log: list[str] | None = None,
+    ) -> None:
+        self.merge = merge
+        self.fold = fold
+        self.harder = harder or (lambda attempt, body: _longer(body))
+        self.log = log if log is not None else []
+        self.prompts: list[str] = []
+
+    async def get_response(self, messages: list[Message], *, stream: bool = False, **kwargs: Any) -> ChatResponse:
+        prompt = messages[0].text or ""
+        body = messages[-1].text or ""
+        self.prompts.append(prompt)
+        if prompt == DEFAULT_USER_SUMMARY_PROMPT:
+            self.log.append("band")
+            text = "The user asked for the earlier things, in order."
+        elif prompt == DEFAULT_USER_FOLD_PROMPT:
+            self.log.append("fold")
+            text = self.fold(body)
+        elif prompt == DEFAULT_RECORD_MERGE_PROMPT:
+            self.log.append("merge")
+            text = self.merge(body)
+        else:
+            attempt = next(n for n in range(1, 10) if prompt == harder_record_prompt(n))
+            self.log.append(f"harder{attempt}")
+            text = self.harder(attempt, body)
+        return ChatResponse(messages=[Message(role="assistant", contents=[text])])
+
+
+class _LoggedFallback:
+    """The default anchored fallback, logging each time it is run into a shared list."""
+
+    def __init__(self, log: list[str], ceiling: int = _CHAIN_CEILING) -> None:
+        self.log = log
+        self.inner = AnchoredCompactionStrategy(max_input_tokens=ceiling, tokenizer=TOKENIZER)
+
+    async def __call__(self, messages: list[Message]) -> bool:
+        self.log.append("fallback")
+        return await self.inner(messages)
+
+
+def _standing_summary(serial: int) -> Message:
+    """Return a user summary as the boundary mode leaves one standing."""
+    return Message(
+        role="user",
+        contents=[f"{USER_SUMMARY_MARKER}\n" + "s" * _CHAIN_PADDING_CHARS],
+        message_id=f"user_summary_{serial}",
+    )
+
+
+def _padded_record(serial: int, indices: list[int]) -> list[Message]:
+    """Return a record covering ``indices`` and padded with the chain fixture's filler."""
+    values = " ".join(f"lookup_{index}: CODE-{index}." for index in indices)
+    return _record_messages(f"{values} " + "r" * _CHAIN_PADDING_CHARS, call_id=f"rec{serial}")
+
+
+def _chain_conversation(*, uncovered: bool = False, trailing: bool = False) -> list[Message]:
+    """Return a conversation holding two records and two standing user summaries.
+
+    Its user band is empty in the boundary mode -- the only turn newer than the newest summary
+    is the tail -- so the user half declines, and every rewrite a test sees is the chain's.
+
+    Args:
+        uncovered: Put a tool group no record quotes in front of the second record, so the
+            coverage check holds it.
+        trailing: Put a tool group after the second record, which no record covers.
+
+    Returns:
+        The messages.
+    """
+    messages = [Message(role="system", contents=["You are an assistant."], message_id="sys")]
+    messages += [
+        Message(role="user", contents=["Turn 0: the task."], message_id="u0"),
+        Message(role="assistant", contents=["Reply 0: " + "a" * 400], message_id="a0"),
+        _standing_summary(0),
+        Message(role="assistant", contents=["Reply 1: " + "a" * 400], message_id="a1"),
+        *_tool_group(1),
+        *_padded_record(1, [1]),
+        Message(role="user", contents=["Turn 2: next."], message_id="u2"),
+        Message(role="assistant", contents=["Reply 2: " + "a" * 400], message_id="a2"),
+        _standing_summary(1),
+        Message(role="assistant", contents=["Reply 3: " + "a" * 400], message_id="a3"),
+        *_tool_group(2),
+    ]
+    if uncovered:
+        messages += _tool_group(3)
+    messages += _padded_record(2, [2])
+    if trailing:
+        messages += _tool_group(5)
+    messages += [
+        Message(role="user", contents=["Turn 4: last."], message_id="u4"),
+        Message(role="assistant", contents=["Reply 4: " + "a" * 400], message_id="a4"),
+    ]
+    return messages
+
+
+def _chain_composed(
+    summarizer: _RoutingSummarizer, *, ceiling: int = _CHAIN_CEILING, **kwargs: Any
+) -> ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
+    """Return the composed row over the chain fixture, its fallback logging into the summarizer's log.
+
+    The record half's trigger is low enough to fire on any budget a test sets, and its give-up
+    line is above everything, so no test here is about waiting for a record. The user half runs
+    in the boundary mode, as the builder runs it.
+    """
+    return ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy(
+        tokenizer=TOKENIZER,
+        tool_results=ToolResultAnchoredSummarizationCompactionStrategy(
+            max_input_tokens=ceiling,
+            tokenizer=TOKENIZER,
+            trigger_fraction=0.01,
+            fallback_fraction=0.99,
+            fallback=_LoggedFallback(summarizer.log, ceiling),
+        ),
+        user_turns=UserTurnAnchoredSummarizationCompactionStrategy(
+            max_input_tokens=ceiling,
+            tokenizer=TOKENIZER,
+            client=summarizer,
+            trigger_fraction=0.01,
+            summary_mode=SUMMARY_MODE_BOUNDARY,
+        ),
+        **kwargs,
+    )
+
+
+async def _post_record_size(**fixture: bool) -> int:
+    """Return the chain fixture's size once the record phase has dropped what its records cover."""
+    messages = _chain_conversation(**fixture)
+    record_phase = _record_phase(_CHAIN_CEILING, trigger_fraction=0.01, fallback_fraction=0.99)
+    entry = _size(messages)
+    await record_phase.compact_against(messages, prompt_tokens=entry, trigger_tokens=1, fallback_after_record=False)
+    return _size(messages)
+
+
+def _active_record_ids(messages: list[Message]) -> list[str]:
+    """Return the message ids of every record still being sent, oldest first."""
+    return [str(messages[group["end_index"]].message_id) for group in active_record_groups(messages)]
+
+
+def _standing_summary_ids(messages: list[Message]) -> list[str]:
+    """Return the ids of the user summaries still being sent."""
+    return [
+        str(message.message_id)
+        for message in project_included_messages(messages)
+        if message.role == "user" and USER_SUMMARY_MARKER in (message.text or "")
+    ]
+
+
+async def test_the_chain_does_not_run_while_the_prompt_fits() -> None:
+    """Every step of the chain is worse than nothing when nothing is needed, so none runs.
+
+    A budget above the post-record size: the record phase acts, the user half declines on its
+    empty band, and no merge, fold, rewrite or fallback is asked for.
+    """
+    summarizer = _RoutingSummarizer(merge=_short_record, fold=_short_summary)
+    budget = await _post_record_size() + 100
+    strategy = _chain_composed(summarizer, ceiling=budget)
+    messages = _chain_conversation()
+
+    assert await strategy(messages) is True, "the record phase dropped the covered tool groups"
+
+    assert summarizer.log == []
+    assert _active_record_ids(messages) == ["rec1_res", "rec2_res"]
+    assert (strategy.records_merged, strategy.user_summaries_merged, strategy.record_rewrites) == (0, 0, 0)
+    assert strategy.last_resort_fallbacks == 0
+
+
+async def test_the_chain_merges_the_records_first_and_stops_once_the_prompt_fits() -> None:
+    """Step a, and the steps after it skipped because it was enough.
+
+    The budget sits between the post-record size and the size a merge leaves, so the merge is
+    the step that brings the prompt under it, and the log must end there: no fold, no rewrite, no
+    fallback.
+    """
+    summarizer = _RoutingSummarizer(merge=_short_record, fold=_short_summary)
+    budget = await _post_record_size() - 500
+    strategy = _chain_composed(summarizer, ceiling=budget)
+    messages = _chain_conversation()
+
+    assert await strategy(messages) is True
+
+    assert summarizer.log == ["merge"], "merged first, and nothing after it once the prompt fit"
+    assert _size(messages) <= budget
+    assert (strategy.records_merged, strategy.record_merges_rejected) == (1, 0)
+    assert _active_record_ids(messages) == ["compaction_record_0_result"], "one record, the merged one"
+    assert _standing_summary_ids(messages) == ["user_summary_0", "user_summary_1"], "the summaries untouched"
+    assert strategy.last_resort_fallbacks == 0
+
+
+async def test_a_merge_that_is_no_smaller_is_refused_and_the_old_records_stay() -> None:
+    """The acceptance rule on step a: no smaller, and the records it would have replaced stand.
+
+    Nothing is mutated on a refusal -- the records keep their preservation and are not excluded
+    -- and the chain moves on to the next step rather than stopping.
+    """
+    summarizer = _RoutingSummarizer(merge=_longer, fold=_short_summary)
+    budget = await _post_record_size() - 500
+    strategy = _chain_composed(summarizer, ceiling=budget)
+    messages = _chain_conversation()
+
+    await strategy(messages)
+
+    assert summarizer.log[:2] == ["merge", "fold"], "refused, and the chain moved on to the fold"
+    assert (strategy.records_merged, strategy.record_merges_rejected) == (0, 1)
+    assert _active_record_ids(messages) == ["rec1_res", "rec2_res"], "both records still being sent"
+    for message_id in ("rec1_call", "rec1_res", "rec2_call", "rec2_res"):
+        (message,) = (m for m in messages if m.message_id == message_id)
+        assert is_preserved(message) and not message.additional_properties.get(EXCLUDED_KEY, False)
+    assert not [m for m in messages if str(m.message_id).startswith("compaction_record_")], "nothing inserted"
+
+
+async def test_a_replacement_the_same_size_as_what_it_replaces_is_refused() -> None:
+    """ "Smaller" means smaller: an equal-sized answer is refused, not kept.
+
+    The record here is one the chain itself wrote, so a rewrite carrying the same text builds a
+    replacement of exactly the same shape and length -- the one case that tells ``>=`` from
+    ``>`` in the rule.
+    """
+    summarizer = _RoutingSummarizer()
+    text = "lookup_1: CODE-1. " + "r" * _CHAIN_PADDING_CHARS
+    summarizer.harder = lambda attempt, body: text
+    messages = [
+        Message(role="system", contents=["You are an assistant."], message_id="sys"),
+        Message(role="user", contents=["Turn 0: the task."], message_id="u0"),
+        Message(role="assistant", contents=["Reply 0."], message_id="a0"),
+        *_tool_group(1),
+        *build_record_messages(text, call_id="compaction_record_7"),
+        Message(role="user", contents=["Turn 1: last."], message_id="u1"),
+    ]
+    strategy = _chain_composed(summarizer, harder_attempts=1)
+
+    await strategy(messages)
+
+    assert "harder1" in summarizer.log
+    assert (strategy.record_rewrites, strategy.record_rewrites_rejected) == (1, 1)
+    assert _active_record_ids(messages) == ["compaction_record_7_result"], "the record it would have replaced stands"
+
+
+async def test_the_user_summaries_are_merged_second_through_the_user_halfs_own_fold() -> None:
+    """Step b, reached because step a was refused, and enough on its own.
+
+    The fold is the user half's own machinery: it counts as a fold there, it is numbered under
+    the fold prefix, and the folded summaries are excluded behind it.
+    """
+    summarizer = _RoutingSummarizer(merge=_longer, fold=_short_summary)
+    budget = await _post_record_size() - 500
+    strategy = _chain_composed(summarizer, ceiling=budget)
+    messages = _chain_conversation()
+
+    assert await strategy(messages) is True
+
+    assert summarizer.log == ["merge", "fold"], "the fold was enough, so no rewrite and no fallback"
+    assert _size(messages) <= budget
+    assert (strategy.user_summaries_merged, strategy.user_merges_rejected) == (1, 0)
+    assert strategy.user_folds == 1, "counted by the user half as the fold it is"
+    (folded,) = _standing_summary_ids(messages)
+    assert folded.startswith(FOLD_ID_PREFIX)
+    assert strategy.last_resort_fallbacks == 0
+
+
+async def test_a_fold_that_is_no_smaller_is_refused_and_the_summaries_stay() -> None:
+    """The acceptance rule on step b, through the user half's seam."""
+    summarizer = _RoutingSummarizer(merge=_longer, fold=_longer)
+    strategy = _chain_composed(summarizer, harder_attempts=0)
+    messages = _chain_conversation()
+
+    await strategy(messages)
+
+    assert (strategy.user_summaries_merged, strategy.user_merges_rejected) == (0, 1)
+    assert strategy.user_folds == 0, "a refused fold is not a fold"
+    assert _standing_summary_ids(messages) == ["user_summary_0", "user_summary_1"]
+
+
+async def test_the_record_is_rewritten_harder_third_and_each_attempt_asks_for_more() -> None:
+    """Step c, reached because a and b were refused: attempts escalate, and a kept one counts.
+
+    The first rewrite comes back longer and is refused; the second comes back short and is kept,
+    which brings the prompt under the budget, so no fallback follows. Both records are handed
+    over together, because the merge was refused, and the kept rewrite stands for both.
+    """
+    summarizer = _RoutingSummarizer(
+        merge=_longer, fold=_longer, harder=lambda attempt, body: _longer(body) if attempt == 1 else _SHORT_RECORD
+    )
+    budget = await _post_record_size() - 500
+    strategy = _chain_composed(summarizer, ceiling=budget)
+    messages = _chain_conversation()
+
+    assert await strategy(messages) is True
+
+    assert summarizer.log == ["merge", "fold", "harder1", "harder2"]
+    assert (strategy.record_rewrites, strategy.record_rewrites_rejected) == (2, 1)
+    assert _active_record_ids(messages) == ["compaction_record_2_result"], (
+        "one record, the kept rewrite -- the third id minted, since the two refused answers had one each"
+    )
+    assert _size(messages) <= budget
+    assert strategy.last_resort_fallbacks == 0
+    first, second = harder_record_prompt(1), harder_record_prompt(2)
+    assert "60%" in first and "36%" in second, "each attempt asks for more compression than the last"
+    for prompt in (first, second, DEFAULT_RECORD_MERGE_PROMPT):
+        assert "verbatim" in prompt and "CODE" not in prompt, "a generic instruction, naming nothing planted"
+
+
+@pytest.mark.parametrize("attempts", [0, 1, 3])
+async def test_the_number_of_harder_attempts_bounds_the_rewrites(attempts: int) -> None:
+    """``harder_attempts`` is how many rewrites one pass may ask for, and not one more.
+
+    Every answer is refused, so the prompt stays over the budget throughout and nothing but the
+    bound can stop the attempts.
+    """
+    summarizer = _RoutingSummarizer()
+    strategy = _chain_composed(summarizer, harder_attempts=attempts)
+
+    await strategy(_chain_conversation())
+
+    assert [kind for kind in summarizer.log if kind.startswith("harder")] == [
+        f"harder{attempt}" for attempt in range(1, attempts + 1)
+    ]
+    assert strategy.record_rewrites == strategy.record_rewrites_rejected == attempts
+
+
+async def test_an_exhausted_chain_ends_in_the_fallback_over_the_budget() -> None:
+    """Steps a to d in order, and then nothing: the prompt goes out over the limit, which is ``DQ``.
+
+    Every replacement is refused, so each step runs and fails; the fallback runs last, holds the
+    tool group no record covers, and sheds narration only; and what is left is still over the
+    budget, because nothing more is tried.
+    """
+    summarizer = _RoutingSummarizer()
+    strategy = _chain_composed(summarizer)
+    messages = _chain_conversation(trailing=True)
+
+    await strategy(messages)
+
+    assert summarizer.log == ["merge", "fold", "harder1", "harder2", "fallback"], "in order, the fallback last"
+    assert strategy.last_resort_fallbacks == 1
+    assert strategy.fallbacks_held_after_record == 1, "with the tool group no record covers held"
+    assert "code_1=CODE-5 " + "x" * _PAYLOAD_CHARS in _rendered(messages), "which comes through whole"
+    assert _active_record_ids(messages) == ["rec1_res", "rec2_res"], "and the records untouched"
+    assert _size(messages) > _CHAIN_CEILING, "still over the budget: the intended loud failure"
+    assert (
+        strategy.record_merges_rejected,
+        strategy.user_merges_rejected,
+        strategy.record_rewrites_rejected,
+    ) == (1, 1, DEFAULT_HARDER_ATTEMPTS)
+
+
+async def test_the_fallback_runs_only_at_the_end_on_the_composed_row_and_straight_behind_the_record_alone() -> None:
+    """Where the fallback runs is the one place the two rows differ, and each is asserted.
+
+    On the composed row it runs after the user phase and after the chain's other steps. On the
+    standalone record row it runs inside the record pass, straight behind the record, exactly as
+    it did -- and that row never merges.
+    """
+    log: list[str] = []
+
+    class _UserSpy(UserTurnAnchoredSummarizationCompactionStrategy):
+        async def compact_against(self, messages: list[Message], *, prompt_tokens: int, trigger_tokens: int) -> bool:
+            log.append("user")
+            return await super().compact_against(messages, prompt_tokens=prompt_tokens, trigger_tokens=trigger_tokens)
+
+    summarizer = _RoutingSummarizer(log=log)
+    composed = ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy(
+        tokenizer=TOKENIZER,
+        tool_results=_record_phase(_CHAIN_CEILING, trigger_fraction=0.01, fallback=_LoggedFallback(log)),
+        user_turns=_UserSpy(
+            max_input_tokens=_CHAIN_CEILING,
+            tokenizer=TOKENIZER,
+            client=summarizer,
+            trigger_fraction=0.01,
+            summary_mode=SUMMARY_MODE_BOUNDARY,
+        ),
+    )
+    await composed(_chain_conversation())
+    assert log == ["user", "merge", "fold", "harder1", "harder2", "fallback"]
+
+    alone_log: list[str] = []
+    alone = _record_phase(_CHAIN_CEILING, trigger_fraction=0.01, fallback=_LoggedFallback(alone_log))
+    messages = _chain_conversation()
+    await alone(messages)
+    assert alone_log == ["fallback"], "the standalone row falls back inside its own pass"
+    assert alone.fallbacks_after_record == 1
+    assert _active_record_ids(messages) == ["rec1_res", "rec2_res"], "and never merges its records"
+
+
+async def test_a_merged_record_is_a_record_to_everything_that_reads_records() -> None:
+    """The merged record is found, preserved, counted, read for coverage and skipped by the holds.
+
+    One merge, then the readers one by one: the newest-record lookup the strategy and the
+    middleware share, the preservation and the count, the coverage check -- which releases and
+    drops a group the old records never quoted once the merged record quotes it -- the pending
+    work the middleware counts from it, the hold the fallback runs behind, and the body a later
+    merge would be handed. And the replaced records are records to none of them.
+    """
+    merged_text = "lookup_1: CODE-1. lookup_2: CODE-2. lookup_3: CODE-3."
+    summarizer = _RoutingSummarizer(merge=lambda body: merged_text)
+    budget = await _post_record_size(uncovered=True) - 500
+    strategy = _chain_composed(summarizer, ceiling=budget)
+    messages = _chain_conversation(uncovered=True)
+
+    await strategy(messages)
+
+    assert strategy.records_merged == 1
+    index = find_record_index(messages)
+    assert index is not None and messages[index].message_id == "compaction_record_0_result"
+    merged_call = messages[index - 1]
+    assert [content.name for content in merged_call.contents] == [RECALL_TOOL_NAME]
+    assert RECORD_MARKER in _record_text(messages[index])
+    (group,) = active_record_groups(messages)
+    assert record_body(messages, group) == merged_text, "the body a later merge would be handed"
+    assert is_preserved(messages[index]) and messages[index].additional_properties[PRESERVE_REASON_KEY] == (
+        "tool_summary_record"
+    )
+    assert _preserve_records(messages) == 1, "counted as one record"
+    assert strategy.records_in_conversation == 2, "the peak, which is what the count reports"
+    for message_id in ("rec1_call", "rec1_res", "rec2_call", "rec2_res"):
+        (old,) = (m for m in messages if m.message_id == message_id)
+        assert old.additional_properties[EXCLUDED_KEY] is True
+        assert old.additional_properties[EXCLUDE_REASON_KEY] == CONSOLIDATE_EXCLUDE_REASON
+        assert not is_preserved(old), "released, so preserved and included keep meaning one thing"
+        assert _record_text(old) == "", "and an excluded record carries no record"
+
+    held = [m for m in messages if m.message_id in ("c3", "r3")]
+    assert all(m.additional_properties.get(PRESERVE_REASON_KEY) == PRESERVE_REASON_UNCOVERED for m in held), (
+        "the group no old record quoted was held on the pass that merged"
+    )
+    await strategy(messages)
+    assert all(m.additional_properties.get(EXCLUDED_KEY) is True for m in held), (
+        "and on the next pass the merged record's coverage licenses dropping it"
+    )
+
+    assert _droppable_groups_after(messages, find_record_index(messages)) == 0
+    messages += _tool_group(9)
+    annotate_message_groups(messages)
+    annotate_token_counts(messages, tokenizer=TOKENIZER)
+    assert _droppable_groups_after(messages, find_record_index(messages)) == 1, "pending work counts from it"
+    middleware = ToolResultRecallMiddleware(
+        max_input_tokens=budget, tokenizer=TOKENIZER, arm=lambda: None, trigger_fraction=0.01, repeat_records=True
+    )
+    assert middleware._record_due(messages, find_record_index(messages)) is True, "and the middleware asks again"
+    assert _hold_unrecorded(messages) == 1, "the new group is held behind it"
+    assert messages[index].additional_properties[PRESERVE_REASON_KEY] == "tool_summary_record", (
+        "and the merged record is not relabelled as a held tool group"
+    )
+
+
+def test_an_excluded_record_is_not_a_record() -> None:
+    """The rule that makes a replaced record disappear from every reader, on a bare conversation."""
+    messages = [
+        Message(role="system", contents=["You are an assistant."], message_id="sys"),
+        *_record_messages("lookup_1: CODE-1.", call_id="old"),
+        *_record_messages("lookup_2: CODE-2.", call_id="new"),
+    ]
+    annotate_message_groups(messages)
+    assert find_record_index(messages) == 4
+
+    for message in messages[3:]:
+        message.additional_properties[EXCLUDED_KEY] = True
+
+    assert find_record_index(messages) == 2, "the newest record still being sent"
+    assert _record_text(messages[4]) == ""
+    assert [str(messages[group["end_index"]].message_id) for group in active_record_groups(messages)] == ["old_res"]
+    assert _preserve_records(messages) == 1
+
+
+async def test_the_other_list_replays_the_merge_rather_than_paying_for_it_again() -> None:
+    """The live path compacts the copies sent on a call and then the store, and both get one merge.
+
+    The second view of the same conversation asks the same question, so it gets the same answer
+    under the same call id -- the model is sent one merged record and the store holds that one --
+    and the summarizer is asked once.
+    """
+    summarizer = _RoutingSummarizer(merge=_short_record)
+    budget = await _post_record_size() - 500
+    strategy = _chain_composed(summarizer, ceiling=budget)
+    copies = _chain_conversation()
+    store = copy.deepcopy(copies)
+
+    await strategy(copies)
+    await strategy(store)
+
+    assert summarizer.log == ["merge"], "asked once"
+    assert strategy.records_merged == 2, "and kept on both views"
+    assert _active_record_ids(copies) == _active_record_ids(store) == ["compaction_record_0_result"]
+
+
+async def test_a_refused_merge_is_not_paid_for_again_on_the_next_pass() -> None:
+    """An identical request refused on one pass is answered from memory on the next."""
+    summarizer = _RoutingSummarizer()
+    strategy = _chain_composed(summarizer, harder_attempts=0)
+
+    await strategy(_chain_conversation())
+    await strategy(_chain_conversation())
+
+    assert summarizer.log.count("merge") == 1
+    assert strategy.record_merges_rejected == 2, "refused on both passes"
+
+
+async def test_a_summarizer_that_fails_a_merge_leaves_the_records_and_moves_on() -> None:
+    """A failure is not a refusal: it is counted apart, and the chain carries on to the next step."""
+    log: list[str] = []
+
+    class _FailsOnMerge(_RoutingSummarizer):
+        async def get_response(self, messages: list[Message], *, stream: bool = False, **kwargs: Any) -> ChatResponse:
+            if messages[0].text == DEFAULT_RECORD_MERGE_PROMPT:
+                log.append("merge")
+                raise RuntimeError("the summarizer is unavailable")
+            return await super().get_response(messages, stream=stream, **kwargs)
+
+    summarizer = _FailsOnMerge(log=log)
+    strategy = _chain_composed(summarizer, harder_attempts=0)
+    messages = _chain_conversation()
+
+    await strategy(messages)
+
+    assert log[:2] == ["merge", "fold"]
+    assert (strategy.record_summary_failures, strategy.record_merges_rejected) == (1, 0)
+    assert _active_record_ids(messages) == ["rec1_res", "rec2_res"]
+
+
+@pytest.mark.parametrize("answer", ["", "  \t\n  "], ids=["empty", "whitespace"])
+async def test_an_empty_merge_answer_is_a_failure_and_never_replaces_the_records(answer: str) -> None:
+    """The one answer the size rule alone would accept, and the one that would cost the most.
+
+    Acceptance is size only -- the strategy must not read content -- and an empty answer is
+    always smaller than what it replaces. Without the emptiness guard in ``_ask`` a summarizer
+    that returned nothing would have every active record excluded in favour of an empty one,
+    discarding every value the records held in one step. It is a failure, counted as one, and
+    the records stay exactly as they were.
+    """
+    log: list[str] = []
+    summarizer = _RoutingSummarizer(log=log, merge=lambda body: answer)
+    strategy = _chain_composed(summarizer, harder_attempts=0)
+    messages = _chain_conversation()
+
+    await strategy(messages)
+
+    assert log[0] == "merge"
+    assert (strategy.record_summary_failures, strategy.record_merges_rejected) == (1, 0)
+    assert strategy.records_merged == 0
+    assert _active_record_ids(messages) == ["rec1_res", "rec2_res"]
+
+
+def test_the_standalone_user_row_keeps_its_defaults() -> None:
+    """``user_summary_anchored`` still recompacts by default and remembers one request."""
+    strategy = _user_phase()
+
+    assert strategy.summary_mode == DEFAULT_SUMMARY_MODE == "recompact"
+    assert strategy.remembered_requests == 1
+
+
+async def test_an_ask_for_another_record_survives_a_merge_that_lowers_the_record_count() -> None:
+    """The record strategy judges an ask by a record count that grew, and a merge lowers the count.
+
+    An ask is made for a group no record quotes; the chain then merges the two records into one;
+    the model's answer arrives as a new record that still does not quote it. Judged against the
+    count the ask was made at, that arrival would read as no record at all and the group would sit
+    held for two more passes; re-based by the merge, it is read as the record that came and covered
+    nothing, and the group is settled on the pass it arrives.
+    """
+    summarizer = _RoutingSummarizer(merge=_short_record)
+    strategy = _chain_composed(summarizer, harder_attempts=0)
+    messages = _chain_conversation(uncovered=True)
+
+    await strategy(messages)
+    assert strategy.records_merged == 1
+    assert strategy.groups_kept_uncovered == 1, "the group no record quotes"
+    assert strategy.tool_results.take_reforce() is True, "and an ask for another record was made for it"
+
+    messages += _record_messages("nothing to add.", call_id="rec9")
+    await strategy(messages)
+
+    assert strategy.groups_preserved_uncovered == 1, "the ask's record arrived, covered nothing, and settled it"
+
+
+async def test_the_harder_rewrites_stop_as_soon_as_the_prompt_fits() -> None:
+    """``harder_attempts`` is a bound, not a quota: a kept rewrite that fits ends step c."""
+    summarizer = _RoutingSummarizer(harder=lambda attempt, body: _SHORT_RECORD)
+    budget = await _post_record_size() - 500
+    strategy = _chain_composed(summarizer, ceiling=budget)
+
+    await strategy(_chain_conversation())
+
+    assert summarizer.log == ["merge", "fold", "harder1"], "the first rewrite fit, so the second was never asked"
+    assert (strategy.record_rewrites, strategy.record_rewrites_rejected) == (1, 0)
+
+
+async def test_a_single_record_is_never_merged_only_rewritten() -> None:
+    """Step a needs two records: merging one is a rewrite, which is step c's to ask for."""
+    summarizer = _RoutingSummarizer()
+    strategy = _chain_composed(summarizer, harder_attempts=1)
+    messages = [message for message in _chain_conversation() if message.message_id not in ("rec1_call", "rec1_res")]
+
+    await strategy(messages)
+
+    assert "merge" not in summarizer.log
+    assert "harder1" in summarizer.log
+    assert (strategy.records_merged, strategy.record_merges_rejected) == (0, 0)
+
+
+async def test_the_other_list_replays_both_the_band_and_the_fold_of_one_pass() -> None:
+    """A pass over the budget may ask the user half for a band and then a fold; both replay.
+
+    The single row remembers one request, which is enough for it; the composed row's user half
+    remembers two, as its builder configures it, so the store pass after the copies pass pays
+    for neither again.
+    """
+    summarizer = _RoutingSummarizer()
+    messages = _chain_conversation()
+    tail = messages[-2:]
+    messages[-2:] = [
+        Message(role="user", contents=["Turn 5: " + "u" * 8_000], message_id="u5"),
+        Message(role="assistant", contents=["Reply 5."], message_id="a5"),
+        *tail,
+    ]
+    strategy = ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy(
+        tokenizer=TOKENIZER,
+        tool_results=_record_phase(_CHAIN_CEILING, trigger_fraction=0.01),
+        user_turns=UserTurnAnchoredSummarizationCompactionStrategy(
+            max_input_tokens=_CHAIN_CEILING,
+            tokenizer=TOKENIZER,
+            client=summarizer,
+            trigger_fraction=0.01,
+            summary_mode=SUMMARY_MODE_BOUNDARY,
+            remembered_requests=2,
+        ),
+        harder_attempts=0,
+    )
+    store = copy.deepcopy(messages)
+
+    await strategy(messages)
+    await strategy(store)
+
+    assert summarizer.log.count("band") == 1 and summarizer.log.count("fold") == 1, summarizer.log
+    assert strategy.user_summaries_replayed == 1, "the band replayed; the refused fold is refused again from memory"

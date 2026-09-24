@@ -83,9 +83,20 @@ undroppable, and counted against the ceiling in full. That is a floor under the 
 grows a record at a time, and
 :attr:`ToolResultAnchoredSummarizationCompactionStrategy.records_in_conversation` reports it,
 because a row whose compaction has stopped paying for a good reason and one whose unshrinkable
-part has quietly grown are otherwise the same row. Consolidating them is deliberately not done:
+part has quietly grown are otherwise the same row. This strategy still never consolidates them:
 an older record is the sole account of the groups behind *it*, so a merge rewrites the evidence
 rather than the bulk.
+
+**The composed row now does, as a last resort, and this paragraph used to say nobody would.**
+:class:`~._composed.ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy` merges the
+active records into one when the prompt is still over the ceiling after both of its halves have
+run, and rewrites the record shorter if that is not enough -- on the stated ground that the
+alternative at that point is the fallback or a disqualified row, both worse than a rewrite that
+is at least smaller. What this module supplies for that is the record's shape and nothing else:
+:func:`active_record_groups` says which records still stand,
+:meth:`ToolResultAnchoredSummarizationCompactionStrategy.consolidate_records` swaps them for one,
+and an excluded record is not a record to anything that reads records -- see
+:func:`find_record_index` and :func:`_record_text`. The standalone row calls none of it.
 
 **Coverage is measured in values, not in tool names, because models do not write tool names.**
 The first version of the check asked whether the record contained the group's function name,
@@ -170,7 +181,7 @@ from dataclasses import dataclass
 from math import ceil
 from typing import TYPE_CHECKING, Any, Final
 
-from agent_framework import ChatContext, ChatMiddleware, ChatResponse, Message
+from agent_framework import ChatContext, ChatMiddleware, ChatResponse, Content, Message
 from agent_framework._compaction import (
     EXCLUDED_KEY,
     annotate_message_groups,
@@ -187,6 +198,8 @@ if TYPE_CHECKING:
     from agent_framework import CompactionStrategy, TokenizerProtocol
 
 __all__ = [
+    "CONSOLIDATED_CALL_ID_PREFIX",
+    "CONSOLIDATE_EXCLUDE_REASON",
     "DEFAULT_COVERAGE_SHARE",
     "DEFAULT_FALLBACK_FRACTION",
     "DEFAULT_RECORD_MAX_TOKENS",
@@ -199,8 +212,12 @@ __all__ = [
     "RecallGate",
     "ToolResultAnchoredSummarizationCompactionStrategy",
     "ToolResultRecallMiddleware",
+    "active_record_groups",
+    "build_record_messages",
     "find_record_index",
     "make_recall_tool",
+    "next_consolidated_call_id",
+    "record_body",
 ]
 
 #: Name of the tool the agent must call. The strategy looks for this name in the history, so
@@ -219,6 +236,32 @@ RECALL_TOOL_NAME: Final[str] = "recall_earlier_tool_results"
 #: has armed it, and a result without this marker is not a record. The model may still call
 #: it; calling it uninvited simply achieves nothing.
 RECORD_MARKER: Final[str] = "[recorded by compaction]"
+
+#: What the recall tool writes between :data:`RECORD_MARKER` and the model's own text.
+#:
+#: A constant rather than a literal inside :func:`make_recall_tool` so that the one other writer
+#: of a record -- :meth:`ToolResultAnchoredSummarizationCompactionStrategy.consolidate_records`,
+#: which the composed row uses to put a merged record in place of several -- writes the same
+#: bytes, and so that :func:`record_body` can take them off again before a record is handed to a
+#: summarizer as content.
+_RECORD_PREAMBLE: Final[str] = (
+    "Earlier tool results may have been shortened, and this is their "
+    "compaction record. Treat values in this record as authoritative for the tool it "
+    "names, and treat information as absent only if it appears nowhere, including "
+    "here."
+)
+
+#: Prefix of the ``call_id`` a consolidated record's synthesised call carries.
+#:
+#: Its own prefix so a conversation read back tells a record the provider issued from one this
+#: package wrote in place of several, and so the numbering in
+#: :meth:`ToolResultAnchoredSummarizationCompactionStrategy.consolidate_records` can find the
+#: highest one already used. See that method for why a client-minted call id is acceptable here
+#: when the module docstring rules it out for the first record.
+CONSOLIDATED_CALL_ID_PREFIX: Final[str] = "compaction_record_"
+
+#: Reason recorded on a record's messages when a consolidated record replaced it.
+CONSOLIDATE_EXCLUDE_REASON: Final[str] = "tool_summary_consolidated"
 
 #: Hard ceiling put on the forced call's response, so a runaway record cannot cost more than
 #: intended.
@@ -425,6 +468,14 @@ def find_record_index(messages: Sequence[Message]) -> int | None:
     count: that is the shape a client-synthesised pair produces, and exactly what breaks on
     routes that track tool calls server-side.
 
+    **An excluded record is not a record.** Nothing excluded one until the composed row began
+    consolidating them -- see
+    :meth:`ToolResultAnchoredSummarizationCompactionStrategy.consolidate_records` -- and the
+    records it replaces stay in the stored conversation as excluded messages. Counting them
+    would make "the newest record" depend on where the replacement was inserted rather than on
+    what is being sent; on every conversation the standalone row produces, where no record is
+    ever excluded, the answer is what it was.
+
     Args:
         messages: The conversation to search.
 
@@ -441,6 +492,8 @@ def find_record_index(messages: Sequence[Message]) -> int | None:
         return None
     newest: int | None = None
     for index, message in enumerate(messages):
+        if message.additional_properties.get(EXCLUDED_KEY, False):
+            continue
         for content in message.contents:
             if content.type != "function_result" or content.call_id not in recall_ids:
                 continue
@@ -461,12 +514,18 @@ def _record_text(message: Message) -> str:
     then count towards coverage without anyone having written it as a record -- which is
     precisely the mistake the coverage check exists to stop.
 
+    An excluded message carries no record, for the reason :func:`find_record_index` gives: a
+    record a consolidated one has replaced is not in the prompt, so it may neither license a
+    deletion in ``_drop_before`` nor be counted and re-preserved by :func:`_preserve_records`.
+
     Args:
         message: The message at the anchor index.
 
     Returns:
         The record, or an empty string when the message carries none.
     """
+    if message.additional_properties.get(EXCLUDED_KEY, False):
+        return ""
     parts: list[str] = []
     for content in message.contents:
         if content.type != "function_result":
@@ -654,19 +713,124 @@ def _preserve_records(messages: list[Message]) -> int:
         How many records the conversation carries. Counted here rather than by a second walk
         because this is already the one place that applies both halves of the identity, and a
         counter disagreeing with what is protected would report a floor the prompt does not
-        actually have.
+        actually have. The walk is :func:`active_record_groups`, so a record a consolidated
+        one replaced is neither counted nor re-protected.
     """
-    records = 0
-    for group in group_messages(messages):
-        if not _is_recall_group(messages, group):
-            continue
-        members = messages[group["start_index"] : group["end_index"] + 1]
-        if not any(_record_text(message) for message in members):
-            continue
-        records += 1
-        for message in members:
+    groups = active_record_groups(messages)
+    for group in groups:
+        for message in messages[group["start_index"] : group["end_index"] + 1]:
             set_preserved(message, preserved=True, reason=PRESERVE_REASON)
-    return records
+    return len(groups)
+
+
+def active_record_groups(messages: list[Message]) -> list[dict[str, Any]]:
+    """Return the spans of every record still being sent, oldest first.
+
+    The identity :func:`_preserve_records` applies -- a call naming the recall tool, and a result
+    carrying :data:`RECORD_MARKER` -- over messages that are not excluded, because
+    :func:`_record_text` reads nothing off an excluded one. Public because the composed row reads
+    it to decide whether there is more than one record to merge; the standalone row reads it
+    only through :func:`_preserve_records`.
+
+    Args:
+        messages: The conversation, already grouped.
+
+    Returns:
+        One span from :func:`group_messages` per record.
+    """
+    return [
+        group
+        for group in group_messages(messages)
+        if _is_recall_group(messages, group)
+        and any(_record_text(message) for message in messages[group["start_index"] : group["end_index"] + 1])
+    ]
+
+
+def record_body(messages: list[Message], group: dict[str, Any]) -> str:
+    """Return what the model wrote in one record, without the marker and the tool's preamble.
+
+    What a summarizer is handed when records are merged or rewritten: the marker and the
+    preamble are this module's framing rather than content, and sending them would invite a
+    summary that repeats them or, worse, paraphrases the instruction they carry.
+
+    Args:
+        messages: The conversation the span indexes into.
+        group: One span from :func:`active_record_groups`.
+
+    Returns:
+        The record's own text, several results in one span joined by newlines.
+    """
+    parts: list[str] = []
+    for message in messages[group["start_index"] : group["end_index"] + 1]:
+        text = _record_text(message)
+        for part in text.split(RECORD_MARKER)[1:]:
+            parts.append(part.strip().removeprefix(_RECORD_PREAMBLE).strip())
+    return "\n".join(part for part in parts if part)
+
+
+def build_record_messages(text: str, *, call_id: str) -> list[Message]:
+    """Return a recall call and its result carrying ``text``, shaped as the recall tool shapes one.
+
+    The arguments carry the text as ``values`` and the result carries it behind the marker and
+    the tool's own preamble, which is byte for byte what :func:`make_recall_tool` returns for the
+    same text. Shaped that way rather than more cheaply -- the arguments could be left empty --
+    for two reasons. Everything that reads records reads this one the same way, with no second
+    shape to keep in step. And the composed row's acceptance rule, "smaller than what it
+    replaces", then compares like with like: a replacement that dropped the argument copy would
+    come out smaller than the record it replaced whatever its text said, and the rule would pass
+    a rewrite that had shortened nothing.
+
+    Args:
+        text: The record's own text, without marker or preamble.
+
+    Keyword Args:
+        call_id: The id the call and its result share. See
+            :meth:`ToolResultAnchoredSummarizationCompactionStrategy.consolidate_records`.
+
+    Returns:
+        The assistant message holding the call, then the tool message holding the result.
+    """
+    return [
+        Message(
+            role="assistant",
+            contents=[Content.from_function_call(call_id=call_id, name=RECALL_TOOL_NAME, arguments={"values": text})],
+            message_id=f"{call_id}_call",
+        ),
+        Message(
+            role="tool",
+            contents=[
+                Content.from_function_result(call_id=call_id, result=f"{RECORD_MARKER} {_RECORD_PREAMBLE}\n{text}")
+            ],
+            message_id=f"{call_id}_result",
+        ),
+    ]
+
+
+def next_consolidated_call_id(messages: Sequence[Message], *, minimum: int) -> str:
+    """Return a :data:`CONSOLIDATED_CALL_ID_PREFIX` id no call in the conversation carries yet.
+
+    Numbered past the highest one the conversation already holds, excluded calls included, for
+    the reason ``_usersummary._next_summary_id`` gives: a conversation outlives the instance that
+    first compacted it, and an id minted twice would pair one result with two calls.
+
+    Args:
+        messages: The conversation, superseded messages included.
+
+    Keyword Args:
+        minimum: The number the caller would use on its own count.
+
+    Returns:
+        The id.
+    """
+    highest = -1
+    for message in messages:
+        for content in message.contents:
+            if content.type != "function_call" or not content.call_id:
+                continue
+            suffix = content.call_id.removeprefix(CONSOLIDATED_CALL_ID_PREFIX)
+            if suffix != content.call_id and suffix.isdigit():
+                highest = max(highest, int(suffix))
+    return f"{CONSOLIDATED_CALL_ID_PREFIX}{max(minimum, highest + 1)}"
 
 
 def _claimed_elsewhere(messages: Sequence[Message]) -> bool:
@@ -846,12 +1010,7 @@ def make_recall_tool(
     def tool(values: str) -> str:
         if gate is not None and not gate.take():
             return "Not required right now: nothing was recorded, and no results have been removed."
-        return (
-            f"{RECORD_MARKER} Earlier tool results may have been shortened, and this is their "
-            "compaction record. Treat values in this record as authoritative for the tool it "
-            "names, and treat information as absent only if it appears nowhere, including "
-            f"here.\n{values}"
-        )
+        return f"{RECORD_MARKER} {_RECORD_PREAMBLE}\n{values}"
 
     tool.__name__ = RECALL_TOOL_NAME
     sections = [RECALL_DESCRIPTION]
@@ -1077,10 +1236,18 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
         had itself pinned, and while it did, a description of one record as "the cost of the
         design" described a number no run had ever produced.
 
-        Deliberately not consolidated. Merging two records would be tempting and wrong: an
-        older record is the sole surviving account of the groups behind *it*, so a merge is a
-        rewrite of the evidence rather than of the bulk, and a partial merge would lose facts
-        with nothing left to trace them to. The count is therefore the whole of the warning.
+        Not consolidated by this strategy. Merging two records rewrites the evidence rather
+        than the bulk -- an older record is the sole surviving account of the groups behind
+        *it* -- so a partial merge loses facts with nothing left to trace them to, and on the
+        standalone row the count is the whole of the warning. **This paragraph used to say the
+        records were never consolidated at all, and that has stopped being true of the composed
+        row**, which merges them as a last resort once the prompt is over the ceiling with both
+        of its halves spent: see
+        :meth:`~._composed.ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy.__call__`.
+        A consolidated record is a record to this count -- the walk is
+        :func:`active_record_groups` -- and the records it replaced are not; the maximum below
+        then keeps the peak, so a composed row reading ``RECORDS:3`` beside ``RECMERGE:1`` held
+        three and merged them, rather than holding three at the end.
 
         A maximum over passes rather than a running total, for the reason
         :attr:`groups_kept_uncovered` is counted by group id: the same conversation is
@@ -1182,7 +1349,14 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
             trigger_tokens=int(self.max_input_tokens * self.trigger_fraction),
         )
 
-    async def compact_against(self, messages: list[Message], *, prompt_tokens: int, trigger_tokens: int) -> bool:
+    async def compact_against(
+        self,
+        messages: list[Message],
+        *,
+        prompt_tokens: int,
+        trigger_tokens: int,
+        fallback_after_record: bool = True,
+    ) -> bool:
         """Run one pass, judged against a size and a line the caller read rather than this pass.
 
         The seam a composition needs and a row does not. What it moves is the *trigger* only:
@@ -1197,6 +1371,15 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
                 by the caller.
             prompt_tokens: Included tokens the trigger and the give-up line are judged against.
             trigger_tokens: Included tokens the prompt must exceed for a pass to run.
+
+        Keyword Args:
+            fallback_after_record: Run :meth:`fall_back_after_record` here when a record has
+                not freed enough. True, the default, is what this strategy's own row does and
+                what :meth:`__call__` passes. The composed row passes False and calls that
+                method itself, last, after everything else it can try: there the fallback is the
+                end of a chain rather than the step straight after the record. The give-up path
+                taken when no record ever arrived is not governed by this and runs here either
+                way.
 
         Returns:
             True if the outgoing messages changed.
@@ -1223,29 +1406,8 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
             self._reforce_or_settle(records)
             # Even a good record may not be enough on its own: the groups after it are
             # untouched by design, and they can exceed the ceiling by themselves.
-            if included_token_count(messages) > self.max_input_tokens:
-                # Counted, and counted apart from the fallback below. This is the other
-                # strategy running over what the record did not free -- which now includes
-                # every group the record did not carry -- so the row is partly measuring that
-                # other strategy. Until this counter existed only the pre-record path
-                # incremented anything, so a run that fell back here reported no FALLBACK at
-                # all and read as this design working.
-                #
-                # Counted after the await and on its answer. Incrementing before it counted
-                # the attempt, and a fallback with nothing left to shorten returns False and
-                # touches nothing: ``RECFALLBACK:5`` could be five no-ops, which is the
-                # opposite of what the flag is read as meaning.
-                #
-                # Every tool group no record covers is held first, so what the fallback may
-                # take here is narration and nothing else. Its False then means "held back",
-                # never "it fits": the prompt is left as it is, over the ceiling, and the row
-                # reads DQ rather than a shortened result. See ``fallbacks_held_after_record``.
-                if _hold_unrecorded(messages):
-                    self._fallbacks_held_after_record += 1
-                shortened = await self.fallback(messages)
-                if shortened:
-                    self._fallbacks_after_record += 1
-                changed = shortened or changed
+            if fallback_after_record and included_token_count(messages) > self.max_input_tokens:
+                changed = await self.fall_back_after_record(messages) or changed
             return changed
 
         if prompt_tokens < int(self.max_input_tokens * self.fallback_fraction):
@@ -1258,6 +1420,103 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
         # results are lost either way at this point; at least the conversation survives.
         self._fallbacks += 1
         return await self.fallback(messages)
+
+    async def fall_back_after_record(self, messages: list[Message]) -> bool:
+        """Hand what a record did not free to the fallback, with every unrecorded tool group held.
+
+        The step :meth:`compact_against` takes when the prompt is still over the ceiling behind a
+        record, and a method of its own so the composed row can take it at the end of its chain
+        instead of straight after the record; the rule and the counters are the same wherever
+        it is called from.
+
+        Counted, and counted apart from the give-up fallback. This is the other strategy running
+        over what the record did not free -- which includes every group the record did not
+        carry -- so the row is partly measuring that other strategy. Until this counter existed
+        only the pre-record path incremented anything, so a run that fell back here reported no
+        ``FALLBACK`` at all and read as this design working.
+
+        Counted after the await and on its answer. Incrementing before it counted the attempt,
+        and a fallback with nothing left to shorten returns False and touches nothing:
+        ``RECFALLBACK:5`` could be five no-ops, which is the opposite of what the flag is read as
+        meaning.
+
+        Every tool group no record covers is held first, so what the fallback may take here is
+        narration and nothing else. Its False then means "held back", never "it fits": the prompt
+        is left as it is, over the ceiling, and the row reads ``DQ`` rather than a shortened
+        result. See :attr:`fallbacks_held_after_record`.
+
+        Args:
+            messages: The conversation, mutated in place, with a record in it.
+
+        Returns:
+            True if the fallback changed the outgoing messages.
+        """
+        if _hold_unrecorded(messages):
+            self._fallbacks_held_after_record += 1
+        shortened = await self.fallback(messages)
+        if shortened:
+            self._fallbacks_after_record += 1
+        return shortened
+
+    def consolidate_records(
+        self, messages: list[Message], groups: list[dict[str, Any]], text: str, *, call_id: str
+    ) -> None:
+        """Put one record carrying ``text`` in place of the records ``groups`` span.
+
+        The composed row's seam for merging records and for rewriting one shorter; this
+        strategy never calls it itself. The replaced records are released from their
+        preservation and excluded with :data:`CONSOLIDATE_EXCLUDE_REASON`, call and result
+        together so no call is left without its answer, and the replacement is inserted
+        directly behind the newest of them. That position is what makes it a record to
+        everything downstream without a second rule anywhere: it is the newest record, so
+        :func:`find_record_index` and the recall middleware anchor on it and count pending tool
+        work from it exactly as they did from the newest record it replaced; every group the
+        replaced records stood in front of is in front of it, so ``_drop_before`` reads the same
+        conversation against its text alone; and it is a recall group, so
+        :func:`_hold_unrecorded` and :func:`_droppable_groups_after` skip it and
+        :func:`_preserve_records` protects and counts it on the spot.
+
+        **The call id is minted here, which the module docstring rules out for the first
+        record, and the ground for that rule does not reach this one.** A client-minted call is
+        unsafe where the service tracks tool calls, and a service that does so holds the
+        conversation itself -- in which case there is no client-side prompt for any of this to
+        compact, which is why ``_live.wants_client_side_history`` forces ``store=False`` for a
+        compacting row in the first place. The first record still has to come from the provider,
+        because it is written by the agent's own model from the tool payload in its context;
+        this one is a rewrite of records already in a history the client owns. A provider that
+        signs its own function calls -- Gemini's thought signatures -- may still refuse an
+        unsigned one, and that is unmeasured: every run of this row has been on OpenAI-family
+        models.
+
+        An outstanding ask for another record is re-based as well. It judges arrival as a record
+        count that grew, and a merge lowers the count; left alone, the record the ask was for
+        would arrive into a count no higher than the one it was made at, read as never having
+        come, and settle its groups for good.
+
+        Args:
+            messages: The conversation, mutated in place. Already grouped.
+            groups: The records being replaced, from :func:`active_record_groups`, oldest first.
+            text: The replacement's own text, without marker or preamble.
+
+        Keyword Args:
+            call_id: The id the replacement's call and result share, from
+                :func:`next_consolidated_call_id`.
+        """
+        for group in groups:
+            for message in messages[group["start_index"] : group["end_index"] + 1]:
+                # Released before the exclusion, as ``_drop_before`` releases a hold: the promise
+                # the mark made passes to the replacement, and "preserved" and "included" keep
+                # meaning one thing on a conversation read back.
+                set_preserved(message, preserved=False)
+                set_excluded(message, excluded=True, reason=CONSOLIDATE_EXCLUDE_REASON)
+        insertion_index = int(groups[-1]["end_index"]) + 1
+        messages[insertion_index:insertion_index] = build_record_messages(text, call_id=call_id)
+        annotate_message_groups(messages, from_index=insertion_index)
+        annotate_token_counts(messages, tokenizer=self.tokenizer, from_index=insertion_index)
+        records = _preserve_records(messages)
+        self._records_in_conversation = max(self._records_in_conversation, records)
+        if self._reforce is not None:
+            self._reforce.records = max(self._reforce.records - (len(groups) - 1), 0)
 
     def _drop_before(self, messages: list[Message], anchor: int) -> bool:
         """Exclude the tool groups the record demonstrably covers, and only those.

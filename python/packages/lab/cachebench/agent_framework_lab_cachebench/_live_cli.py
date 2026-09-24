@@ -55,6 +55,7 @@ from .compaction import (
     DEFAULT_BAND_SHARE,
     DEFAULT_COVERAGE_SHARE,
     DEFAULT_FALLBACK_FRACTION,
+    DEFAULT_HARDER_ATTEMPTS,
     DEFAULT_KEEP_HEAD_USER_TURNS,
     DEFAULT_KEEP_TAIL_USER_TURNS,
     DEFAULT_MIN_BAND_SHARE,
@@ -435,7 +436,9 @@ def build_parser() -> argparse.ArgumentParser:
             "axis. Whether one record can cover everything is a property of the model and the "
             "workload, which is why this is a flag and not a default. --max-groups-before-record "
             "is unaffected: setting a group bound is asking for repeats outright, and it keeps "
-            "forcing them either way."
+            "forcing them either way. tool_and_user_summary_anchored repeats whatever this says: "
+            "recording every new batch of tool work is part of that row's design, and the flag "
+            "moves tool_summary_anchored only."
         ),
     )
     parser.add_argument(
@@ -502,10 +505,12 @@ def build_parser() -> argparse.ArgumentParser:
             "prefix, so it can wait. It decides when the first compaction happens and not how "
             "many there are -- that is --user-min-band-share, and firing late was measured not "
             "to bound the count at all. It moves the single row only: "
-            "tool_and_user_summary_anchored judges both of its halves at --trigger-fraction, "
-            "because two lines there is the record half holding the prompt below the user "
-            "half's for the whole of a run. Read USERCOMPACT in the flags column for how often "
-            "it fired and USERHELD for how often the band was not worth a pass. "
+            "tool_and_user_summary_anchored judges both of its halves at --trigger-fraction -- "
+            "the record half against the prompt the pass began with, the user half against the "
+            "prompt the record half left -- so there the user half acts only when tool "
+            "compaction alone did not bring the prompt under that line, and USERUNDER counts "
+            "the passes it stayed idle because it did. Read USERCOMPACT in the flags column for "
+            "how often it fired and USERHELD for how often the band was not worth a pass. "
             "Default %(default)s."
         ),
     )
@@ -532,6 +537,24 @@ def build_parser() -> argparse.ArgumentParser:
         ),
     )
     parser.add_argument(
+        "--record-harder-attempts",
+        type=int,
+        default=DEFAULT_HARDER_ATTEMPTS,
+        help=(
+            "How many times per pass tool_and_user_summary_anchored may rewrite its record "
+            "harder once the prompt is still over the input budget after both halves and after "
+            "merging its records and its user summaries: step c of that row's last-resort chain, "
+            "read by no other row. Each attempt asks for more compression than the last and "
+            "tells the summarizer to keep every identifier, number and name verbatim and cut "
+            "wording; each is kept only if it comes back smaller than the record it replaces. "
+            "Each costs a summarizer call, and a kept one rewrites a preserved message the cached "
+            "prefix runs through, so the default is small -- one attempt, and one more at a "
+            "harder target in case the first was kept and was not enough. RECHARDER counts "
+            "attempts and RECHARDERREJ the ones refused. 0 switches the step off. "
+            "Default %(default)s."
+        ),
+    )
+    parser.add_argument(
         "--user-summary-mode",
         choices=SUMMARY_MODES,
         default=DEFAULT_SUMMARY_MODE,
@@ -553,8 +576,8 @@ def build_parser() -> argparse.ArgumentParser:
             "so expect more USERHELD there; it is not re-tuned per mode, because the three are "
             "the arms of one comparison. The default is the mode every archived row ran and the "
             "live run in progress is measuring, and it does not move until a run has measured "
-            "the arms against it. Reaches the composed row's user half through the same "
-            "builder. Default %(default)s."
+            "the arms against it. Moves the single row only: tool_and_user_summary_anchored "
+            "runs its user half in boundary whatever this says. Default %(default)s."
         ),
     )
     parser.add_argument(
@@ -957,6 +980,13 @@ def _seed_record(
         user_summaries_in_conversation=outcome.user_summaries_in_conversation,
         user_summary_tokens=outcome.user_summary_tokens,
         user_folds=outcome.user_folds,
+        records_merged=outcome.records_merged,
+        record_merges_rejected=outcome.record_merges_rejected,
+        user_summaries_merged=outcome.user_summaries_merged,
+        user_merges_rejected=outcome.user_merges_rejected,
+        record_rewrites=outcome.record_rewrites,
+        record_rewrites_rejected=outcome.record_rewrites_rejected,
+        last_resort_fallbacks=outcome.last_resort_fallbacks,
         strategy_notes=outcome.strategy_notes,
         dropped_options=outcome.dropped_options,
         answer=outcome.answer,
@@ -2251,22 +2281,26 @@ _LEGEND: Final[tuple[str, ...]] = (
     "            held 95%.",
     "            USERSUMMFAIL:<n> passes where the summarizer raised or returned",
     "            nothing, so the band was left exactly as it was found and those passes",
-    "            are the control too. USERSTARVED:<n> passes of",
-    "            tool_and_user_summary_anchored where the record half's removals are why",
-    "            the prompt was under the user half's trigger, so the user half was never",
-    "            consulted. It is the subset of USERUNDER the composition caused rather",
-    "            than the conversation, and the only reading of USERCOMPACT:0 that is not",
-    "            about the user half at all. It counts a pass whenever the prompt would",
-    "            have been over that trigger with what the record half removed on earlier",
-    "            passes, while the user half was declining at its own line, still in it.",
-    "            Zero is the ordinary reading now, and zero is what the default produces:",
-    "            both halves of that row are judged at --trigger-fraction, against one",
-    "            reading of the prompt taken before either acts, so the record half never",
-    "            removes anything on a pass the user half was not offered. Non-zero on a",
-    "            default row is a defect report. It was the row's ordinary state while the",
-    "            two halves had two lines -- the record half fires at the lower one and",
-    "            holds the prompt below the higher one from before it is ever reached --",
-    "            and a caller who sets them apart again is asking for that row back.",
+    "            are the control too. USERSTARVED:<n> (retired at schema 16; only on",
+    "            older records) passes of tool_and_user_summary_anchored where the record",
+    "            half's removals kept the prompt under the user half's trigger. From schema",
+    "            16 that row judges its user half after the record half on purpose, so the",
+    "            user half staying idle because tool compaction was enough is the design",
+    "            working, and USERUNDER counts it.",
+    "            tool_and_user_summary_anchored's last-resort chain, which runs only while",
+    "            the prompt is over the input budget after both halves, reads in order:",
+    "            RECMERGE:<n> passes that merged the records into one, and RECMERGEREJ:<n>",
+    "            merges refused as no smaller than the records; USERMERGE:<n> passes that",
+    "            folded the user summaries into one, and USERMERGEREJ:<n> folds refused;",
+    "            RECHARDER:<n> harder rewrites of the record tried, up to",
+    "            --record-harder-attempts per pass, and RECHARDERREJ:<n> of them refused;",
+    "            RECSUMMFAIL:<n> merges or rewrites the summarizer did not answer;",
+    "            LASTFALLBACK:<n> passes that reached the record half's fallback, which on",
+    "            this row runs there and nowhere else and may drop narration only. Every",
+    "            replacement is kept on size alone -- non-empty and smaller than what it",
+    "            replaces -- and never checked against content, so what a merge lost is",
+    "            read in facts and acc1, not here. LASTFALLBACK beside DQ is the chain",
+    "            exhausted: the intended loud failure.",
     "            REFORCED:<n> calls the recall middleware pinned at the strategy's own request,",
     "            because the standing record left tool groups uncovered: layer one of the",
     "            answer to the gap UNCOVERED beside RECFALLBACK names, where the fallback could",
@@ -2727,6 +2761,7 @@ def _strategy_options(args: argparse.Namespace, tokenizer: Any, summarizer: Any 
         user_trigger_fraction=args.user_trigger_fraction,
         user_min_band_share=args.user_min_band_share,
         user_summary_mode=args.user_summary_mode,
+        record_harder_attempts=args.record_harder_attempts,
         token_budget_fraction=args.budget_fraction,
         summarizer=summarizer,
     )
@@ -2776,6 +2811,7 @@ def _strategy_settings(
         user_trigger_fraction=options.user_trigger_fraction,
         user_min_band_share=options.user_min_band_share,
         user_summary_mode=options.user_summary_mode,
+        record_harder_attempts=options.record_harder_attempts,
         token_budget_fraction=options.token_budget_fraction,
         max_output_tokens=options.max_output_tokens,
         answer_max_tokens=args.answer_max_tokens,
