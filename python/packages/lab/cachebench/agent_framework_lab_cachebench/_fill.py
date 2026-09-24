@@ -51,11 +51,13 @@ achieved fill by a few points -- which is exactly why :func:`plan_fill` records 
 the runner reports the deviation instead of assuming the target was hit.
 """
 
-MAX_FILL_FRACTION: Final[float] = 2.0
+MAX_FILL_FRACTION: Final[float] = 10.0
 """Largest share of the context limit a seeded conversation may be sized to.
 
 Above 1.0 on purpose: a cell whose control overflows the window is the one compaction exists
-for. See :func:`plan_fill` for what such a fill means and why it stops at 2.0.
+for. Well above it on purpose too: a small window under a long conversation is the only way
+to reach a strategy's last resorts. See :func:`plan_fill` for what such a fill means and why
+it stops at 10.0.
 """
 
 _FUNCTION_CALL_TOKENS: Final[int] = 20
@@ -305,15 +307,20 @@ def plan_fill(
     it was one where not compacting simply worked: the control is expected to disqualify, and
     the comparison becomes which compacting row keeps the run under the limit, and at what
     cost. The target is still ``context_limit * fill_fraction``, so nothing in the solve changes.
-    The cap is 2.0 rather than none because the replies the solver cannot compute are the one
-    term that can land a fill short, and a cell twice the size of its window has cleared the
-    limit by far more than that; a larger fraction is a typo far more often than a design.
+    Far past 1.0 is a design too. What a compacting row cannot remove -- chiefly the model's
+    own replies, which no strategy here rewrites -- grows with the conversation, not with the
+    window, so a small window under a long conversation is how a strategy is driven past its
+    ordinary halves into its last resorts. At a 30,000-token window that takes a fill of about
+    6 to 8, and the uncompacted control still has to fit the model's real limit to finish:
+    272,000 tokens is a fill of about 9 at 30,000. The cap is 10.0 rather than none because a
+    fraction written as a percentage -- 65 for 0.65 -- still has to be refused, and nothing
+    between the two is a cell any model accepts at a window worth trying.
 
     Keyword Args:
         tokenizer: Token counter, the same one the strategies budget with.
         context_limit: The limit this cell stands in for.
         fill_fraction: Share of that limit the seeded conversation should reach, in
-            ``(0.0, 2.0]``. Above 1.0 the control is sized to overflow the limit on purpose.
+            ``(0.0, 10.0]``. Above 1.0 the control is sized to overflow the limit on purpose.
         salt: Cell-unique string for the probe scenarios built while solving. Immaterial to
             the answer, since markers are fixed-width whatever the salt.
         tool_turns: Tool-call groups to plant.

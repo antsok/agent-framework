@@ -192,10 +192,12 @@ def build_parser() -> argparse.ArgumentParser:
             "an uncompacted run. Solved analytically from the payload and filler sizes, so the "
             "user-side turn list is identical across strategies without having to run one "
             "first. The filler is the dial and the payload is held fixed, which is what makes "
-            "this 'how much irrelevant context surrounds a fixed set of facts'. Up to 2.0: above "
+            "this 'how much irrelevant context surrounds a fixed set of facts'. Up to 10.0: above "
             "1.0 the uncompacted conversation is sized past the window on purpose, so the control "
             "is expected to disqualify and the cell asks which compacting row keeps the run under "
-            "the limit, and at what cost. Pass 0 to size manually from --filler-turns and "
+            "the limit, and at what cost; far above it, a small window under a long conversation "
+            "is what reaches a strategy's last resorts. The control must still fit the model's "
+            "real limit to finish. Pass 0 to size manually from --filler-turns and "
             "--filler-tokens instead. Default %(default)s."
         ),
     )
