@@ -207,6 +207,20 @@ What it shows, and what it is void for:
 No `.sh` is kept: the script that produced it is the same one run 47 uses, and re-running it
 against this tree produces the repaired rows rather than these.
 
+Run 57 is run 56 repeated on `32f1a9ae8`, where the composed row's user half waits for the
+record half. Same cell: 200,000 tokens, 0.9 fill, `--trigger-fraction 0.8`; five seeds, $3.17.
+**The layering now works as designed on four of five seeds.** The record half wrote a record on
+seeds 2-5 (run 56: none), the user half held for it (`USERWAIT` 3-4 on every seed), and it then
+acted only where the record fell short -- seed 3, `UNCOVERED:5` after a re-force -- and stayed idle
+on seeds 2, 4 and 5. Seed 1 wrote no record: its prompt peaked at 171K, over the 158K line and
+under the 178K give-up line, and it carries `DRIFT:11`, so its snapshot moved during probing. The
+likely reading, inferred and not verified from a per-call trace the record does not keep: the
+prompt crossed at the very end of seeding, the pinned call that would have carried the record
+would have been the next agent turn, the next calls were probes instead, and the wait ran out
+there. That is the benchmark's fixed end, not the strategy in a conversation that continues.
+53/53 on every seed; seed$ +13% on not compacting, below the window as the fill series predicts
+(run 56, the user half alone: +16%). `truncation` kept 37.
+
 Run 56 is the composed strategy as rebuilt in `42cb2c03e`, alone with `none` and `truncation`,
 at 200,000 tokens, 0.9 fill and `--trigger-fraction 0.8` -- the one line both halves share on
 that row, 158,361 of a 197,952 budget. Five seeds, $3.13, no disqualifications, fill on target.
