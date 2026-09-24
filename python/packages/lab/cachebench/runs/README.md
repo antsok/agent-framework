@@ -208,9 +208,14 @@ No `.sh` is kept: the script that produced it is the same one run 47 uses, and r
 against this tree produces the repaired rows rather than these.
 
 Run 58 is the composed row against `none` at 200,000 tokens, **1.0 fill** and `--trigger-fraction
-0.9`, five seeds, $3.73. `--fallback-fraction` was raised from its default 0.9 to 1.0: at 0.9 the
-record half's give-up line coincides with a 0.9 trigger, so it would give up on the same pass it
-asks for a record and the row would measure `anchored`.
+0.9`, five seeds, $3.73. `--fallback-fraction` was raised from its default 0.9 to 1.0, because the
+record half's give-up line has to sit above its trigger. *Corrected 25 September:* the reason
+given at the time -- that at 0.9 the row would give up on the same pass it asked for a record and
+measure `anchored` -- was wrong. The constructor refuses `fallback_fraction <= trigger_fraction`,
+and a real run builds every strategy before its first call, so that configuration would have
+stopped before spending anything. A dry run without `--summarizer-provider` did not catch it,
+because the pre-flight skipped strategies needing a summarizer; it now builds them against a
+stand-in client and refuses the configuration there too.
 
 - **The control overflowed on 4 of 5 seeds** (peak 102% of the window). The composed row stayed
   inside on all five, at 53/53, filling 90% at peak and 65% after compaction, at seed$ +4% on the

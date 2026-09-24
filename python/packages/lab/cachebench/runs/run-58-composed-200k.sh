@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 # Run 58: the composed row (32f1a9ae8) at 200,000 tokens, 1.0 fill, --trigger-fraction 0.9,
-# compared with none. --fallback-fraction raised to 1.0: at its default of 0.9 the record
-# half's give-up line coincides with a 0.9 trigger, so it would give up on the same pass it
-# asks for a record and the row would measure anchored.
+# compared with none. --fallback-fraction raised to 1.0 because the record half's give-up line
+# must sit above its trigger; at the default 0.9 the strategy refuses to build (see the run 58
+# entry in runs/README.md for the correction of the reason first given here).
 set -u
 export FOUNDRY_PROJECT_ENDPOINT="https://<resource>.services.ai.azure.com/api/projects/<project>"
 export FOUNDRY_MODEL=gpt-5.6-luna
