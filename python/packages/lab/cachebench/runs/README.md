@@ -207,6 +207,35 @@ What it shows, and what it is void for:
 No `.sh` is kept: the script that produced it is the same one run 47 uses, and re-running it
 against this tree produces the repaired rows rather than these.
 
+Runs 54 and 55 complete a **fill series at 120,000 tokens on one codebase** (`e16955b30`: the
+fixed post-record fallback, `--assumed-reply-tokens 384`): run 55 at 0.7 fill ($9.75), run 54 at
+0.9 ($12.41), and run 53 at 1.15. Run 50's 0.8 cell predates the fix and the re-sizing and is not
+part of it. All twenty strategies, five seeds each, ran concurrently on five streams.
+
+Seed$ means, with the best row that kept 53/53 on every seed:
+
+    seed$                             0.7 fill   0.9 fill   1.15 fill
+    none (not compacting)              0.0555     0.0733     0.1058 (disqualified)
+    tool_summary_anchored              0.0552     0.0785     0.0802
+    anchored_min_gain                  0.0570     0.0743     0.1116
+    tool_and_user_summary_anchored     0.0758     0.0952     0.1169
+    user_summary_anchored              0.0551     0.0905     0.1284
+    best full retainer vs none           -1%        +1%     -24%, every seed
+
+- **Below the window compaction is a wash, not a loss.** At 0.7 and 0.9 the best full retainer
+  sits within 1% of not compacting, well inside the ~20% seed spread. The strategies do act --
+  at 0.7 the record row writes a record on every seed and cuts its snapshot to 51% of the
+  control's -- but the saving on the calls after compaction roughly equals the broken cache and
+  the record call. Not compacting stays the right default when the conversation fits, and the
+  earlier below-window verdicts of `none` survive the corrected counter and sizing.
+- **Past the window the saving is resolved** (run 53), and the series shows its source: from 0.9
+  to 1.15 the uncompacted conversation grows from 110K to 142K seeded tokens and its seed$ rises
+  44%, while the record row holds its snapshot at 79-86K and its seed$ moves 2%. Once engaged it
+  caps the prompt. The crossover lies between 0.9 and 1.15 and has not been located.
+- Rows keeping 53/53 on every seed: 7 at 0.7, 6 at 0.9, 4 at 1.15.
+- The composed row's premium over not compacting falls as pressure rises -- +37%, +30%, +11% --
+  consistent with a strategy whose headroom is only worth its price when the window is tight.
+
 Run 53 is run 51 repeated in full on `00061004b`, where the post-record fallback may no longer
 shorten a tool group no record covers. Same cell -- all twenty strategies, 120,000 tokens, the
 uncompacted conversation sized to 115% of the window -- five seeds, $15.21. The control
