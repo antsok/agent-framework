@@ -233,7 +233,17 @@ __all__ = [
 #: a composed row before 16 is a different design from one after it, not an earlier run of the
 #: same one. It also retired ``USERSTARVED``, which was only ever a flag; notes already on disk
 #: keep it.
-SCHEMA_VERSION: Final[int] = 16
+#:
+#: 17 adds ``user_passes_waited``, on the version 5 argument once more. Before it the composed
+#: row's user half was judged on every pass the prompt was over the line, including the pass on
+#: which the record half had only just asked for its record, so the user half acted first and --
+#: when its summary took the prompt under the line -- the record was never asked for: measured on
+#: gpt-5.6-luna at 200,000 tokens and a 0.8 trigger, no record on five seeds of five. From 17 the user half
+#: holds while a record is due, for a bounded number of model responses. The field reads back as
+#: zero on an older record because zero is what those runs did: no pass was held. As at 16, the
+#: schema is the only mark of the change in ordering itself, and a composed row before 17 is a
+#: different design from one after it.
+SCHEMA_VERSION: Final[int] = 17
 
 #: Versions this reader accepts, which is not only the current one.
 #:
@@ -309,7 +319,10 @@ SCHEMA_VERSION: Final[int] = 16
 #: Version 15 joins on the same argument: its composed row had no last-resort chain, so the
 #: chain's seven counts read back as the zeroes those runs produced and ``record_harder_attempts``
 #: as zero.
-_READABLE_SCHEMAS: Final[frozenset[int]] = frozenset({2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, SCHEMA_VERSION})
+#:
+#: Version 16 joins on the same argument: its composed row's user half never waited for a record,
+#: so ``user_passes_waited`` reads back as the zero those runs produced.
+_READABLE_SCHEMAS: Final[frozenset[int]] = frozenset({*range(2, 17), SCHEMA_VERSION})
 
 #: The parameters that make two records the same cell, and so aggregable into one row.
 #:
@@ -1253,6 +1266,15 @@ class SeedRecord:
     """Of those, the rewrites discarded because they came back no smaller."""
     last_resort_fallbacks: int
     """Passes on which the chain reached its fallback, step d, with everything above it tried."""
+    user_passes_waited: int
+    """Passes where ``tool_and_user_summary_anchored`` held its user half back for a due record.
+
+    The composed row's user half waits, a bounded number of model responses, while the record
+    half has tool work a record is due for, because the record half compacts in two steps and
+    the user half in one. ``strategy_notes`` carries it as ``USERWAIT:<n>``. Zero for every
+    strategy that keeps no such count, and zero on a record written before schema 17 -- see
+    :data:`SCHEMA_VERSION` for why that zero is a measurement rather than a gap.
+    """
     strategy_notes: tuple[str, ...]
     dropped_options: tuple[str, ...]
     answer: str
@@ -1520,6 +1542,9 @@ class SeedRecord:
             "last_resort_fallbacks",
         ):
             values.setdefault(name, 0)
+        # Zero on the same reading, schema 17 along: the composed row's user half never waited
+        # before it, so no pass was held.
+        values.setdefault("user_passes_waited", 0)
         # None, on the probe-token reading. A record written before schema 11 carried one
         # standing summary or none, and which is a deduction from ``user_compactions`` rather
         # than a number anybody took; the tokens are not recoverable at all.

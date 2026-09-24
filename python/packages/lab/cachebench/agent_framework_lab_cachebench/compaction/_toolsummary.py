@@ -1327,6 +1327,33 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
         request.taken = True
         return True
 
+    def record_pending(self, messages: list[Message]) -> bool:
+        """Return whether this conversation has tool work a record is due for or already asked for.
+
+        Read by the composed row, which holds its user half back while this is true; this
+        strategy never calls it, and nothing here changes because it exists. It states no rule
+        of its own. "Due" is what :meth:`ToolResultRecallMiddleware._record_due` counts as
+        *pending* -- the non-recall tool groups after the newest record, or all of them before
+        the first -- and "asked for" is an outstanding :meth:`take_reforce` ask. The middleware
+        also wants the prompt over its trigger before a pending count asks for anything; that
+        half is a size, and the caller holds the reading, so the caller applies it.
+
+        The count errs where the middleware's does: it includes tool groups ``keep_head_groups``
+        or ``keep_tail_groups`` protect, which a record would not free. A caller that waits on
+        this may therefore wait for a record that drops nothing, and that is the direction to
+        err in: the middleware asks for that record anyway, and a caller that bounds its wait
+        loses at most the bound.
+
+        Args:
+            messages: The conversation, already grouped.
+
+        Returns:
+            True when a record is due or already asked for.
+        """
+        if self._reforce is not None:
+            return True
+        return _droppable_groups_after(messages, find_record_index(messages)) > 0
+
     async def __call__(self, messages: list[Message]) -> bool:
         """Request a record, or drop what an existing record covers.
 

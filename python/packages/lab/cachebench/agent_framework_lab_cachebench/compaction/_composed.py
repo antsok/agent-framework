@@ -17,12 +17,33 @@ three things in order.
    record covers. Existing records are left as they are.
 2. **The user half acts only if the record half was not enough.** It is judged at the same
    line, against the prompt *as the record half left it*, and it runs in the boundary mode, so
-   a summary it wrote is kept as a boundary rather than re-summarised on the next pass.
+   a summary it wrote is kept as a boundary rather than re-summarised on the next pass. While
+   a record is due and still has time to arrive it is not judged at all: see below.
 3. **A last-resort chain, only while the prompt is still over the input budget.** Merge the
    records into one; merge the user summaries into one; rewrite the record harder, up to
    ``harder_attempts`` times; then the record half's fallback, which may drop narration only.
    If the prompt is still over after that, nothing more is done: it goes out over the limit and
    the row reads ``DQ``, which is the intended loud failure.
+
+**The user half waits for a record that is due, because the two halves compact at different
+speeds.** The record half compacts in two steps: on the pass where the prompt crosses the line
+it can only ask -- its middleware pins a *later* call, the model writes the record there, and
+only the pass after that drops what the record covers. The user half compacts in one. Judged
+on the asking pass, it saw a prompt the record half had not yet touched and acted at once; when
+summarising the user turns alone got back under the line, the middleware, which reads the
+prompt on each call's way out, never saw it over the line again and never asked. Measured on
+gpt-5.6-luna at 200,000 tokens, 0.9 fill and a 0.8 trigger: no record and one user compaction
+on five seeds of five -- the layering inverted, and the cache-breaking half doing all the work.
+So on a pass over the line where the record half has tool work a record is due for, or has
+already asked for, the user half holds; it acts on the pass that sees the record arrive, if the
+prompt is still over the line after the record's drops, or after
+:data:`_RECORD_WAIT_RESPONSES` model responses with no record, so a model that never records
+cannot leave the conversation uncompacted. With nothing pending it acts as before. The rule,
+and the guards on it, are on
+:meth:`ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy._holds_for_record`;
+``USERWAIT`` counts the passes held. At 0.6 of 120,000 tokens earlier runs still got a record,
+because summarising the user turns there did not get back under the line; a late trigger makes
+the inversion more likely rather than causing it.
 
 **Judged after the record phase, which reverses what this module used to argue.** Commit
 ``4be71a904`` made both halves judge against one reading of the prompt taken at pass entry, on
@@ -159,6 +180,7 @@ from agent_framework._compaction import (
 )
 
 from ._toolsummary import (
+    RECORD_MARKER,
     ToolResultAnchoredSummarizationCompactionStrategy,
     active_record_groups,
     build_record_messages,
@@ -209,6 +231,29 @@ DEFAULT_HARDER_ATTEMPTS: Final[int] = 2
 #: failure the instruction beside it is there to forbid.
 _HARDER_RATIO: Final[float] = 0.6
 
+#: Model responses the user half waits through for a record that is due, before acting anyway.
+#:
+#: **Two, and it is the re-force layer's number for the re-force layer's reason**, counted in a
+#: different unit. The wait begins on the pass that finds the prompt over the line with a record
+#: due. The recall middleware decides on the exit of that pass's call and pins the call after
+#: it, so the first response the wait sees is the deciding call's own, and it cannot be the
+#: record. The second is the pinned call's. If the model wrote the record, the follow-up call's
+#: pass finds it and ends the wait as a completed cycle before the count is read. If the model
+#: did anything else -- ignored the pin, was cut off, had the option refused -- the count
+#: reaches two on the next pass, the record was not written, and the user half acts. Waiting
+#: longer would keep the prompt over the line on the evidence of an ask that has already failed;
+#: waiting less would give up on a pass that could not have seen the record. See
+#: ``_toolsummary._REFORCE_ARRIVAL_PASSES``, whose argument this is.
+#:
+#: **Responses rather than passes, because the live path runs two passes per call.** The
+#: strategy runs over the copies sent on a call and again over the store after the turn, so a
+#: bound of two *passes* would be spent on the crossing turn's own two lists and expire on the
+#: pinned call's pass, before the model had written anything. A response is counted off the
+#: conversation itself -- an assistant message, see :func:`_responses` -- so the store pass and
+#: the next call's copy pass read the same number for the same point in the conversation, and
+#: one crossing cannot be counted twice.
+_RECORD_WAIT_RESPONSES: Final[int] = 2
+
 #: What the summarizer is asked when the chain merges the active records into one.
 #:
 #: Generic on purpose, in the sense the acceptance rule is: nothing in it names this benchmark's
@@ -248,6 +293,36 @@ def harder_record_prompt(attempt: int) -> str:
         "several numbered records are given, write one record that carries the values of all of "
         "them. Reply with the record text only."
     )
+
+
+def _responses(messages: list[Message]) -> int:
+    """Count the assistant messages in the conversation: the clock the user half's wait runs on.
+
+    Excluded messages count too, because the clock measures how far the conversation has gone
+    and not what is sent. Nothing needs subtracting. A record the model writes is an assistant
+    message, but the pass that sees it ends the wait as an arrival before the count is read. And
+    a compaction's own insertions -- the fallback's notes, a merged record -- are made only on
+    passes the wait does not hold: a held pass is under the give-up line, so neither fallback
+    runs, and under the budget, so the chain does not, and any pass that does not hold ends the
+    wait.
+    """
+    return sum(1 for message in messages if message.role == "assistant")
+
+
+def _newest_record_id(messages: list[Message]) -> str:
+    """Return the call id of the newest record, or an empty string when there is none.
+
+    The identity of what the record half anchors on, read the way it reads it
+    (:func:`~._toolsummary.find_record_index`). A call id rather than a position because the id
+    is the provider's, so the copies sent on a call and the store after it agree on it.
+    """
+    index = find_record_index(messages)
+    if index is None:
+        return ""
+    for content in messages[index].contents:
+        if content.type == "function_result" and RECORD_MARKER in str(content.result):
+            return content.call_id or ""
+    return ""
 
 
 class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
@@ -328,6 +403,18 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
         self._record_rewrites_rejected = 0
         self._record_summary_failures = 0
         self._last_resort_fallbacks = 0
+        # The user half's wait for the record half; see ``_holds_for_record``. All of it is read
+        # off the conversation or kept here, never in message annotations, because the copies'
+        # annotations do not reach the store the next pass runs over.
+        self._user_passes_waited = 0
+        # The response count the current wait began at, or None when none is running.
+        self._wait_since: int | None = None
+        # The newest record's call id as the last pass saw it; a change is a record arriving.
+        self._anchor = ""
+        # No new wait may begin at or before this response count: set when a record arrives.
+        self._quiet_through = -1
+        # The anchor a wait ran out behind, or None. No new wait begins behind it.
+        self._declined_behind: str | None = None
         # Record requests answered on this pass and on the one before, keyed by the exact
         # request. Two generations, because the pass that replays is the one straight after the
         # pass that asked; see ``_ask``.
@@ -451,6 +538,19 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
         return self.user_turns.user_passes_declined
 
     @property
+    def user_passes_waited(self) -> int:
+        """Passes where the user half was over the line and held back for a record that was due.
+
+        This row's own count, not the user half's: on these passes the user half was not asked
+        at all, so none of its counters moved. Counted per pass, as ``USERUNDER`` is, so one
+        wait on the live path usually reads three or four -- the copy and store passes of the
+        crossing turn and the pinned call's pass -- and a wait that ended in a record reads
+        beside a ``RECORDS`` that grew, where one that ran out reads beside the ``USERCOMPACT``
+        that followed it. ``USERWAIT`` in the flags. See :meth:`_holds_for_record`.
+        """
+        return self._user_passes_waited
+
+    @property
     def tokens_removed_by_record_phase(self) -> int:
         """Tokens the record phase has removed from the prompt over this run.
 
@@ -540,10 +640,13 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
 
         The record phase is judged against the size the pass began with, at the record half's
         trigger. The user phase is judged against the size the record phase left, at the shared
-        line, so it acts only when tool compaction was not enough. What either does once it has
-        decided to act -- the band's share of the prompt, and so on -- is read off the
-        conversation as it now stands. The chain then reads the live size against the input
-        budget before each step and stops as soon as the prompt fits.
+        line, so it acts only when tool compaction was not enough -- and not at all while a record
+        is due and still has time to arrive, because the record half compacts in two steps and a
+        pass that only asked for one has not yet shown what tool compaction can do: see
+        :meth:`_holds_for_record`. What either does once it has decided to act -- the band's
+        share of the prompt, and so on -- is read off the conversation as it now stands. The
+        chain then reads the live size against the input budget before each step and stops as
+        soon as the prompt fits.
 
         Args:
             messages: The conversation, mutated in place.
@@ -573,13 +676,102 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
             annotate_token_counts(messages, tokenizer=self.tokenizer, force_retokenize=True)
             self._removed_by_record += max(entry_tokens - included_token_count(messages), 0)
 
-        compacted = await self.user_turns.compact_against(
-            messages,
-            prompt_tokens=included_token_count(messages),
-            trigger_tokens=int(self.max_input_tokens * self.user_trigger_fraction),
-        )
+        prompt_tokens = included_token_count(messages)
+        compacted = False
+        if not self._holds_for_record(messages, entry_tokens=entry_tokens, prompt_tokens=prompt_tokens):
+            compacted = await self.user_turns.compact_against(
+                messages,
+                prompt_tokens=prompt_tokens,
+                trigger_tokens=int(self.max_input_tokens * self.user_trigger_fraction),
+            )
         chained = await self._last_resort(messages)
         return changed or compacted or chained
+
+    def _holds_for_record(self, messages: list[Message], *, entry_tokens: int, prompt_tokens: int) -> bool:
+        """Return whether the user half must stay idle on this pass because a record is on its way.
+
+        **Why there is a wait at all.** The record half compacts in two steps and the user half
+        in one. On the pass where the prompt first crosses the line, the record half can only
+        ask: its middleware pins a later call, the model writes the record there, and only the
+        pass after that drops what the record covers. The user half, judged on that first pass,
+        sees a prompt the record half has not yet touched, acts at once, and -- when summarising
+        the user turns alone gets back under the line -- takes the prompt below the trigger the
+        middleware reads, so the record is never asked for. Measured on gpt-5.6-luna at 200,000
+        tokens, 0.9 fill and a 0.8 trigger: no record on five seeds of five and one user
+        compaction on each, which is this row with its layers the wrong way round.
+
+        **The rule.** The user half holds on a pass where the prompt, as the record phase left
+        it, is over the shared line and over the record half's own trigger, and the record half
+        has work pending -- :meth:`~._toolsummary.ToolResultAnchoredSummarizationCompactionStrategy.record_pending`,
+        which is the middleware's own count of tool work no record covers, or an outstanding
+        re-force ask. It stops holding when either
+
+        - the record arrives -- the newest record changes, which on the pass that sees it means
+          ``_drop_before`` has just applied it -- and the user half is then judged, on that pass,
+          against the prompt the record left; or
+        - :data:`_RECORD_WAIT_RESPONSES` responses pass without one, and the user half is judged
+          as though there had been no wait. No new wait then begins behind the same newest
+          record: the model has had its chance at it, and a model that never records must not
+          leave the user half idling one bound in every three responses.
+
+        With nothing pending the record half cannot help, and nothing is held; nor under the
+        record half's own trigger, which a caller's explicit ``user_trigger_fraction`` can put
+        above the user line, because the middleware does not ask there. A wait is one unbroken
+        run of held passes: any pass that does not hold ends it.
+
+        **Two more guards, each for a way the wait could do harm.** None at or past the record half's
+        give-up line, read on the pass-entry size the record half itself judged: that line is
+        how long this row may wait for a record at all, and past it the record half has stopped
+        waiting and shed tool results, so the user half must not wait longer than it does. It
+        also keeps every held pass under the input budget, so the chain never runs on one. And
+        none for one response after a record arrives: the live path runs this over a call's
+        copies and then over the store, and a user half that acted on the copies must act on the
+        store too -- where it replays the same summary -- or the store keeps the band the model
+        was already sent without, and the next call is sent it again.
+
+        **State that survives the two lists.** Everything is read off the conversation -- the
+        response count, the newest record's call id -- or kept on this object, and nothing in a
+        message annotation, because the copies' annotations never reach the store. A
+        conversation that has gone backwards past the wait's start, which is what restoring a
+        snapshot for a probe looks like, drops the wait rather than reading a negative count.
+
+        Args:
+            messages: The conversation, grouped and token-annotated.
+
+        Keyword Args:
+            entry_tokens: The prompt as the pass began, which the record half judged.
+            prompt_tokens: The prompt as the record phase left it, which the user half is judged on.
+
+        Returns:
+            True to keep the user half idle on this pass.
+        """
+        clock = _responses(messages)
+        anchor = _newest_record_id(messages)
+        if anchor != self._anchor:
+            # The wait itself ends below: nothing holds within one response of an arrival.
+            self._anchor = anchor
+            self._quiet_through = clock + 1
+        elif self._wait_since is not None and clock < self._wait_since:
+            self._wait_since = None
+        holding = (
+            prompt_tokens > int(self.max_input_tokens * self.user_trigger_fraction)
+            and prompt_tokens > int(self.max_input_tokens * self.tool_results.trigger_fraction)
+            and entry_tokens < int(self.max_input_tokens * self.tool_results.fallback_fraction)
+            and clock > self._quiet_through
+            and anchor != self._declined_behind
+            and self.tool_results.record_pending(messages)
+        )
+        if not holding:
+            self._wait_since = None
+            return False
+        if self._wait_since is None:
+            self._wait_since = clock
+        if clock - self._wait_since >= _RECORD_WAIT_RESPONSES:
+            self._wait_since = None
+            self._declined_behind = anchor
+            return False
+        self._user_passes_waited += 1
+        return True
 
     async def _last_resort(self, messages: list[Message]) -> bool:
         """Run the chain's steps in order, each only while the prompt is still over the budget.

@@ -483,7 +483,8 @@ recall middleware asks again whenever tool work no record covers has accumulated
 trigger — `--record-repeats` is on for this row whatever the flag says — and the pass drops what
 each record covers, never re-summarising a record. (2) The user half is judged at the same line
 against the prompt *the record half left*, and runs in the `boundary` mode, so its summaries
-stand rather than being re-summarised. (3) A last-resort chain, run only while the live prompt is
+stand rather than being re-summarised; while a record is due and still has time to arrive it is
+not judged at all (below). (3) A last-resort chain, run only while the live prompt is
 over the input budget and re-read before every step: merge the records into one; fold the user
 summaries into one; rewrite the record harder, up to `--record-harder-attempts` (default 2) times
 per pass; then the record half's fallback, which may drop narration only. If the prompt is still
@@ -500,6 +501,33 @@ line, staying idle is correct. The cost the old section accepted — "the user h
 the prompt is already under the line, spending a summarizer call to free tokens a live reading
 would have left alone" — was that design buying a smaller prompt with a broken prefix, and it is
 no longer paid.
+
+**The user half waits for a record that is due, because the two halves compact at different
+speeds.** Judging the user half after the record half was not enough on its own. The record half
+compacts in two steps: on the pass where the prompt crosses the line it can only *ask* — the
+recall middleware pins a later call, the model writes the record there, and only the pass after
+that drops what the record covers. The user half compacts in one. Judged on the asking pass, it
+saw a prompt nothing had touched and acted at once, and when summarising the user turns alone got
+back under the line the middleware, which reads the prompt on each call's way out, never saw it
+over the line again and never asked. Measured on `gpt-5.6-luna` at 200,000 tokens, 0.9 fill and
+`--trigger-fraction 0.8`: `records_in_conversation` 0, `REFORCED` 0 and `USERCOMPACT:1` on five
+seeds of five — the layering inverted, the cache-breaking half doing all the work. (At 0.6 of
+120,000 earlier runs still got a record, because summarising the user turns there did not get
+back under the line; a late trigger makes the inversion likelier rather than causing it.) So on a
+pass over the line where the record half has tool work a record is due for — the middleware's own
+count of tool groups no record covers — or has an ask for another record outstanding, the user
+half holds. It acts on the pass that sees the record arrive, judged on what the record's drops
+left, or once **two model responses** have passed with no record: the deciding call's own, which
+cannot be the record, and the pinned call's. That is the re-force layer's bound and its reasoning
+("the pinned call's own pass cannot see a record; the follow-up's can"), counted in responses
+rather than passes because the live path runs two passes per call — the copies and then the
+store — and two passes would be spent before the pinned call answered. A wait that runs out is
+not begun again behind the same newest record, none is begun at or past the record half's own
+give-up line (0.9 by default), none within one response of a record arriving (so the store pass
+replays the summary the copies were given rather than holding it back), and with no tool work
+pending there is nothing to wait for and the user half acts as before. `USERWAIT:<n>` counts the
+passes held, per pass as `USERUNDER` is, and is on the seed record from schema 17. The
+standalone `tool_summary_anchored` and `user_summary_anchored` rows do not wait.
 
 **Every rewrite the chain makes is kept on size alone.** A merged or rewritten record, or a
 folded user summary, is kept if it is non-empty and smaller than what it replaces; otherwise the
@@ -544,7 +572,8 @@ unchanged.
 **Run 47 measured the pass-entry version, not this one: `gpt-5.6-luna`, 170,000-token window,
 0.9 fill, scaled payload, five seeds.** Every figure in this paragraph describes a row whose user
 half was judged at pass entry, recompacted its summary, had no chain and ran its fallback straight
-behind the record; none has been re-measured since schema 16 changed all four. Both halves fired on every seed and `USERSTARVED` was absent from
+behind the record; none has been re-measured since schema 16 changed all four, and none since
+schema 17 made its user half wait for a record that is due. Both halves fired on every seed and `USERSTARVED` was absent from
 all five, which is the aligned trigger behaving as designed; run 47a beside it in `runs/` is the
 aborted attempt at the two-line row, kept as evidence of what the shared line replaced. `snap%`
 **30** against the record half's 50, the user half's 71 and the control's 86 — the two halves
