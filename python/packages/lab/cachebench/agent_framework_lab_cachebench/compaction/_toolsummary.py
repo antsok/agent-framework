@@ -41,12 +41,19 @@ appear, which is correct: they are a real record of what the agent did.
 safe when the client owns the conversation. Responses-API routes with ``store=True`` track
 tool calls server-side, so a fabricated call is unknown to the service or mismatched against
 it, and Gemini's thought signatures behave similarly. Letting the provider issue the call
-avoids the problem entirely, at the price of one extra agent turn.
+avoids the problem entirely, at the price of one extra agent turn. The argument reaches every
+record, not only the first: the composed row's merged record used to be a synthesised recall
+call, and run 59 -- gpt-5.6-luna on Foundry -- refused the first request carrying one with
+``400 invalid_payload`` on both seeds. A record this package writes is now an ordinary message;
+see :func:`build_record_message`.
 
 **Why a tool result rather than an assistant message.** A tool result is data. Assistant prose
 is the first thing a size-pressed strategy sheds -- this package's own anchored strategy sheds
 it as a last resort -- so a record written as narration would be eligible for exactly the step
-that destroys it.
+that destroys it. The one record written as an assistant message -- the one the composed row
+writes in place of several, which cannot be a tool call for the reason above -- is preserved
+from the moment it is inserted, so that step never reaches it; :func:`build_record_message`
+says why that is enough.
 
 **Why forcing beats asking.** Asking required the model to choose, which meant the benchmark
 could not pin ``tool_choice`` -- and unpinned, the uncompacted control's cost varied by 102%
@@ -95,7 +102,9 @@ alternative at that point is the fallback or a disqualified row, both worse than
 is at least smaller. What this module supplies for that is the record's shape and nothing else:
 :func:`active_record_groups` says which records still stand,
 :meth:`ToolResultAnchoredSummarizationCompactionStrategy.consolidate_records` swaps them for one,
-and an excluded record is not a record to anything that reads records -- see
+:func:`build_record_message` is the form the replacement takes -- an assistant message carrying
+the marker, never a tool call -- and every reader of records recognises that form beside the
+recall tool's result; an excluded record is not a record to anything that reads records -- see
 :func:`find_record_index` and :func:`_record_text`. The standalone row calls none of it.
 
 **Coverage is measured in values, not in tool names, because models do not write tool names.**
@@ -181,7 +190,7 @@ from dataclasses import dataclass
 from math import ceil
 from typing import TYPE_CHECKING, Any, Final
 
-from agent_framework import ChatContext, ChatMiddleware, ChatResponse, Content, Message
+from agent_framework import ChatContext, ChatMiddleware, ChatResponse, Message
 from agent_framework._compaction import (
     EXCLUDED_KEY,
     annotate_message_groups,
@@ -198,7 +207,6 @@ if TYPE_CHECKING:
     from agent_framework import CompactionStrategy, TokenizerProtocol
 
 __all__ = [
-    "CONSOLIDATED_CALL_ID_PREFIX",
     "CONSOLIDATE_EXCLUDE_REASON",
     "DEFAULT_COVERAGE_SHARE",
     "DEFAULT_FALLBACK_FRACTION",
@@ -213,10 +221,9 @@ __all__ = [
     "ToolResultAnchoredSummarizationCompactionStrategy",
     "ToolResultRecallMiddleware",
     "active_record_groups",
-    "build_record_messages",
+    "build_record_message",
     "find_record_index",
     "make_recall_tool",
-    "next_consolidated_call_id",
     "record_body",
 ]
 
@@ -240,10 +247,10 @@ RECORD_MARKER: Final[str] = "[recorded by compaction]"
 #: What the recall tool writes between :data:`RECORD_MARKER` and the model's own text.
 #:
 #: A constant rather than a literal inside :func:`make_recall_tool` so that the one other writer
-#: of a record -- :meth:`ToolResultAnchoredSummarizationCompactionStrategy.consolidate_records`,
-#: which the composed row uses to put a merged record in place of several -- writes the same
-#: bytes, and so that :func:`record_body` can take them off again before a record is handed to a
-#: summarizer as content.
+#: of a record -- :func:`build_record_message`, which the composed row uses to put a merged record
+#: in place of several -- writes the same bytes, so that :func:`record_body` can take them off
+#: again before a record is handed to a summarizer as content, and so that
+#: :data:`_WRITTEN_RECORD_PREFIX` can recognise a record that other writer made.
 _RECORD_PREAMBLE: Final[str] = (
     "Earlier tool results may have been shortened, and this is their "
     "compaction record. Treat values in this record as authoritative for the tool it "
@@ -251,14 +258,12 @@ _RECORD_PREAMBLE: Final[str] = (
     "here."
 )
 
-#: Prefix of the ``call_id`` a consolidated record's synthesised call carries.
+#: How a record this package wrote opens: the marker, then the recall tool's own preamble.
 #:
-#: Its own prefix so a conversation read back tells a record the provider issued from one this
-#: package wrote in place of several, and so the numbering in
-#: :meth:`ToolResultAnchoredSummarizationCompactionStrategy.consolidate_records` can find the
-#: highest one already used. See that method for why a client-minted call id is acceptable here
-#: when the module docstring rules it out for the first record.
-CONSOLIDATED_CALL_ID_PREFIX: Final[str] = "compaction_record_"
+#: The whole of how :func:`_is_written_record` recognises one. Both parts rather than the marker
+#: alone, because the model reads records and may quote the marker back in a reply of its own; a
+#: reply that opens with the marker *and* the full preamble is not one it has a reason to write.
+_WRITTEN_RECORD_PREFIX: Final[str] = f"{RECORD_MARKER} {_RECORD_PREAMBLE}"
 
 #: Reason recorded on a record's messages when a consolidated record replaced it.
 CONSOLIDATE_EXCLUDE_REASON: Final[str] = "tool_summary_consolidated"
@@ -468,6 +473,11 @@ def find_record_index(messages: Sequence[Message]) -> int | None:
     count: that is the shape a client-synthesised pair produces, and exactly what breaks on
     routes that track tool calls server-side.
 
+    **Two forms are records.** The recall tool's result, as above, and a record this package
+    wrote in place of several (:func:`build_record_message`), which is a message of its own with
+    no call behind it and is recognised by how it opens -- see :func:`_is_written_record`. The
+    index is then that message's.
+
     **An excluded record is not a record.** Nothing excluded one until the composed row began
     consolidating them -- see
     :meth:`ToolResultAnchoredSummarizationCompactionStrategy.consolidate_records` -- and the
@@ -488,11 +498,14 @@ def find_record_index(messages: Sequence[Message]) -> int | None:
         for content in message.contents
         if content.type == "function_call" and content.name == RECALL_TOOL_NAME and content.call_id
     }
-    if not recall_ids:
-        return None
     newest: int | None = None
     for index, message in enumerate(messages):
         if message.additional_properties.get(EXCLUDED_KEY, False):
+            continue
+        if _is_written_record(message):
+            newest = index
+            continue
+        if not recall_ids:
             continue
         for content in message.contents:
             if content.type != "function_result" or content.call_id not in recall_ids:
@@ -506,10 +519,32 @@ def find_record_index(messages: Sequence[Message]) -> int | None:
     return newest
 
 
-def _record_text(message: Message) -> str:
-    """Return the record text carried by a recall tool result message.
+def _is_written_record(message: Message) -> bool:
+    """Return whether ``message`` is a record this package wrote, rather than one the model made.
 
-    Only results bearing :data:`RECORD_MARKER` are read. A provider may batch several tool
+    The form :func:`build_record_message` produces: an assistant message holding no function call,
+    whose text opens with :data:`_WRITTEN_RECORD_PREFIX`. Whether it is excluded is the caller's
+    question, as it is for a recall tool result. The role is tested first because it is free and
+    rules out every user turn and tool result before any text is joined.
+
+    Args:
+        message: The message to inspect.
+
+    Returns:
+        True when the message is a written record.
+    """
+    return (
+        message.role == "assistant"
+        and not any(content.type == "function_call" for content in message.contents)
+        and (message.text or "").startswith(_WRITTEN_RECORD_PREFIX)
+    )
+
+
+def _record_text(message: Message) -> str:
+    """Return the record text a message carries: a recall tool result, or a record this package wrote.
+
+    A written record (:func:`_is_written_record`) is its text, whole. Otherwise only results
+    bearing :data:`RECORD_MARKER` are read. A provider may batch several tool
     results into one message, and text from an unrelated result sitting beside the record would
     then count towards coverage without anyone having written it as a record -- which is
     precisely the mistake the coverage check exists to stop.
@@ -526,6 +561,8 @@ def _record_text(message: Message) -> str:
     """
     if message.additional_properties.get(EXCLUDED_KEY, False):
         return ""
+    if _is_written_record(message):
+        return message.text
     parts: list[str] = []
     for content in message.contents:
         if content.type != "function_result":
@@ -677,16 +714,21 @@ def _is_recall_group(messages: Sequence[Message], group: dict[str, Any]) -> bool
 
     Shared by the strategy and the middleware for the same reason :func:`find_record_index` is:
     one half must not count a record as work still to be covered while the other treats it as
-    the coverage.
+    the coverage. A record this package wrote is a record group too, though it holds no call: it
+    is an assistant message, so the framework groups it as narration, and without this it would
+    be neither a record to :func:`active_record_groups` nor anything the readers of tool groups
+    skip by name.
 
     Args:
         messages: The conversation the span indexes into.
         group: One span from :func:`group_messages`.
 
     Returns:
-        True when the span contains a call to the recall tool.
+        True when the span contains a call to the recall tool, or a record this package wrote.
     """
-    return RECALL_TOOL_NAME in _called_function_names(messages, group)
+    if RECALL_TOOL_NAME in _called_function_names(messages, group):
+        return True
+    return any(_is_written_record(message) for message in messages[group["start_index"] : group["end_index"] + 1])
 
 
 def _preserve_records(messages: list[Message]) -> int:
@@ -704,7 +746,8 @@ def _preserve_records(messages: list[Message]) -> int:
     Both halves of the identity are required. The call must name the recall tool and the result
     must carry :data:`RECORD_MARKER`, matching :func:`find_record_index`, so that an uninvited
     call the gate refused -- which returns ordinary text and preserves nothing -- does not get
-    itself protected as though it had recorded something.
+    itself protected as though it had recorded something. A record this package wrote carries
+    both in one message (:func:`_is_written_record`).
 
     Args:
         messages: The conversation, whose messages are annotated in place.
@@ -727,7 +770,8 @@ def active_record_groups(messages: list[Message]) -> list[dict[str, Any]]:
     """Return the spans of every record still being sent, oldest first.
 
     The identity :func:`_preserve_records` applies -- a call naming the recall tool, and a result
-    carrying :data:`RECORD_MARKER` -- over messages that are not excluded, because
+    carrying :data:`RECORD_MARKER`, or a record this package wrote -- over messages that are not
+    excluded, because
     :func:`_record_text` reads nothing off an excluded one. Public because the composed row reads
     it to decide whether there is more than one record to merge; the standalone row reads it
     only through :func:`_preserve_records`.
@@ -768,69 +812,58 @@ def record_body(messages: list[Message], group: dict[str, Any]) -> str:
     return "\n".join(part for part in parts if part)
 
 
-def build_record_messages(text: str, *, call_id: str) -> list[Message]:
-    """Return a recall call and its result carrying ``text``, shaped as the recall tool shapes one.
+def build_record_message(text: str) -> Message:
+    """Return the message a record this package writes is inserted as: an assistant turn, not a tool call.
 
-    The arguments carry the text as ``values`` and the result carries it behind the marker and
-    the tool's own preamble, which is byte for byte what :func:`make_recall_tool` returns for the
-    same text. Shaped that way rather than more cheaply -- the arguments could be left empty --
-    for two reasons. Everything that reads records reads this one the same way, with no second
-    shape to keep in step. And the composed row's acceptance rule, "smaller than what it
-    replaces", then compares like with like: a replacement that dropped the argument copy would
-    come out smaller than the record it replaced whatever its text said, and the rule would pass
-    a rewrite that had shortened nothing.
+    **Not a tool call, because a provider validates tool calls.** This used to return a recall
+    call and its result under a client-minted call id, shaped as the recall tool shapes one. Run
+    59 put that on the wire for the first time -- gpt-5.6-luna on Foundry, the composed row's
+    first merge -- and the next request was refused with ``400 invalid_payload`` on both seeds. A
+    call the model made carries the provider's own identity for it; a fabricated one does not,
+    so the module docstring's argument against synthesising the first record reaches every
+    record. An ordinary message is what the user half already inserts for its summaries, and no
+    provider validates one against its own history.
+
+    **An assistant message rather than a user one.** A record stands for results of tool calls
+    the model already made. Read in an assistant turn it is the model's own earlier statement;
+    the same words in a user turn are the user speaking, and the preamble -- treat these values as
+    authoritative -- would read as an instruction. The user half also reads user turns and
+    nothing else: a record in one would sit in its band, and a record written after the newest
+    real turn would take the live request's place in the tail it keeps verbatim. As an assistant
+    message the record is outside that half altogether, and the wait's response clock, which
+    counts assistant messages, counts it as it counted the synthesised call it replaces. The
+    cached prefix is the same either way: the record goes where the newest record it replaces
+    stood, and everything from there on is re-billed whatever its role. Neither role keeps
+    strict alternation at that position. The message after a record is normally the model's own
+    reply to the recall result, so this one can sit beside another assistant message; a user
+    record would sit beside the user turn in front of it just as often. The clients this package
+    runs against accept consecutive messages of one role; a provider that does not would need
+    its client to merge them, and that is unmeasured.
+
+    **Assistant prose is what the fallback sheds**, which the module docstring gives as the
+    reason the first record is a tool result. That reason is about a record nothing protects.
+    This one is preserved on the pass that inserts it, by the walk that protects every record
+    (:func:`_preserve_records`), and the anchored fallback skips a preserved message on each of
+    its removal paths, narration included.
+
+    **The text is the recall tool's result, byte for byte**: the marker, the preamble, then the
+    record. :func:`record_body` reads it the way it reads the tool's, and
+    :func:`_is_written_record` recognises it by that opening. What it no longer carries is the
+    second copy a recall call holds in its arguments, and that is the trap in the composed row's
+    acceptance rule, "smaller than what it replaces": measured against a record the model made,
+    call and all, a replacement in this form is about half the size whatever its text says, and
+    the rule would pass a rewrite that had shortened nothing. So the rule is not measured against
+    the messages being replaced. Both sides are measured in this form -- the candidate, and each
+    replaced record's body rebuilt through this function -- so a replacement is kept only when
+    its text is shorter than theirs.
 
     Args:
         text: The record's own text, without marker or preamble.
 
-    Keyword Args:
-        call_id: The id the call and its result share. See
-            :meth:`ToolResultAnchoredSummarizationCompactionStrategy.consolidate_records`.
-
     Returns:
-        The assistant message holding the call, then the tool message holding the result.
+        The message, with no id: nothing reads one, and the framework assigns it on grouping.
     """
-    return [
-        Message(
-            role="assistant",
-            contents=[Content.from_function_call(call_id=call_id, name=RECALL_TOOL_NAME, arguments={"values": text})],
-            message_id=f"{call_id}_call",
-        ),
-        Message(
-            role="tool",
-            contents=[
-                Content.from_function_result(call_id=call_id, result=f"{RECORD_MARKER} {_RECORD_PREAMBLE}\n{text}")
-            ],
-            message_id=f"{call_id}_result",
-        ),
-    ]
-
-
-def next_consolidated_call_id(messages: Sequence[Message], *, minimum: int) -> str:
-    """Return a :data:`CONSOLIDATED_CALL_ID_PREFIX` id no call in the conversation carries yet.
-
-    Numbered past the highest one the conversation already holds, excluded calls included, for
-    the reason ``_usersummary._next_summary_id`` gives: a conversation outlives the instance that
-    first compacted it, and an id minted twice would pair one result with two calls.
-
-    Args:
-        messages: The conversation, superseded messages included.
-
-    Keyword Args:
-        minimum: The number the caller would use on its own count.
-
-    Returns:
-        The id.
-    """
-    highest = -1
-    for message in messages:
-        for content in message.contents:
-            if content.type != "function_call" or not content.call_id:
-                continue
-            suffix = content.call_id.removeprefix(CONSOLIDATED_CALL_ID_PREFIX)
-            if suffix != content.call_id and suffix.isdigit():
-                highest = max(highest, int(suffix))
-    return f"{CONSOLIDATED_CALL_ID_PREFIX}{max(minimum, highest + 1)}"
+    return Message(role="assistant", contents=[f"{_WRITTEN_RECORD_PREFIX}\n{text}"])
 
 
 def _claimed_elsewhere(messages: Sequence[Message]) -> bool:
@@ -1485,9 +1518,7 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
             self._fallbacks_after_record += 1
         return shortened
 
-    def consolidate_records(
-        self, messages: list[Message], groups: list[dict[str, Any]], text: str, *, call_id: str
-    ) -> None:
+    def consolidate_records(self, messages: list[Message], groups: list[dict[str, Any]], text: str) -> None:
         """Put one record carrying ``text`` in place of the records ``groups`` span.
 
         The composed row's seam for merging records and for rewriting one shorter; this
@@ -1499,21 +1530,14 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
         :func:`find_record_index` and the recall middleware anchor on it and count pending tool
         work from it exactly as they did from the newest record it replaced; every group the
         replaced records stood in front of is in front of it, so ``_drop_before`` reads the same
-        conversation against its text alone; and it is a recall group, so
-        :func:`_hold_unrecorded` and :func:`_droppable_groups_after` skip it and
-        :func:`_preserve_records` protects and counts it on the spot.
+        conversation against its text alone; it is not a tool group, so :func:`_hold_unrecorded`
+        and :func:`_droppable_groups_after` never count it; and it is a record group
+        (:func:`_is_recall_group`), so :func:`_preserve_records` protects and counts it on the
+        spot and a later merge or rewrite can replace it in turn.
 
-        **The call id is minted here, which the module docstring rules out for the first
-        record, and the ground for that rule does not reach this one.** A client-minted call is
-        unsafe where the service tracks tool calls, and a service that does so holds the
-        conversation itself -- in which case there is no client-side prompt for any of this to
-        compact, which is why ``_live.wants_client_side_history`` forces ``store=False`` for a
-        compacting row in the first place. The first record still has to come from the provider,
-        because it is written by the agent's own model from the tool payload in its context;
-        this one is a rewrite of records already in a history the client owns. A provider that
-        signs its own function calls -- Gemini's thought signatures -- may still refuse an
-        unsigned one, and that is unmeasured: every run of this row has been on OpenAI-family
-        models.
+        **The replacement is an ordinary assistant message, not a recall call.** A call the model
+        never made is one a provider may refuse, and run 59 measured Foundry refusing it; see
+        :func:`build_record_message` for that, and for why the role is the assistant's.
 
         An outstanding ask for another record is re-based as well. It judges arrival as a record
         count that grew, and a merge lowers the count; left alone, the record the ask was for
@@ -1524,10 +1548,6 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
             messages: The conversation, mutated in place. Already grouped.
             groups: The records being replaced, from :func:`active_record_groups`, oldest first.
             text: The replacement's own text, without marker or preamble.
-
-        Keyword Args:
-            call_id: The id the replacement's call and result share, from
-                :func:`next_consolidated_call_id`.
         """
         for group in groups:
             for message in messages[group["start_index"] : group["end_index"] + 1]:
@@ -1537,7 +1557,7 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
                 set_preserved(message, preserved=False)
                 set_excluded(message, excluded=True, reason=CONSOLIDATE_EXCLUDE_REASON)
         insertion_index = int(groups[-1]["end_index"]) + 1
-        messages[insertion_index:insertion_index] = build_record_messages(text, call_id=call_id)
+        messages.insert(insertion_index, build_record_message(text))
         annotate_message_groups(messages, from_index=insertion_index)
         annotate_token_counts(messages, tokenizer=self.tokenizer, from_index=insertion_index)
         records = _preserve_records(messages)
