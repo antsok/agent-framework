@@ -17,7 +17,7 @@ Related documents:
   — the five strategies written here, in depth. **Read that for `anchored`,
   `anchored_min_gain`, `tool_summary_anchored`, `user_summary_anchored` and
   `tool_and_user_summary_anchored`;** this file gives only their place in the set. It is
-  current on the composed row's shared trigger and on the `0.6`/`0.9` record thresholds — the
+  current on the composed row's design as of schema 16 and on the `0.6`/`0.9` record thresholds — the
   caveats at the end say where this file's own numbers come from. It is separate because
   the subpackage is meant to be lifted out whole into a repository
   of its own, and the design notes travel with the code rather than with the instrument that
@@ -75,9 +75,11 @@ that fell back is partly measuring `anchored`; `RECFALLBACK:<n>` in the flags co
 and it counts effects rather than attempts.
 
 **`tool_and_user_summary_anchored` has one line for two halves, and it is the record half's.**
-Both halves are judged at `--trigger-fraction` against a single reading of the prompt taken
-before either acts, and `--user-trigger-fraction` does not reach the row. The section on it
-says why the two obvious alternatives are one defect under two numbers.
+Both halves are judged at `--trigger-fraction` — the record half against the prompt the pass
+began with, the user half against what the record half left, so the user half acts only when
+tool compaction was not enough — and a last-resort chain runs behind both while the prompt is
+over the input budget. `--user-trigger-fraction` and `--user-summary-mode` do not reach the row,
+and `--record-repeats` is always on for it. The section on it says why.
 
 **Exclusion order versus size.** Every strategy outside the `token_budget_*` family decides
 *when* to compact from its own trigger, so different strategies leave prompts of different
@@ -476,20 +478,39 @@ call for the summary, so a cell running it beside `none` compares a row with two
 types against one with none. It needs `--summarizer-provider`, for the user half; the record
 half needs none.
 
-**The shared line.** Both halves are judged at `--trigger-fraction` (0.6), against one reading
-of the prompt taken *before either phase acts*. The obvious version of this does not work. Give
-each half its own line — 0.6 for the record, 0.8 for the user turns — and the record half
-fires first, removes the tool payload while the prompt is still in the 60s of the budget, and
-holds it there; the prompt never reaches 0.8, the user half is never consulted, and the row is
-`tool_summary_anchored` under a longer name. Giving both halves the same fraction and judging
-them one after the other is the same defect with a different number on it: the record half
-still acts first, still takes the prompt below the shared line, and the user half still
-declines on its own re-test of what is left. What makes one line mean anything is that both
-halves are compared with the size the pass *began* with, so a half that would have fired on the
-entry size fires, whatever the other has already removed. What that costs is stated: the user
-half may act when the prompt is already under the line, spending a summarizer call to free
-tokens a live reading would have left alone. A pass that removes slightly more than it had to
-is a cheaper defect than a row that silently measures one half.
+**The design, in three parts.** (1) The record half records every new batch of tool work: the
+recall middleware asks again whenever tool work no record covers has accumulated past the
+trigger — `--record-repeats` is on for this row whatever the flag says — and the pass drops what
+each record covers, never re-summarising a record. (2) The user half is judged at the same line
+against the prompt *the record half left*, and runs in the `boundary` mode, so its summaries
+stand rather than being re-summarised. (3) A last-resort chain, run only while the live prompt is
+over the input budget and re-read before every step: merge the records into one; fold the user
+summaries into one; rewrite the record harder, up to `--record-harder-attempts` (default 2) times
+per pass; then the record half's fallback, which may drop narration only. If the prompt is still
+over after that, nothing more is done, and the row reads `DQ` — the intended loud failure.
+
+**The user half is judged after the record half, which reverses what this section used to
+say.** It used to say that both halves are compared with the size the pass *began* with, so the
+user half fires whatever the record half removed, and that a user half judged after the record
+half "declines on its own re-test" — the row being `tool_summary_anchored` under a longer name.
+That argument came from the benchmark's short, bounded conversation. In the intended design the
+user half is the second line of defence: its edit rewrites a message just behind the head and so
+breaks nearly the whole cached prefix, and if tool compaction alone brings the prompt under the
+line, staying idle is correct. The cost the old section accepted — "the user half may act when
+the prompt is already under the line, spending a summarizer call to free tokens a live reading
+would have left alone" — was that design buying a smaller prompt with a broken prefix, and it is
+no longer paid.
+
+**Every rewrite the chain makes is kept on size alone.** A merged or rewritten record, or a
+folded user summary, is kept if it is non-empty and smaller than what it replaces; otherwise the
+old material stands and the chain moves on. Nothing is checked against the old records, the tool
+results or the planted facts: a real deployment has none of the last, and an overlap check fitted
+to this benchmark's codes would either reject correct paraphrase or pass a lossy summary. What a
+merge loses is `facts` and `acc1`'s to measure. The records are merged by the summarizer client
+the user half already has, not by a pinned agent turn, because the moment a merge is wanted is
+the moment the prompt is over the budget, and an agent turn would be a call made with that
+prompt. The flags say how far down the chain a row went: `RECMERGE`/`RECMERGEREJ`,
+`USERMERGE`/`USERMERGEREJ`, `RECHARDER`/`RECHARDERREJ`, `RECSUMMFAIL` and `LASTFALLBACK`.
 
 **Why the alignment runs down to 0.6 and not up to 0.8.** The record is written by a model
 reading the tool payload, and it is measured degrading with the bulk it is given, so a record
@@ -498,33 +519,32 @@ the same prompt, so a record asked for after the prompt has been cut below its l
 never asked for at all. Aligning down costs the user half an earlier first compaction than its
 own row takes; aligning up costs the record its quality and possibly its existence.
 
-**So `--user-trigger-fraction` does not reach this row.** It moves `user_summary_anchored`
-only; `--trigger-fraction` moves both halves of this row together. A caller assembling the parts
-by hand can pass the class an explicit `user_trigger_fraction` and get the two-line row back,
-kept so that the two can be run side by side; the CLI does not expose it.
+**So `--user-trigger-fraction` and `--user-summary-mode` do not reach this row.** They move
+`user_summary_anchored` only; `--trigger-fraction` moves both halves of this row together. A
+caller assembling the parts by hand can pass the class an explicit `user_trigger_fraction` and get
+the two-line row back; the CLI does not expose it.
 
-**Order: the record half first.** The record has to be asked for before the user half shrinks
-the prompt below the line that asks for one — removals are permanent, so this is about the size
-the *next* call sees rather than which half acts within a pass. The record half's removal also
-makes the band a larger share of what is left, so the user half clears its share more easily
-this way round. And the record half's fallback counts groups from each end; run after the user
-half it would count a band containing this pass's summary rather than the turns it replaced,
-and the `tool_summary_anchored` row would mean something different inside the composition than
-beside it. The conversation is re-annotated between the phases because that fallback rewrites
-tool results in place and token counts are cached per message.
+**Order: the record half, the user half, then the chain.** The record has to be asked for before
+the user half shrinks the prompt below the line that asks for one — removals are permanent, so
+this is about the size the *next* call sees. The user half goes second because its action is the
+one that breaks the cache. The record half's fallback, which used to run straight behind the
+record, now runs last in the chain: this section used to argue it had to run before the user half
+so that its band geometry matched the `tool_summary_anchored` row's, and that is given up — it is
+the last resort here, and behind a record it may take narration only, so the difference is which
+assistant replies it sheds. The standalone row keeps its fallback where it was.
 
-**`USERSTARVED:<n>` is zero by construction on this row.** It is the one counter the
-composition adds: passes where the record half's removals on *earlier* passes are why the prompt
-was under the user half's line, so the user half was never consulted. With one line the record
-half can only act on a pass whose entry size is above it, and that is a pass the user half is
-offered, so nothing is ever removed out of its reach. A non-zero value on a row built by the CLI
-is a defect report, not a configuration note. A silent user half here therefore has the same
-three readings as on the single row — `USERUNDER`, `USERHELD`, `USERSUMMFAIL` — and the record
-half's `REC`, `RECORDS`, `FORCED`, `UNCOVERED`, `FALLBACK` and `RECFALLBACK` read off the
-composed row unchanged.
+**`USERSTARVED` is retired.** It counted passes where the record half's removals were why the
+prompt was under the user half's line, and read that as a defect. Under this design it is the
+row working, and it is counted as `USERUNDER`, the same as a conversation that has not grown.
+Records written before schema 16 keep the notes they were written with. A silent user half has
+the single row's three readings — `USERUNDER`, `USERHELD`, `USERSUMMFAIL` — and the record half's
+`REC`, `RECORDS`, `FORCED`, `UNCOVERED`, `FALLBACK` and `RECFALLBACK` read off the composed row
+unchanged.
 
-**Run 47 measured it, on the shared line: `gpt-5.6-luna`, 170,000-token window, 0.9 fill,
-scaled payload, five seeds.** Both halves fired on every seed and `USERSTARVED` was absent from
+**Run 47 measured the pass-entry version, not this one: `gpt-5.6-luna`, 170,000-token window,
+0.9 fill, scaled payload, five seeds.** Every figure in this paragraph describes a row whose user
+half was judged at pass entry, recompacted its summary, had no chain and ran its fallback straight
+behind the record; none has been re-measured since schema 16 changed all four. Both halves fired on every seed and `USERSTARVED` was absent from
 all five, which is the aligned trigger behaving as designed; run 47a beside it in `runs/` is the
 aborted attempt at the two-line row, kept as evidence of what the shared line replaced. `snap%`
 **30** against the record half's 50, the user half's 71 and the control's 86 — the two halves

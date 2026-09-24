@@ -231,7 +231,7 @@ the instrument declining to look.
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING, Any, Final, NamedTuple
+from typing import TYPE_CHECKING, Any, Final, Literal, NamedTuple
 
 from agent_framework import Message
 from agent_framework._compaction import (
@@ -266,14 +266,24 @@ __all__ = [
     "EXCLUDE_REASON",
     "FOLD_EXCLUDE_REASON",
     "FOLD_ID_PREFIX",
+    "FOLD_OUTCOMES",
     "SUMMARY_ID_PREFIX",
     "SUMMARY_MODES",
     "SUMMARY_MODE_BOUNDARY",
     "SUMMARY_MODE_FOLD",
     "SUMMARY_MODE_RECOMPACT",
     "USER_SUMMARY_MARKER",
+    "FoldOutcome",
     "UserTurnAnchoredSummarizationCompactionStrategy",
 ]
+
+#: What :meth:`UserTurnAnchoredSummarizationCompactionStrategy.fold_if_smaller` did: collapsed the
+#: standing summaries, refused an answer that was no smaller than them, got no answer at all, or
+#: had fewer than two summaries to collapse.
+FoldOutcome = Literal["folded", "rejected", "failed", "skipped"]
+
+#: Every :data:`FoldOutcome`, for a caller that wants to count them.
+FOLD_OUTCOMES: Final[tuple[FoldOutcome, ...]] = ("folded", "rejected", "failed", "skipped")
 
 logger = logging.getLogger(__name__)
 
@@ -299,10 +309,10 @@ logger = logging.getLogger(__name__)
 #:
 #: **This is the single row's line, and the composed row does not use it.**
 #: :class:`~._composed.ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy` judges this
-#: strategy at the record strategy's fraction instead, because the two being apart there is the
-#: record phase removing the tool payload at 0.6 and holding the prompt under 0.8 for the rest
-#: of the run -- a composed row whose user half never fires. Nothing about this constant or the
-#: strategy that reads it changes; the composition supplies the line rather than the object.
+#: strategy at the record strategy's fraction instead, against the prompt as the record phase
+#: left it: one line, and the user half acts only when tool compaction alone did not bring the
+#: prompt under it. Nothing about this constant or the strategy that reads it changes; the
+#: composition supplies the line rather than the object.
 DEFAULT_USER_TRIGGER_FRACTION: Final[float] = 0.8
 
 #: Share of the included prompt the band must be worth before a pass may run.
@@ -636,12 +646,15 @@ def _format_turns(turns: list[Message], *, text: Callable[[Message], str | None]
 
 
 class _Remembered(NamedTuple):
-    """The last summarizer request and its answer, kept so a repeat of the request is not sent.
+    """One summarizer request and its answer, kept so a repeat of the request is not sent.
 
-    One entry, because the repeat always follows at once: the after-turn pass over the store
-    comes straight after the in-call pass over the copies, and a tool turn's second call comes
-    between them. Nothing else this strategy asks for can intervene -- a fold is reached only
-    through a declined band, which is a pass that asks for nothing.
+    One entry by default, because on this strategy's own row the repeat always follows at once:
+    the after-turn pass over the store comes straight after the in-call pass over the copies,
+    and a tool turn's second call comes between them. Nothing else this strategy asks for can
+    intervene -- a fold is reached only through a declined band, which is a pass that asks for
+    nothing. The composed row breaks that last premise: its last-resort chain may ask for a
+    fold on the same pass the band was summarised on, so its builder keeps two -- see
+    ``remembered_requests``.
     """
 
     prompt: str
@@ -687,7 +700,15 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
             why the default is the one it is.
         prompt: What the summarizer is asked for. See :data:`DEFAULT_USER_SUMMARY_PROMPT`.
         fold_prompt: What the summarizer is asked for when a fold collapses the standing
-            summaries. Read in the fold mode only. See :data:`DEFAULT_USER_FOLD_PROMPT`.
+            summaries. Read in the fold mode and by :meth:`fold_if_smaller`. See
+            :data:`DEFAULT_USER_FOLD_PROMPT`.
+        remembered_requests: How many of the most recent summarizer requests are remembered
+            for replay on the other list the live path runs this on. One, the default, is what
+            every row of this strategy has run with and is enough for it: a pass makes at most
+            one request. The composed row makes two on a pass that is over its ceiling -- the
+            band, then the fold its last-resort chain asks for -- and its builder asks for two,
+            so the second list replays both rather than paying for both again. See
+            :class:`_Remembered`.
     """
 
     def __init__(
@@ -703,6 +724,7 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
         summary_mode: str = DEFAULT_SUMMARY_MODE,
         prompt: str | None = None,
         fold_prompt: str | None = None,
+        remembered_requests: int = 1,
     ) -> None:
         """Validate and store the configuration.
 
@@ -723,6 +745,8 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
             raise ValueError("max_input_tokens must be positive.")
         if keep_head_user_turns < 0 or keep_tail_user_turns < 0:
             raise ValueError("keep_head_user_turns and keep_tail_user_turns must be >= 0.")
+        if remembered_requests < 1:
+            raise ValueError("remembered_requests must be >= 1.")
         if not 0.0 < trigger_fraction <= 1.0:
             raise ValueError("trigger_fraction must be in (0.0, 1.0].")
         if not 0.0 <= min_band_share < 1.0:
@@ -748,7 +772,8 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
         self._summaries_in_conversation = 0
         self._summary_tokens = 0
         self._replayed = 0
-        self._remembered: _Remembered | None = None
+        self.remembered_requests = remembered_requests
+        self._remembered: list[_Remembered] = []
 
     @property
     def recompacts_summaries(self) -> bool:
@@ -924,11 +949,12 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
         same conversation -- so a row where the user half did nothing always has exactly one
         non-zero number saying why.
 
-        On a composed row this number is the one
-        :attr:`~._composed.ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy.user_passes_starved`
-        subdivides: of the passes counted here, the starved ones are those the phase in front
-        took below the line. That subset is empty on a composed row judging both halves at one
-        line, where every pass counted here is a conversation that had not grown yet.
+        On a composed row this counts two things that are both the design working: a
+        conversation that had not grown yet, and one the record phase had already brought under
+        the shared line on this pass. The composed row judges this half after the record phase
+        on purpose -- user compaction breaks the cached prefix, so it is the second line of
+        defence -- and the counter that used to single the second case out as starvation is
+        retired; see the ``_composed`` module docstring.
         """
         return self._below_trigger
 
@@ -983,8 +1009,8 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
         was produced by. :meth:`compact_against` is the same pass with that pair supplied, and
         is how
         :class:`~._composed.ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy` judges
-        this half against the size its pass began with rather than against whatever the half in
-        front of it has already removed.
+        this half against its own shared line and the size the record phase left, rather than
+        against this strategy's own trigger.
 
         Args:
             messages: The conversation, mutated in place.
@@ -1064,7 +1090,7 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
             # already carries: see :func:`_next_summary_id`.
             summary_id = _next_summary_id(messages, prefix=SUMMARY_ID_PREFIX, minimum=self._compactions)
             self._compactions += 1
-            self._remembered = _Remembered(self.prompt, transcript, summary_id, summary)
+            self._remember(_Remembered(self.prompt, transcript, summary_id, summary))
         else:
             # The same band, seen again on the other list the live path runs this on. The answer
             # and the id are the ones the model has already been sent.
@@ -1324,23 +1350,105 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
         Returns:
             True if the outgoing messages changed.
         """
-        summaries = [messages[span["start_index"]] for span in standing]
-        transcript = _format_turns(summaries, text=_summary_body)
-        remembered = self._recall(self.fold_prompt, transcript)
-        if remembered is None:
-            summary = await self._summarize(transcript, prompt=self.fold_prompt)
-            if summary is None:
-                return False
-            summary_id = _next_summary_id(messages, prefix=FOLD_ID_PREFIX, minimum=self._folds)
-            self._folds += 1
-            self._remembered = _Remembered(self.fold_prompt, transcript, summary_id, summary)
-        else:
-            summary_id, summary = remembered.summary_id, remembered.text
-            self._replayed += 1
-        for message in summaries:
-            set_preserved(message, preserved=False)
-        self._replace(messages, standing, summary, summary_id=summary_id, reason=FOLD_EXCLUDE_REASON)
+        answer = await self._fold_answer(messages, standing)
+        if answer is None:
+            return False
+        self._apply_fold(messages, standing, *answer)
         return True
+
+    async def fold_if_smaller(self, messages: list[Message]) -> FoldOutcome:
+        """Collapse every standing summary into one, but only into one smaller than they are.
+
+        The composed row's seam, and not a pass of this strategy's own: nothing here reads the
+        trigger, the band or :meth:`_fold_due`, because the caller has already decided that the
+        prompt is over its ceiling and a fold is the next thing to try. What it shares with a
+        fold-mode pass is everything else -- the request, the replay on the second list, the id,
+        the replacement and the counters -- through :meth:`_fold_answer` and :meth:`_apply_fold`,
+        which :meth:`_fold` is built from too.
+
+        **The one rule added is generic on purpose.** The answer is kept only if it is shorter,
+        in tokens, than the standing summaries it would replace; otherwise nothing is mutated
+        and the caller moves on. Nothing is checked against the summaries' content: a fold
+        judged by overlap with what it folds would be a fold tuned to one workload's wording,
+        and what it loses is the benchmark's to measure, not the strategy's to guess at.
+
+        Args:
+            messages: The conversation, mutated in place when the fold is taken. Already grouped
+                and token-annotated.
+
+        Returns:
+            ``"folded"`` when the summaries were collapsed, ``"rejected"`` when the answer was no
+            smaller than them, ``"failed"`` when the summarizer gave none -- counted under
+            :attr:`user_summary_failures` like any other -- and ``"skipped"`` when fewer than
+            two summaries stand, which is the rewrite-of-one the fold mode refuses as well.
+        """
+        standing = self._observe_summaries(messages)
+        if len(standing) < 2:
+            return "skipped"
+        answer = await self._fold_answer(messages, standing)
+        if answer is None:
+            return "failed"
+        remembered, replayed = answer
+        summaries: list[Message] = [messages[span["start_index"]] for span in standing]
+        candidate = [self._summary_message(summaries, standing, remembered.text, summary_id=remembered.summary_id)]
+        annotate_token_counts(candidate, tokenizer=self.tokenizer, force_retokenize=True)
+        if included_token_count(candidate) >= included_token_count(summaries):
+            return "rejected"
+        self._apply_fold(messages, standing, remembered, replayed)
+        return "folded"
+
+    async def _fold_answer(
+        self, messages: list[Message], standing: list[dict[str, Any]]
+    ) -> tuple[_Remembered, bool] | None:
+        """Return the fold's answer and whether it was replayed, or None when there is none.
+
+        Asks the summarizer only when this exact request was not the last one made; the answer
+        and the id it will carry are remembered either way, so the other list the live path
+        runs on gets the same text under the same id. A failure is counted under
+        :attr:`user_summary_failures` by :meth:`_summarize`.
+
+        Args:
+            messages: The conversation, read for the ids it already carries.
+            standing: The standing summaries' spans, oldest first.
+
+        Returns:
+            The remembered request with its answer, and True when it was replayed rather than
+            asked; None when the summarizer gave nothing.
+        """
+        transcript = _format_turns([messages[span["start_index"]] for span in standing], text=_summary_body)
+        remembered = self._recall(self.fold_prompt, transcript)
+        if remembered is not None:
+            return remembered, True
+        summary = await self._summarize(transcript, prompt=self.fold_prompt)
+        if summary is None:
+            return None
+        summary_id = _next_summary_id(messages, prefix=FOLD_ID_PREFIX, minimum=self._folds)
+        remembered = _Remembered(self.fold_prompt, transcript, summary_id, summary)
+        self._remember(remembered)
+        return remembered, False
+
+    def _apply_fold(
+        self, messages: list[Message], standing: list[dict[str, Any]], answer: _Remembered, replayed: bool
+    ) -> None:
+        """Put the fold's answer in place of the standing summaries, and count it.
+
+        Counted here rather than when the answer arrived, so that an answer a caller refuses
+        -- :meth:`fold_if_smaller`'s ``"rejected"`` -- is neither a fold nor a replay.
+
+        Args:
+            messages: The conversation, mutated in place.
+            standing: The standing summaries' spans, oldest first.
+            answer: The remembered request and its answer, from :meth:`_fold_answer`.
+            replayed: Whether the answer was replayed rather than asked for.
+        """
+        if replayed:
+            self._replayed += 1
+        else:
+            self._folds += 1
+        folded: list[Message] = [messages[span["start_index"]] for span in standing]
+        for message in folded:
+            set_preserved(message, preserved=False)
+        self._replace(messages, standing, answer.text, summary_id=answer.summary_id, reason=FOLD_EXCLUDE_REASON)
 
     def _recall(self, prompt: str, transcript: str) -> _Remembered | None:
         """Return the remembered answer to exactly this request, or None if it was never asked.
@@ -1356,10 +1464,18 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
         Returns:
             The remembered request when it matches, else None.
         """
-        remembered = self._remembered
-        if remembered is not None and remembered.prompt == prompt and remembered.transcript == transcript:
-            return remembered
+        for remembered in self._remembered:
+            if remembered.prompt == prompt and remembered.transcript == transcript:
+                return remembered
         return None
+
+    def _remember(self, request: _Remembered) -> None:
+        """Keep ``request`` for replay, dropping the oldest beyond :attr:`remembered_requests`.
+
+        Args:
+            request: The request just answered.
+        """
+        self._remembered = [*self._remembered, request][-self.remembered_requests :]
 
     async def _summarize(self, transcript: str, *, prompt: str) -> str | None:
         """Return the summary of ``transcript``, or None when the summarizer did not produce one.
@@ -1395,6 +1511,39 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
             self._failures += 1
             return None
         return summary
+
+    @staticmethod
+    def _summary_message(
+        replaced: list[Message], band: list[dict[str, Any]], summary: str, *, summary_id: str
+    ) -> Message:
+        """Return the message a summary is inserted as, linked to what it stands for.
+
+        One constructor for the message :meth:`_replace` inserts and the one
+        :meth:`fold_if_smaller` measures before deciding, so the size a fold is judged at is the
+        size it would have.
+
+        Args:
+            replaced: The messages the summary stands for, oldest first.
+            band: Their spans.
+            summary: The summarizer's text.
+
+        Keyword Args:
+            summary_id: The ``message_id`` the summary carries.
+
+        Returns:
+            The unannotated summary message.
+        """
+        return Message(
+            role="user",
+            contents=[f"{USER_SUMMARY_MARKER}\n{summary}"],
+            message_id=summary_id,
+            additional_properties={
+                GROUP_ANNOTATION_KEY: {
+                    SUMMARY_OF_MESSAGE_IDS_KEY: [message.message_id for message in replaced if message.message_id],
+                    SUMMARY_OF_GROUP_IDS_KEY: [str(span["group_id"]) for span in band],
+                }
+            },
+        )
 
     def _replace(
         self,
@@ -1443,18 +1592,8 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
                 point back to.
             reason: Recorded on each superseded message with its exclusion.
         """
-        replaced = [messages[span["start_index"]] for span in band]
-        summary_message = Message(
-            role="user",
-            contents=[f"{USER_SUMMARY_MARKER}\n{summary}"],
-            message_id=summary_id,
-            additional_properties={
-                GROUP_ANNOTATION_KEY: {
-                    SUMMARY_OF_MESSAGE_IDS_KEY: [message.message_id for message in replaced if message.message_id],
-                    SUMMARY_OF_GROUP_IDS_KEY: [str(span["group_id"]) for span in band],
-                }
-            },
-        )
+        replaced: list[Message] = [messages[span["start_index"]] for span in band]
+        summary_message = self._summary_message(replaced, band, summary, summary_id=summary_id)
         for message in replaced:
             _mark_summarized_by(message, summary_id)
             set_excluded(message, excluded=True, reason=reason)

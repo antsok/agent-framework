@@ -686,6 +686,29 @@ class LiveOutcome:
     is very nearly the whole of it. Beside the ``USERFOLD`` flag, and zero on every strategy
     that keeps no such count.
     """
+    records_merged: int = 0
+    """Passes where ``tool_and_user_summary_anchored``'s last-resort chain merged its records.
+
+    Step a of the chain, kept because the merge came back smaller than the records it replaced.
+    ``RECMERGE`` in ``strategy_notes``. This and the six fields after it are that row's chain,
+    and zero on every other strategy: they say how far down the chain a row went.
+    """
+    record_merges_rejected: int = 0
+    """Record merges discarded because they came back no smaller. ``RECMERGEREJ``."""
+    user_summaries_merged: int = 0
+    """Passes where the chain folded the standing user summaries into one: step b. ``USERMERGE``."""
+    user_merges_rejected: int = 0
+    """User-summary folds the chain discarded because they came back no smaller. ``USERMERGEREJ``."""
+    record_rewrites: int = 0
+    """Harder rewrites of the record the chain tried, kept or not: step c. ``RECHARDER``."""
+    record_rewrites_rejected: int = 0
+    """Of those, the rewrites discarded because they came back no smaller. ``RECHARDERREJ``."""
+    last_resort_fallbacks: int = 0
+    """Passes on which the chain reached its fallback, step d, having tried everything above it.
+
+    Counts the fallback being run, where ``fallbacks_after_record`` counts it changing something.
+    ``LASTFALLBACK`` in ``strategy_notes``; beside ``DQ`` it is step e, the intended loud failure.
+    """
     record_text: str = ""
     """The recall record the run produced, exactly as the model wrote it.
 
@@ -996,15 +1019,36 @@ def _strategy_notes(strategy: Any) -> tuple[str, ...]:
         ("user_passes_below_trigger", "USERUNDER"),
         ("user_passes_declined", "USERHELD"),
         ("user_summary_failures", "USERSUMMFAIL"),
-        ("user_passes_starved", "USERSTARVED"),
         ("user_summaries_in_conversation", "USERSUMMARIES"),
         ("user_summary_tokens", "USERSUMMTOKENS"),
         ("user_folds", "USERFOLD"),
+        ("records_merged", "RECMERGE"),
+        ("record_merges_rejected", "RECMERGEREJ"),
+        ("user_summaries_merged", "USERMERGE"),
+        ("user_merges_rejected", "USERMERGEREJ"),
+        ("record_rewrites", "RECHARDER"),
+        ("record_rewrites_rejected", "RECHARDERREJ"),
+        ("record_summary_failures", "RECSUMMFAIL"),
+        ("last_resort_fallbacks", "LASTFALLBACK"),
     ):
         value = getattr(strategy, attribute, None)
         if isinstance(value, int) and value:
             notes.append(f"{label}:{value}")
     return tuple(notes)
+
+
+def _count(strategy: Any, attribute: str) -> int:
+    """Return an integer counter a strategy reports, or zero when it keeps no such count.
+
+    Args:
+        strategy: The strategy that was installed, or None for the control.
+        attribute: The counter's name.
+
+    Returns:
+        The count.
+    """
+    value = getattr(strategy, attribute, 0)
+    return value if isinstance(value, int) else 0
 
 
 def wants_client_side_history(client: Any, *, allow_server_history: bool = False) -> bool:
@@ -1419,10 +1463,12 @@ def recall_record_text(agent: Agent[Any], state: Mapping[str, Any]) -> str:
     it works: a capture is state threaded through the object under measurement, and this
     package has already had one measurement moved by an instrument it installed.
 
-    Read off the *stored* messages rather than the projected ones. A record is never excluded
-    by the strategy that anchors on it, but nothing here should depend on that: a projection
-    would make "the model wrote no record" and "compaction removed the record" the same empty
-    string, and those are opposite findings.
+    Read off the *stored* messages rather than the projected ones. A projection would make "the
+    model wrote no record" and "compaction removed the record" the same empty string, and those
+    are opposite findings. The composed row does now exclude records, when its last-resort chain
+    merges or rewrites them, and :func:`find_record_index` then answers with the replacement --
+    the newest record still being sent -- so on that row this is the text the chain kept, which
+    is the record the probes were answered from.
 
     Args:
         agent: The agent whose providers say where the history lives.
@@ -1809,7 +1855,12 @@ async def run_live(
             trigger_fraction=recording.trigger_fraction,
             record_max_tokens=record_max_tokens,
             max_groups_before_record=max_groups_before_record,
-            repeat_records=repeat_records,
+            # The composed row asks for a record for every new batch of tool work, and says so
+            # on the object rather than through the flag, so its halves are configured for its
+            # purposes without moving the single row's default. Read off the outermost strategy:
+            # the record half itself reports nothing, so ``tool_summary_anchored`` still repeats
+            # only when --record-repeats asks.
+            repeat_records=repeat_records or bool(getattr(strategy, "repeat_records", False)),
             # The strategy's own ask for another record, made when a record leaves tool groups
             # uncovered. Wired here because the middleware holds no reference to the strategy
             # and the strategy none to the middleware; found through the same nested lookup as
@@ -2093,6 +2144,15 @@ async def run_live(
         ),
         user_summary_tokens=user_compacting.user_summary_tokens if user_compacting is not None else 0,
         user_folds=user_compacting.user_folds if user_compacting is not None else 0,
+        # The chain is the composed row's own, so it is read off the outermost strategy by name,
+        # the way the flags column reads it, and is zero for every row that has none.
+        records_merged=_count(strategy, "records_merged"),
+        record_merges_rejected=_count(strategy, "record_merges_rejected"),
+        user_summaries_merged=_count(strategy, "user_summaries_merged"),
+        user_merges_rejected=_count(strategy, "user_merges_rejected"),
+        record_rewrites=_count(strategy, "record_rewrites"),
+        record_rewrites_rejected=_count(strategy, "record_rewrites_rejected"),
+        last_resort_fallbacks=_count(strategy, "last_resort_fallbacks"),
         # Taken from the snapshot rather than from the live session, so it is the record the
         # probes were answered from and not one a probe's own compaction pass moved.
         record_text=recall_record_text(agent, snapshot),

@@ -31,13 +31,14 @@ far the two halves reach together, and normalising their sizes away is exactly w
 ``token_budget_*`` family does. Its parts are built by the same two builders the single rows
 use, so a sweep of any of their flags moves this row's half the way it moves theirs.
 
-What it does share is one *trigger*. The two halves are judged at ``--trigger-fraction``,
-against one reading of the prompt taken before either acts, because the alternative was measured
-and it was a row that could not work: the record half fires at the lower of the two fractions,
-its removals hold the prompt below the higher one, and the user half is never consulted. That is
-a property of the composition and not of either part, so it is fixed there; ``compaction/_composed``
-carries the argument, including why the alignment runs down to the record half's line rather than
-up to the user half's, and how a caller asks for the two-line row back.
+What it does share is one *trigger*. The two halves are judged at ``--trigger-fraction``: the
+record half against the prompt the pass began with, the user half against the prompt the record
+half left, so the user half -- whose edits break the cached prefix -- acts only when tool
+compaction was not enough. Behind both runs a last-resort chain, merging records, merging user
+summaries and rewriting the record harder before the record half's fallback, and only while the
+prompt is over the input budget. ``compaction/_composed`` carries the argument, including why this
+reverses the pass-entry judging the row used to have and why the alignment runs down to the record
+half's line rather than up to the user half's.
 
 Budgets are sized relative to the transcript rather than to a model's real context window.
 A 20-turn transcript never approaches a 128k window, so a real window would mean no
@@ -47,7 +48,7 @@ strategy ever fires and the benchmark would measure nothing.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING, Any, Final
 
 from agent_framework import (
@@ -66,6 +67,7 @@ from .compaction import (
     DEFAULT_BAND_SHARE,
     DEFAULT_COVERAGE_SHARE,
     DEFAULT_FALLBACK_FRACTION,
+    DEFAULT_HARDER_ATTEMPTS,
     DEFAULT_KEEP_HEAD_USER_TURNS,
     DEFAULT_KEEP_TAIL_USER_TURNS,
     DEFAULT_MIN_BAND_SHARE,
@@ -73,6 +75,7 @@ from .compaction import (
     DEFAULT_SUMMARY_MODE,
     DEFAULT_TRIGGER_FRACTION,
     DEFAULT_USER_TRIGGER_FRACTION,
+    SUMMARY_MODE_BOUNDARY,
     AnchoredCompactionStrategy,
     MinimumGainAnchoredCompactionStrategy,
     ToolResultAnchoredSummarizationCompactionStrategy,
@@ -203,8 +206,18 @@ class StrategyOptions:
     ``recompact``, ``boundary`` or ``fold``; ``compaction/_usersummary`` says what each buys and
     what each costs. Sweepable because the three are the arms of one measurement, and the default
     is the arm the archive was taken on -- the recompacting one -- until a run has measured the
-    others against it. It reaches the composed row's user half through the same builder as the
-    single row, so the two cannot be in different modes under one command line.
+    others against it.
+
+    **It does not reach the composed row any more**, which it used to, through the same builder.
+    ``tool_and_user_summary_anchored`` keeps its user summaries standing rather than re-summarising
+    them, so its builder runs the user half in ``boundary`` whatever this says; the single row is
+    the only one this field moves.
+    """
+    record_harder_attempts: int = DEFAULT_HARDER_ATTEMPTS
+    """Harder rewrites of the record ``tool_and_user_summary_anchored`` may try per pass when over.
+
+    Step c of that row's last-resort chain, and read by no other row. ``compaction/_composed``
+    says why the default is two; zero switches the step off.
     """
     token_budget_fraction: float = 0.5
     summarizer: SupportsChatGetResponse[Any] | None = None
@@ -373,7 +386,9 @@ def _build_tool_summary_anchored(options: StrategyOptions) -> ToolResultAnchored
     )
 
 
-def _build_user_summary_anchored(options: StrategyOptions) -> UserTurnAnchoredSummarizationCompactionStrategy:
+def _build_user_summary_anchored(
+    options: StrategyOptions, *, remembered_requests: int = 1
+) -> UserTurnAnchoredSummarizationCompactionStrategy:
     """Return the strategy that compacts the user's own turns.
 
     The mirror of ``tool_summary_anchored`` on the other half of the conversation, and the pair
@@ -386,6 +401,9 @@ def _build_user_summary_anchored(options: StrategyOptions) -> UserTurnAnchoredSu
     threshold-driven framework strategies: the trigger is a fraction of that ceiling and is
     configured separately, so subtracting a second margin here would make the flag mean
     something other than what it says.
+
+    ``remembered_requests`` is the composed row's, and the single row leaves it at one: see the
+    user-turn strategy's constructor.
 
     Raises:
         ValueError: If no summarizer client was configured.
@@ -404,6 +422,7 @@ def _build_user_summary_anchored(options: StrategyOptions) -> UserTurnAnchoredSu
         trigger_fraction=options.user_trigger_fraction,
         min_band_share=options.user_min_band_share,
         summary_mode=options.user_summary_mode,
+        remembered_requests=remembered_requests,
     )
 
 
@@ -412,18 +431,20 @@ def _build_tool_and_user_summary_anchored(options: StrategyOptions) -> Compactio
 
     Built from the same two builders the single rows use rather than from two fresh
     constructor calls, which is what makes the comparison the row exists for legitimate: a
-    sweep moving ``--coverage-share``, ``--keep-head-user-turns`` or ``--user-summary-mode``
-    moves this row's half in exactly the way it moves the corresponding single row, and neither
-    half can drift into a configuration no other row was measured at.
+    sweep moving ``--coverage-share`` or ``--keep-head-user-turns`` moves this row's half in
+    exactly the way it moves the corresponding single row, and neither half can drift into a
+    configuration no other row was measured at.
 
-    The one setting that does not reach this row is ``--user-trigger-fraction``. The composition
-    judges both halves at ``--trigger-fraction``, taking that line from the record half it was
-    handed, so a sweep of the record row's trigger moves both halves of this row together and a
-    sweep of the user row's trigger moves the single row only. That is the composed row's whole
-    subject: with two lines the record half's removals hold the prompt below the user half's and
-    the row is ``tool_summary_anchored`` under a longer name. ``compaction/_composed`` carries
-    the argument and the escape hatch -- its ``user_trigger_fraction`` restores the two-line row
-    for a caller assembling the parts by hand.
+    Three settings do not reach this row, and each is this row's own configuration rather than a
+    new default for the objects. ``--user-trigger-fraction``: the composition judges both halves
+    at ``--trigger-fraction``, taking that line from the record half it was handed, so a sweep of
+    the user row's trigger moves the single row only. ``--user-summary-mode``: this row's user
+    half runs in ``boundary``, so its summaries stand rather than being re-summarised, and it
+    remembers two summarizer requests rather than one, because its last-resort chain may ask for
+    a fold on the pass that summarised a band. ``--record-repeats``: the recall middleware asks
+    again for every new batch of tool work on this row whatever that flag says -- the composed
+    object reports ``repeat_records`` and ``run_live`` reads it. ``compaction/_composed`` carries
+    the argument for all three.
 
     Selecting this is selecting both halves' costs together. The record half spends an agent
     turn writing its record and the user half spends a summarizer call, so a cell running this
@@ -436,7 +457,10 @@ def _build_tool_and_user_summary_anchored(options: StrategyOptions) -> Compactio
     return ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy(
         tokenizer=options.tokenizer,
         tool_results=_build_tool_summary_anchored(options),
-        user_turns=_build_user_summary_anchored(options),
+        user_turns=_build_user_summary_anchored(
+            replace(options, user_summary_mode=SUMMARY_MODE_BOUNDARY), remembered_requests=2
+        ),
+        harder_attempts=options.record_harder_attempts,
     )
 
 

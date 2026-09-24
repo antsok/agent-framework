@@ -32,16 +32,15 @@ What is here:
   alone let it fire once per turn. It touches nothing the other three touch, so the rows stay
   comparable.
 - :class:`ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy` runs those last two
-  over one conversation, the record phase first. It is the only entry here that composes
-  rather than compacts: it owns no selection rule and removes nothing itself. What it adds is
-  an order; one line for both halves, taken from the record phase's trigger; one reading of the
-  prompt, taken before either phase acts, which is what makes that line more than a shared
-  number -- a half that would have fired on the size the pass began with fires whatever the
-  other half has already removed; one re-read of the conversation between the phases, for the
-  in-place rewrites the record phase's fallback makes; and the attribution of a silent second
-  phase, which on a row whose halves have been set apart again says which passes the first
-  phase's removals kept under the second's trigger, as against the passes the second phase
-  declined for its own reasons.
+  over one conversation, the record phase first, with its recall middleware asking for a new
+  record for every new batch of tool work. It owns no selection rule of its own. What it adds
+  is an order; one line for both halves, taken from the record phase's trigger, with the user
+  half judged against the prompt the record phase left -- so it acts only when tool compaction
+  was not enough, since its edits break the cached prefix; and a last-resort chain that runs
+  only while the prompt is over the input budget: merge the records, merge the user summaries,
+  rewrite the record harder, and then the record phase's fallback, moved there from straight
+  behind the record. Every replacement the chain makes is kept only if it is smaller than what
+  it replaces, and nothing is checked against content.
 - :func:`set_preserved` and :func:`is_preserved` carry one annotation between the two: a
   message no strategy may shorten, drop or shed. It exists because the record is a tool
   result, the anchored strategy trims tool results, and for a while it trimmed the record --
@@ -80,7 +79,7 @@ from ._anchored import (
     AnchoredCompactionStrategy,
     MinimumGainAnchoredCompactionStrategy,
 )
-from ._composed import ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy
+from ._composed import DEFAULT_HARDER_ATTEMPTS, ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy
 from ._preserve import (
     PRESERVE_REASON_KEY,
     PRESERVED_KEY,
@@ -126,6 +125,7 @@ __all__ = [
     "DEFAULT_BAND_SHARE",
     "DEFAULT_COVERAGE_SHARE",
     "DEFAULT_FALLBACK_FRACTION",
+    "DEFAULT_HARDER_ATTEMPTS",
     "DEFAULT_KEEP_HEAD_USER_TURNS",
     "DEFAULT_KEEP_TAIL_USER_TURNS",
     "DEFAULT_KEEP_TOKENS",
