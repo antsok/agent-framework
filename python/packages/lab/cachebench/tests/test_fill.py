@@ -189,9 +189,12 @@ def test_the_plan_leaves_room_for_every_tool_group_it_planted() -> None:
     assert len(scenario.tool_lookups) == 16
 
 
-@pytest.mark.parametrize("fill", [0.0, -0.5, 2.5])
+@pytest.mark.parametrize("fill", [0.0, -0.5, 10.5, 65.0])
 def test_an_impossible_fill_fraction_is_refused(fill: float) -> None:
-    """A fraction outside (0, 2] describes no cell, and would silently size to nonsense."""
+    """A fraction outside (0, 10] describes no cell, and would silently size to nonsense.
+
+    65 is the typo the cap is kept for: a percentage written where a fraction was meant.
+    """
     with pytest.raises(ValueError, match="fill_fraction"):
         _plan(fill)
 
