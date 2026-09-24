@@ -207,6 +207,24 @@ What it shows, and what it is void for:
 No `.sh` is kept: the script that produced it is the same one run 47 uses, and re-running it
 against this tree produces the repaired rows rather than these.
 
+Run 58 is the composed row against `none` at 200,000 tokens, **1.0 fill** and `--trigger-fraction
+0.9`, five seeds, $3.73. `--fallback-fraction` was raised from its default 0.9 to 1.0: at 0.9 the
+record half's give-up line coincides with a 0.9 trigger, so it would give up on the same pass it
+asks for a record and the row would measure `anchored`.
+
+- **The control overflowed on 4 of 5 seeds** (peak 102% of the window). The composed row stayed
+  inside on all five, at 53/53, filling 90% at peak and 65% after compaction, at seed$ +4% on the
+  control -- inside the seed spread, so level with what an unlimited model pays. `truncation` also
+  fit, at -2%, and kept 30-37 facts.
+- **No record arrived on 2 of 5 seeds** (2 and 4), both with high peaks (188-192K) and `DRIFT:11`,
+  as on run 57's seed 1: 3 of 10 seeds across runs 57 and 58, and more often at 0.9 than at 0.8.
+  The reading, inferred: the later the trigger, the nearer the crossing falls to the end of
+  seeding, until no agent turn is left to carry the record, and compaction happens during probing
+  instead. Those two seeds measured the user half as the fallback, not the layered design. In
+  this benchmark's fixed-length conversation a 0.9 trigger is too late for the record half to act
+  reliably; in one that continued, the next turn would carry it.
+- No merge step fired.
+
 Run 57 is run 56 repeated on `32f1a9ae8`, where the composed row's user half waits for the
 record half. Same cell: 200,000 tokens, 0.9 fill, `--trigger-fraction 0.8`; five seeds, $3.17.
 **The layering now works as designed on four of five seeds.** The record half wrote a record on
