@@ -207,6 +207,21 @@ What it shows, and what it is void for:
 No `.sh` is kept: the script that produced it is the same one run 47 uses, and re-running it
 against this tree produces the repaired rows rather than these.
 
+Run 56 is the composed strategy as rebuilt in `42cb2c03e`, alone with `none` and `truncation`,
+at 200,000 tokens, 0.9 fill and `--trigger-fraction 0.8` -- the one line both halves share on
+that row, 158,361 of a 197,952 budget. Five seeds, $3.13, no disqualifications, fill on target.
+**It did not measure the design, and is kept as the evidence that it could not.** On every seed
+the composed row reads `records_in_conversation 0` and `user_compactions 1`: the record half never
+wrote a record and only the user half acted, the layering inverted. The record half compacts in
+two steps -- when the prompt first crosses the line it removes nothing, and relies on the
+middleware to have the model write a record on a later call -- so on that pass the size the user
+half is judged on is still over the line, it fires at once, and its summary takes the prompt back
+under the line, after which the record is never asked for. What the row measured is the user half
+alone in `boundary` mode at 0.8: 53/53 on every seed only because no tool result was ever
+compacted, at seed$ +16% on not compacting. The fix -- the user half waiting while the record half
+still has work pending -- is in the commit that follows. Earlier composed cells at 0.6 on 120K
+wrote their record because summarising the user turns there did not clear the line on its own.
+
 Runs 54 and 55 complete a **fill series at 120,000 tokens on one codebase** (`e16955b30`: the
 fixed post-record fallback, `--assumed-reply-tokens 384`): run 55 at 0.7 fill ($9.75), run 54 at
 0.9 ($12.41), and run 53 at 1.15. Run 50's 0.8 cell predates the fix and the re-sizing and is not
