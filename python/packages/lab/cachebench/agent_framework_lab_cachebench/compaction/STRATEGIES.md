@@ -618,23 +618,35 @@ different question -- what a record licenses *deleting* -- from whether a rewrit
 standing is worth keeping.
 
 **A merged record is a record to everything that reads records.** It is written by
-`consolidate_records` as a recall call and its marked result, shaped byte for byte as the recall
-tool shapes one, and inserted directly behind the newest record it replaces, which are released and
-excluded call and result together. Being the newest record, it is what the newest-record lookup and
-the middleware anchor on and count pending work from; every group the replaced records stood in
-front of is in front of it, so the coverage check reads the same conversation against its text;
-and being a recall group, the hold the fallback runs behind skips it and the preservation walk
-protects and counts it. An excluded record, conversely, is no record to any of them -- the lookup,
+`consolidate_records` as an ordinary assistant message whose text is the recall tool's result byte
+for byte -- the marker, the tool's preamble, then the record -- and inserted directly behind the
+newest record it replaces, which are released and excluded call and result together. It is not a
+tool call. It used to be one, a synthesised recall call under a client-minted id, and run 59
+(gpt-5.6-luna on Foundry) refused the first request carrying it with `400 invalid_payload` on both
+seeds: a provider validates the function calls it is sent against the ones it issued. An assistant
+message rather than a user one, because a record is the model's own account of results it already
+had, a user turn would read the preamble as an instruction, and the user half reads user turns and
+nothing else. Every reader of records recognises both forms (`_is_written_record` for this one).
+Being the newest record, it is what the newest-record lookup and the middleware anchor on and count
+pending work from; every group the replaced records stood in front of is in front of it, so the
+coverage check reads the same conversation against its text; it is not a tool group, so the hold
+the fallback runs behind never counts it; and it is a record group, so the preservation walk
+protects and counts it and a later merge or rewrite replaces it in turn. The acceptance rule
+measures both sides in this form -- the candidate, and each replaced record rebuilt from its body --
+because a record the model made carries its text twice, once in its call's arguments, and a
+rewrite measured against that would pass at half the size with its text unchanged. The user half's
+wait names the newest record by call id when the model made it and by text when the chain wrote
+it; the store pass replays the text the copies pass was given, so both lists name it alike. An excluded record, conversely, is no record to any of them -- the lookup,
 the coverage text and the count all skip it. `records_in_conversation` stays a peak, so `RECORDS:3`
 beside `RECMERGE:1` held three and merged them.
 
 **The records are merged by the user half's summarizer client, not by an agent turn.** The first
 record must come from the agent's model, the only one with the tool payload in context. A merge
 needs only the records, and the moment it is wanted is the moment the prompt is over the budget --
-so an agent turn pinned to the recall tool would itself be a call made with that prompt. The price
-is a client-minted call id on the merged record, which is safe wherever this compaction can run:
-a service that tracks tool calls holds the conversation itself, and there is then no client-side
-prompt to compact. A provider that signs its function calls may refuse an unsigned one; unmeasured.
+so an agent turn pinned to the recall tool would itself be a call made with that prompt. What the
+summarizer writes goes in as the assistant message above, never as a tool call, so nothing is
+minted that a provider could refuse. (This paragraph used to call a client-minted call id safe
+wherever this compaction can run; run 59 measured it refused.)
 
 **`harder_attempts` defaults to 2.** Each attempt is a summarizer call and, if kept, a rewrite of a
 preserved message the cached prefix runs through. The first is the one that pays most; the second

@@ -70,7 +70,6 @@ from ._transcripts import TRUE_CHARS_PER_TOKEN, sized_text
 from .compaction import (
     DEFAULT_RECORD_MAX_TOKENS,
     DEFAULT_RECORD_TARGET_TOKENS,
-    RECORD_MARKER,
     RecallGate,
     ToolResultAnchoredSummarizationCompactionStrategy,
     ToolResultRecallMiddleware,
@@ -78,6 +77,7 @@ from .compaction import (
     find_record_index,
     make_recall_tool,
 )
+from .compaction._toolsummary import _record_text  # pyright: ignore[reportPrivateUsage]
 
 if TYPE_CHECKING:
     from agent_framework import CompactionStrategy, TokenizerProtocol
@@ -1481,7 +1481,9 @@ def recall_record_text(agent: Agent[Any], state: Mapping[str, Any]) -> str:
     are opposite findings. The composed row does now exclude records, when its last-resort chain
     merges or rewrites them, and :func:`find_record_index` then answers with the replacement --
     the newest record still being sent -- so on that row this is the text the chain kept, which
-    is the record the probes were answered from.
+    is the record the probes were answered from. That replacement is an ordinary assistant
+    message rather than a tool result, and is read through the same function every record reader
+    uses, so neither form is missed here.
 
     Args:
         agent: The agent whose providers say where the history lives.
@@ -1490,21 +1492,14 @@ def recall_record_text(agent: Agent[Any], state: Mapping[str, Any]) -> str:
     Returns:
         The record, or an empty string when the conversation holds none. Several results
         batched into one message are joined, which is what a provider that batches them
-        produces; only results carrying :data:`RECORD_MARKER` are read, so an ordinary tool
-        result sitting beside the record is not mistaken for part of it.
+        produces; only results carrying :data:`~.compaction.RECORD_MARKER` are read, so an
+        ordinary tool result sitting beside the record is not mistaken for part of it.
     """
     messages = _stored_messages(agent, state)
     index = find_record_index(messages)
     if index is None:
         return ""
-    parts: list[str] = []
-    for content in messages[index].contents:
-        if content.type != "function_result":
-            continue
-        result = content.result if isinstance(content.result, str) else str(content.result)
-        if RECORD_MARKER in result:
-            parts.append(result)
-    return chr(10).join(parts)
+    return _record_text(messages[index])
 
 
 def snapshot_state(session: AgentSession) -> dict[str, Any]:

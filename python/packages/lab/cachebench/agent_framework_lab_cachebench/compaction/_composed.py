@@ -119,6 +119,8 @@ record ever arrived is not part of the chain and still runs inside the record ph
 a. *Merge the active records into one*, when there are at least two -- one is a rewrite, which
    is step c. The merged record replaces them in place and is a record to everything that reads
    records: see :meth:`~._toolsummary.ToolResultAnchoredSummarizationCompactionStrategy.consolidate_records`.
+   It is an ordinary assistant message carrying the record marker, never a tool call: see
+   :func:`~._toolsummary.build_record_message`.
 b. *Merge the user summaries into one*, when there are at least two, through the user half's own
    fold machinery (:meth:`~._usersummary.UserTurnAnchoredSummarizationCompactionStrategy.fold_if_smaller`).
    After the records because a record merge rewrites the prompt from the oldest record, which
@@ -134,7 +136,10 @@ summary, is kept if it is non-empty and smaller, in tokens, than what it replace
 old ones stay and the chain moves on. Nothing is checked against the old records, against the
 tool results, or against anything the benchmark plants. A real deployment has no planted facts,
 and an overlap check fitted to this benchmark's exact codes would either reject correct
-paraphrase on real content or pass a lossy summary that happened to keep the codes. What a merge
+paraphrase on real content or pass a lossy summary that happened to keep the codes. "Smaller" is
+measured like for like: both sides in the form a written record takes, so a rewrite does not pass
+merely because that form drops the second copy a record the model made carries in its call's
+arguments -- see :func:`~._toolsummary.build_record_message`. What a merge
 loses is measured by the benchmark, through ``facts`` and ``acc1``, not guessed at here. The
 record's coverage check is a different thing and is untouched: it decides what a record
 *licenses deleting*, which is a question about tool results still in the prompt; this decides
@@ -145,9 +150,10 @@ turn.** The first record has to come from the agent's own model, because only th
 tool payload in its context. A merge needs only the records, which are short, and the moment it
 is wanted is the moment the prompt is over the budget -- so an agent turn pinned to the recall
 tool would be a call made *with* that over-budget prompt, which is the call the chain exists to
-avoid. The summarizer sees the records alone. The price is a client-minted call id on the merged
-record, which :meth:`~._toolsummary.ToolResultAnchoredSummarizationCompactionStrategy.consolidate_records`
-explains is safe wherever this compaction can run at all.
+avoid. The summarizer sees the records alone. What it writes goes in as an ordinary assistant
+message carrying the record marker rather than as a recall call: this used to mint a call id and
+synthesise the call, and run 59 measured Foundry refusing the first request that carried one with
+``400 invalid_payload`` -- see :func:`~._toolsummary.build_record_message`.
 
 **The other list.** The live path runs this over the copies sent on a call and then over the
 store, and a request asked on the first is replayed on the second rather than paid for twice:
@@ -183,9 +189,8 @@ from ._toolsummary import (
     RECORD_MARKER,
     ToolResultAnchoredSummarizationCompactionStrategy,
     active_record_groups,
-    build_record_messages,
+    build_record_message,
     find_record_index,
-    next_consolidated_call_id,
     record_body,
 )
 from ._usersummary import UserTurnAnchoredSummarizationCompactionStrategy
@@ -309,20 +314,30 @@ def _responses(messages: list[Message]) -> int:
     return sum(1 for message in messages if message.role == "assistant")
 
 
-def _newest_record_id(messages: list[Message]) -> str:
-    """Return the call id of the newest record, or an empty string when there is none.
+def _newest_record_identity(messages: list[Message]) -> str:
+    """Return what identifies the newest record, or an empty string when there is none.
 
-    The identity of what the record half anchors on, read the way it reads it
-    (:func:`~._toolsummary.find_record_index`). A call id rather than a position because the id
-    is the provider's, so the copies sent on a call and the store after it agree on it.
+    The record the record half anchors on, found the way it finds it
+    (:func:`~._toolsummary.find_record_index`), and named by something the copies sent on a call
+    and the store after it both carry -- not a position, which differs between the two lists.
+
+    A record the model made is named by its call id, which the provider issued. A record the
+    chain wrote has no call id -- it is an ordinary message, see
+    :func:`~._toolsummary.build_record_message` -- so it is named by its text. The two lists
+    agree on that text because the store pass replays the answer the copies pass was given
+    (:meth:`ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy._ask`). And a change of
+    text is always a new record: the chain writes one only in place of every standing record,
+    and only when it is smaller than them, so a written record never repeats the one straight
+    before it. The two forms are prefixed apart so neither can read as the other.
     """
     index = find_record_index(messages)
     if index is None:
         return ""
-    for content in messages[index].contents:
+    message = messages[index]
+    for content in message.contents:
         if content.type == "function_result" and RECORD_MARKER in str(content.result):
-            return content.call_id or ""
-    return ""
+            return f"call:{content.call_id or ''}"
+    return f"text:{message.text}"
 
 
 class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
@@ -409,7 +424,8 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
         self._user_passes_waited = 0
         # The response count the current wait began at, or None when none is running.
         self._wait_since: int | None = None
-        # The newest record's call id as the last pass saw it; a change is a record arriving.
+        # The newest record's identity as the last pass saw it -- see ``_newest_record_identity``;
+        # a change is a record arriving.
         self._anchor = ""
         # No new wait may begin at or before this response count: set when a record arrives.
         self._quiet_through = -1
@@ -418,9 +434,8 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
         # Record requests answered on this pass and on the one before, keyed by the exact
         # request. Two generations, because the pass that replays is the one straight after the
         # pass that asked; see ``_ask``.
-        self._answers: dict[tuple[str, str], tuple[str, str]] = {}
-        self._previous_answers: dict[tuple[str, str], tuple[str, str]] = {}
-        self._call_ids_minted = 0
+        self._answers: dict[tuple[str, str], str] = {}
+        self._previous_answers: dict[tuple[str, str], str] = {}
 
     @property
     def strategies(self) -> tuple[_Phase, ...]:
@@ -730,7 +745,8 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
         was already sent without, and the next call is sent it again.
 
         **State that survives the two lists.** Everything is read off the conversation -- the
-        response count, the newest record's call id -- or kept on this object, and nothing in a
+        response count, the newest record's identity (:func:`_newest_record_identity`) -- or kept
+        on this object, and nothing in a
         message annotation, because the copies' annotations never reach the store. A
         conversation that has gone backwards past the wait's start, which is what restoring a
         snapshot for a probe looks like, drops the wait rather than reading a negative count.
@@ -746,7 +762,7 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
             True to keep the user half idle on this pass.
         """
         clock = _responses(messages)
-        anchor = _newest_record_id(messages)
+        anchor = _newest_record_identity(messages)
         if anchor != self._anchor:
             # The wait itself ends below: nothing holds within one response of an arrival.
             self._anchor = anchor
@@ -856,7 +872,12 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
 
         The acceptance rule is the module docstring's, and nothing else: non-empty -- a
         summarizer that answers with nothing is a failure -- and fewer tokens than the records it
-        replaces, measured on a replacement built exactly as it would be inserted.
+        replaces. Both sides are measured in the form the replacement is inserted in: the
+        candidate as built, and each replaced record rebuilt from its body the same way, rather
+        than the replaced messages themselves. A record the model made carries its text twice,
+        once in the call's arguments, and a candidate measured against that would come out at
+        about half the size with its text unchanged -- see
+        :func:`~._toolsummary.build_record_message`.
 
         Args:
             messages: The conversation, mutated in place when the replacement is kept.
@@ -871,36 +892,33 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
         transcript = "\n".join(
             f"{number}. {record_body(messages, group)}" for number, group in enumerate(groups, start=1)
         )
-        answer = await self._ask(messages, prompt=prompt, transcript=transcript)
-        if answer is None:
+        text = await self._ask(prompt=prompt, transcript=transcript)
+        if text is None:
             return "failed"
-        text, call_id = answer
-        candidate = build_record_messages(text, call_id=call_id)
+        candidate = [build_record_message(text)]
+        replaced = [build_record_message(record_body(messages, group)) for group in groups]
         annotate_token_counts(candidate, tokenizer=self.tokenizer, force_retokenize=True)
-        replaced = [message for group in groups for message in messages[group["start_index"] : group["end_index"] + 1]]
+        annotate_token_counts(replaced, tokenizer=self.tokenizer, force_retokenize=True)
         if included_token_count(candidate) >= included_token_count(replaced):
             return "rejected"
-        self.tool_results.consolidate_records(messages, groups, text, call_id=call_id)
+        self.tool_results.consolidate_records(messages, groups, text)
         return "accepted"
 
-    async def _ask(self, messages: list[Message], *, prompt: str, transcript: str) -> tuple[str, str] | None:
-        """Return the summarizer's answer and the call id it will carry, asking only if new.
+    async def _ask(self, *, prompt: str, transcript: str) -> str | None:
+        """Return the summarizer's answer, asking only if the request is new.
 
         Remembered for this pass and the next, so the second list the live path runs on replays
-        the text and the id the first list was given -- the model is sent one merged record, and
-        the store holds the same one -- and a request refused as no smaller is not paid for
-        again while it keeps being asked. A failure is not remembered, for the reason the user
-        half gives: the next view should ask again.
-
-        Args:
-            messages: The conversation, read for the call ids it already carries.
+        the text the first list was given -- the model is sent one merged record, the store holds
+        the same one, and :func:`_newest_record_identity` reads the same name off both -- and a
+        request refused as no smaller is not paid for again while it keeps being asked. A failure
+        is not remembered, for the reason the user half gives: the next view should ask again.
 
         Keyword Args:
             prompt: The system prompt.
             transcript: The numbered records.
 
         Returns:
-            The text and its call id, or None when the summarizer raised or said nothing.
+            The text, or None when the summarizer raised or said nothing.
         """
         key = (prompt, transcript)
         remembered = self._answers.get(key) or self._previous_answers.get(key)
@@ -923,7 +941,5 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
             logger.warning("Skipping record consolidation: the summarizer returned no text.")
             self._record_summary_failures += 1
             return None
-        call_id = next_consolidated_call_id(messages, minimum=self._call_ids_minted)
-        self._call_ids_minted += 1
-        self._answers[key] = (text, call_id)
-        return text, call_id
+        self._answers[key] = text
+        return text

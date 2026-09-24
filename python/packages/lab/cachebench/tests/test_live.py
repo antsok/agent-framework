@@ -255,6 +255,46 @@ class StubChatClient(FunctionInvocationLayer[Any], ChatMiddlewareLayer[Any], Bas
         self.reply = reply
         self.obey_tool_choice = obey_tool_choice
         self.finish_reason = finish_reason
+        #: Every function call id this stub has answered with, across every conversation it served.
+        self.issued_call_ids: set[str] = set()
+        # Bound on the instance, so the check wraps whichever ``_inner_get_response`` the most
+        # derived class defines -- several subclasses answer tool calls without calling up.
+        self._inner_get_response = self._validated(self._inner_get_response)  # type: ignore[method-assign]
+
+    def _validated(self, script: Callable[..., Any]) -> Callable[..., Any]:
+        """Return ``script`` behind the check a real provider makes on every request.
+
+        A provider pairs every function call it is sent with one it issued, and every function
+        result with such a call, and refuses a request that breaks either: run 59 was refused
+        with ``400 invalid_payload`` the first time the composed row sent a recall call it had
+        synthesised itself. A stub that took any history it was handed let that pass the whole
+        suite, so this one refuses the same way, loudly, and records the ids of the calls it
+        answers with on the way out.
+        """
+
+        def checked(*, messages: Sequence[Message], stream: bool, options: Mapping[str, Any], **kwargs: Any) -> Any:
+            for message in messages:
+                for content in message.contents:
+                    if content.type not in ("function_call", "function_result"):
+                        continue
+                    if content.call_id not in self.issued_call_ids:
+                        raise AssertionError(
+                            f"the request carries a {content.type} with call id {content.call_id!r}, "
+                            "which this model never issued; a provider refuses such a request"
+                        )
+            answer = script(messages=messages, stream=stream, options=options, **kwargs)
+
+            async def _noted() -> Any:
+                response = await answer
+                for message in response.messages:
+                    for content in message.contents:
+                        if content.type == "function_call" and content.call_id:
+                            self.issued_call_ids.add(content.call_id)
+                return response
+
+            return _noted()
+
+        return checked
 
     def _inner_get_response(
         self,
@@ -2049,14 +2089,17 @@ class _LookupAndRecordStub(StubChatClient):
     answers in text, which is the model that never records.
     """
 
-    def __init__(self, *, writes: bool = True) -> None:
+    def __init__(self, *, writes: bool = True, record_padding: int = 0) -> None:
         """Create the stub.
 
         Keyword Args:
             writes: Answer a call pinned to the recall tool with a record.
+            record_padding: Characters of prose each record carries beside the codes, so a test
+                can make the records themselves what keeps the prompt over the budget.
         """
         super().__init__(reply="a reply " * 20)
         self.writes = writes
+        self.record_padding = record_padding
         self.pinned_calls = 0
         self.records_written = 0
 
@@ -2081,7 +2124,8 @@ class _LookupAndRecordStub(StubChatClient):
                 if content.type == "function_result"
             )
             codes = " ".join(sorted(set(re.findall(r"CODE-\w+", results))))
-            name, arguments = RECALL_TOOL_NAME, json.dumps({"values": codes})
+            padding = " and a note" * (self.record_padding // 11)
+            name, arguments = RECALL_TOOL_NAME, json.dumps({"values": codes + padding})
             self.records_written += 1
         elif last.role == "user" and (last.text or "").startswith(_LOOKUP):
             name, arguments = f"lookup_{(last.text or '').split()[1]}", "{}"
@@ -2117,17 +2161,22 @@ async def _run_wait_fixture(
     filler_turns: int = 7,
     lookups: Sequence[str] = ("a", "b", "c"),
     user_trigger_fraction: float | None = None,
+    record_padding: int = 0,
+    later_lookups: Sequence[str] = (),
+    later_filler_turns: int = 0,
 ) -> SimpleNamespace:
     """Drive a strategy through the harness's real session, wired the way ``run_live`` wires it.
 
-    Two filler turns of about 830 tokens, the lookups, then ``filler_turns`` more. The user
+    Two filler turns of about 830 tokens, the lookups, then ``filler_turns`` more, then
+    ``later_lookups`` and ``later_filler_turns`` -- a second batch of tool work, for a test that
+    needs a second record. The user
     half's ``compact_against`` is wrapped on the instance, so every pass that reached it is
     logged as whether a record stood in the conversation at that moment and whether the pass
     compacted.
 
     Returns:
         The strategy, its record and user halves (either may be None), the middleware, the stub,
-        the stored conversation, the log and the line.
+        the agent and its session, the stored conversation, the log and the line.
     """
     options = StrategyOptions(
         tokenizer=TOKENIZER,
@@ -2164,7 +2213,7 @@ async def _run_wait_fixture(
             return compacted
 
         user.compact_against = logged  # type: ignore[method-assign]
-    client = _LookupAndRecordStub(writes=writes)
+    client = _LookupAndRecordStub(writes=writes, record_padding=record_padding)
     agent = build_live_agent(
         ProviderRuntime(client=client, model="stub"),
         kind="harness",
@@ -2180,6 +2229,9 @@ async def _run_wait_fixture(
     turns = [f"Turn {index}: " + "u" * 3_200 for index in range(2)]
     turns += [f"{_LOOKUP} {scope}" for scope in lookups]
     turns += [f"Turn {index}: " + "u" * 3_200 for index in range(2, 2 + filler_turns)]
+    turns += [f"{_LOOKUP} {scope}" for scope in later_lookups]
+    later = 2 + filler_turns
+    turns += [f"Turn {index}: " + "u" * 3_200 for index in range(later, later + later_filler_turns)]
     for text in turns:
         await agent.run(text, session=session)
     history = next(provider for provider in agent.context_providers if isinstance(provider, HistoryProvider))
@@ -2189,6 +2241,8 @@ async def _run_wait_fixture(
         user=user,
         middleware=middleware,
         client=client,
+        agent=agent,
+        session=session,
         stored=list(session.state.get(history.source_id, {}).get("messages", [])),
         log=log,
         line=int(options.input_budget_tokens * options.trigger_fraction),
@@ -2303,6 +2357,91 @@ async def test_the_standalone_rows_do_not_wait(strategy_name: str) -> None:
         assert run.client.pinned_calls == 0
         assert run.user.user_compactions == 1
         assert run.log[0] == (False, True), "it compacted on the first pass over the line"
+
+
+async def test_the_stub_refuses_a_request_carrying_a_call_it_never_issued() -> None:
+    """The check every live-path test now runs under, shown biting on its own.
+
+    A function call the stub did not answer with, and a result for one, are each refused before
+    the script is consulted; the same call is accepted once the stub has issued it.
+    """
+    client = StubChatClient()
+    fabricated = [
+        Message(role="user", contents=["go"]),
+        Message(
+            role="assistant",
+            contents=[Content.from_function_call(call_id="minted_0", name=RECALL_TOOL_NAME, arguments="{}")],
+        ),
+        Message(role="tool", contents=[Content.from_function_result(call_id="minted_0", result="done")]),
+    ]
+
+    with pytest.raises(AssertionError, match="minted_0"):
+        client._inner_get_response(messages=fabricated, stream=False, options={})
+    assert client.seen == [], "refused before the script ran"
+
+    client.issued_call_ids.add("minted_0")
+    response = await client._inner_get_response(messages=fabricated, stream=False, options={})
+    assert response.text, "accepted, and answered"
+
+
+async def test_a_merge_through_the_live_path_sends_the_model_no_call_it_never_made() -> None:
+    """Run 59's crash, offline: the chain's merged record reaches the model on the next call.
+
+    Records padded so that two of them keep the prompt over the input budget once both halves
+    have run, which is step a -- merge the records -- and nothing further down the chain. The
+    merged record then rides along on every later request, and the stub refuses any function
+    call or result it did not issue, as Foundry refused it with ``400 invalid_payload``. When
+    the merge was a synthesised recall call under a minted id this test failed on that check;
+    written as an assistant message it passes, and the conversation reads it as the record.
+    """
+    run = await _run_wait_fixture(record_padding=12_000, later_lookups=("d", "e"), later_filler_turns=6)
+    strategy = run.strategy
+
+    assert strategy.records_merged >= 1, "the premise: the chain reached step a"
+    assert strategy.record_rewrites == 0, "and nothing below it"
+    index = find_record_index(run.stored)
+    assert index is not None
+    record = run.stored[index]
+    assert record.role == "assistant" and [content.type for content in record.contents] == ["text"]
+    assert (record.text or "").startswith(RECORD_MARKER), "the newest record is the merged one"
+    assert any(message.role == "assistant" for message in run.stored[index + 1 :]), (
+        "and the model was called with it in the prompt, which is where the check bites"
+    )
+    stored_ids = {
+        content.call_id
+        for message in run.stored
+        for content in message.contents
+        if content.type in ("function_call", "function_result")
+    }
+    assert stored_ids <= run.client.issued_call_ids, "every call in the store is one the model made"
+    assert recall_record_text(run.agent, run.session.state) == record.text, "the dump reads the merged record"
+
+
+@pytest.mark.parametrize("strategy_name", ["tool_summary_anchored", "user_summary_anchored"])
+async def test_the_standalone_rows_write_no_record_of_their_own_on_the_merge_fixture(strategy_name: str) -> None:
+    """Neither half run as its own row has the chain, so the fixture that merges above merges nothing here."""
+    run = await _run_wait_fixture(
+        strategy_name,
+        user_trigger_fraction=0.6,
+        record_padding=12_000,
+        later_lookups=("d", "e"),
+        later_filler_turns=6,
+    )
+
+    assert not hasattr(run.strategy, "records_merged")
+    assert not [
+        message
+        for message in run.stored
+        if message.role == "assistant" and (message.text or "").startswith(RECORD_MARKER)
+    ], "no record written as a message"
+    if run.recording is not None:
+        assert run.recording.records_in_conversation == 1, "one record, and its repeats are off"
+        assert all(
+            content.call_id in run.client.issued_call_ids
+            for message in run.stored
+            for content in message.contents
+            if content.type == "function_call"
+        )
 
 
 async def test_the_wait_count_reaches_the_seed_record_and_the_flags_column() -> None:

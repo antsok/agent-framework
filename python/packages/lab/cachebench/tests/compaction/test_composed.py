@@ -31,7 +31,10 @@ may look at.
 
 **A merged record is a record to everything downstream, and an excluded one is not.** The
 coverage check, the record count, the newest-record lookup the middleware uses, and the hold
-the fallback runs behind are each asserted against a merged record.
+the fallback runs behind are each asserted against a merged record. It is an ordinary assistant
+message carrying the marker -- never a function call, which a provider refuses when it did not
+issue it -- and it can itself be merged again and rewritten harder; the wait reads its arrival
+off something both lists the live path compacts carry alike.
 
 **The single rows are unchanged.** ``tool_summary_anchored`` still falls back straight behind
 its record, never merges, and reports no repeat request; ``user_summary_anchored`` still
@@ -59,6 +62,8 @@ from agent_framework_lab_cachebench.compaction._composed import (
     DEFAULT_HARDER_ATTEMPTS,
     DEFAULT_RECORD_MERGE_PROMPT,
     ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy,
+    _newest_record_identity,
+    _responses,
     harder_record_prompt,
 )
 from agent_framework_lab_cachebench.compaction._preserve import PRESERVE_REASON_KEY, is_preserved
@@ -73,11 +78,13 @@ from agent_framework_lab_cachebench.compaction._toolsummary import (
     ToolResultRecallMiddleware,
     _droppable_groups_after,
     _hold_unrecorded,
+    _is_written_record,
     _preserve_records,
     _record_text,
     active_record_groups,
-    build_record_messages,
+    build_record_message,
     find_record_index,
+    make_recall_tool,
     record_body,
 )
 from agent_framework_lab_cachebench.compaction._usersummary import (
@@ -1484,8 +1491,27 @@ async def _post_record_size(**fixture: bool) -> int:
 
 
 def _active_record_ids(messages: list[Message]) -> list[str]:
-    """Return the message ids of every record still being sent, oldest first."""
-    return [str(messages[group["end_index"]].message_id) for group in active_record_groups(messages)]
+    """Return every record still being sent, oldest first: a model's by message id, a written one by body.
+
+    A record the chain wrote carries no id of its own -- the framework numbers it by position,
+    which says nothing -- so it is named ``written:<body>``, which is what a test can check.
+    """
+    return [
+        f"written:{record_body(messages, group)}"
+        if _is_written_record(messages[group["end_index"]])
+        else str(messages[group["end_index"]].message_id)
+        for group in active_record_groups(messages)
+    ]
+
+
+def _function_call_ids(messages: list[Message]) -> set[str]:
+    """Return the call id of every function call and result in ``messages``, excluded or not."""
+    return {
+        str(content.call_id)
+        for message in messages
+        for content in message.contents
+        if content.type in ("function_call", "function_result")
+    }
 
 
 def _standing_summary_ids(messages: list[Message]) -> list[str]:
@@ -1533,7 +1559,7 @@ async def test_the_chain_merges_the_records_first_and_stops_once_the_prompt_fits
     assert summarizer.log == ["merge"], "merged first, and nothing after it once the prompt fit"
     assert _size(messages) <= budget
     assert (strategy.records_merged, strategy.record_merges_rejected) == (1, 0)
-    assert _active_record_ids(messages) == ["compaction_record_0_result"], "one record, the merged one"
+    assert _active_record_ids(messages) == [f"written:{_SHORT_RECORD}"], "one record, the merged one"
     assert _standing_summary_ids(messages) == ["user_summary_0", "user_summary_1"], "the summaries untouched"
     assert strategy.last_resort_fallbacks == 0
 
@@ -1557,7 +1583,7 @@ async def test_a_merge_that_is_no_smaller_is_refused_and_the_old_records_stay() 
     for message_id in ("rec1_call", "rec1_res", "rec2_call", "rec2_res"):
         (message,) = (m for m in messages if m.message_id == message_id)
         assert is_preserved(message) and not message.additional_properties.get(EXCLUDED_KEY, False)
-    assert not [m for m in messages if str(m.message_id).startswith("compaction_record_")], "nothing inserted"
+    assert not [m for m in messages if _is_written_record(m)], "nothing inserted"
 
 
 async def test_a_replacement_the_same_size_as_what_it_replaces_is_refused() -> None:
@@ -1565,7 +1591,8 @@ async def test_a_replacement_the_same_size_as_what_it_replaces_is_refused() -> N
 
     The record here is one the chain itself wrote, so a rewrite carrying the same text builds a
     replacement of exactly the same shape and length -- the one case that tells ``>=`` from
-    ``>`` in the rule.
+    ``>`` in the rule. :func:`test_a_rewrite_is_measured_like_for_like_against_a_record_the_model_made`
+    is the same case against a record the model made, which is not the same shape.
     """
     summarizer = _RoutingSummarizer()
     text = "lookup_1: CODE-1. " + "r" * _CHAIN_PADDING_CHARS
@@ -1575,7 +1602,7 @@ async def test_a_replacement_the_same_size_as_what_it_replaces_is_refused() -> N
         Message(role="user", contents=["Turn 0: the task."], message_id="u0"),
         Message(role="assistant", contents=["Reply 0."], message_id="a0"),
         *_tool_group(1),
-        *build_record_messages(text, call_id="compaction_record_7"),
+        build_record_message(text),
         Message(role="user", contents=["Turn 1: last."], message_id="u1"),
     ]
     strategy = _chain_composed(summarizer, harder_attempts=1)
@@ -1584,7 +1611,7 @@ async def test_a_replacement_the_same_size_as_what_it_replaces_is_refused() -> N
 
     assert "harder1" in summarizer.log
     assert (strategy.record_rewrites, strategy.record_rewrites_rejected) == (1, 1)
-    assert _active_record_ids(messages) == ["compaction_record_7_result"], "the record it would have replaced stands"
+    assert _active_record_ids(messages) == [f"written:{text}"], "the record it would have replaced stands"
 
 
 async def test_the_user_summaries_are_merged_second_through_the_user_halfs_own_fold() -> None:
@@ -1640,9 +1667,7 @@ async def test_the_record_is_rewritten_harder_third_and_each_attempt_asks_for_mo
 
     assert summarizer.log == ["merge", "fold", "harder1", "harder2"]
     assert (strategy.record_rewrites, strategy.record_rewrites_rejected) == (2, 1)
-    assert _active_record_ids(messages) == ["compaction_record_2_result"], (
-        "one record, the kept rewrite -- the third id minted, since the two refused answers had one each"
-    )
+    assert _active_record_ids(messages) == [f"written:{_SHORT_RECORD}"], "one record, the kept rewrite"
     assert _size(messages) <= budget
     assert strategy.last_resort_fallbacks == 0
     first, second = harder_record_prompt(1), harder_record_prompt(2)
@@ -1752,10 +1777,13 @@ async def test_a_merged_record_is_a_record_to_everything_that_reads_records() ->
 
     assert strategy.records_merged == 1
     index = find_record_index(messages)
-    assert index is not None and messages[index].message_id == "compaction_record_0_result"
-    merged_call = messages[index - 1]
-    assert [content.name for content in merged_call.contents] == [RECALL_TOOL_NAME]
-    assert RECORD_MARKER in _record_text(messages[index])
+    assert index is not None and _is_written_record(messages[index])
+    merged = messages[index]
+    assert merged.role == "assistant" and [content.type for content in merged.contents] == ["text"], (
+        "one assistant message and no function call: a provider refuses a call it never issued"
+    )
+    assert _function_call_ids(messages) == {"call_1", "call_2", "call_3", "rec1", "rec2"}, "no call id was minted"
+    assert _record_text(merged).startswith(RECORD_MARKER)
     (group,) = active_record_groups(messages)
     assert record_body(messages, group) == merged_text, "the body a later merge would be handed"
     assert is_preserved(messages[index]) and messages[index].additional_properties[PRESERVE_REASON_KEY] == (
@@ -1817,8 +1845,8 @@ async def test_the_other_list_replays_the_merge_rather_than_paying_for_it_again(
     """The live path compacts the copies sent on a call and then the store, and both get one merge.
 
     The second view of the same conversation asks the same question, so it gets the same answer
-    under the same call id -- the model is sent one merged record and the store holds that one --
-    and the summarizer is asked once.
+    -- the model is sent one merged record and the store holds that one -- and the summarizer is
+    asked once.
     """
     summarizer = _RoutingSummarizer(merge=_short_record)
     budget = await _post_record_size() - 500
@@ -1831,7 +1859,7 @@ async def test_the_other_list_replays_the_merge_rather_than_paying_for_it_again(
 
     assert summarizer.log == ["merge"], "asked once"
     assert strategy.records_merged == 2, "and kept on both views"
-    assert _active_record_ids(copies) == _active_record_ids(store) == ["compaction_record_0_result"]
+    assert _active_record_ids(copies) == _active_record_ids(store) == [f"written:{_SHORT_RECORD}"]
 
 
 async def test_a_refused_merge_is_not_paid_for_again_on_the_next_pass() -> None:
@@ -1983,3 +2011,129 @@ async def test_the_other_list_replays_both_the_band_and_the_fold_of_one_pass() -
 
     assert summarizer.log.count("band") == 1 and summarizer.log.count("fold") == 1, summarizer.log
     assert strategy.user_summaries_replayed == 1, "the band replayed; the refused fold is refused again from memory"
+
+
+async def test_a_written_record_is_merged_again_and_rewritten_harder() -> None:
+    """A merged record stands among the records the chain may replace, in both of its later steps.
+
+    One merge leaves a written record; the model then records again, so two stand -- the
+    written one and the model's -- and step a merges them into one; step c then rewrites that
+    one harder. If a written record were not a record to :func:`active_record_groups`, the
+    second merge would see one record and skip, and the rewrite would see the model's record
+    alone and leave the written one standing beside its replacement.
+    """
+    summarizer = _RoutingSummarizer(merge=_short_record)
+    strategy = _chain_composed(summarizer, harder_attempts=0)
+    messages = _chain_conversation()
+    await strategy(messages)
+    assert _active_record_ids(messages) == [f"written:{_SHORT_RECORD}"]
+
+    messages += _record_messages("lookup_9: CODE-9.", call_id="rec9")
+    again = "lookup_1: CODE-1. lookup_9: CODE-9."
+    summarizer.merge = lambda body: again
+    await strategy(messages)
+
+    assert summarizer.log.count("merge") == 2
+    assert strategy.records_merged == 2
+    assert _active_record_ids(messages) == [f"written:{again}"], "the written record and the model's, merged"
+    (first,) = (m for m in messages if _is_written_record(m) and _SHORT_RECORD in (m.text or ""))
+    assert first.additional_properties[EXCLUDED_KEY] is True, "the earlier written record is replaced"
+    assert first.additional_properties[EXCLUDE_REASON_KEY] == CONSOLIDATE_EXCLUDE_REASON
+    assert not is_preserved(first)
+
+    harder = "CODE-1 CODE-9"
+    summarizer.harder = lambda attempt, body: harder
+    strategy.harder_attempts = 1
+    messages.append(Message(role="user", contents=["Turn 5: more."], message_id="u5"))
+    await strategy(messages)
+
+    assert "harder1" in summarizer.log
+    assert (strategy.record_rewrites, strategy.record_rewrites_rejected) == (1, 0)
+    assert _active_record_ids(messages) == [f"written:{harder}"], "the written record, rewritten harder"
+    assert len([m for m in messages if _is_written_record(m)]) == 3, "three written, two of them replaced"
+    assert _function_call_ids(messages) == {"call_1", "call_2", "rec1", "rec2", "rec9"}, "and still no call id minted"
+
+
+async def test_a_rewrite_is_measured_like_for_like_against_a_record_the_model_made() -> None:
+    """A rewrite that shortens nothing is refused, even though its form is half the size.
+
+    The model's record is shaped as the recall tool shapes one: the text in the call's
+    arguments and again in the result. A written record carries it once. Measured against the
+    messages it replaces, a rewrite returning the text unchanged would come out at about half
+    their size and be kept; measured in one form on both sides, it is exactly the same size, and
+    is refused.
+    """
+    body = "lookup_1: CODE-1. " + "r" * _CHAIN_PADDING_CHARS
+    summarizer = _RoutingSummarizer(harder=lambda attempt, sent: body)
+    messages = [
+        Message(role="system", contents=["You are an assistant."], message_id="sys"),
+        Message(role="user", contents=["Turn 0: the task."], message_id="u0"),
+        Message(role="assistant", contents=["Reply 0."], message_id="a0"),
+        *_tool_group(1),
+        Message(
+            role="assistant",
+            contents=[
+                {"type": "function_call", "call_id": "rec", "name": RECALL_TOOL_NAME, "arguments": {"values": body}}
+            ],
+            message_id="rec_call",
+        ),
+        Message(
+            role="tool",
+            contents=[{"type": "function_result", "call_id": "rec", "result": make_recall_tool()(body)}],
+            message_id="rec_res",
+        ),
+        Message(role="user", contents=["Turn 1: last."], message_id="u1"),
+    ]
+    strategy = _chain_composed(summarizer, harder_attempts=1)
+    (group,) = active_record_groups(messages)
+    as_sent = messages[group["start_index"] : group["end_index"] + 1]
+    annotate_token_counts(as_sent, tokenizer=TOKENIZER)
+    written = [build_record_message(body)]
+    annotate_token_counts(written, tokenizer=TOKENIZER)
+    assert included_token_count(written) * 3 < included_token_count(as_sent) * 2, (
+        "the premise: the written form is well under the model's record it would replace"
+    )
+
+    await strategy(messages)
+
+    assert "harder1" in summarizer.log
+    assert (strategy.record_rewrites, strategy.record_rewrites_rejected) == (1, 1), "the same text is no shorter"
+    assert _active_record_ids(messages) == ["rec_res"], "and the model's record stands"
+
+
+async def test_the_wait_reads_a_written_record_arriving_the_same_way_on_both_lists() -> None:
+    """The user half's wait ends when the newest record changes, and a written record has no call id.
+
+    The live path compacts the copies sent on a call and then the store, and the wait reads the
+    newest record off whichever it is handed. A merge on the copies is replayed on the store, and
+    both must then name the newest record alike, or the store pass would read the replay as a
+    second arrival. The pass after that -- the next call's copies -- is the first to see the merged
+    record at the moment the wait looks, and must read it as an arrival; so must a later rewrite,
+    which replaces one written record with another.
+    """
+    summarizer = _RoutingSummarizer(merge=_short_record)
+    budget = await _post_record_size() - 500
+    strategy = _chain_composed(summarizer, ceiling=budget)
+    copies = _chain_conversation()
+    store = copy.deepcopy(copies)
+    model_made = _newest_record_identity(copies)
+
+    await strategy(copies)
+    await strategy(store)
+
+    merged = _newest_record_identity(copies)
+    assert model_made == "call:rec2" and merged.startswith("text:") and merged != model_made
+    assert _newest_record_identity(store) == merged, "the replay is named alike on both lists"
+    assert strategy._anchor == model_made, "neither pass saw the merge before it was made"
+
+    next_copies = copy.deepcopy(store)
+    quiet = strategy._quiet_through
+    await strategy(next_copies)
+    assert strategy._anchor == merged, "the next call's pass reads the merged record as an arrival"
+    assert strategy._quiet_through == _responses(next_copies) + 1 != quiet
+
+    strategy.tool_results.consolidate_records(next_copies, active_record_groups(next_copies), "CODE-1")
+    rewritten = _newest_record_identity(next_copies)
+    assert rewritten.startswith("text:") and rewritten != merged, "a written record replacing a written one"
+    await strategy(next_copies)
+    assert strategy._anchor == rewritten
