@@ -1,5 +1,7 @@
 # Measured results
 
+**Start with the [final report](#final-report-runs-63-and-64-26-september) (runs 63 and 64, 26 September 2026).**
+
 Live-agent runs (`cachebench-live`). Each row of each table is the **median of 3 repeats**;
 the `+-` column is the spread between cheapest and dearest repeat, and a ranking is only
 meaningful where the gap between strategies exceeds it.
@@ -1468,6 +1470,97 @@ So luna writes at great length about the first two lookups and never reaches the
 is a property of the model's writing, not of a setting, and no bound reachable from the CLI moved
 it.
 
+## Final report: runs 63 and 64, 26 September
+
+**Inside the context window, don't compact. Past it, only `tool_and_user_summary_anchored` keeps
+every fact inside a 120K window: 19-23% below an unlimited model at 1.5x the window, and at 3x it
+holds on four seeds of five per model and fails loudly on the fifth.** This section supersedes the
+verdicts of the earlier runs where they conflict; the archived records and per-run notes are in
+[`runs/run-63-final-grid/`](runs/run-63-final-grid/), [`runs/run-64-record-repeats/`](runs/run-64-record-repeats/)
+and [`runs/README.md`](runs/README.md).
+
+### Setup
+
+All twenty strategies, the MAF harness agent, a simulated 120,000-token window, five seeds per
+cell. Six tool lookups carry 60% of the tokens and 53 planted facts; filler user turns carry the
+rest. Reservations: 2,048 output, 12,000 for the closing answers.
+
+| Setting | Value |
+| --- | --- |
+| Models | gpt-5.6-luna (Foundry project endpoint); gpt-6-luna (Azure resource endpoint via `azure-responses`, same Responses API -- the project endpoint returned HTTP 500 for it on every request) |
+| Prices per 1M tokens | 5.6-luna $0.20 in / $0.02 cached / $1.20 out; 6-luna $0.10 / $0.01 / $0.50, cache writes $0.125 (`--price-cache-write`) |
+| Fills | 0.9, 1.5, 3.0 |
+| Spend | $140.56 (run 63) + $15.80 (run 64) |
+
+`seed$` is what the conversation cost, summarizer included, probes excluded. `DQ` is a prompt over
+120K at any point. The control disqualifies at 1.5 and 3.0 and is a price reference, not a
+baseline. A row keeps the facts when its acc1 is at least 90% of the control's.
+
+### Results
+
+Seed$ means over five seeds, disqualified seeds in brackets. Every row shown kept 53/53; `-` is
+below the accuracy bar.
+
+| Strategy | 5.6 / 0.9 | 5.6 / 1.5 | 5.6 / 3.0 | 6 / 0.9 | 6 / 1.5 | 6 / 3.0 |
+| --- | --- | --- | --- | --- | --- | --- |
+| none (control) | $0.067 | $0.147 (5) | $0.467 (5) | $0.035 | $0.075 (5) | $0.226 (5) |
+| tool_and_user_summary_anchored | $0.075 | **$0.120** | $0.438 (1) | $0.035 | $0.058 | $0.205 (1) |
+| tool_summary_anchored, repeats off | $0.074 | $0.234 (1) | $2.51 (5) | $0.035 | **$0.049** | $1.29 (5) |
+| tool_summary_anchored, repeats on | not run | $0.302 (2) | $0.788 (5) | not run | $0.053 | $0.307 (5) |
+| user_summary_anchored | $0.088 | $0.219 (4) | $0.601 (5) | $0.046 | $0.115 (5) | $0.301 (5) |
+| anchored_min_gain | $0.078 | - | - | $0.035 | - | - |
+
+- **0.9:** the best complete rows cost 10-15% more than not compacting on 5.6-luna, inside its 29%
+  seed spread, and within 1% on 6-luna.
+- **1.5:** on 5.6-luna the composed row is the only complete row with no disqualification, -19% on
+  the unlimited control. On 6-luna `tool_summary_anchored` is cheapest (-35%), the composed row -23%.
+- **3.0:** the composed row kept 53/53 inside the window on four seeds of five per model, at seed$
+  0.17-0.43 (5.6) and 0.10-0.13 (6) against the control's 0.47 and 0.23, and disqualified on the fifth.
+- The other fifteen strategies lose facts past the window (truncation, sliding-window and the
+  token-budget rows keep 8-22 of 53) or disqualify.
+
+### Why strategies fail
+
+1. **User text outgrows the window (3x only).** Fill 3.0 carries 69 filler user turns of ~1,636
+   tokens, ~114K. Every anchored row keeps every user turn. The simulator's replay of the cell put
+   the peak prompt at 113,931 tokens of user turns plus one 35,977-token tool result awaiting its
+   record -- the ~155K plateau measured live. Only a row that also summarises user turns can fit.
+2. **An incomplete record.** A lookup the record leaves out is kept whole rather than lost; at 3x
+   each is ~36K, so three missed lookups are ~107K nothing may shed. That is the composed row's one
+   failed seed per model at 3.0 (153-162K, 53/53 kept) and `tool_summary_anchored`'s two on
+   5.6-luna at 1.5 (168K, five missed). A loud failure, not a quiet loss.
+3. **One record per conversation.** With repeats off, `tool_summary_anchored` compacts once and keeps
+   every later tool result, growing to 262-334K at 3.0. Repeats are on by default since `d3aca3450`;
+   they cut that row's 3.0 cost by 69-76% but leave cause 1.
+
+### gpt-6-luna against gpt-5.6-luna
+
+gpt-6-luna costs about half on every row, write premium included, and ranks the strategies the
+same way. Seeding cache hit on the control at 0.9: 94.1% against 93.6%. Both answer the full ~360K
+conversation less reliably (control acc1 76-91% across runs 63 and 64) than the composed row's
+compacted one (87-100%). gpt-6-luna answered rate limits with a one-second `Retry-After` while the
+minute's quota stayed spent; under the old retry policy that failed 17 rows, re-run after
+`d85540c12`.
+
+### Recommendations
+
+| Conversation vs window | Use |
+| --- | --- |
+| Fits (up to ~0.9) | No compaction: the cache already serves ~94% of the prompt |
+| Up to ~1.5x | `tool_and_user_summary_anchored`: the only row complete and within the window on both models |
+| Up to ~1.5x, a model whose single record covers every lookup (`UNCOVERED:0`) | `tool_summary_anchored`: cheapest on 6-luna |
+| ~3x and beyond | `tool_and_user_summary_anchored`, knowing its incomplete-record failure |
+
+### Caveats and open questions
+
+- One workload shape; facts narrated in replies are not tested.
+- The composed row's seed spread reaches +-380% at 3.0 because of its failed seed; 3-25% at 1.5.
+- 17 gpt-6-luna rows were re-run later under lighter load; the failed records are in `set-aside/`.
+- The 2x input rate above 272K is not modelled; only the control and 3.0 disqualifiers cross it.
+- **Next fix:** a chain step for lookups kept whole because a record missed them, measured at 3.0.
+- Beyond 3x at 120K is unmeasured; at 30K and 6.5x (runs 61-62) the composed row kept 197/197 on
+  every seed at 1.3x an unlimited model's cost.
+
 ### Runs 41 to 48 -- the record row's retention is bimodal, 13 September
 
 Re-reading the archive after run 48 printed the record row at 50/53 on the cell where run 47 had
@@ -2396,6 +2489,11 @@ information a strategy keeps should not depend on where in the payload a tool ha
 it.
 
 ## Observations holding across runs
+
+> **Qualified, 26 September 2026.** "No strategy has been both cheaper and as accurate" held for
+> every cell where the whole conversation fit. Past the window it no longer holds: see the final
+> report above (runs 63 and 64), where `tool_and_user_summary_anchored` keeps every fact for less
+> than an unlimited model would pay.
 
 **The correctness result is a cliff, not a gradient.** Strategies that never evict messages
 (`none`, `tool_result`, `selective_tool_call`) lost **0** of 17 facts in every run.
