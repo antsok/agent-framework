@@ -207,6 +207,33 @@ What it shows, and what it is void for:
 No `.sh` is kept: the script that produced it is the same one run 47 uses, and re-running it
 against this tree produces the repaired rows rather than these.
 
+Run 62 is the long cell again on `f615f3dcf`: refused merges and rewrites are no longer re-asked
+(`fe600c0a8`), the chain's decisions are kept across the live path's two lists, and the chain,
+once started, works down to a target below the budget (`--chain-gain-fraction`, default 0.29)
+instead of stopping at it. Settings as run 61, five seeds, $5.06 (run 61: $7.01).
+
+- **Composed seed$ $0.362 against run 61's $0.714 -- down 49%, and every seed lower (0.335-0.391
+  against 0.595-0.887).** Against the unlimited control's $0.280 that is 1.30x, where run 61 was
+  2.6x. The seeding cache hit rose from 36-42% to 56-60%, summarizer spend fell from $0.25-0.53 to
+  $0.09-0.13 per seed, and harder rewrites from 98-194 to 12-20. The chain started 9-10 times per
+  seed and reached its target every time (no `CHAINSHORT`); `CHAINKEPT` 7-16 is its decisions
+  re-applied on the other list.
+- **Compaction lost no fact on any seed.** The control disqualified on all five (197/197) and
+  `truncation` kept 8-10.
+- **Two single-answer readings are low, and both are the model's variance, not compaction.** Seed
+  3 read acc1 52%: one answer declared about eleven whole lookups "not present in this
+  conversation" while their codes were in the snapshot (88 ignored). The five repeated answers
+  on the same final snapshot scored 96, 96, 51, 96, 96% -- 96% being every fact that was fetched,
+  since the agent never called the tool for 8 (`nofetch`, `FETCH`). Seed 4 read acc1 88% with
+  five repeats at 100%. Read acc2 here: 97% mean against acc1's 88%.
+- Run 62b re-ran seed 3 (control and composed row, $0.81) with `--dump-record` to rule out the alternative -- a
+  rewrite that kept the codes but lost which lookup they belong to. It came back 197/197, acc1
+  and acc2 100%, seed$ $0.346, and its final record lists every code under its lookup name
+  (`lookup_extra0=TL-...`). The 52% did not reproduce and the record keeps the mapping.
+- The offline estimate for this change was seed$ $0.28-0.40; it landed at the upper half. The
+  remaining premium over not compacting is the price of running a 195K conversation in a 30K
+  window at all, which the control cannot do.
+
 Run 61 is the long cell run to completion on `b2bfe07d8`, after the two crashes of 59a and 60a:
 a 30,000-token window under a conversation of about 195K (6.5x), 24 tool turns (197 facts), tool
 share 0.4, trigger 0.7, output and answer reservation 6,000. Five seeds, $7.01, no provider
