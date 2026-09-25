@@ -107,6 +107,7 @@ from agent_framework_lab_cachebench._live_cli import (
     _progress,
     _rate,
     _render,
+    _resolve_pricing,
     _row,
     _seed_record,
     _seed_spread,
@@ -3526,6 +3527,68 @@ def test_total_cost_is_the_agent_plus_its_own_summarizer() -> None:
     agent_only = (2_000_000 * 1.0 + 100_000 * 10.0) / 1_000_000
     assert _cost(outcome, pricing) == pytest.approx(agent_only + _summarizer_cost(outcome, pricing))
     assert _summarizer_cost(outcome, pricing) == pytest.approx((500_000 * 1.0 + 50_000 * 10.0) / 1_000_000)
+
+
+def test_a_cache_write_rate_charges_every_uncached_input_token_the_agent_and_summarizer_send() -> None:
+    """With a write premium, a cache miss costs more than the input rate, on both halves of a row.
+
+    The premium is what compaction pays for a broken prefix, so leaving it off a model that
+    bills it (gpt-6-luna, 1.25x) would under-charge exactly the rows that break the cache most.
+    """
+    pricing = ModelPricing(
+        input_per_million=1.0, cached_read_per_million=0.1, output_per_million=10.0, cache_write_per_million=1.25
+    )
+    outcome = LiveOutcome(
+        strategy="summarization",
+        calls=(_call(1, 1, inp=2_000_000, cached=1_000_000, out=100_000),),
+        answer="",
+        snapshot_prompt="",
+        tool_calls_made=0,
+        turns_completed=1,
+        turns_total=1,
+        summarizer_input_tokens=400_000,
+        summarizer_output_tokens=50_000,
+    )
+
+    summarizer = (400_000 * 1.25 + 50_000 * 10.0) / 1_000_000
+    agent = (1_000_000 * 1.25 + 1_000_000 * 0.1 + 100_000 * 10.0) / 1_000_000
+    assert _summarizer_cost(outcome, pricing) == pytest.approx(summarizer)
+    assert _cost(outcome, pricing) == pytest.approx(agent + summarizer)
+    assert "$1.250/M cache write" in pricing.describe()
+    assert "cache write" not in replace(pricing, cache_write_per_million=None).describe()
+
+
+def test_the_cache_write_rate_is_parsed_recorded_and_keeps_its_cell_apart() -> None:
+    """The flag reaches the pricing and the record, and a cell priced with it never pools with one without."""
+    args = build_parser().parse_args([
+        "foundry:gpt-6-luna",
+        "--price-input",
+        "0.10",
+        "--price-cached",
+        "0.01",
+        "--price-cache-write",
+        "0.125",
+    ])
+    pricing = _resolve_pricing(args, "foundry", "gpt-6-luna")
+    assert pricing.cache_write_per_million == pytest.approx(0.125)
+
+    written = _cell_params(price_cache_write=0.125)
+    assert CellParams.from_dict(written.to_dict()).pricing.cache_write_per_million == pytest.approx(0.125)
+    assert written.key != _cell_params().key
+    assert written.model_key != _cell_params().model_key
+
+    older = _cell_params().to_dict()
+    del older["price_cache_write"]
+    assert CellParams.from_dict(older).price_cache_write is None, "no run before 20 charged a write premium"
+    assert CellParams.from_dict(older).key == _cell_params().key
+
+
+def test_the_cache_write_rate_is_refused_without_stated_prices() -> None:
+    """Catalogue rates carry no write price, so one given alone would be silently mixed with them."""
+    args = build_parser().parse_args(["openrouter:some/model", "--price-cache-write", "0.125"])
+
+    with pytest.raises(SystemExit, match="--price-cache-write needs --price-input"):
+        _resolve_pricing(args, "openrouter", "some/model")
 
 
 def _priced(strategy: str, inp: int) -> LiveOutcome:

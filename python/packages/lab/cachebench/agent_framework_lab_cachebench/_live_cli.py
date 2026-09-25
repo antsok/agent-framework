@@ -759,6 +759,17 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--price-input", type=float, default=None, help="Input price per million tokens.")
     parser.add_argument("--price-cached", type=float, default=None, help="Cached-read price per million tokens.")
     parser.add_argument("--price-output", type=float, default=None, help="Output price per million tokens.")
+    parser.add_argument(
+        "--price-cache-write",
+        type=float,
+        default=None,
+        help=(
+            "Cache-write price per million tokens, for a model that bills the uncached part of a "
+            "prompt above the input rate (gpt-6-luna: 1.25x). When set, every uncached input token, "
+            "the summarizer's included, is charged at this rate instead of --price-input. Omit it "
+            "for a model that charges no write premium."
+        ),
+    )
     parser.add_argument("--tokenizer", default="tiktoken", choices=list(TOKENIZER_NAMES), help="Token counter.")
     parser.add_argument(
         "--no-force-tool-calls",
@@ -841,7 +852,10 @@ def _resolve_pricing(args: argparse.Namespace, provider: str, model: str) -> Mod
             input_per_million=args.price_input,
             cached_read_per_million=args.price_cached if args.price_cached is not None else args.price_input,
             output_per_million=args.price_output if args.price_output is not None else args.price_input,
+            cache_write_per_million=args.price_cache_write,
         )
+    if args.price_cache_write is not None:
+        raise SystemExit("--price-cache-write needs --price-input: the catalogue rates carry no cache-write price.")
     if provider == "openrouter":
         try:
             return fetch_openrouter_pricing(model)
@@ -880,10 +894,12 @@ def _summarizer_cost(outcome: LiveOutcome, pricing: ModelPricing) -> float:
     once leaked one strategy's summarizer spend into every later row as a flat addition,
     which a single total cannot show but a per-row column makes obvious.
     """
+    # No cached count is reported for these calls, so all of their input is priced as uncached,
+    # at the cache-write rate where the model charges one, as the agent's own uncached input is.
     return (
-        outcome.summarizer_input_tokens * pricing.input_per_million
-        + outcome.summarizer_output_tokens * pricing.output_per_million
-    ) / 1_000_000
+        pricing.input_cost(outcome.summarizer_input_tokens, 0)
+        + outcome.summarizer_output_tokens * pricing.output_per_million / 1_000_000
+    )
 
 
 def _sample_scores(outcome: LiveOutcome, scenario: RecallScenario) -> tuple[RecallScore, ...]:
@@ -2574,10 +2590,7 @@ def _render(
             f"Model: {cell_params.model}   agent: {cell_params.agent_kind}   "
             f"probe repeats: {cell_params.probe_repeats} (acc1), {cell_params.combined_repeats} (acc2)"
         ),
-        (
-            f"Pricing: ${pricing.input_per_million:.2f}/M in, "
-            f"${pricing.cached_read_per_million:.3f}/M cached, ${pricing.output_per_million:.2f}/M out"
-        ),
+        f"Pricing: {pricing.describe()}",
         _ranking_note(
             cleared,
             len(ranked_rows),
@@ -3439,11 +3452,7 @@ def _across_cells(groups: Sequence[_CellGroup]) -> str:
         pricing = first.pricing
         lines += [
             "",
-            (
-                f"Model: {first.provider}:{first.model}  agent {first.agent_kind}  at "
-                f"${pricing.input_per_million:.2f}/M in, ${pricing.cached_read_per_million:.3f}/M cached, "
-                f"${pricing.output_per_million:.2f}/M out"
-            ),
+            f"Model: {first.provider}:{first.model}  agent {first.agent_kind}  at {pricing.describe()}",
         ]
         by_workload: dict[tuple[Any, ...], list[_CellGroup]] = {}
         for group in model_groups:
@@ -3856,6 +3865,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
         price_input=pricing.input_per_million,
         price_cached=pricing.cached_read_per_million,
         price_output=pricing.output_per_million,
+        price_cache_write=pricing.cache_write_per_million,
         min_correctness=min_correctness,
         plan=plan,
         workload=workload,
