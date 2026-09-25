@@ -254,7 +254,19 @@ __all__ = [
 #: second list replaying a refusal as a second attempt and a second refusal, and from 18 that
 #: replay is a skip, so a composed row's two counts before 18 read higher for the same work.
 #: ``RECMERGESKIP``, the same rule on step a, is a flag and not a field.
-SCHEMA_VERSION: Final[int] = 18
+#:
+#: 19 adds ``chain_gain_fraction`` to the settings block, on the version 5 argument. Before it the
+#: composed row's chain stopped as soon as the prompt fitted the budget, which left it just under
+#: the budget for the next turn to push back over; from 19 a firing goes on until it has removed
+#: that share of the tokens behind its earliest edit. The field reads back as zero on an older
+#: record, because zero is what those runs did. The same version keeps every decision the chain
+#: makes -- a merge, a rewrite, a fold, narration shed -- on both of the live path's lists, where
+#: before it a decision made on a call's copies reached the store only if the store's pass was
+#: over the budget too, and otherwise was undone on the next call. No field records that, and it
+#: moves two flags: ``RECMERGE`` and ``USERMERGE`` counted the store's replay of a copies-pass
+#: merge as a second one, and from 19 count each decision once, with ``CHAINKEPT`` counting the
+#: passes that put one back.
+SCHEMA_VERSION: Final[int] = 19
 
 #: Versions this reader accepts, which is not only the current one.
 #:
@@ -336,7 +348,10 @@ SCHEMA_VERSION: Final[int] = 18
 #:
 #: Version 17 joins on the same argument: its chain never skipped a rewrite, so
 #: ``record_rewrites_skipped`` reads back as the zero those runs produced.
-_READABLE_SCHEMAS: Final[frozenset[int]] = frozenset({*range(2, 18), SCHEMA_VERSION})
+#:
+#: Version 18 joins on the same argument: its chain stopped at the budget, so
+#: ``chain_gain_fraction`` reads back as the zero those runs used.
+_READABLE_SCHEMAS: Final[frozenset[int]] = frozenset({*range(2, 19), SCHEMA_VERSION})
 
 #: The parameters that make two records the same cell, and so aggregable into one row.
 #:
@@ -631,6 +646,14 @@ class StrategySettings:
     Read by that row alone. Zero on a record written before schema 16, and that is what those runs
     could do: the row had no chain.
     """
+    chain_gain_fraction: float
+    """Share of the tokens behind its earliest edit that the composed row's chain removed once started.
+
+    Read by ``tool_and_user_summary_anchored`` alone. Zero on a record written before schema 19,
+    and that is what those runs did: the chain stopped at the budget. Two runs at different values
+    are not one cell -- the setting decides how often the chain fires and so the whole cache side
+    of the row.
+    """
     token_budget_fraction: float
     max_output_tokens: int
     """The output reservation, which every anchored and composed ceiling is the window less.
@@ -726,6 +749,9 @@ def _settings_from_dict(data: Mapping[str, Any]) -> StrategySettings:
         # The band-share licence once more, schema 16 along: an older composed row had no chain,
         # which is a harder-attempt count of zero, and the single rows never read it.
         record_harder_attempts=int(data.get("record_harder_attempts", 0)),
+        # The same licence, schema 19 along: an older composed row's chain stopped at the budget,
+        # which is a gain fraction of zero, and the single rows never read it.
+        chain_gain_fraction=float(data.get("chain_gain_fraction", 0.0)),
         token_budget_fraction=float(data["token_budget_fraction"]),
         max_output_tokens=int(data["max_output_tokens"]),
         answer_max_tokens=int(data["answer_max_tokens"]),

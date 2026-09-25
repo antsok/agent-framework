@@ -65,6 +65,7 @@ from agent_framework import (
 
 from .compaction import (
     DEFAULT_BAND_SHARE,
+    DEFAULT_CHAIN_GAIN_FRACTION,
     DEFAULT_COVERAGE_SHARE,
     DEFAULT_FALLBACK_FRACTION,
     DEFAULT_HARDER_ATTEMPTS,
@@ -218,6 +219,16 @@ class StrategyOptions:
 
     Step c of that row's last-resort chain, and read by no other row. ``compaction/_composed``
     says why the default is two; zero switches the step off.
+    """
+    chain_gain_fraction: float = DEFAULT_CHAIN_GAIN_FRACTION
+    """Share of the tokens behind its earliest edit that ``tool_and_user_summary_anchored``'s chain removes.
+
+    The chain's hysteresis, read by that row alone: once the prompt is over the input budget
+    the chain goes on, past the budget, until a firing has removed this share of what stands
+    behind the earliest edit it made, so the next turns fit without another early edit. The
+    default is the break-even share an edit must remove to repay the re-bill it causes, the
+    anchored floor's number; ``compaction/_composed`` carries the argument. Zero stops the chain
+    at the budget, as it stopped before the setting existed.
     """
     token_budget_fraction: float = 0.5
     summarizer: SupportsChatGetResponse[Any] | None = None
@@ -461,6 +472,7 @@ def _build_tool_and_user_summary_anchored(options: StrategyOptions) -> Compactio
             replace(options, user_summary_mode=SUMMARY_MODE_BOUNDARY), remembered_requests=2
         ),
         harder_attempts=options.record_harder_attempts,
+        chain_gain_fraction=options.chain_gain_fraction,
     )
 
 

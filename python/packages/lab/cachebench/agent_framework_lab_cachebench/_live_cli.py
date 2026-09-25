@@ -53,6 +53,7 @@ from ._summary import DEFAULT_MIN_CORRECTNESS, JointOutcome, JointVerdict, recom
 from ._tokenizers import TOKENIZER_NAMES, build_tokenizer
 from .compaction import (
     DEFAULT_BAND_SHARE,
+    DEFAULT_CHAIN_GAIN_FRACTION,
     DEFAULT_COVERAGE_SHARE,
     DEFAULT_FALLBACK_FRACTION,
     DEFAULT_HARDER_ATTEMPTS,
@@ -555,6 +556,23 @@ def build_parser() -> argparse.ArgumentParser:
             "attempts and RECHARDERREJ the ones refused; an attempt refused on a record is not made "
             "again, nor any milder one, until the record changes, and RECHARDERSKIP counts those. "
             "0 switches the step off. "
+            "Default %(default)s."
+        ),
+    )
+    parser.add_argument(
+        "--chain-gain-fraction",
+        type=float,
+        default=DEFAULT_CHAIN_GAIN_FRACTION,
+        help=(
+            "How far tool_and_user_summary_anchored's last-resort chain compacts once it has "
+            "started, which it does only when the prompt is over the input budget: until it has "
+            "removed this share of the tokens behind the earliest edit it made on that pass, past "
+            "the budget if need be, rather than stopping as soon as the prompt fits. Every firing "
+            "re-bills what stands behind its earliest edit, so one that stops just under the "
+            "budget fires again on the next turn; the default is the break-even share an edit "
+            "must remove to repay that re-bill, the same as --min-gain-fraction's. Read by no "
+            "other row. CHAINTARGET counts firings that reached the target and CHAINSHORT the "
+            "ones every step left above it. 0 stops the chain at the budget, as before schema 19. "
             "Default %(default)s."
         ),
     )
@@ -2305,8 +2323,9 @@ _LEGEND: Final[tuple[str, ...]] = (
     "            reads several. Beside a RECORDS that grew it is the wait ending in a record,",
     "            and any USERCOMPACT then acted on what the record left; with no record it",
     "            ran out, and the USERCOMPACT after it is the user half acting anyway.",
-    "            tool_and_user_summary_anchored's last-resort chain, which runs only while",
-    "            the prompt is over the input budget after both halves, reads in order:",
+    "            tool_and_user_summary_anchored's last-resort chain, which starts only when",
+    "            the prompt is over the input budget after both halves and, from schema 19,",
+    "            then works down to a target below it (--chain-gain-fraction), reads in order:",
     "            RECMERGE:<n> passes that merged the records into one, and RECMERGEREJ:<n>",
     "            merges refused as no smaller than the records; USERMERGE:<n> passes that",
     "            folded the user summaries into one, and USERMERGEREJ:<n> folds refused;",
@@ -2321,7 +2340,11 @@ _LEGEND: Final[tuple[str, ...]] = (
     "            replacement is kept on size alone -- non-empty and smaller than what it",
     "            replaces -- and never checked against content, so what a merge lost is",
     "            read in facts and acc1, not here. LASTFALLBACK beside DQ is the chain",
-    "            exhausted: the intended loud failure.",
+    "            exhausted: the intended loud failure. CHAINTARGET:<n> passes the chain",
+    "            started on and brought down to its target, and CHAINSHORT:<n> passes every",
+    "            step left above it; CHAINKEPT:<n> passes that put back a merge, rewrite, fold",
+    "            or shed the chain had made on the live path's other list, which from schema",
+    "            19 is kept on both, so RECMERGE and USERMERGE count each decision once.",
     "            REFORCED:<n> calls the recall middleware pinned at the strategy's own request,",
     "            because the standing record left tool groups uncovered: layer one of the",
     "            answer to the gap UNCOVERED beside RECFALLBACK names, where the fallback could",
@@ -2783,6 +2806,7 @@ def _strategy_options(args: argparse.Namespace, tokenizer: Any, summarizer: Any 
         user_min_band_share=args.user_min_band_share,
         user_summary_mode=args.user_summary_mode,
         record_harder_attempts=args.record_harder_attempts,
+        chain_gain_fraction=args.chain_gain_fraction,
         token_budget_fraction=args.budget_fraction,
         summarizer=summarizer,
     )
@@ -2833,6 +2857,7 @@ def _strategy_settings(
         user_min_band_share=options.user_min_band_share,
         user_summary_mode=options.user_summary_mode,
         record_harder_attempts=options.record_harder_attempts,
+        chain_gain_fraction=options.chain_gain_fraction,
         token_budget_fraction=options.token_budget_fraction,
         max_output_tokens=options.max_output_tokens,
         answer_max_tokens=args.answer_max_tokens,

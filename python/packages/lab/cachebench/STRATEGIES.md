@@ -552,6 +552,27 @@ the same pass asks it. A skipped step moves the chain on exactly as a refusal do
 summaries' fold needs none of this: the user half's own replay memory already answers a fold over
 unchanged summaries.
 
+**What the chain decides on one list is what the other holds** (schema 19). The live path
+compacts a call's copies and then the store, and the chain starts only on a list over the budget.
+A call's copies can be over while the store is under -- a record arriving on the next call lets
+the record half drop the lookup the copies still carried -- and the store then kept what the model
+had been sent without: the next call was sent the old record, the unfolded summaries or the
+unshed narration again, an early edit made and undone, and a later firing re-asked the identical
+summarizer request (offline at run 60's settings with a fuzzed model, 2 to 63 requests a seed).
+Every merge, rewrite, fold and shed the chain makes is now kept for the run and put back on any
+list that holds what it changed, whatever that list's size: `CHAINKEPT`. `RECMERGE` and
+`USERMERGE` therefore count each decision once, where the store's replay used to count a second.
+
+**Once started, the chain compacts to a target, not to the budget** (schema 19,
+`--chain-gain-fraction`). Stopping as soon as the prompt fitted left it just under the budget, the
+next turn put it back over, and nearly every call paid a re-bill from an early edit -- run 61
+seeded at a 38% hit rate against the control's 98%. A firing now goes on until it has removed
+`chain_gain_fraction` of the tokens behind its earliest edit, the break-even share an edit must
+remove to repay its own re-bill (`R > B(p - c)/(p + T*c)`, the anchored floor's derivation and
+number, 0.29). The fallback's narration shedding does most of it; merges and folds help once;
+the harder rewrites barely move a record dense with codes. A target the steps cannot reach ends
+the chain where they left the prompt: `CHAINTARGET` and `CHAINSHORT`. Zero is the old behaviour.
+
 **Why the alignment runs down to 0.6 and not up to 0.8.** The record is written by a model
 reading the tool payload, and it is measured degrading with the bulk it is given, so a record
 asked for at 0.8 is a bigger ask and a worse record. The middleware that does the asking reads

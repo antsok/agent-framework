@@ -48,6 +48,7 @@ beats a silent loss it cannot.
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Final
 
@@ -116,6 +117,14 @@ REMOVAL_MARKER: Final[str] = "... removed by compaction"
 
 #: Prefix of the ``message_id`` given to every note this strategy leaves behind.
 MARKER_ID_PREFIX: Final[str] = "anchored_"
+
+#: The two group kinds the shed step removes, and the note each leaves in its place.
+_TOOL_CALL: Final[str] = "tool_call"
+_ASSISTANT_TEXT: Final[str] = "assistant_text"
+_NOTES: Final[dict[str, str]] = {
+    _TOOL_CALL: "[compacted: an earlier tool call and its result]",
+    _ASSISTANT_TEXT: "[compacted: an earlier assistant reply]",
+}
 
 #: Ceiling on shed passes. Two is enough in practice; the bound exists so a mistake in the
 #: termination condition cannot become an infinite loop inside a chat client.
@@ -250,7 +259,24 @@ class AnchoredCompactionStrategy:
         self.collapse_assistant_text = collapse_assistant_text
 
     async def __call__(self, messages: list[Message]) -> bool:
-        """Compact in place and report whether anything changed.
+        """Compact in place down to :attr:`max_input_tokens`, and report whether anything changed.
+
+        :meth:`compact_to` at this strategy's own ceiling, which is all a standalone row ever
+        asks for.
+
+        Returns:
+            True if any message was excluded or replaced. False does not imply the prompt now
+            fits -- check ``included_token_count`` for that.
+        """
+        return await self.compact_to(messages, ceiling=self.max_input_tokens)
+
+    async def compact_to(self, messages: list[Message], *, ceiling: int) -> bool:
+        """Compact in place, shedding until the prompt is at or under ``ceiling``.
+
+        The composed row's seam: its last-resort chain hands this a ceiling below the input
+        budget when it compacts to a target rather than to the budget -- see
+        ``compaction/_composed``. The shortening step does not read the ceiling at all, since it
+        is decided by position alone; only how far the shedding goes does.
 
         The shed loop below terminates on "nothing moved" rather than on "the ceiling is met",
         and that is what makes preservation safe. A preserved group is skipped but still
@@ -260,6 +286,12 @@ class AnchoredCompactionStrategy:
         ceiling: the caller sees a prompt it must deal with, instead of a strategy quietly
         eating the one message another strategy has made irreplaceable, or spinning against a
         band it is no longer allowed to touch.
+
+        Args:
+            messages: The conversation, mutated in place.
+
+        Keyword Args:
+            ceiling: Included tokens the shedding stops at.
 
         Returns:
             True if any message was excluded or replaced. False does not imply the prompt now
@@ -289,11 +321,11 @@ class AnchoredCompactionStrategy:
         # prompt fractionally over the ceiling it just tried to meet. Bounded: every pass
         # removes at least one group, and there are finitely many.
         for _ in range(_MAX_SHED_PASSES):
-            if included_token_count(messages) <= self.max_input_tokens:
+            if included_token_count(messages) <= ceiling:
                 break
-            shed = self._shed(messages, "tool_call", "[compacted: an earlier tool call and its result]")
-            if self.collapse_assistant_text and included_token_count(messages) > self.max_input_tokens:
-                shed = self._shed(messages, "assistant_text", "[compacted: an earlier assistant reply]") or shed
+            shed = self._shed(messages, _TOOL_CALL, ceiling=ceiling)
+            if self.collapse_assistant_text and included_token_count(messages) > ceiling:
+                shed = self._shed(messages, _ASSISTANT_TEXT, ceiling=ceiling) or shed
             changed = shed or changed
             if not shed:
                 break
@@ -508,7 +540,7 @@ class AnchoredCompactionStrategy:
             chars = int(chars * tokens / max(counted, 1))
         return max(chars, 0)
 
-    def _shed(self, messages: list[Message], kind: str, note: str) -> bool:
+    def _shed(self, messages: list[Message], kind: str, *, ceiling: int) -> bool:
         """Exclude whole groups of one kind from the band, oldest first, until the ceiling is met.
 
         Exclusion and insertion are separated on purpose. Excluding leaves every index in the
@@ -520,7 +552,9 @@ class AnchoredCompactionStrategy:
         Args:
             messages: The message list, mutated in place.
             kind: Group kind to shed, one of ``"tool_call"`` or ``"assistant_text"``.
-            note: Text left in place of each dropped group.
+
+        Keyword Args:
+            ceiling: Included tokens the shedding stops at.
 
         Returns:
             True if any group was dropped.
@@ -531,7 +565,7 @@ class AnchoredCompactionStrategy:
         for group in band:
             if group.get("kind") != kind:
                 continue
-            if included_token_count(messages) <= self.max_input_tokens:
+            if included_token_count(messages) <= ceiling:
                 break
             members = messages[group["start_index"] : group["end_index"] + 1]
             if all(message.additional_properties.get(EXCLUDED_KEY, False) for message in members):
@@ -560,12 +594,62 @@ class AnchoredCompactionStrategy:
             dropped.append(group)
 
         for group in reversed(dropped):
-            self._insert_note(messages, group, note)
+            self._insert_note(messages, group, _NOTES[kind])
         if dropped:
             # Each note is itself a message with a cost. Counting it only on the next call
             # would let this one stop just above its ceiling and look as though it had met
             # it -- and on the following turn the strategy would shed one more group,
             # changing a decision it had already made.
+            annotate_token_counts(messages, tokenizer=self.tokenizer)
+        return bool(dropped)
+
+    def shed_again(self, messages: list[Message], message_ids: Collection[str]) -> bool:
+        """Shed again every group an earlier pass shed, found by its messages' ids.
+
+        The composed row's seam for keeping a decision this strategy made on one list: the live
+        path compacts a model call's copies and then the stored history, and a group shed on the
+        copies is sent without it while the store still holds it -- so the next call would be
+        sent it again. This takes the same groups off whatever list it is given, whatever its
+        size, with the note :meth:`_shed` leaves, so every list that carries them agrees with
+        the prompt the model was already sent.
+
+        Read off the whole conversation rather than the band: the band is counted in positions,
+        and two lists holding different tails can place the same group differently. The rules
+        :meth:`_shed` keeps are kept here too -- a preserved group, a group whose call and
+        result would not leave together, and a note are never shed -- and a group is shed only
+        when every one of its messages carries an id in ``message_ids``, so a group that has
+        gained a message since is left alone.
+
+        Args:
+            messages: The conversation, mutated in place.
+            message_ids: The ids of the messages shed before.
+
+        Returns:
+            True if any group was shed.
+        """
+        if not message_ids:
+            return False
+        annotate_message_groups(messages)
+        spans = group_messages(messages)
+        dropped: list[dict[str, Any]] = []
+        for group in spans:
+            kind = group.get("kind")
+            if kind not in _NOTES:
+                continue
+            members = messages[group["start_index"] : group["end_index"] + 1]
+            if not all(message.message_id in message_ids for message in members):
+                continue
+            if all(message.additional_properties.get(EXCLUDED_KEY, False) for message in members):
+                continue
+            if any_preserved(members) or not removable_whole(messages, spans, group):
+                continue
+            for message in members:
+                set_excluded(message, excluded=True, reason=EXCLUDE_REASON)
+            dropped.append(group)
+        for group in reversed(dropped):
+            self._insert_note(messages, group, _NOTES[str(group["kind"])])
+        if dropped:
+            annotate_message_groups(messages)
             annotate_token_counts(messages, tokenizer=self.tokenizer)
         return bool(dropped)
 
