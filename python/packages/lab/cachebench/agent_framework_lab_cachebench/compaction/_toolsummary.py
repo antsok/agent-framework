@@ -1913,20 +1913,21 @@ class ToolResultRecallMiddleware(ChatMiddleware):
             same constant the strategy defaults to, so the two halves cannot silently disagree
             about when a record is wanted.
         repeat_records: Let the size trigger ask again once there is new tool work to record.
-            **Off by default**, which is also what this did before repeats existed, so a run
-            left alone is comparable with one taken before them.
+            **On by default** since run 63. Off, the strategy compacts exactly once: the first
+            record is written when the prompt passes the trigger, and every tool result after
+            it is never recorded and, since it is held from the fallback, never shortened, so
+            a conversation that keeps going grows until it passes the window. Run 63 measured
+            that at three times the window: the row disqualified on every seed of both models,
+            peaking at 270-292K against 120K. Off is right only for a conversation that ends
+            soon after it first outgrows its window, which is not a default a framework can
+            assume.
 
-            Off is the default because on is conditional and the condition is not knowable
-            from here. Repeats help exactly when one record cannot cover the whole
-            conversation, and the signal for that is the strategy's own
-            ``groups_kept_uncovered`` -- the ``UNCOVERED:<n>`` flag -- being non-zero: those
-            are groups the record never named and the strategy refused to drop. Where a record is
-            already complete, a second one is duplication, and duplication here is preserved,
-            unshrinkable prompt. Measured in run 40: on ``gpt-5.4-mini``, whose records carry
-            every value from every group, repeats produced negative shrink on all three seeds
-            (-1%, -4%, -2%); on ``gpt-5.6-luna``, whose record covered two of six groups, they
-            were better on every axis. A framework cannot tell those two models apart in
-            advance, so the safe default is the one that cannot hurt the complete-record case.
+            What on costs where one record is already complete: a second one is duplication,
+            and duplication here is preserved, unshrinkable prompt. Run 40 measured it on
+            ``gpt-5.4-mini``, whose records carry every value from every group: -1%, -4% and
+            -2% shrink on three seeds. Pass ``False`` for such a model and a bounded
+            conversation. Records still accumulate with this on and nothing here merges them;
+            ``tool_and_user_summary_anchored``'s last-resort chain is what does.
 
             Repeating cannot be done by reading size alone, and the gate that used to sit here
             is why: the size that fired the trigger does not go away when a record arrives,
@@ -1985,7 +1986,7 @@ class ToolResultRecallMiddleware(ChatMiddleware):
         trigger_fraction: float = DEFAULT_TRIGGER_FRACTION,
         record_max_tokens: int | None = DEFAULT_RECORD_MAX_TOKENS,
         max_groups_before_record: int | None = None,
-        repeat_records: bool = False,
+        repeat_records: bool = True,
         reforce: Callable[[], bool] | None = None,
     ) -> None:
         """Validate and store the configuration.
@@ -2203,7 +2204,7 @@ class ToolResultRecallMiddleware(ChatMiddleware):
         - the size trigger asks for the *first* record as soon as the prompt passes
           ``trigger_fraction`` of the ceiling;
         - it asks again only when ``pending`` is at least one -- and not at all when
-          ``repeat_records`` is off, which is what every run before repeats existed did.
+          ``repeat_records`` is off, which is what every run up to 63 did.
 
         **Why the second record needs ``pending`` and the first does not.** The size that fires
         the trigger does not go away once a record exists: the record is *added* to the

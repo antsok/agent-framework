@@ -453,7 +453,7 @@ def _build_tool_and_user_summary_anchored(options: StrategyOptions) -> Compactio
     half runs in ``boundary``, so its summaries stand rather than being re-summarised, and it
     remembers two summarizer requests rather than one, because its last-resort chain may ask for
     a fold on the pass that summarised a band. ``--record-repeats``: the recall middleware asks
-    again for every new batch of tool work on this row whatever that flag says -- the composed
+    again for every new batch of tool work on this row even under ``--no-record-repeats`` -- the composed
     object reports ``repeat_records`` and ``run_live`` reads it. ``compaction/_composed`` carries
     the argument for all three.
 

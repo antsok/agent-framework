@@ -86,8 +86,8 @@ reads its own ``trigger_fraction`` exactly as before.
 
 **How this row configures its halves, and what it leaves alone.** Repeated records and the
 boundary mode are this row's configuration, not new defaults for the objects: the recall
-middleware's ``repeat_records`` stays off for ``tool_summary_anchored`` unless
-``--record-repeats`` is passed, and the user-turn strategy's default mode stays
+middleware's ``repeat_records`` follows ``--record-repeats`` for ``tool_summary_anchored``
+(on by default since run 63) and stays on here whatever that says, and the user-turn strategy's default mode stays
 ``recompact`` for ``user_summary_anchored``. Repeats are requested through
 :attr:`ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy.repeat_records`, which the
 run reads when it wires the middleware; the boundary mode is set by ``_strategies``' builder for
