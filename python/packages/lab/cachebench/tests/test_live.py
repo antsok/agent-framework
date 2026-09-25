@@ -1894,6 +1894,7 @@ async def test_the_recall_middleware_is_wired_for_the_composed_strategy(monkeypa
     ("strategy_name", "repeat_flag", "expected"),
     [
         ("tool_and_user_summary_anchored", False, True),
+        ("tool_and_user_summary_anchored", True, True),
         ("tool_summary_anchored", False, False),
         ("tool_summary_anchored", True, True),
     ],
@@ -1906,7 +1907,7 @@ async def test_the_composed_row_records_every_new_batch_of_tool_work_and_the_rec
     The composed row's record half has to ask again whenever tool work no record covers has
     accumulated past the trigger, and the setting that does that lives on the recall middleware
     the run builds. So the composed row turns it on whatever ``--record-repeats`` says, and the
-    standalone ``tool_summary_anchored`` row keeps its default: off, unless the flag asks.
+    standalone ``tool_summary_anchored`` row follows the flag.
     """
     built: list[dict[str, Any]] = []
     real = build_live_agent
@@ -7299,12 +7300,11 @@ async def test_the_record_repeat_setting_reaches_the_run_that_installs_the_middl
 ) -> None:
     """A reproducibility flag that stops at the parser is worse than not having one.
 
-    ``--record-repeats`` is off by default, so the default is the axis runs 26-39 were measured
-    on and the flag is what leaves it. A flag that parsed, appeared in the archived command
-    line, and then never reached the middleware would produce a cell labelled repeating that was
-    not one, and the comparison it exists for would be made against the wrong thing with nothing
-    saying so. Run 40 is why the default is this way round: repeats cost ``gpt-5.4-mini``
-    shrink on all three seeds, whose records were already complete.
+    ``--record-repeats`` is on by default since run 63, and ``--no-record-repeats`` is what
+    reproduces every run before it. A flag that parsed, appeared in the archived command line,
+    and then never reached the middleware would produce a cell labelled one way that ran the
+    other, and the comparison it exists for would be made against the wrong thing with nothing
+    saying so.
     """
     _stub_provider(monkeypatch)
     live = run_live
@@ -7318,10 +7318,10 @@ async def test_the_record_repeat_setting_reaches_the_run_that_installs_the_middl
 
     await run_live_comparison(build_parser().parse_args(_live_argv()))
     default = list(seen)
-    await run_live_comparison(build_parser().parse_args(_live_argv("--record-repeats")))
+    await run_live_comparison(build_parser().parse_args(_live_argv("--no-record-repeats")))
 
-    assert default and not any(default), "repeats are off unless the run asks for them"
-    assert all(seen[len(default) :]), "and on for every strategy-seed of a run that does"
+    assert default and all(default), "repeats are on unless the run turns them off"
+    assert not any(seen[len(default) :]), "and off for every strategy-seed of a run that does"
 
 
 async def test_every_finished_seed_is_on_disk_before_the_cell_is(
@@ -8360,23 +8360,22 @@ def test_the_workload_block_is_what_the_run_resolves_from_the_flags() -> None:
     assert _workload_settings(build_parser().parse_args(_live_argv())) == _workload()
 
 
-def test_record_repeats_are_off_unless_a_run_asks_for_them() -> None:
-    """Run 40 does not support them as a default, and the flag reads the way round that says so.
+def test_record_repeats_are_on_unless_a_run_turns_them_off() -> None:
+    """Off, ``tool_summary_anchored`` compacts once and then grows, which is no default.
 
-    Repeats were better on ``gpt-5.6-luna``, whose record named two of six tool groups, and worse
-    on every axis on ``gpt-5.4-mini``, whose records are complete: -1%, -4% and -2% shrink on the
-    three seeds, because a second record is duplication added to the prompt as preserved,
-    unshrinkable tokens. Whether one record can cover a conversation is a property of the model
-    and the workload, which a framework cannot know, so the default is the one that cannot hurt.
-    A ``--no-record-repeats`` flag would be a double negative over an off default, so the flag is
-    the positive form.
+    Run 63, at three times a 120K window: with repeats off the row wrote one record, kept every
+    later tool result whole, and disqualified on every seed of both models at 270-292K. The
+    cost of on is duplication where one record is already complete (run 40, ``gpt-5.4-mini``,
+    -1% to -4% shrink), which matters only for a conversation that ends soon after it outgrows
+    its window; that caller turns them off.
     """
     parser = build_parser()
 
-    assert parser.parse_args(["azure"]).record_repeats is False
+    assert parser.parse_args(["azure"]).record_repeats is True
+    assert parser.parse_args(["azure", "--no-record-repeats"]).record_repeats is False
     assert parser.parse_args(["azure", "--record-repeats"]).record_repeats is True
-    assert signature(run_live).parameters["repeat_records"].default is False
-    assert signature(ToolResultRecallMiddleware).parameters["repeat_records"].default is False
+    assert signature(run_live).parameters["repeat_records"].default is True
+    assert signature(ToolResultRecallMiddleware).parameters["repeat_records"].default is True
     assert "UNCOVERED" in parser.format_help(), "the help has to name the signal that says repeats would help"
 
 
@@ -8581,7 +8580,7 @@ async def test_the_settings_recorded_are_the_resolved_ones_rather_than_the_flags
     assert settings is not None
     assert settings.keep_tokens is None, "0 is the absence of a fixed retention, not a retention of nothing"
     assert settings.record_max_tokens is None, "0 leaves the run's own cap in place"
-    assert settings.repeat_records is False
+    assert settings.repeat_records is True, "on unless --no-record-repeats"
     assert settings.band_share == 0.4
     assert settings.tokenizer == "estimator"
     assert seen == [

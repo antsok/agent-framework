@@ -1070,14 +1070,17 @@ async def test_the_middleware_pins_the_call_after_the_strategys_ask_and_counts_i
     The middleware holds no reference to the strategy, so the strategy's decision reaches it
     the way the gate's does: through one callable it asks on the exit of every call it did not
     pin. The size trigger is kept out of range here so the only thing that can pin is the ask,
-    and repeats are left at their default of off, because this must fire without them -- it
-    asks on a measured shortfall, which is exactly the case the repeats default protects
-    against firing on.
+    and repeats are turned off, because this must fire without them -- it asks on a measured
+    shortfall, which a caller who turned repeats off for a complete-record model still needs.
     """
     _armings.clear()
     strategy = _chained()
     middleware = ToolResultRecallMiddleware(
-        max_input_tokens=10_000_000, tokenizer=TOKENIZER, arm=lambda: _armings.append(1), reforce=strategy.take_reforce
+        max_input_tokens=10_000_000,
+        tokenizer=TOKENIZER,
+        arm=lambda: _armings.append(1),
+        reforce=strategy.take_reforce,
+        repeat_records=False,
     )
     messages = _conversation(tool_turns=6, record=_covering_record(2))
 

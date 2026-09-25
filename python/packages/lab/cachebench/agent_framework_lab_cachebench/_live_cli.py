@@ -424,20 +424,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--record-repeats",
-        action="store_true",
+        action=argparse.BooleanOptionalAction,
+        default=True,
         help=(
             "Let the size trigger ask for a further recall record once the agent has done tool "
-            "work no existing record accounts for. Off by default, which is also what every run "
-            "up to and including 39 did, so a row is comparable with those unless this is set. "
-            "Read UNCOVERED before setting it: a non-zero UNCOVERED:<n> in the flags column "
-            "means one record is not covering the whole conversation -- the strategy keeps every "
-            "group the record never named -- and that is the condition repeats are for. At "
-            "UNCOVERED:0 they can only cost: run 40 measured them on gpt-5.4-mini, whose records "
-            "are already complete, at -1%%, -4%% and -2%% shrink on three seeds, because a second "
-            "record is duplication added to the prompt as preserved, unshrinkable tokens. On "
-            "gpt-5.6-luna, whose record covered two of six groups, they were better on every "
-            "axis. Whether one record can cover everything is a property of the model and the "
-            "workload, which is why this is a flag and not a default. --max-groups-before-record "
+            "work no existing record accounts for. On by default since run 63; every run up to "
+            "it had this off, so pass --no-record-repeats to compare a row with those. Off, "
+            "tool_summary_anchored compacts once and then grows: every tool result after its "
+            "first record stays whole, and at three times the window run 63 disqualified it on "
+            "every seed of both models. Where one record already covers everything (UNCOVERED:0) "
+            "a second is duplication added as preserved, unshrinkable tokens -- run 40 measured "
+            "-1%%, -4%% and -2%% shrink on gpt-5.4-mini -- which only matters for a conversation "
+            "that ends soon after it outgrows its window. --max-groups-before-record "
             "is unaffected: setting a group bound is asking for repeats outright, and it keeps "
             "forcing them either way. tool_and_user_summary_anchored repeats whatever this says: "
             "recording every new batch of tool work is part of that row's design, and the flag "

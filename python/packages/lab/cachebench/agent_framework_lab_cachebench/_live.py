@@ -1704,7 +1704,7 @@ async def run_live(
     record_max_tokens: int | None = DEFAULT_RECORD_MAX_TOKENS,
     record_target_tokens: int | None = DEFAULT_RECORD_TARGET_TOKENS,
     max_groups_before_record: int | None = None,
-    repeat_records: bool = False,
+    repeat_records: bool = True,
     sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
 ) -> LiveOutcome:
     """Seed a conversation against a real agent, snapshot it, then probe the snapshot.
@@ -1808,12 +1808,11 @@ async def run_live(
             compacting almost nothing; this is what buys the compaction back.
         repeat_records: Let the size trigger ask for a further record once the agent has done
             tool work no existing record accounts for, used only by ``tool_summary_anchored``.
-            Off by default, which is also what every run up to and including 39 did, so a row
-            left alone is comparable with those. On, records accumulate and every one of them
-            is preserved: worth it only when one record cannot cover the conversation, which
-            the ``UNCOVERED:<n>`` flag is what says. Run 40 measured both sides -- negative
-            shrink on all three ``gpt-5.4-mini`` seeds, whose records were already complete,
-            and better on every axis on ``gpt-5.6-luna``, whose record named two of six groups.
+            On by default since run 63, where the row with it off compacted once and then
+            grew past three times its window on every seed; every run up to 63 left it off, so
+            compare a row with those by passing ``False``. On, records accumulate and every one
+            of them is preserved: on a model whose one record is already complete that is
+            duplication -- run 40, ``gpt-5.4-mini``, -1% to -4% shrink.
             It governs the size trigger alone; ``max_groups_before_record`` is a caller asking
             for repeats outright and keeps forcing them either way.
         sleep: How the backoff between re-sent attempts is taken, throttled and disconnected
@@ -1887,8 +1886,8 @@ async def run_live(
             # The composed row asks for a record for every new batch of tool work, and says so
             # on the object rather than through the flag, so its halves are configured for its
             # purposes without moving the single row's default. Read off the outermost strategy:
-            # the record half itself reports nothing, so ``tool_summary_anchored`` still repeats
-            # only when --record-repeats asks.
+            # the record half itself reports nothing, so ``tool_summary_anchored`` follows
+            # --record-repeats / --no-record-repeats.
             repeat_records=repeat_records or bool(getattr(strategy, "repeat_records", False)),
             # The strategy's own ask for another record, made when a record leaves tool groups
             # uncovered. Wired here because the middleware holds no reference to the strategy
