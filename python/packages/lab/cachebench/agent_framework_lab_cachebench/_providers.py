@@ -133,6 +133,30 @@ def _build_foundry(temperature: float | None, response_max_tokens: int, model_ov
     return ProviderRuntime(client=client, model=model, options=_base_options(temperature, response_max_tokens))
 
 
+def _build_azure_responses(
+    temperature: float | None, response_max_tokens: int, model_override: str | None
+) -> ProviderRuntime:
+    """Build a Responses API client on an Azure OpenAI resource endpoint, with Entra auth.
+
+    The request path the ``foundry`` route uses -- ``FoundryChatClient`` delegates to the same
+    ``RawOpenAIChatClient`` -- sent to the resource instead of the project. It exists because a
+    deployment can work on one and not the other: on 2026-09-25 gpt-6-luna answered on the
+    resource's ``/openai/v1/responses`` and returned HTTP 500 on the project's for every request,
+    a bare "Say hi." included, while gpt-5.6-luna answered on both. Keeping the API the same
+    keeps the two models' cells comparable, which the chat-completions ``azure`` route would not.
+    """
+    from agent_framework_openai import OpenAIChatClient
+    from azure.identity.aio import DefaultAzureCredential
+
+    model = model_override or _require_env("AZURE_OPENAI_RESPONSES_MODEL")
+    client = OpenAIChatClient(
+        model=model,
+        azure_endpoint=_require_env("AZURE_OPENAI_ENDPOINT"),
+        credential=DefaultAzureCredential(),
+    )
+    return ProviderRuntime(client=client, model=model, options=_base_options(temperature, response_max_tokens))
+
+
 def _build_openrouter(
     temperature: float | None, response_max_tokens: int, model_override: str | None
 ) -> ProviderRuntime:
@@ -206,6 +230,17 @@ PROVIDER_SPECS: Final[dict[str, ProviderSpec]] = {
         env_vars=("FOUNDRY_PROJECT_ENDPOINT", "FOUNDRY_MODEL"),
         notes="Foundry project route. Cache reporting depends on the deployed model.",
         builder=_build_foundry,
+    ),
+    "azure-responses": ProviderSpec(
+        name="azure-responses",
+        cache_reporting="yes",
+        cache_key_mode="unsupported",
+        env_vars=("AZURE_OPENAI_ENDPOINT", "AZURE_OPENAI_RESPONSES_MODEL"),
+        notes=(
+            "The foundry route's Responses API on the resource endpoint, Entra auth. No cache key sent, "
+            "as on foundry. Reports cache writes as well as reads."
+        ),
+        builder=_build_azure_responses,
     ),
     "openrouter": ProviderSpec(
         name="openrouter",

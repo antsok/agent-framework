@@ -22,6 +22,7 @@ from agent_framework_lab_cachebench import (
     ProviderCaller,
     ProviderRuntime,
     build_preset,
+    build_provider,
     build_strategy,
     build_transcript,
     common_message_prefix,
@@ -639,6 +640,21 @@ def test_a_rate_limit_and_a_lost_connection_are_not_each_other() -> None:
 )
 def test_parse_provider_selector(selector: str, expected: tuple[str, str | None]) -> None:
     assert parse_provider_selector(selector) == expected
+
+
+def test_the_azure_responses_route_is_the_foundry_request_path_on_a_resource(monkeypatch: pytest.MonkeyPatch) -> None:
+    """It must be the Responses client the foundry route delegates to, so two models' cells stay comparable."""
+    from agent_framework_openai import OpenAIChatClient
+    from agent_framework_openai._chat_client import RawOpenAIChatClient
+
+    monkeypatch.setenv("AZURE_OPENAI_ENDPOINT", "https://example.openai.azure.com")
+    runtime = build_provider("azure-responses", temperature=None, response_max_tokens=64, model="gpt-6-luna")
+
+    assert isinstance(runtime.client, OpenAIChatClient)
+    assert isinstance(runtime.client, RawOpenAIChatClient)
+    assert runtime.model == "gpt-6-luna"
+    assert parse_provider_selector("azure-responses:gpt-6-luna") == ("azure-responses", "gpt-6-luna")
+    assert prompt_cache_key_options("azure-responses", "salt-a", enable_optional=True) == {}, "as on foundry"
 
 
 # region prompt cache key
