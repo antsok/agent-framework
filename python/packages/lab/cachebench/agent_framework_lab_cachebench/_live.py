@@ -178,7 +178,14 @@ DEFAULT_TOOL_RESULT_TOKENS: Final[int] = 4_000
 #:
 #: Not free to raise: every attempt re-sends the whole prompt, and at the sizes measured here
 #: that is 50,000 to 230,000 tokens the provider will charge for if it accepts it.
-RATE_LIMIT_ATTEMPTS: Final[int] = 6
+#:
+#: Ten since run 63, where six ran out in 5-14 seconds of a 300-second allowance: gpt-6-luna
+#: answered each 429 with a one-second ``Retry-After`` while the minute's quota stayed spent,
+#: and five uncompacted controls at fill 1.5 and 3.0 failed mid-conversation. A refused call is
+#: not billed, so the count guarded nothing there; with the backoff now a floor under the
+#: requested wait (see ``_retry_delay``), ten attempts reach the 300-second budget, which is the
+#: bound that was meant to decide.
+RATE_LIMIT_ATTEMPTS: Final[int] = 10
 
 #: First backoff in seconds, doubled per attempt: 2, 4, 8, 16, 32.
 #:
@@ -1583,11 +1590,14 @@ def _retry_delay(attempt: int, requested: float | None, *, base: float, maximum:
     Returns:
         Seconds to wait, never more than ``maximum``.
     """
-    if requested is not None:
-        # Taken as given, only capped. The provider knows when its window refills and we do
-        # not, so jittering an instruction downwards just spends an attempt early.
-        return min(requested, maximum)
     delay = min(base * 2**attempt, maximum)
+    if requested is not None:
+        # Taken as given when it is longer than the backoff, only capped: the provider knows
+        # when its window refills and we do not, so jittering an instruction downwards just
+        # spends an attempt early. A shorter one is a floor rather than the answer -- a
+        # one-second Retry-After repeated while the minute's quota stays spent burned every
+        # attempt in seconds on run 63 -- so the backoff still grows underneath it.
+        return min(max(requested, delay), maximum)
     # SystemRandom only because both linters reject the ordinary generator on sight, and a
     # backoff wait is worth neither an argument nor a pair of suppression comments.
     jitter = _JITTER_SOURCE.random()

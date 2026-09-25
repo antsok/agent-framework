@@ -3895,6 +3895,32 @@ async def test_the_wait_a_provider_asks_for_is_taken_verbatim() -> None:
     assert outcome.throttled_seconds == 7.0
 
 
+async def test_a_short_requested_wait_repeated_does_not_spend_every_attempt_in_seconds() -> None:
+    """A one-second ``Retry-After`` sent while the minute's quota stays spent must not end the turn.
+
+    Run 63: gpt-6-luna answered each 429 with one second, six attempts went in 5-14 seconds of
+    a 300-second allowance, and five uncompacted controls failed mid-conversation. The backoff
+    is a floor under a shorter request, so a limit that lifts within a couple of minutes is
+    survived.
+    """
+    waits = _Waits()
+    scenario = build_live_scenario(salt="ra1", filler_turns=3, filler_tokens=50, tool_turns=6)
+
+    outcome = await run_live(
+        ProviderRuntime(client=ThrottlingStub(refusals=7, retry_after="1"), model="stub"),
+        strategy_name="none",
+        options=_options(),
+        scenario=scenario,
+        sleep=waits,
+    )
+
+    assert outcome.error is None
+    assert len(waits.delays) == 7
+    assert waits.delays == sorted(waits.delays), "the backoff grows under a constant short request"
+    assert sum(waits.delays) > 60, "the waits span more than one quota window"
+    assert sum(waits.delays) <= RATE_LIMIT_MAX_WAIT
+
+
 async def test_a_wait_longer_than_the_quota_window_is_capped() -> None:
     """An hour-long ``Retry-After`` is a daily cap, and parking a sweep on one is not surviving it."""
     waits = _Waits()
