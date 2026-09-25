@@ -207,6 +207,23 @@ What it shows, and what it is void for:
 No `.sh` is kept: the script that produced it is the same one run 47 uses, and re-running it
 against this tree produces the repaired rows rather than these.
 
+Run 61 is the long cell run to completion on `b2bfe07d8`, after the two crashes of 59a and 60a:
+a 30,000-token window under a conversation of about 195K (6.5x), 24 tool turns (197 facts), tool
+share 0.4, trigger 0.7, output and answer reservation 6,000. Five seeds, $7.01, no provider
+errors. **It is the first complete live run of the composed strategy's last-resort chain.**
+
+- **The composed row kept 197/197 facts at acc1 and acc2 100% on every seed**, peaking at about
+  22K against the 30K window, never disqualified. The control disqualified on all five (199K
+  peak -- no 30K model could run it) and `truncation` kept 8 of 197. It is the only row that both
+  fits and keeps the facts.
+- The chain ran on nearly every call: 19-26 record merges and 30-43 user-summary merges per seed,
+  none refused; 98-194 harder rewrites, of which **57-85% were refused as no smaller**.
+- **Cost: seed$ $0.71 against the unlimited control's $0.27 -- about 2.7x** -- of which $0.37 is
+  summarizer spend, and the seeding cache hit rate is 38% against the control's 98%, because the
+  chain rewrites the prefix continually. The refused rewrites are paid calls that buy nothing:
+  a record dense with codes cannot shrink, so the rule refuses it and the next pass asks again.
+- `DRIFT:30` and `DRIFT:5` on two seeds: compaction during probing moved their snapshots.
+
 Run 60a is the long cell again on `d60c44e51`, where merged and rewritten records became
 assistant messages instead of synthetic tool calls. **Aborted after two seeds, kept as evidence.**
 That fix held -- no `invalid_payload` -- and **the last-resort chain ran live for the first time**:
