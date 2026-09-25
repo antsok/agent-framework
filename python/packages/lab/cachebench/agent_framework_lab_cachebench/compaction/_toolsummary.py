@@ -185,7 +185,7 @@ from __future__ import annotations
 
 import string
 from collections import Counter
-from collections.abc import Awaitable, Callable, Sequence
+from collections.abc import Awaitable, Callable, Collection, Sequence
 from dataclasses import dataclass
 from math import ceil
 from typing import TYPE_CHECKING, Any, Final
@@ -1504,7 +1504,7 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
         self._fallbacks += 1
         return await self.fallback(messages)
 
-    async def fall_back_after_record(self, messages: list[Message]) -> bool:
+    async def fall_back_after_record(self, messages: list[Message], *, ceiling: int | None = None) -> bool:
         """Hand what a record did not free to the fallback, with every unrecorded tool group held.
 
         The step :meth:`compact_against` takes when the prompt is still over the ceiling behind a
@@ -1528,18 +1528,55 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
         is left as it is, over the ceiling, and the row reads ``DQ`` rather than a shortened
         result. See :attr:`fallbacks_held_after_record`.
 
+        ``ceiling`` is the composed row's: its chain compacts to a target below the input budget
+        rather than to the budget, and hands the target down here. It reaches a fallback that is
+        an :class:`~._anchored.AnchoredCompactionStrategy` -- the one this strategy builds, and
+        the one ``_strategies`` builds for it -- through
+        :meth:`~._anchored.AnchoredCompactionStrategy.compact_to`; any other fallback is run as
+        it is and compacts to its own ceiling. None, the default, is the fallback's own ceiling,
+        which is every caller but that chain.
+
         Args:
             messages: The conversation, mutated in place, with a record in it.
+
+        Keyword Args:
+            ceiling: Included tokens to shed down to, or None for the fallback's own ceiling.
 
         Returns:
             True if the fallback changed the outgoing messages.
         """
         if _hold_unrecorded(messages):
             self._fallbacks_held_after_record += 1
-        shortened = await self.fallback(messages)
+        if ceiling is not None and isinstance(self.fallback, AnchoredCompactionStrategy):
+            shortened = await self.fallback.compact_to(messages, ceiling=ceiling)
+        else:
+            shortened = await self.fallback(messages)
         if shortened:
             self._fallbacks_after_record += 1
         return shortened
+
+    def shed_again_after_record(self, messages: list[Message], message_ids: Collection[str]) -> bool:
+        """Take off ``messages`` the groups an earlier fallback behind a record shed, by message id.
+
+        The composed row's seam for keeping its chain's fallback consistent across the live
+        path's two lists; see :meth:`~._anchored.AnchoredCompactionStrategy.shed_again`, which
+        this hands to. Nothing is held first, as :meth:`fall_back_after_record` holds every
+        unrecorded tool group: the ids handed in are of what that fallback shed with the holds
+        in place, which is narration, and a group is shed here only if all of its messages are
+        among them. Not counted as a fallback: nothing is decided here, only repeated. A
+        fallback that is not an :class:`~._anchored.AnchoredCompactionStrategy` sheds nothing
+        this way.
+
+        Args:
+            messages: The conversation, mutated in place.
+            message_ids: The ids of the messages the earlier fallback shed.
+
+        Returns:
+            True if any group was shed.
+        """
+        if not message_ids or not isinstance(self.fallback, AnchoredCompactionStrategy):
+            return False
+        return self.fallback.shed_again(messages, message_ids)
 
     def consolidate_records(self, messages: list[Message], groups: list[dict[str, Any]], text: str) -> None:
         """Put one record carrying ``text`` in place of the records ``groups`` span.

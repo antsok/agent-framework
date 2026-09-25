@@ -60,6 +60,7 @@ from agent_framework._compaction import (
 )
 from agent_framework_lab_cachebench.compaction._anchored import AnchoredCompactionStrategy
 from agent_framework_lab_cachebench.compaction._composed import (
+    _MAX_FALLBACK_ROUNDS,
     DEFAULT_HARDER_ATTEMPTS,
     DEFAULT_RECORD_MERGE_PROMPT,
     ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy,
@@ -1389,16 +1390,20 @@ class _RoutingSummarizer:
         return ChatResponse(messages=[Message(role="assistant", contents=[text])])
 
 
-class _LoggedFallback:
-    """The default anchored fallback, logging each time it is run into a shared list."""
+class _LoggedFallback(AnchoredCompactionStrategy):
+    """The default anchored fallback, logging each time it is run into a shared list.
+
+    A subclass rather than a wrapper, so the chain can hand it a ceiling below its own and shed
+    again what it shed on another list, as it does the fallback it is built with.
+    """
 
     def __init__(self, log: list[str], ceiling: int = _CHAIN_CEILING) -> None:
+        super().__init__(max_input_tokens=ceiling, tokenizer=TOKENIZER)
         self.log = log
-        self.inner = AnchoredCompactionStrategy(max_input_tokens=ceiling, tokenizer=TOKENIZER)
 
-    async def __call__(self, messages: list[Message]) -> bool:
+    async def compact_to(self, messages: list[Message], *, ceiling: int) -> bool:
         self.log.append("fallback")
-        return await self.inner(messages)
+        return await super().compact_to(messages, ceiling=ceiling)
 
 
 def _standing_summary(serial: int) -> Message:
@@ -1854,9 +1859,10 @@ def test_an_excluded_record_is_not_a_record() -> None:
 async def test_the_other_list_replays_the_merge_rather_than_paying_for_it_again() -> None:
     """The live path compacts the copies sent on a call and then the store, and both get one merge.
 
-    The second view of the same conversation asks the same question, so it gets the same answer
-    -- the model is sent one merged record and the store holds that one -- and the summarizer is
-    asked once.
+    The second view is not asked anything: the merge the first kept is put back on it, so the
+    model is sent one merged record, the store holds that one, and the summarizer is asked once.
+    Counted once as a merge, where the replay used to count a second, and once as a decision
+    kept.
     """
     summarizer = _RoutingSummarizer(merge=_short_record)
     budget = await _post_record_size() - 500
@@ -1868,16 +1874,17 @@ async def test_the_other_list_replays_the_merge_rather_than_paying_for_it_again(
     await strategy(store)
 
     assert summarizer.log == ["merge"], "asked once"
-    assert strategy.records_merged == 2, "and kept on both views"
+    assert strategy.records_merged == 1, "one merge"
+    assert strategy.chain_decisions_kept == 1, "put back on the other view"
     assert _active_record_ids(copies) == _active_record_ids(store) == [f"written:{_SHORT_RECORD}"]
 
 
 async def _idle_passes(strategy: ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy) -> None:
-    """Run two passes under the budget, which is long enough for the replay memo to let go.
+    """Run two passes under the budget, which was long enough for the replay memo to let go.
 
-    The memo keeps a request for one pass beyond the last that asked it, and the chain does not
-    run on a pass under the budget, so these are the passes that used to make a refused request
-    new again: run 61's wasted rewrites were asked across gaps like this one.
+    The memo, gone from schema 19, kept a request for one pass beyond the last that asked it,
+    and the chain does not run on a pass under the budget, so these are the passes that used to
+    make a refused request new again: run 61's wasted rewrites were asked across gaps like this.
     """
     for _ in range(2):
         await strategy([Message(role="user", contents=["Idle."], message_id="idle")])
@@ -2249,7 +2256,9 @@ async def test_the_wait_reads_a_written_record_arriving_the_same_way_on_both_lis
     quiet = strategy._quiet_through
     await strategy(next_copies)
     assert strategy._anchor == merged, "the next call's pass reads the merged record as an arrival"
-    assert strategy._quiet_through == _responses(next_copies) + 1 != quiet
+    # The quiet window is re-based on the arrival, and on nothing else: the merged record is not
+    # a response the model made, so the clock it is counted on has not moved.
+    assert strategy._quiet_through == _responses(next_copies) + 1 == quiet
 
     strategy.tool_results.consolidate_records(next_copies, active_record_groups(next_copies), "CODE-1")
     rewritten = _newest_record_identity(next_copies)
@@ -2426,3 +2435,247 @@ def test_a_call_and_an_output_split_across_two_spans_are_not_removable_on_either
     assert [span["group_id"] for span in spans if span["kind"] == "tool_call"] == ["group_c1", "group_c1"]
     assert not any(removable_whole(messages, spans, span) for span in spans if span["kind"] == "tool_call")
     assert removable_whole(messages, spans, spans[1]), "the narration between them is a group of its own"
+
+
+# What the chain decides on one of the live path's two lists is what the other ends up holding.
+#
+# The live path runs the composed row over a call's copies -- the stored history plus what the
+# call carries in -- and then over the store. The chain starts only on a list over the budget, and
+# the carried-in turn can put the copies over while the store is under, which is when the two used
+# to part: the copies' changes last for their call only, and the store, never running the chain,
+# kept what the model had been sent without. ``_tail`` is that carried-in turn.
+
+
+def _tail(chars: int) -> list[Message]:
+    """Return a carried-in turn of ``chars`` characters: what a call's copies hold beyond the store."""
+    return [Message(role="user", contents=["Turn 5: " + "t" * chars], message_id="u5")]
+
+
+def _sent_before_tail(messages: list[Message]) -> str:
+    """Return what ``messages`` sends, less the carried-in turn."""
+    return _rendered([message for message in messages if message.message_id != "u5"])
+
+
+def _harder_to_one(attempt: int, body: str) -> str:
+    """Answer a harder rewrite with one short record, whatever was sent."""
+    return "lookup_1: CODE-1. lookup_2: CODE-2"
+
+
+#: Per chain step, the summarizer that makes that step one the copies' pass keeps.
+_KEPT_ON_BOTH: dict[str, dict[str, Any]] = {
+    "merge": {"merge": _short_record, "fold": _longer},
+    "fold": {"merge": _longer, "fold": _short_summary},
+    "rewrite": {"merge": _longer, "fold": _longer, "harder": _harder_to_one},
+    "shed": {"merge": _longer, "fold": _longer},
+}
+
+
+@pytest.mark.parametrize("step", list(_KEPT_ON_BOTH))
+async def test_what_the_chain_changes_on_a_calls_copies_is_what_the_store_ends_up_holding(step: str) -> None:
+    """A merge, a fold, a rewrite or a shed made on the copies is put on the store, under the budget.
+
+    The store here fits the budget once the record phase has run, so the chain never starts on
+    it. Before schema 19 it therefore kept the unmerged records, the unfolded summaries, the
+    unrewritten record or the unshed narration -- whatever the copies had just been sent
+    without -- and the next call was sent it again. The store must now send exactly what the
+    copies sent, less the carried-in turn, and nothing is asked of the summarizer for it.
+    """
+    summarizer = _RoutingSummarizer(**_KEPT_ON_BOTH[step])
+    budget = await _post_record_size() + 100
+    strategy = _chain_composed(summarizer, ceiling=budget)
+    store = _chain_conversation()
+    copies = copy.deepcopy(store) + _tail(1_600)
+
+    await strategy(copies)
+    asked = list(summarizer.log)
+    kept = {
+        "merge": strategy.records_merged,
+        "fold": strategy.user_summaries_merged,
+        "rewrite": strategy.record_rewrites - strategy.record_rewrites_rejected,
+        "shed": strategy.fallbacks_after_record,
+    }[step]
+    assert kept >= 1, f"the premise: the copies' pass kept a {step}"
+
+    await strategy(store)
+
+    assert _rendered(store) == _sent_before_tail(copies)
+    assert summarizer.log == asked, "nothing asked on the store's pass"
+    assert strategy.chain_targets_reached + strategy.chain_targets_missed == 1, "the chain started on the copies only"
+    assert strategy.chain_decisions_kept == 1
+
+
+async def test_a_kept_decision_is_not_put_back_on_records_that_have_changed() -> None:
+    """A merge is keyed by what it replaced: a record whose text differs is not the record merged."""
+    summarizer = _RoutingSummarizer(merge=_short_record, fold=_longer)
+    budget = await _post_record_size() + 100
+    strategy = _chain_composed(summarizer, ceiling=budget)
+    store = _chain_conversation()
+    copies = copy.deepcopy(store) + _tail(1_600)
+    await strategy(copies)
+    assert strategy.records_merged == 1, "the premise"
+
+    _change_record(store, "rec2", [2, 9])
+    await strategy(store)
+
+    assert _active_record_ids(store) == ["rec1_res", "rec2_res"], "neither record replaced"
+    assert strategy.chain_decisions_kept == 0
+
+
+def test_a_compactions_own_insertions_are_not_responses_to_the_user_halfs_wait() -> None:
+    """The wait's clock counts what the model said; a written record and a shed note it did not say."""
+    messages = [
+        Message(role="user", contents=["Turn 0."], message_id="u0"),
+        Message(role="assistant", contents=["Reply 0."], message_id="a0"),
+    ]
+    before = _responses(messages)
+    messages += [
+        build_record_message("lookup_1: CODE-1."),
+        Message(role="assistant", contents=["[compacted: an earlier assistant reply]"], message_id="anchored_g1"),
+    ]
+
+    assert before == 1
+    assert _responses(messages) == before
+
+
+# Once started, the chain works down to a target below the budget.
+
+
+async def test_once_started_the_chain_goes_on_to_its_target_rather_than_stopping_at_the_budget() -> None:
+    """Hysteresis: a firing removes its share of what stands behind its earliest edit, not just enough.
+
+    At a gain fraction of zero the merge brings the prompt under the budget and the chain stops
+    there, as it always did. At a fraction the merge alone does not meet, the chain goes on --
+    the fold next -- and ends at or under its target, well below the budget.
+    """
+    at_budget = _RoutingSummarizer(merge=_short_record, fold=_short_summary)
+    budget = await _post_record_size() - 500
+    stopped = _chain_composed(at_budget, ceiling=budget, chain_gain_fraction=0.0)
+    stopped_messages = _chain_conversation()
+    await stopped(stopped_messages)
+
+    to_target = _RoutingSummarizer(merge=_short_record, fold=_short_summary)
+    going_on = _chain_composed(to_target, ceiling=budget, chain_gain_fraction=0.6)
+    messages = _chain_conversation()
+    await going_on(messages)
+
+    assert at_budget.log == ["merge"], "the premise: the merge alone fits the budget"
+    assert to_target.log[:2] == ["merge", "fold"], "past the budget, to the next step"
+    assert going_on.chain_targets_reached == 1 and going_on.chain_targets_missed == 0
+    assert _size(messages) < _size(stopped_messages) <= budget
+
+
+async def test_a_target_the_steps_cannot_reach_ends_the_chain_where_they_left_it() -> None:
+    """An unreachable target neither loops nor fails: every step runs once, and the chain stops.
+
+    Each step is bounded as it always was -- one merge, one fold, ``harder_attempts`` rewrites,
+    and the fallback at most :data:`_MAX_FALLBACK_ROUNDS` times -- and a pass that ends above its
+    target counts as ``CHAINSHORT``. The prompt still fits the budget, which those steps could
+    reach, and the next pass under the budget asks for nothing.
+    """
+    summarizer = _RoutingSummarizer(merge=_short_record, fold=_short_summary)
+    budget = await _post_record_size() - 500
+    strategy = _chain_composed(summarizer, ceiling=budget, chain_gain_fraction=0.95)
+    messages = _chain_conversation()
+
+    await strategy(messages)
+
+    assert summarizer.log[:2] == ["merge", "fold"]
+    assert summarizer.log.count("harder1") <= 1 and summarizer.log.count("harder2") <= 1
+    assert 1 <= summarizer.log.count("fallback") <= _MAX_FALLBACK_ROUNDS
+    assert (strategy.chain_targets_reached, strategy.chain_targets_missed) == (0, 1)
+    assert _size(messages) <= budget
+    asked = list(summarizer.log)
+
+    await strategy(messages)
+
+    assert summarizer.log == asked, "under the budget, the chain does not start"
+    assert strategy.chain_targets_missed == 1
+
+
+def _reply(index: int, chars: int) -> Message:
+    """Return an assistant reply of ``chars`` characters: narration, which no half summarises."""
+    return Message(role="assistant", contents=[f"Reply {index}: " + "n" * chars], message_id=f"n{index}")
+
+
+async def test_after_a_firing_the_chain_leaves_the_next_turns_alone_until_the_prompt_is_back_over() -> None:
+    """The point of the target: the turns after a firing extend the prompt, and no early edit follows.
+
+    The prompt grows by narration after the firing, a reply at a time, each pass leaving what the
+    one before sent as the prefix of what it sends; only a reply that takes the prompt back over
+    the budget starts the chain again.
+    """
+    summarizer = _RoutingSummarizer(merge=_short_record, fold=_short_summary)
+    budget = await _post_record_size() - 500
+    strategy = _chain_composed(summarizer, ceiling=budget)
+    messages = _chain_conversation()
+    await strategy(messages)
+    assert strategy.chain_targets_reached == 1, "the premise: one firing, to its target"
+
+    room = budget - _size(messages)
+    assert room >= 200, "the premise: the target left room below the budget"
+    index = 10
+    while _size(messages) + 60 <= budget:
+        before = _rendered(messages)
+        messages.append(_reply(index, 120))
+        index += 1
+        await strategy(messages)
+        assert _rendered(messages).startswith(before), "nothing already sent was edited"
+        assert strategy.chain_targets_reached == 1, "and the chain did not start"
+    assert index >= 13, "several turns fitted after the firing"
+
+    messages.append(_reply(index, 4 * room))
+    await strategy(messages)
+
+    assert strategy.chain_targets_reached + strategy.chain_targets_missed == 2, "back over, so it started again"
+
+
+def _shorter_each_attempt(attempt: int, body: str) -> str:
+    """Answer the ``attempt``-th rewrite with the first fifth fewer of the body than the one before."""
+    return body[: int(len(body) * (1.0 - 0.2 * attempt))]
+
+
+@pytest.mark.parametrize(("fraction", "attempts"), [(0.0, ["harder1"]), (0.6, ["harder1", "harder2"])])
+async def test_the_harder_rewrites_go_on_to_the_target_and_not_only_to_the_budget(
+    fraction: float, attempts: list[str]
+) -> None:
+    """Step c's second attempt is asked while the prompt is short of the target, not only while over.
+
+    The first rewrite is kept and fits the budget; stopping at the budget, the chain asks no
+    second one, and working to a target it cannot yet meet, it does.
+    """
+    summarizer = _RoutingSummarizer(merge=_longer, fold=_longer, harder=_shorter_each_attempt)
+    budget = await _post_record_size() - 200
+    strategy = _chain_composed(summarizer, ceiling=budget, chain_gain_fraction=fraction)
+    messages = _chain_conversation()
+
+    await strategy(messages)
+
+    assert [kind for kind in summarizer.log if kind.startswith("harder")] == attempts
+    assert strategy.record_rewrites_rejected == 0, "the premise: every rewrite kept"
+    assert _size(messages) <= budget
+
+
+async def test_a_new_record_reading_as_one_already_rewritten_takes_the_rewrite_without_asking() -> None:
+    """A merge can come back as the very record an earlier pass went on to rewrite; that rewrite stands.
+
+    The merge here answers every request with one text, so the second pass's merge, over records
+    that changed, writes the record the first pass's rewrite started from. The rewrite of it is
+    already decided and is put in at once, rather than asked for again.
+    """
+    summarizer = _RoutingSummarizer(merge=_short_record, fold=_longer, harder=lambda attempt, body: "lookup_1: CODE-1.")
+    merged = _chain_conversation()
+    merging = _chain_composed(
+        _RoutingSummarizer(merge=_short_record), ceiling=await _post_record_size() - 500, chain_gain_fraction=0.0
+    )
+    await merging(merged)
+    budget = _size(merged) - 2
+    strategy = _chain_composed(summarizer, ceiling=budget, chain_gain_fraction=0.0, harder_attempts=1)
+
+    await strategy(_chain_conversation())
+    assert summarizer.log == ["merge", "fold", "harder1"], "the premise: merged, then rewritten"
+    changed = _chain_conversation()
+    _change_record(changed, "rec2", [2, 9])
+    await strategy(changed)
+
+    assert summarizer.log[3:] == ["merge"], "the rewrite taken, not asked for again"
+    assert _active_record_ids(changed) == ["written:lookup_1: CODE-1."]

@@ -1051,6 +1051,9 @@ def _strategy_notes(strategy: Any) -> tuple[str, ...]:
         ("record_merges_skipped", "RECMERGESKIP"),
         ("record_summary_failures", "RECSUMMFAIL"),
         ("last_resort_fallbacks", "LASTFALLBACK"),
+        ("chain_targets_reached", "CHAINTARGET"),
+        ("chain_targets_missed", "CHAINSHORT"),
+        ("chain_decisions_kept", "CHAINKEPT"),
     ):
         value = getattr(strategy, attribute, None)
         if isinstance(value, int) and value:

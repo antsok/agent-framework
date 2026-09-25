@@ -872,6 +872,7 @@ def test_every_argument_the_runner_reads_is_defined() -> None:
         "user_min_band_share",
         "user_summary_mode",
         "record_harder_attempts",
+        "chain_gain_fraction",
         "record_repeats",
         "min_correctness",
         "summarizer_provider",
@@ -2105,15 +2106,22 @@ class _LookupAndRecordStub(StubChatClient):
     answers in text, which is the model that never records.
     """
 
-    def __init__(self, *, writes: bool = True, record_padding: int = 0) -> None:
+    def __init__(self, *, writes: bool = True, record_padding: int = 0, reply: str = "a reply " * 20) -> None:
         """Create the stub.
 
         Keyword Args:
             writes: Answer a call pinned to the recall tool with a record.
             record_padding: Characters of prose each record carries beside the codes, so a test
                 can make the records themselves what keeps the prompt over the budget.
+            reply: What the stub answers an ordinary turn with, so a test can make narration what
+                the conversation grows by.
         """
-        super().__init__(reply="a reply " * 20)
+        super().__init__(reply=reply)
+        #: Per request, the written records it carried, oldest first: what a test reads to see
+        #: whether an edit the chain made was ever sent back undone.
+        self.written_sent: list[list[str]] = []
+        #: Per request, every message serialized as the provider is sent it.
+        self.sent: list[list[str]] = []
         self.writes = writes
         self.record_padding = record_padding
         self.pinned_calls = 0
@@ -2131,6 +2139,12 @@ class _LookupAndRecordStub(StubChatClient):
         pinned = choice.get("required_function_name") if isinstance(choice, Mapping) else None
         if pinned == RECALL_TOOL_NAME:
             self.pinned_calls += 1
+        self.sent.append([_serialize_message(message) for message in messages])
+        self.written_sent.append([
+            message.text or ""
+            for message in messages
+            if message.role == "assistant" and (message.text or "").startswith(RECORD_MARKER)
+        ])
         last = messages[-1]
         if pinned == RECALL_TOOL_NAME and self.writes:
             results = " ".join(
@@ -2181,13 +2195,23 @@ async def _run_wait_fixture(
     later_lookups: Sequence[str] = (),
     later_filler_turns: int = 0,
     summarizer: Any = None,
+    final_turns: Sequence[str] = (),
+    big_lookup_tokens: int = 0,
+    chain_gain_fraction: float | None = None,
+    reply: str = "a reply " * 20,
+    on_strategy: Callable[[Any], None] | None = None,
 ) -> SimpleNamespace:
     """Drive a strategy through the harness's real session, wired the way ``run_live`` wires it.
 
     Two filler turns of about 830 tokens, the lookups, then ``filler_turns`` more, then
     ``later_lookups`` and ``later_filler_turns`` -- a second batch of tool work, for a test that
-    needs a second record. ``summarizer`` replaces the stub one that answers every request with
-    one short line. The user
+    needs a second record -- then ``final_turns`` verbatim, where a lookup is ``"LOOKUP <scope>"``
+    and its scope must be one the agent has a tool for: ``lookups``, or ``z`` when
+    ``big_lookup_tokens`` gives it a lookup of that size. ``summarizer`` replaces the stub
+    one that answers every request with one short line. ``chain_gain_fraction`` reaches the
+    composed row's chain; None leaves the default. ``reply`` is what the model answers an
+    ordinary turn with. ``on_strategy`` is handed the strategy once it is built, before the first
+    turn. The user
     half's ``compact_against`` is wrapped on the instance, so every pass that reached it is
     logged as whether a record stood in the conversation at that moment and whether the pass
     compacted.
@@ -2202,11 +2226,16 @@ async def _run_wait_fixture(
         max_output_tokens=2_000,
         summarizer=summarizer if summarizer is not None else _StubSummarizer(),
         **({} if user_trigger_fraction is None else {"user_trigger_fraction": user_trigger_fraction}),
+        **({} if chain_gain_fraction is None else {"chain_gain_fraction": chain_gain_fraction}),
     )
     strategy = build_strategy(strategy_name, options)
+    if on_strategy is not None:
+        on_strategy(strategy)
     recording = find_nested_strategy(strategy, ToolResultAnchoredSummarizationCompactionStrategy)
     user = find_nested_strategy(strategy, UserTurnAnchoredSummarizationCompactionStrategy)
     tools: list[Callable[..., str]] = [_coded_lookup(scope, tool_tokens) for scope in lookups]
+    if big_lookup_tokens:
+        tools.append(_coded_lookup("z", big_lookup_tokens))
     middleware: ToolResultRecallMiddleware | None = None
     if recording is not None:
         gate = RecallGate()
@@ -2231,7 +2260,7 @@ async def _run_wait_fixture(
             return compacted
 
         user.compact_against = logged  # type: ignore[method-assign]
-    client = _LookupAndRecordStub(writes=writes, record_padding=record_padding)
+    client = _LookupAndRecordStub(writes=writes, record_padding=record_padding, reply=reply)
     agent = build_live_agent(
         ProviderRuntime(client=client, model="stub"),
         kind="harness",
@@ -2250,6 +2279,7 @@ async def _run_wait_fixture(
     turns += [f"{_LOOKUP} {scope}" for scope in later_lookups]
     later = 2 + filler_turns
     turns += [f"Turn {index}: " + "u" * 3_200 for index in range(later, later + later_filler_turns)]
+    turns += list(final_turns)
     for text in turns:
         await agent.run(text, session=session)
     history = next(provider for provider in agent.context_providers if isinstance(provider, HistoryProvider))
@@ -2412,18 +2442,30 @@ async def test_a_merge_through_the_live_path_sends_the_model_no_call_it_never_ma
     merged record then rides along on every later request, and the stub refuses any function
     call or result it did not issue, as Foundry refused it with ``400 invalid_payload``. When
     the merge was a synthesised recall call under a minted id this test failed on that check;
-    written as an assistant message it passes, and the conversation reads it as the record.
+    written as an assistant message it passes.
+
+    The merge is taken on the copies of the call after the second record arrived, and the store
+    holds exactly what that call was sent: the two records merged, and a third the model wrote
+    on that very call standing beside it, since a record carried in is not merged on the call
+    that carries it. The store used to merge all three instead, which the model had never been
+    sent -- an early edit on the next call, bought by the store pass disagreeing with the copies.
     """
     run = await _run_wait_fixture(record_padding=12_000, later_lookups=("d", "e"), later_filler_turns=6)
     strategy = run.strategy
 
     assert strategy.records_merged >= 1, "the premise: the chain reached step a"
     assert strategy.record_rewrites == 0, "and nothing below it"
-    index = find_record_index(run.stored)
-    assert index is not None
+    written = [
+        index
+        for index, message in enumerate(run.stored)
+        if message.role == "assistant"
+        and (message.text or "").startswith(RECORD_MARKER)
+        and not message.additional_properties.get(EXCLUDED_KEY)
+    ]
+    assert len(written) == 1, "one merged record stands in the store"
+    index = written[0]
     record = run.stored[index]
-    assert record.role == "assistant" and [content.type for content in record.contents] == ["text"]
-    assert (record.text or "").startswith(RECORD_MARKER), "the newest record is the merged one"
+    assert [content.type for content in record.contents] == ["text"], "a message, not a call"
     assert any(message.role == "assistant" for message in run.stored[index + 1 :]), (
         "and the model was called with it in the prompt, which is where the check bites"
     )
@@ -2434,7 +2476,6 @@ async def test_a_merge_through_the_live_path_sends_the_model_no_call_it_never_ma
         if content.type in ("function_call", "function_result")
     }
     assert stored_ids <= run.client.issued_call_ids, "every call in the store is one the model made"
-    assert recall_record_text(run.agent, run.session.state) == record.text, "the dump reads the merged record"
 
 
 async def test_the_stub_refuses_a_request_carrying_a_call_without_its_output_or_the_reverse() -> None:
@@ -2482,7 +2523,8 @@ async def test_a_merge_through_the_live_path_leaves_no_call_without_its_output()
     }
     records = [message for message in run.stored if any(content.call_id in recall_ids for content in message.contents)]
     assert len(recall_ids) >= 2 and len(records) == 2 * len(recall_ids), "the premise: records the model made"
-    assert all(message.additional_properties.get(EXCLUDED_KEY) for message in records), "each merged, whole"
+    merged = [message for message in records if message.additional_properties.get(EXCLUDED_KEY)]
+    assert len(merged) >= 4, "at least two records merged, call and result together"
     states: dict[str, set[bool]] = {}
     for message in run.stored:
         for content in message.contents:
@@ -2517,6 +2559,173 @@ async def test_the_standalone_rows_write_no_record_of_their_own_on_the_merge_fix
             for content in message.contents
             if content.type == "function_call"
         )
+
+
+class _LoggingSummarizer(_StubSummarizer):
+    """The stub summarizer, keeping every request it was asked, whole."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.requests: list[tuple[str, ...]] = []
+
+    async def get_response(self, messages: Any, *, stream: bool = False, **kwargs: Any) -> Any:
+        self.requests.append(tuple(message.text or "" for message in messages))
+        return await super().get_response(messages, stream=stream, **kwargs)
+
+
+async def test_a_rewrite_the_chain_made_on_a_calls_copies_is_never_sent_back_undone() -> None:
+    """The live path's two lists disagreed about the chain, and the model was sent both answers.
+
+    A lookup far larger than the rest pushes the call that carries its result over the input
+    budget, while a record is due for it. The chain runs on that call's copies and rewrites the
+    standing record, and the model is sent the rewrite. The record then arrives and the record
+    phase drops the lookup it covers, so every later pass -- the next calls' copies and the
+    store after the turn -- is under the budget and the chain never runs there. The copies'
+    changes last for their call only, so the store kept the old record, and the next call was
+    sent it again: an early edit made and undone, a prefix broken twice. A later pass over the
+    budget then asked the summarizer the identical request again. From schema 19 a decision the
+    chain made is put back on every list that holds what it changed, whatever that list's size.
+    On the code before it the requests read ``W..`` where they now read ``WWW``.
+    """
+    summarizer = _LoggingSummarizer()
+    run = await _run_wait_fixture(
+        record_padding=12_000,
+        later_filler_turns=3,
+        final_turns=(f"{_LOOKUP} z", "Turn x: " + "u" * 3_200, "Turn y: " + "u" * 3_200),
+        big_lookup_tokens=8_000,
+        summarizer=summarizer,
+    )
+    strategy = run.strategy
+    sent = run.client.written_sent
+
+    assert strategy.record_rewrites + strategy.records_merged >= 1, "the premise: the chain replaced a record"
+    first = next(index for index, written in enumerate(sent) if written)
+    assert len(sent) - first >= 3, "the premise: calls were made after it"
+    assert all(sent[index] == sent[first] for index in range(first, len(sent))), (
+        "every later request carried the record the model was first sent, and nothing else"
+    )
+    stored = [
+        message.text or ""
+        for message in run.stored
+        if message.role == "assistant"
+        and (message.text or "").startswith(RECORD_MARKER)
+        and not message.additional_properties.get(EXCLUDED_KEY)
+    ]
+    assert stored == sent[-1], "and the store holds what the last request was sent"
+    assert len(summarizer.requests) == len(set(summarizer.requests)), "no request was asked twice"
+
+
+def _firings(strategy: Any) -> list[tuple[bool, bool]]:
+    """Log, per pass, whether the composed row's chain started and whether it reached its fallback.
+
+    Wraps the instance's ``_last_resort``, which every pass reaches.
+    """
+    log: list[tuple[bool, bool]] = []
+    inner = strategy._last_resort
+
+    async def logged(messages: list[Message]) -> bool:
+        started = strategy.chain_targets_reached + strategy.chain_targets_missed
+        fallbacks = strategy.last_resort_fallbacks
+        changed = await inner(messages)
+        log.append((
+            strategy.chain_targets_reached + strategy.chain_targets_missed > started,
+            strategy.last_resort_fallbacks > fallbacks,
+        ))
+        return changed
+
+    strategy._last_resort = logged
+    return log
+
+
+async def _run_narration_fixture(**kwargs: Any) -> SimpleNamespace:
+    """Drive the composed row through a conversation that grows by narration alone, near the budget.
+
+    One batch of lookups and a heavy record, then thirty short user turns each answered with a
+    long reply. The user band is too small to be worth summarising and no tool work is pending,
+    so once the prompt reaches the budget the chain is what keeps it there, and its fallback --
+    narration only, behind the record -- is the step that does most of the work. Every pass is
+    logged in ``firings`` as whether the chain started on it and whether it reached its fallback.
+    """
+    watched: list[list[tuple[bool, bool]]] = []
+    run = await _run_wait_fixture(
+        record_padding=12_000,
+        filler_turns=2,
+        final_turns=[f"Turn {index}: go" for index in range(30)],
+        reply="r" * 2_400,
+        on_strategy=lambda strategy: watched.append(_firings(strategy)),
+        **kwargs,
+    )
+    run.firings = watched[0]
+    return run
+
+
+def _prefix_breaks(requests: list[list[str]]) -> list[bool]:
+    """Return, for each request after the first, whether it failed to carry the one before it whole."""
+    breaks: list[bool] = []
+    for previous, current in zip(requests, requests[1:], strict=False):
+        kept = 0
+        while kept < min(len(previous), len(current)) and previous[kept] == current[kept]:
+            kept += 1
+        breaks.append(kept < len(previous))
+    return breaks
+
+
+async def test_the_chain_compacts_to_its_target_and_leaves_the_next_turns_alone() -> None:
+    """Hysteresis, through the live path: a firing buys the turns after it.
+
+    Once only narration is left to shed, the chain stopping at the budget sheds one reply's
+    worth and the next reply puts the prompt back over, so it fires on every turn and nearly
+    every request breaks the cached prefix of the one before it. Compacting to the target, a
+    firing sheds several replies, and the requests after it extend the prefix untouched until
+    the conversation has grown back over the budget. Measured here: at the budget, eleven
+    fallback firings two passes -- one turn -- apart; at the default, two, thirty-one passes
+    apart. The firings before the first fallback are the record's rewrite and a new record's
+    arrival, which no setting of this moves.
+    """
+    at_budget = await _run_narration_fixture(chain_gain_fraction=0.0)
+    at_target = await _run_narration_fixture()
+
+    def fallbacks(run: SimpleNamespace) -> list[int]:
+        return [index for index, (_, fell_back) in enumerate(run.firings) if fell_back]
+
+    def gaps(indices: list[int]) -> list[int]:
+        return [later - earlier for earlier, later in zip(indices, indices[1:], strict=False)]
+
+    assert len(fallbacks(at_budget)) >= 8 and min(gaps(fallbacks(at_budget))) == 2, (
+        "the premise: at the budget, the fallback fired on every turn"
+    )
+    assert "BBBB" in "".join("B" if broke else "." for broke in _prefix_breaks(at_budget.client.sent))
+    assert at_target.strategy.chain_targets_missed == 0, "every firing reached its target"
+    assert 2 <= len(fallbacks(at_target)) <= len(fallbacks(at_budget)) // 3
+    assert min(gaps(fallbacks(at_target))) >= 10, "at least five turns between fallback firings"
+    started = [index for index, (fired, _) in enumerate(at_target.firings) if fired]
+    assert at_target.strategy.chain_targets_reached == len(started)
+    breaks = _prefix_breaks(at_target.client.sent)
+    assert "BB" not in "".join("B" if broke else "." for broke in breaks[-20:]), "never two breaks in a row"
+
+
+@pytest.mark.parametrize("strategy_name", ["tool_summary_anchored", "user_summary_anchored", "anchored"])
+async def test_the_chain_gain_fraction_moves_no_standalone_row(strategy_name: str) -> None:
+    """The setting is the composed row's chain's, and a row without that chain never reads it."""
+    runs = [
+        await _run_wait_fixture(
+            strategy_name,
+            user_trigger_fraction=0.6,
+            record_padding=12_000,
+            filler_turns=2,
+            final_turns=[f"Turn {index}: go" for index in range(12)],
+            reply="r" * 2_400,
+            chain_gain_fraction=fraction,
+        )
+        for fraction in (0.0, 0.9)
+    ]
+
+    assert not hasattr(runs[0].strategy, "chain_gain_fraction")
+    assert [_serialize_message(message) for message in runs[0].stored] == [
+        _serialize_message(message) for message in runs[1].stored
+    ]
+    assert _strategy_notes(runs[0].strategy) == _strategy_notes(runs[1].strategy)
+    assert not [note for note in _strategy_notes(runs[0].strategy) if note.startswith("CHAIN")]
 
 
 class _RefusingRecordSummarizer:
@@ -7710,6 +7919,7 @@ def _settings(**overrides: Any) -> StrategySettings:
         "user_min_band_share": 0.1,
         "user_summary_mode": "recompact",
         "record_harder_attempts": 2,
+        "chain_gain_fraction": 0.29,
         "token_budget_fraction": 0.5,
         "max_output_tokens": 2_048,
         "answer_max_tokens": 12_000,

@@ -774,6 +774,9 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
         self._replayed = 0
         self.remembered_requests = remembered_requests
         self._remembered: list[_Remembered] = []
+        # Folds :meth:`fold_if_smaller` kept, by the transcript of the summaries they replaced,
+        # for the whole run. See :meth:`refold`.
+        self._kept_folds: dict[str, _Remembered] = {}
 
     @property
     def recompacts_summaries(self) -> bool:
@@ -1395,7 +1398,40 @@ class UserTurnAnchoredSummarizationCompactionStrategy:
         if included_token_count(candidate) >= included_token_count(summaries):
             return "rejected"
         self._apply_fold(messages, standing, remembered, replayed)
+        self._kept_folds[remembered.transcript] = remembered
         return "folded"
+
+    def refold(self, messages: list[Message]) -> bool:
+        """Put back a fold :meth:`fold_if_smaller` kept, wherever the summaries it replaced stand.
+
+        The composed row's seam for keeping its chain's fold consistent across the live path's
+        two lists. That chain runs only while the prompt is over its budget, and the two lists
+        can disagree about that: a fold kept on a call's copies was sent to the model, and if
+        the store's pass is under the budget, the store keeps the unfolded summaries and the
+        next call is sent them again. So a kept fold is remembered for the run, by the summaries'
+        transcript -- which both lists present identically -- and put back here, on any list,
+        whatever its size, with the same text under the same id. Nothing is asked and nothing is
+        judged: the fold was judged smaller when it was kept, and the same summaries give the
+        same sizes. A fold never kept is not put back, and :meth:`fold_if_smaller` stays the only
+        way to make one. Counted as a replay, as a fold replayed on the second list always was.
+
+        Args:
+            messages: The conversation, mutated in place. Already grouped and token-annotated.
+
+        Returns:
+            True if a fold was put back.
+        """
+        if not self._kept_folds:
+            return False
+        standing = self._observe_summaries(messages)
+        if len(standing) < 2:
+            return False
+        transcript = _format_turns([messages[span["start_index"]] for span in standing], text=_summary_body)
+        kept = self._kept_folds.get(transcript)
+        if kept is None:
+            return False
+        self._apply_fold(messages, standing, kept, True)
+        return True
 
     async def _fold_answer(
         self, messages: list[Message], standing: list[dict[str, Any]]

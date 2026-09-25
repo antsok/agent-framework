@@ -19,11 +19,12 @@ three things in order.
    line, against the prompt *as the record half left it*, and it runs in the boundary mode, so
    a summary it wrote is kept as a boundary rather than re-summarised on the next pass. While
    a record is due and still has time to arrive it is not judged at all: see below.
-3. **A last-resort chain, only while the prompt is still over the input budget.** Merge the
-   records into one; merge the user summaries into one; rewrite the record harder, up to
+3. **A last-resort chain, started only when the prompt is still over the input budget.** Merge
+   the records into one; merge the user summaries into one; rewrite the record harder, up to
    ``harder_attempts`` times; then the record half's fallback, which may drop narration only.
-   If the prompt is still over after that, nothing more is done: it goes out over the limit and
-   the row reads ``DQ``, which is the intended loud failure.
+   Once started it works down to a target below the budget rather than to the budget -- see
+   below. If the prompt is still over the budget after every step, nothing more is done: it
+   goes out over the limit and the row reads ``DQ``, which is the intended loud failure.
 
 **The user half waits for a record that is due, because the two halves compact at different
 speeds.** The record half compacts in two steps: on the pass where the prompt crosses the line
@@ -100,8 +101,21 @@ are permanent, so a user phase that ran first would hand the middleware a conver
 shrunk below the line that asks for a record at all. And the user phase is the one whose action
 breaks the cache, so it is the one that should act only on what the other left. The chain comes
 last because every step in it is worse than doing nothing when nothing is needed: each spends a
-summarizer call and rewrites a message the cached prefix runs through, so each runs only on a
-live reading over the budget, re-read before every step.
+summarizer call and rewrites a message the cached prefix runs through, so the chain starts only
+on a live reading over the budget, and each step is re-read against the target before it runs.
+
+**Once started, the chain works down to a target, not to the budget.** It used to stop as soon
+as the prompt fitted, which left it just under the budget; the next turn put it back over, and
+the chain fired again with another early edit, so nearly every call re-billed most of its prompt
+-- run 61 seeded at a 38% cache hit rate against the control's 98%. Every firing re-bills what
+stands behind its earliest edit whether it removes a little or a lot, so a firing now goes on
+until it has removed ``chain_gain_fraction`` of those tokens, which is the break-even share an
+edit has to remove to repay its own re-bill -- :data:`DEFAULT_CHAIN_GAIN_FRACTION` carries the
+derivation -- and leaves the next turns that much room before the chain is needed again. Which
+steps can go that far is on :meth:`ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy._last_resort`;
+a target they cannot reach ends the chain where they left the prompt, as a budget they cannot
+reach always did. The halves are left as they are: the record half removes whatever its record
+covers, not an amount, and the user half's ``min_band_share`` is already its own hysteresis.
 
 **The fallback now runs at the end of the chain, which moves one of this module's older
 reasons.** It used to run inside the record phase, before the user phase, on the stated ground
@@ -155,20 +169,31 @@ message carrying the record marker rather than as a recall call: this used to mi
 synthesise the call, and run 59 measured Foundry refusing the first request that carried one with
 ``400 invalid_payload`` -- see :func:`~._toolsummary.build_record_message`.
 
-**The other list.** The live path runs this over the copies sent on a call and then over the
-store, and a request asked on the first is replayed on the second rather than paid for twice:
-the chain remembers its record requests for one pass beyond the one they were made on, and the
-user half's builder for this row keeps its last two requests, because a pass over the budget
-may ask it for both a band and a fold.
+**The other list, and what the chain decides is kept on both.** The live path runs this over
+the copies sent on a call and then over the store. The chain used to replay a request asked on
+the first list when the second reached the same step, from a memo lasting one pass beyond the
+one it was made on. That only worked when the second list was over the budget too, and it need
+not be: the record phase on the store can drop a tool group the copies still had to carry, and
+take the prompt under the budget without the chain. The store then kept what the copies had
+replaced, the next call was sent it again -- an early edit made and undone -- and when the prompt
+next went over, the chain asked the summarizer the identical request again. Measured offline at
+run 60's settings with a fuzzed model, on 2 to 63 requests a seed. So every decision the chain
+makes -- a record merged or rewritten, a user fold, narration shed -- is now kept for the run and
+put back on every list that holds what it changed, whatever that list's size, before the chain
+decides anything new: see
+:meth:`ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy._keep_decisions`. The memo is
+gone, because nothing reaches the summarizer twice for records a kept answer already replaced.
+The user half's builder for this row still keeps its last two requests, for its own band
+summaries.
 
-**A refused request is not asked again while what it would rewrite is unchanged.** The replay
-memo lasts one pass beyond its last use, and the chain does not run on a pass under the budget,
-so a record refused as no smaller used to be asked for again -- and paid for again -- whenever
-the prompt went back over the budget with the record as it was. Run 61 measured the refusals: of
+**A refused request is not asked again while what it would rewrite is unchanged.** The chain
+does not run on a pass under the budget, so a record refused as no smaller used to be asked for
+again -- and paid for again -- whenever the prompt went back over the budget with the record as
+it was. Run 61 measured the refusals: of
 98 to 194 harder rewrites a seed, 57 to 164 were refused, a record dense with codes being one that
 cannot shrink while keeping them. So a refusal is remembered for as long as the run lasts, keyed
 by the request's transcript -- the numbered record bodies, which are the records' content and
-the one thing both lists present identically, since the replay memo already depends on it --
+the one thing both lists present identically, which is what a kept answer is keyed by too --
 and a step whose transcript was refused is skipped rather than asked. A record that changes,
 because a merge folded new material in or a rewrite was kept, has a new transcript and is
 eligible again, so nothing needs forgetting. See
@@ -190,24 +215,34 @@ the requests skipped as already refused --
 :attr:`ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy.record_merges_skipped` and
 :attr:`ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy.record_rewrites_skipped` --
 and :attr:`ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy.last_resort_fallbacks`
--- so a row says how far down the chain it went.
+-- so a row says how far down the chain it went. Whether it got as far as it meant to is
+:attr:`ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy.chain_targets_reached` and
+:attr:`ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy.chain_targets_missed`, and how
+often a decision had to be put back on the other list is
+:attr:`ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy.chain_decisions_kept`.
 """
 
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
+from math import ceil
 from typing import TYPE_CHECKING, Any, Final, Literal
 
 from agent_framework import Message
 from agent_framework._compaction import (
+    EXCLUDE_REASON_KEY,
+    EXCLUDED_KEY,
     annotate_message_groups,
     annotate_token_counts,
     included_token_count,
 )
 
+from ._anchored import DEFAULT_MIN_GAIN_FRACTION, EXCLUDE_REASON, MARKER_ID_PREFIX
 from ._toolsummary import (
     RECORD_MARKER,
     ToolResultAnchoredSummarizationCompactionStrategy,
+    _is_written_record,  # pyright: ignore[reportPrivateUsage]
     build_record_message,
     consolidatable_record_groups,
     find_record_index,
@@ -219,6 +254,7 @@ if TYPE_CHECKING:
     from agent_framework import TokenizerProtocol
 
 __all__ = [
+    "DEFAULT_CHAIN_GAIN_FRACTION",
     "DEFAULT_HARDER_ATTEMPTS",
     "DEFAULT_RECORD_MERGE_PROMPT",
     "ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy",
@@ -255,6 +291,54 @@ DEFAULT_HARDER_ATTEMPTS: Final[int] = 2
 #: count tokens; and stated as an aim, because a record that meets it by dropping values is the
 #: failure the instruction beside it is there to forbid.
 _HARDER_RATIO: Final[float] = 0.6
+
+#: Share of the tokens behind the chain's earliest edit that a firing of the chain must remove.
+#:
+#: **The chain's hysteresis, and derived from the break-even every other threshold here comes
+#: from.** The chain starts only when the prompt is over the input budget, and it used to stop
+#: as soon as the prompt fitted: just under the budget, where the next turn's growth put it
+#: back over and the chain fired again. Every firing edits early in the prompt -- a record sits
+#: where the earliest tool results were, a user summary straight after the first user turn,
+#: narration in the oldest part of the band -- so every firing re-billed nearly the whole prompt,
+#: and the chain fired on nearly every call. Run 61's composed row seeded at a 38% cache hit rate
+#: against the uncompacted control's 98%, and that is the mechanism.
+#:
+#: A firing is an edit, and :data:`~._anchored.DEFAULT_MIN_GAIN_FRACTION` already prices one:
+#: an edit that re-bills the ``B`` tokens behind it repays itself over ``T`` further calls only
+#: when it removes ``R > B * (p - c) / (p + T * c)``, where ``p`` and ``c`` are the uncached
+#: and cached prices -- its docstring carries the derivation. The chain has no choice about
+#: *whether* to edit, since the prompt is over the budget, but it does choose *how much* to
+#: remove once it has, and the re-bill of ``B`` is paid either way. So a firing is made to
+#: pass the same test: it goes on, past the budget, until it has removed at least this share
+#: of the tokens behind the earliest edit it made -- ``B`` measured on the pass, from where the
+#: first changed message sat in the prompt the chain started from. A firing that stopped at the
+#: budget removed the few hundred tokens of one turn's growth for a re-bill of the whole prompt,
+#: which is the loss that inequality exists to refuse, and bought another such firing on the
+#: next call. One removing ``R`` leaves room for about ``R`` tokens of growth before the next.
+#:
+#: **The same number as the anchored floor, on purpose**: the same prices and the same twenty
+#: remaining calls give the same share, and a second constant would be a second place for them
+#: to drift apart. At run 61's prices, a tenth of the uncached rate for a cached token, the
+#: formula reads 0.30 at twenty calls -- the default's rounding -- 0.45 at ten and 0.18 at
+#: forty.
+#:
+#: **A target, not a promise.** The steps are what they are: a record merge runs once per set
+#: of records, a user fold once, the harder rewrites a bounded number of times, and the
+#: fallback sheds narration and nothing else. When they cannot reach the target the chain stops
+#: where they left the prompt, exactly as it stops over the budget when they cannot reach that;
+#: ``CHAINSHORT`` counts those firings and ``CHAINTARGET`` the ones that reached it. Zero is the
+#: old behaviour: the target is the budget.
+DEFAULT_CHAIN_GAIN_FRACTION: Final[float] = DEFAULT_MIN_GAIN_FRACTION
+
+#: Rounds the chain's fallback may run on one pass, when its own shedding moves the target.
+#:
+#: The target is a share of the tokens behind the earliest edit, and the fallback may make an
+#: edit earlier than any before it, so the target it was handed can move below where it
+#: stopped. It is handed the new one and runs again, which it may do this many times in all.
+#: Bounded so a termination mistake cannot loop inside a chat client; in practice the second
+#: round is the last, because the fallback sheds oldest first and its first shed is its
+#: earliest.
+_MAX_FALLBACK_ROUNDS: Final[int] = 3
 
 #: Model responses the user half waits through for a record that is due, before acting anyway.
 #:
@@ -321,17 +405,27 @@ def harder_record_prompt(attempt: int) -> str:
 
 
 def _responses(messages: list[Message]) -> int:
-    """Count the assistant messages in the conversation: the clock the user half's wait runs on.
+    """Count the model's responses in the conversation: the clock the user half's wait runs on.
 
     Excluded messages count too, because the clock measures how far the conversation has gone
-    and not what is sent. Nothing needs subtracting. A record the model writes is an assistant
-    message, but the pass that sees it ends the wait as an arrival before the count is read. And
-    a compaction's own insertions -- the fallback's notes, a merged record -- are made only on
-    passes the wait does not hold: a held pass is under the give-up line, so neither fallback
-    runs, and under the budget, so the chain does not, and any pass that does not hold ends the
-    wait.
+    and not what is sent. A record the model writes is an assistant message, but the pass that
+    sees it ends the wait as an arrival before the count is read.
+
+    **A compaction's own insertions are not responses, and are subtracted.** The anchored
+    fallback's notes and the records the chain writes are assistant messages the model never
+    sent. They used to need no subtracting, because they were inserted only on passes the wait
+    does not hold. That stopped being true when the chain began keeping its decisions on every
+    list (:meth:`ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy._keep_decisions`):
+    a merged record or a shed note is now put back on a pass under the budget, which a held pass
+    is, and counted as a response it would end a wait a response early.
     """
-    return sum(1 for message in messages if message.role == "assistant")
+    return sum(
+        1
+        for message in messages
+        if message.role == "assistant"
+        and not (message.message_id or "").startswith(MARKER_ID_PREFIX)
+        and not _is_written_record(message)
+    )
 
 
 def _newest_record_identity(messages: list[Message]) -> str:
@@ -344,7 +438,7 @@ def _newest_record_identity(messages: list[Message]) -> str:
     A record the model made is named by its call id, which the provider issued. A record the
     chain wrote has no call id -- it is an ordinary message, see
     :func:`~._toolsummary.build_record_message` -- so it is named by its text. The two lists
-    agree on that text because the store pass replays the answer the copies pass was given
+    agree on that text because the chain puts the answer the copies pass was given on the store
     (:meth:`ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy._ask`). And a change of
     text is always a new record: the chain writes one only in place of every standing record,
     and only when it is smaller than them, so a written record never repeats the one straight
@@ -366,9 +460,56 @@ def _transcript(messages: list[Message], groups: list[dict[str, Any]]) -> str:
     Also the key a refusal is remembered by. It is the records' content and nothing else -- no
     position, no object, no pass -- so the copies sent on a call and the store after it, which
     hold the same records at different positions in different objects, give the same key, as
-    they must for the replay memo to work at all.
+    they must for a kept answer to be put back at all.
     """
     return "\n".join(f"{number}. {record_body(messages, group)}" for number, group in enumerate(groups, start=1))
+
+
+def _is_excluded(message: Message) -> bool:
+    """Return whether ``message`` carries the exclusion flag."""
+    return bool(message.additional_properties.get(EXCLUDED_KEY, False))
+
+
+@dataclass(frozen=True, slots=True)
+class _ChainStart:
+    """The prompt the chain started from on one pass, which its target is measured against.
+
+    Held by identity and exclusion flag rather than copied, because what the target needs from
+    it is *where* the chain first changed the prompt, and every step changes it in one of two
+    ways a walk from the front can see: it excludes a message that was included, or it inserts
+    one where another stood. ``behind`` is read in the prompt as it was, because the re-bill an
+    edit costs is of the tokens that stood behind it when it was made.
+    """
+
+    messages: tuple[Message, ...]
+    excluded: tuple[bool, ...]
+    #: Included tokens at each position and every one after it, with a zero at the end.
+    behind: tuple[int, ...]
+
+    @classmethod
+    def take(cls, messages: list[Message]) -> _ChainStart:
+        """Read ``messages``, already token-annotated, as the chain finds them."""
+        behind = [0] * (len(messages) + 1)
+        for index in range(len(messages) - 1, -1, -1):
+            behind[index] = behind[index + 1] + included_token_count([messages[index]])
+        return cls(tuple(messages), tuple(_is_excluded(message) for message in messages), tuple(behind))
+
+    @property
+    def tokens(self) -> int:
+        """The prompt's included tokens when the chain started."""
+        return self.behind[0]
+
+    def tokens_behind_first_edit(self, messages: list[Message]) -> int | None:
+        """Return the tokens that stood behind the earliest change to ``messages``, or None.
+
+        None when nothing has changed: the lists agree message for message and flag for flag.
+        """
+        for index, message in enumerate(messages):
+            if index >= len(self.messages):
+                return 0
+            if message is not self.messages[index] or _is_excluded(message) != self.excluded[index]:
+                return self.behind[index]
+        return None if len(messages) == len(self.messages) else self.behind[len(messages)]
 
 
 class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
@@ -396,12 +537,17 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
             switches the step off.
         merge_prompt: What the summarizer is asked when the records are merged. See
             :data:`DEFAULT_RECORD_MERGE_PROMPT`.
+        chain_gain_fraction: Share of the tokens behind the chain's earliest edit on a pass that
+            the chain, once started, goes on removing until it has removed -- past the budget
+            if need be. See :data:`DEFAULT_CHAIN_GAIN_FRACTION`; zero stops the chain at the
+            budget, as it stopped before the setting existed.
 
     Raises:
         ValueError: If the two phases measure against different ceilings, if an explicit
             ``user_trigger_fraction`` is outside ``(0.0, 1.0]``, or if ``harder_attempts`` is
-            negative. Each phase's trigger is a fraction of its own ``max_input_tokens``, and
-            one shared line is a line only while the two fractions are fractions of one number;
+            negative, or if ``chain_gain_fraction`` is outside ``[0.0, 1.0)``. Each phase's
+            trigger is a fraction of its own ``max_input_tokens``, and one shared line is a line
+            only while the two fractions are fractions of one number;
             the chain's budget is that number too. A fraction of zero would fire the user half on
             an empty conversation and one above one could never fire it, which are the bounds
             :class:`~._usersummary.UserTurnAnchoredSummarizationCompactionStrategy` sets on its
@@ -417,6 +563,7 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
         user_trigger_fraction: float | None = None,
         harder_attempts: int = DEFAULT_HARDER_ATTEMPTS,
         merge_prompt: str | None = None,
+        chain_gain_fraction: float = DEFAULT_CHAIN_GAIN_FRACTION,
     ) -> None:
         """Validate the pair and store it."""
         if tool_results.max_input_tokens != user_turns.max_input_tokens:
@@ -429,6 +576,10 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
             raise ValueError("user_trigger_fraction must be in (0.0, 1.0].")
         if harder_attempts < 0:
             raise ValueError("harder_attempts must be >= 0.")
+        # One is refused as well as anything above it: a firing asked to remove everything behind
+        # its earliest edit would be asked to empty the prompt from there on.
+        if not 0.0 <= chain_gain_fraction < 1.0:
+            raise ValueError("chain_gain_fraction must be in [0.0, 1.0).")
         self.tokenizer = tokenizer
         self.tool_results = tool_results
         self.user_turns = user_turns
@@ -440,6 +591,7 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
         )
         self.harder_attempts = harder_attempts
         self.merge_prompt = merge_prompt or DEFAULT_RECORD_MERGE_PROMPT
+        self.chain_gain_fraction = chain_gain_fraction
         self._removed_by_record = 0
         self._records_merged = 0
         self._record_merges_rejected = 0
@@ -451,6 +603,9 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
         self._record_rewrites_skipped = 0
         self._record_summary_failures = 0
         self._last_resort_fallbacks = 0
+        self._chain_targets_reached = 0
+        self._chain_targets_missed = 0
+        self._decisions_kept = 0
         # The user half's wait for the record half; see ``_holds_for_record``. All of it is read
         # off the conversation or kept here, never in message annotations, because the copies'
         # annotations do not reach the store the next pass runs over.
@@ -464,11 +619,12 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
         self._quiet_through = -1
         # The anchor a wait ran out behind, or None. No new wait begins behind it.
         self._declined_behind: str | None = None
-        # Record requests answered on this pass and on the one before, keyed by the exact
-        # request. Two generations, because the pass that replays is the one straight after the
-        # pass that asked; see ``_ask``.
-        self._answers: dict[tuple[str, str], str] = {}
-        self._previous_answers: dict[tuple[str, str], str] = {}
+        # What the chain decided, kept for the whole run and put back on every list it applies
+        # to, whatever that list's size: the records a merge or rewrite replaced, by their
+        # transcript, with the text that replaced them; and the ids of the messages its fallback
+        # shed. See ``_keep_decisions``. The user fold's are kept by the user half.
+        self._kept_records: dict[str, str] = {}
+        self._shed_ids: set[str] = set()
         # Refusals, kept for the whole run and keyed by the request's transcript, which is the
         # records' content: the transcripts a merge was refused on, and the harshest rewrite
         # attempt refused on each. See ``_merge_records`` and ``_rewrite_records``.
@@ -714,6 +870,40 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
         """
         return self._last_resort_fallbacks
 
+    @property
+    def chain_targets_reached(self) -> int:
+        """Passes on which the chain started and brought the prompt down to its target.
+
+        The target is the budget less :attr:`chain_gain_fraction` of the tokens behind the
+        chain's earliest edit on that pass -- see :data:`DEFAULT_CHAIN_GAIN_FRACTION` -- or the
+        budget itself at a fraction of zero. ``CHAINTARGET`` in the flags. Counted per pass, so
+        one firing on the live path can read twice: once on a call's copies and once on the
+        store.
+        """
+        return self._chain_targets_reached
+
+    @property
+    def chain_targets_missed(self) -> int:
+        """Passes on which the chain started and every step it had left the prompt above its target.
+
+        Under the budget or over it: a firing that fitted but fell short of the target counts
+        here, and so does one that ended over the budget, which the row also reads as ``DQ`` if a
+        model call went out that way. ``CHAINSHORT`` in the flags.
+        """
+        return self._chain_targets_missed
+
+    @property
+    def chain_decisions_kept(self) -> int:
+        """Passes on which a decision the chain made earlier was put back on the list in hand.
+
+        A merged or rewritten record, a user fold, or narration the chain's fallback shed, made
+        on one of the live path's two lists and missing from the other -- see
+        :meth:`_keep_decisions`. Nothing is asked or decided on these passes, so a high count is
+        not spend: it is how often the two lists would otherwise have disagreed, and the model
+        been sent back what it had already been sent without. ``CHAINKEPT`` in the flags.
+        """
+        return self._decisions_kept
+
     async def __call__(self, messages: list[Message]) -> bool:
         """Run the record phase, then the user phase on what it left, then the chain if still over.
 
@@ -724,8 +914,8 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
         pass that only asked for one has not yet shown what tool compaction can do: see
         :meth:`_holds_for_record`. What either does once it has decided to act -- the band's
         share of the prompt, and so on -- is read off the conversation as it now stands. The
-        chain then reads the live size against the input budget before each step and stops as
-        soon as the prompt fits.
+        chain then puts back what it decided on earlier passes, starts if the prompt is still
+        over the input budget, and reads the live size against its target before each step.
 
         Args:
             messages: The conversation, mutated in place.
@@ -736,7 +926,6 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
         """
         if not messages:
             return False
-        self._previous_answers, self._answers = self._answers, {}
         annotate_message_groups(messages)
         annotate_token_counts(messages, tokenizer=self.tokenizer)
         entry_tokens = included_token_count(messages)
@@ -854,27 +1043,109 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
         return True
 
     async def _last_resort(self, messages: list[Message]) -> bool:
-        """Run the chain's steps in order, each only while the prompt is still over the budget.
+        """Put back the chain's earlier decisions, then run its steps if the prompt is over.
+
+        The chain starts only on a prompt over the input budget. Once started, each step runs
+        only while the prompt is still over the chain's target -- :meth:`_short_of_target` --
+        which is below the budget by :data:`DEFAULT_CHAIN_GAIN_FRACTION`'s argument. A pass that
+        started is counted as reaching the target or missing it.
+
+        **Which steps reach the target.** Each is as bounded as it was: the merge runs once per
+        set of records, the fold once, the harder rewrites up to :attr:`harder_attempts` times
+        (the second is now asked while the prompt is short of the target, not only while it is
+        over the budget), and the fallback sheds narration, and only narration, down to the target
+        it is handed -- see :meth:`_fall_back`. Offline at run 60's settings the fallback did
+        about two thirds of the removal, the record merge and the user fold about a third between
+        them, and the rewrites almost nothing, a record dense with codes having little else to
+        lose; the target was reached on 43 of 46 firings over six seeds.
 
         Args:
             messages: The conversation, mutated in place.
 
         Returns:
-            True if any step changed the outgoing messages.
+            True if anything changed the outgoing messages.
         """
+        changed = self._keep_decisions(messages)
         if not self._over(messages):
-            return False
-        changed = await self._merge_records(messages)
-        if self._over(messages):
+            return changed
+        start = _ChainStart.take(messages)
+        changed = await self._merge_records(messages) or changed
+        if self._short_of_target(messages, start):
             changed = await self._merge_user_summaries(messages) or changed
-        if self._over(messages):
-            changed = await self._rewrite_records(messages) or changed
-        if self._over(messages) and find_record_index(messages) is not None:
+        if self._short_of_target(messages, start):
+            changed = await self._rewrite_records(messages, start) or changed
+        if self._short_of_target(messages, start) and find_record_index(messages) is not None:
             # Only behind a record. With none, the record phase has already taken its give-up
             # fallback on this pass -- a prompt over the budget is over the give-up line -- and
             # that path is not the chain's to repeat.
             self._last_resort_fallbacks += 1
-            changed = await self.tool_results.fall_back_after_record(messages) or changed
+            changed = await self._fall_back(messages, start) or changed
+        if self._short_of_target(messages, start):
+            self._chain_targets_missed += 1
+        else:
+            self._chain_targets_reached += 1
+        return changed
+
+    def _keep_decisions(self, messages: list[Message]) -> bool:
+        """Put back on ``messages`` every decision the chain made on an earlier pass.
+
+        **Why.** The live path runs this strategy over the copies a model call sends and then
+        over the stored history, and the chain runs only on a list over the budget -- which the
+        two need not agree on. The record phase on the next list can drop a tool group the
+        copies still had to carry, and take the prompt under the budget without the chain.
+        Measured offline at run 60's settings with a fuzzed model: a record rewrite kept on a
+        call's copies never reached the store, the next call was sent the old record -- an early
+        edit undone -- and when the prompt next went over, the chain asked the summarizer the
+        identical request again. Narration the fallback shed and a user fold went the same way,
+        silently, since neither asks anything a repeat would show.
+
+        **What.** Whatever the chain changes on one list is put on every list that holds what it
+        changed, whatever that list's size, before the chain decides anything new:
+
+        - a record merge or rewrite, by the transcript of the records it replaced -- the one
+          thing both lists present identically -- replacing any leading run of the records that
+          matches one, as often as one does, since a merge followed by a rewrite is two;
+        - a user fold, through
+          :meth:`~._usersummary.UserTurnAnchoredSummarizationCompactionStrategy.refold`;
+        - narration the chain's fallback shed, by message id, through
+          :meth:`~._toolsummary.ToolResultAnchoredSummarizationCompactionStrategy.shed_again_after_record`.
+
+        Nothing is asked and nothing is judged: each was judged when it was made, on the same
+        content. A record whose content changed has a new transcript and is not touched, and a
+        group that gained a message is not shed. The halves' own decisions are not here: they
+        run on every pass and re-derive them.
+
+        Args:
+            messages: The conversation, mutated in place.
+
+        Returns:
+            True if anything was put back.
+        """
+        annotate_message_groups(messages)
+        annotate_token_counts(messages, tokenizer=self.tokenizer)
+        changed = self._keep_records(messages)
+        if changed:
+            annotate_message_groups(messages)
+            annotate_token_counts(messages, tokenizer=self.tokenizer)
+        changed = self.user_turns.refold(messages) or changed
+        changed = self.tool_results.shed_again_after_record(messages, self._shed_ids) or changed
+        if changed:
+            self._decisions_kept += 1
+        return changed
+
+    def _keep_records(self, messages: list[Message]) -> bool:
+        """Replace every leading run of records the chain has already replaced, as it did."""
+        changed = False
+        while self._kept_records:
+            groups = consolidatable_record_groups(messages)
+            for count in range(len(groups), 0, -1):
+                text = self._kept_records.get(_transcript(messages, groups[:count]))
+                if text is not None:
+                    self.tool_results.consolidate_records(messages, groups[:count], text)
+                    changed = True
+                    break
+            else:
+                break
         return changed
 
     def _over(self, messages: list[Message]) -> bool:
@@ -882,6 +1153,52 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
         annotate_message_groups(messages)
         annotate_token_counts(messages, tokenizer=self.tokenizer)
         return included_token_count(messages) > self.max_input_tokens
+
+    def _target(self, messages: list[Message], start: _ChainStart) -> int:
+        """Return the included tokens the chain is working down to on this pass.
+
+        The budget until the chain has edited anything -- until then the prompt is over the
+        budget and every step runs whatever the target is -- and after that the lower of the
+        budget and the chain's starting size less :attr:`chain_gain_fraction` of the tokens
+        behind its earliest edit so far. Re-read before every step, because a later step may
+        edit earlier than any before it and so raise what the firing has to remove.
+        """
+        behind = start.tokens_behind_first_edit(messages)
+        if behind is None or not self.chain_gain_fraction:
+            return self.max_input_tokens
+        return min(self.max_input_tokens, start.tokens - ceil(self.chain_gain_fraction * behind))
+
+    def _short_of_target(self, messages: list[Message], start: _ChainStart) -> bool:
+        """Return whether the prompt, as it now stands, is over the chain's target."""
+        annotate_message_groups(messages)
+        annotate_token_counts(messages, tokenizer=self.tokenizer)
+        return included_token_count(messages) > self._target(messages, start)
+
+    async def _fall_back(self, messages: list[Message], start: _ChainStart) -> bool:
+        """Step d: the record half's fallback, shedding down to the target, and remembered.
+
+        Handed the target as its ceiling. Its own first shed may be the chain's earliest edit,
+        which moves the target lower; it is then run again against the new one, up to
+        :data:`_MAX_FALLBACK_ROUNDS` times in all, and only while each round both shed something
+        and moved the target. What it shed is remembered by message id for
+        :meth:`_keep_decisions`.
+        """
+        changed = False
+        for _ in range(_MAX_FALLBACK_ROUNDS):
+            ceiling = self._target(messages, start)
+            included = [message for message in messages if not _is_excluded(message)]
+            shed = await self.tool_results.fall_back_after_record(messages, ceiling=ceiling)
+            self._shed_ids.update(
+                message.message_id
+                for message in included
+                if message.message_id
+                and _is_excluded(message)
+                and message.additional_properties.get(EXCLUDE_REASON_KEY) == EXCLUDE_REASON
+            )
+            changed = shed or changed
+            if not shed or self._target(messages, start) >= ceiling:
+                break
+        return changed
 
     async def _merge_records(self, messages: list[Message]) -> bool:
         """Step a: merge the active records into one, when there are at least two.
@@ -892,7 +1209,7 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
 
         **Not asked again on records it was refused on.** A refused merge leaves the records as
         they were, and if step c is refused too they are still as they were when the prompt next
-        goes over the budget -- possibly passes later, when the replay memo has let the request
+        goes over the budget -- possibly passes later, long after the request was made
         go. The same records give the same transcript, and a merge refused on it is skipped. A new
         record, or a kept rewrite, changes the transcript and the merge is asked for again.
         """
@@ -922,7 +1239,7 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
             self._user_merges_rejected += 1
         return False
 
-    async def _rewrite_records(self, messages: list[Message]) -> bool:
+    async def _rewrite_records(self, messages: list[Message], start: _ChainStart) -> bool:
         """Step c: rewrite the record harder, up to :attr:`harder_attempts` times on this pass.
 
         Every active record is handed over, which is one record whenever step a succeeded or
@@ -954,7 +1271,7 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
         """
         changed = False
         for attempt in range(1, self.harder_attempts + 1):
-            if attempt > 1 and not self._over(messages):
+            if attempt > 1 and not self._short_of_target(messages, start):
                 break
             groups = consolidatable_record_groups(messages)
             if not groups:
@@ -1009,17 +1326,23 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
         if included_token_count(candidate) >= included_token_count(replaced):
             return "rejected"
         self.tool_results.consolidate_records(messages, groups, text)
+        self._kept_records[transcript] = text
+        # The new record may read exactly as one an earlier pass went on to replace -- a merge of
+        # new material can come back as the record an earlier rewrite started from -- and that
+        # replacement is already decided, so it is taken here rather than asked for again.
+        self._keep_records(messages)
         return "accepted"
 
     async def _ask(self, *, prompt: str, transcript: str) -> str | None:
-        """Return the summarizer's answer, asking only if the request is new.
+        """Return the summarizer's answer to one merge or rewrite request.
 
-        Remembered for this pass and the next, so the second list the live path runs on replays
-        the text the first list was given -- the model is sent one merged record, the store holds
-        the same one, and :func:`_newest_record_identity` reads the same name off both. A request
-        refused as no smaller does not reach here again: its caller skips it, on a memory that
-        outlasts this one (see :meth:`_rewrite_records`). A failure is not remembered, for the
-        reason the user half gives: the next view should ask again.
+        Asked every time it is reached, because nothing reaches it twice for the same records: a
+        kept answer is put back by :meth:`_keep_decisions` before the chain starts, so the second
+        list the live path runs on holds the text the first was given -- the model is sent one
+        merged record, the store holds the same one, and :func:`_newest_record_identity` reads
+        the same name off both -- and a request refused as no smaller is skipped by its caller
+        (see :meth:`_rewrite_records`). A failure is not remembered, for the reason the user half
+        gives: the next view should ask again.
 
         Keyword Args:
             prompt: The system prompt.
@@ -1028,11 +1351,6 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
         Returns:
             The text, or None when the summarizer raised or said nothing.
         """
-        key = (prompt, transcript)
-        remembered = self._answers.get(key) or self._previous_answers.get(key)
-        if remembered is not None:
-            self._answers[key] = remembered
-            return remembered
         try:
             response = await self.user_turns.client.get_response(
                 [Message(role="system", contents=[prompt]), Message(role="user", contents=[transcript])],
@@ -1049,5 +1367,4 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
             logger.warning("Skipping record consolidation: the summarizer returned no text.")
             self._record_summary_failures += 1
             return None
-        self._answers[key] = text
         return text

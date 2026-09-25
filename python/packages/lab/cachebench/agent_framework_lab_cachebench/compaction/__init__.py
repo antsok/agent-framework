@@ -79,7 +79,11 @@ from ._anchored import (
     AnchoredCompactionStrategy,
     MinimumGainAnchoredCompactionStrategy,
 )
-from ._composed import DEFAULT_HARDER_ATTEMPTS, ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy
+from ._composed import (
+    DEFAULT_CHAIN_GAIN_FRACTION,
+    DEFAULT_HARDER_ATTEMPTS,
+    ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy,
+)
 from ._preserve import (
     PRESERVE_REASON_KEY,
     PRESERVED_KEY,
@@ -123,6 +127,7 @@ from ._usersummary import (
 
 __all__ = [
     "DEFAULT_BAND_SHARE",
+    "DEFAULT_CHAIN_GAIN_FRACTION",
     "DEFAULT_COVERAGE_SHARE",
     "DEFAULT_FALLBACK_FRACTION",
     "DEFAULT_HARDER_ATTEMPTS",
