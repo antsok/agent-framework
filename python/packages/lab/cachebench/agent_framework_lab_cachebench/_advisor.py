@@ -52,6 +52,16 @@ class ModelPricing:
     output_per_million: float = 0.0
     """Generation rate. Zero for the replay benchmarks, which cap output at a few tokens
     and study only the prompt side; a live run generates real replies and must price them."""
+    cache_write_per_million: float | None = None
+    """Rate for a prompt token the provider writes into its cache, ``None`` when it charges none.
+
+    Some models bill the uncached part of a prompt above the input rate, because that is the
+    part written into the cache for the next call to read -- gpt-6-luna at 1.25x. Pricing it at
+    the input rate would under-charge exactly what compaction causes, a broken prefix, and so
+    flatter the strategies that break it most. With automatic caching every uncached prompt
+    token is taken as written, which is what the provider bills when the prefix is long enough to
+    cache at all; a prompt too short to cache is billed at the input rate instead and is
+    over-charged here by the premium, which on this benchmark's prompts does not arise."""
 
     @property
     def cache_discount(self) -> float:
@@ -75,7 +85,22 @@ class ModelPricing:
             Cost in the pricing's currency units.
         """
         fresh = max(input_tokens - cached_tokens, 0)
-        return (fresh * self.input_per_million + cached_tokens * self.cached_read_per_million) / 1_000_000
+        return (fresh * self.fresh_per_million + cached_tokens * self.cached_read_per_million) / 1_000_000
+
+    @property
+    def fresh_per_million(self) -> float:
+        """Return the rate an uncached prompt token is billed at: the cache-write rate when set."""
+        return self.cache_write_per_million if self.cache_write_per_million is not None else self.input_per_million
+
+    def describe(self) -> str:
+        """Return the rates as the reports print them, the cache-write rate only when there is one."""
+        text = (
+            f"${self.input_per_million:.2f}/M in, ${self.cached_read_per_million:.3f}/M cached, "
+            f"${self.output_per_million:.2f}/M out"
+        )
+        if self.cache_write_per_million is not None:
+            text += f", ${self.cache_write_per_million:.3f}/M cache write (charged on every uncached input token)"
+        return text
 
 
 @dataclass(frozen=True, slots=True)

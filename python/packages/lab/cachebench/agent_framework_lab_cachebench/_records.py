@@ -266,7 +266,10 @@ __all__ = [
 #: moves two flags: ``RECMERGE`` and ``USERMERGE`` counted the store's replay of a copies-pass
 #: merge as a second one, and from 19 count each decision once, with ``CHAINKEPT`` counting the
 #: passes that put one back.
-SCHEMA_VERSION: Final[int] = 19
+#:
+#: 20 adds ``price_cache_write`` to the cell, on the version 5 argument: before it no run charged
+#: a write premium, so the field reads back as ``None``, the rate those runs used.
+SCHEMA_VERSION: Final[int] = 20
 
 #: Versions this reader accepts, which is not only the current one.
 #:
@@ -351,7 +354,10 @@ SCHEMA_VERSION: Final[int] = 19
 #:
 #: Version 18 joins on the same argument: its chain stopped at the budget, so
 #: ``chain_gain_fraction`` reads back as the zero those runs used.
-_READABLE_SCHEMAS: Final[frozenset[int]] = frozenset({*range(2, 19), SCHEMA_VERSION})
+#:
+#: Version 19 joins on the same argument: it charged no write premium, so ``price_cache_write``
+#: reads back as the ``None`` those runs used.
+_READABLE_SCHEMAS: Final[frozenset[int]] = frozenset({*range(2, 20), SCHEMA_VERSION})
 
 #: The parameters that make two records the same cell, and so aggregable into one row.
 #:
@@ -409,6 +415,7 @@ _CELL_KEY_FIELDS: Final[tuple[str, ...]] = (
     "price_input",
     "price_cached",
     "price_output",
+    "price_cache_write",
     "workload",
     "settings",
 )
@@ -427,6 +434,7 @@ _MODEL_KEY_FIELDS: Final[tuple[str, ...]] = (
     "price_input",
     "price_cached",
     "price_output",
+    "price_cache_write",
 )
 
 
@@ -832,6 +840,14 @@ class CellParams:
     Defaulted to 0 for a record written before the payload could be derived, where the size was
     stated outright and 0 is what that means.
     """
+    price_cache_write: float | None = None
+    """The cache-write rate every uncached input token was charged at, ``None`` for none.
+
+    ``None`` on a record written before schema 20, and that is a measurement rather than a gap:
+    those runs charged uncached input at ``price_input``, which is what ``None`` means here. In
+    the key, like the other rates, so a cell priced with a write premium never pools with one
+    priced without.
+    """
     min_correctness: float = DEFAULT_MIN_CORRECTNESS
     """The correctness bar the verdict applied.
 
@@ -874,6 +890,7 @@ class CellParams:
             input_per_million=self.price_input,
             cached_read_per_million=self.price_cached,
             output_per_million=self.price_output,
+            cache_write_per_million=self.price_cache_write,
         )
 
     @property
