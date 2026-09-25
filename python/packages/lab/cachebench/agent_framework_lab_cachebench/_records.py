@@ -243,7 +243,18 @@ __all__ = [
 #: zero on an older record because zero is what those runs did: no pass was held. As at 16, the
 #: schema is the only mark of the change in ordering itself, and a composed row before 17 is a
 #: different design from one after it.
-SCHEMA_VERSION: Final[int] = 17
+#:
+#: 18 adds ``record_rewrites_skipped``, on the version 5 argument once more. Before it the
+#: composed row's chain asked again for a rewrite it had already had refused, whenever the prompt
+#: went back over the budget with the record unchanged -- run 61 measured 57 to 164 refusals a
+#: seed -- and from 18 an attempt refused on a record is not made again, nor any milder one,
+#: until the record changes. The field reads back as zero on an older record because zero is what
+#: those runs did: nothing was skipped. It also moves ``record_rewrites`` and
+#: ``record_rewrites_rejected``, which no field records: they used to count the live path's
+#: second list replaying a refusal as a second attempt and a second refusal, and from 18 that
+#: replay is a skip, so a composed row's two counts before 18 read higher for the same work.
+#: ``RECMERGESKIP``, the same rule on step a, is a flag and not a field.
+SCHEMA_VERSION: Final[int] = 18
 
 #: Versions this reader accepts, which is not only the current one.
 #:
@@ -322,7 +333,10 @@ SCHEMA_VERSION: Final[int] = 17
 #:
 #: Version 16 joins on the same argument: its composed row's user half never waited for a record,
 #: so ``user_passes_waited`` reads back as the zero those runs produced.
-_READABLE_SCHEMAS: Final[frozenset[int]] = frozenset({*range(2, 17), SCHEMA_VERSION})
+#:
+#: Version 17 joins on the same argument: its chain never skipped a rewrite, so
+#: ``record_rewrites_skipped`` reads back as the zero those runs produced.
+_READABLE_SCHEMAS: Final[frozenset[int]] = frozenset({*range(2, 18), SCHEMA_VERSION})
 
 #: The parameters that make two records the same cell, and so aggregable into one row.
 #:
@@ -1264,6 +1278,14 @@ class SeedRecord:
     """Harder rewrites of the record the chain tried, kept or not: step c, per attempt."""
     record_rewrites_rejected: int
     """Of those, the rewrites discarded because they came back no smaller."""
+    record_rewrites_skipped: int
+    """Rewrite attempts not made because the same record had already been refused at them.
+
+    A refused rewrite is not asked for again, nor any milder one, until the record changes.
+    ``strategy_notes`` carries it as ``RECHARDERSKIP:<n>``. Zero for every strategy that keeps no
+    such count, and zero on a record written before schema 18 -- see :data:`SCHEMA_VERSION` for
+    why that zero is a measurement rather than a gap, and for how 18 moved the two counts above.
+    """
     last_resort_fallbacks: int
     """Passes on which the chain reached its fallback, step d, with everything above it tried."""
     user_passes_waited: int
@@ -1545,6 +1567,8 @@ class SeedRecord:
         # Zero on the same reading, schema 17 along: the composed row's user half never waited
         # before it, so no pass was held.
         values.setdefault("user_passes_waited", 0)
+        # Zero on the same reading, schema 18 along: the chain never skipped a rewrite before it.
+        values.setdefault("record_rewrites_skipped", 0)
         # None, on the probe-token reading. A record written before schema 11 carried one
         # standing summary or none, and which is a deduction from ``user_compactions`` rather
         # than a number anybody took; the tokens are not recoverable at all.

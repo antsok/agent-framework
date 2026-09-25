@@ -540,6 +540,18 @@ the moment the prompt is over the budget, and an agent turn would be a call made
 prompt. The flags say how far down the chain a row went: `RECMERGE`/`RECMERGEREJ`,
 `USERMERGE`/`USERMERGEREJ`, `RECHARDER`/`RECHARDERREJ`, `RECSUMMFAIL` and `LASTFALLBACK`.
 
+**A refused merge or rewrite is not asked for again until the records change** (schema 18). A
+record dense with codes cannot shrink while keeping them, and run 61 measured 57 to 164 refused
+rewrites a seed, many of them the same request paid for again when the prompt went back over the
+budget with the record unchanged. The chain now remembers each refusal for the whole run, keyed
+by the records' text -- the one thing the live path's two lists present identically -- and skips
+it: `RECHARDERSKIP` and `RECMERGESKIP`. A refused rewrite attempt forecloses the milder ones on
+the same record as well, since a record the summarizer could not shorten at all when asked for a
+third will not shorten when asked for more; a milder refusal leaves the harsher attempt open, and
+the same pass asks it. A skipped step moves the chain on exactly as a refusal does. The user
+summaries' fold needs none of this: the user half's own replay memory already answers a fold over
+unchanged summaries.
+
 **Why the alignment runs down to 0.6 and not up to 0.8.** The record is written by a model
 reading the tool payload, and it is measured degrading with the bulk it is given, so a record
 asked for at 0.8 is a bigger ask and a worse record. The middleware that does the asking reads

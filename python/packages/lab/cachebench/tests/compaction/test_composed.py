@@ -1872,16 +1872,125 @@ async def test_the_other_list_replays_the_merge_rather_than_paying_for_it_again(
     assert _active_record_ids(copies) == _active_record_ids(store) == [f"written:{_SHORT_RECORD}"]
 
 
-async def test_a_refused_merge_is_not_paid_for_again_on_the_next_pass() -> None:
-    """An identical request refused on one pass is answered from memory on the next."""
+async def _idle_passes(strategy: ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy) -> None:
+    """Run two passes under the budget, which is long enough for the replay memo to let go.
+
+    The memo keeps a request for one pass beyond the last that asked it, and the chain does not
+    run on a pass under the budget, so these are the passes that used to make a refused request
+    new again: run 61's wasted rewrites were asked across gaps like this one.
+    """
+    for _ in range(2):
+        await strategy([Message(role="user", contents=["Idle."], message_id="idle")])
+
+
+def _change_record(messages: list[Message], call_id: str, indices: list[int]) -> None:
+    """Give the record under ``call_id`` new content, as a record that folded new material in has."""
+    (index,) = (i for i, message in enumerate(messages) if message.message_id == f"{call_id}_res")
+    messages[index] = _padded_record(int(call_id.removeprefix("rec")), indices)[1]
+
+
+async def test_a_refused_merge_is_not_asked_again_on_the_same_records_until_they_change() -> None:
+    """Step a remembers a refusal by the records' content, past the replay memo, until they change.
+
+    Refused on the first pass. Asked for again on the same records after two idle passes, it used
+    to be paid for again, because the memo that replayed it had let it go; now it is skipped, and
+    the chain goes on to the fold as after a refusal. Once a record's content changes the records
+    are new and the merge is asked for.
+    """
     summarizer = _RoutingSummarizer()
     strategy = _chain_composed(summarizer, harder_attempts=0)
 
     await strategy(_chain_conversation())
+    await _idle_passes(strategy)
     await strategy(_chain_conversation())
 
-    assert summarizer.log.count("merge") == 1
-    assert strategy.record_merges_rejected == 2, "refused on both passes"
+    assert summarizer.log.count("merge") == 1, "not paid for again on the same records"
+    assert (strategy.record_merges_rejected, strategy.record_merges_skipped) == (1, 1)
+    assert summarizer.log == ["merge", "fold", "fallback", "fallback"], "on past the skipped merge, the fold replayed"
+
+    changed = _chain_conversation()
+    _change_record(changed, "rec2", [2, 7])
+    await strategy(changed)
+
+    assert summarizer.log.count("merge") == 2, "asked again once a record changed"
+    assert (strategy.record_merges_rejected, strategy.record_merges_skipped) == (2, 1)
+
+
+async def test_a_refused_rewrite_is_not_asked_again_until_the_record_changes_and_the_chain_reaches_d() -> None:
+    """Step c remembers a refusal by the record's content, and a skipped step c still leads to d.
+
+    Every attempt is refused on the first pass. On a later pass over the same record, past the
+    replay memo, neither attempt is asked -- both are skipped -- and the fallback runs, exactly
+    as it did after the refusals. Once the record changes, both attempts are asked again.
+    """
+    summarizer = _RoutingSummarizer()
+    strategy = _chain_composed(summarizer)
+
+    await strategy(_chain_conversation(trailing=True))
+    assert summarizer.log == ["merge", "fold", "harder1", "harder2", "fallback"]
+    await _idle_passes(strategy)
+    del summarizer.log[:]
+    await strategy(_chain_conversation(trailing=True))
+
+    assert [kind for kind in summarizer.log if kind.startswith("harder")] == [], "no attempt asked again"
+    assert summarizer.log[-1] == "fallback", "and the chain reached step d all the same"
+    assert strategy.last_resort_fallbacks == 2
+    assert (strategy.record_rewrites, strategy.record_rewrites_rejected) == (2, 2)
+    assert strategy.record_rewrites_skipped == DEFAULT_HARDER_ATTEMPTS
+
+    changed = _chain_conversation(trailing=True)
+    _change_record(changed, "rec1", [1, 8])
+    del summarizer.log[:]
+    await strategy(changed)
+
+    assert [kind for kind in summarizer.log if kind.startswith("harder")] == ["harder1", "harder2"], "asked again"
+    assert strategy.record_rewrites_skipped == DEFAULT_HARDER_ATTEMPTS, "nothing more skipped"
+
+
+async def test_a_refusal_forecloses_its_own_attempt_and_milder_ones_but_not_harsher_ones() -> None:
+    """The escalation rule, both ways round.
+
+    Attempt one refused and attempt two failed: the next pass skips one and asks two, which was
+    never answered. Attempt one kept and attempt two refused on the kept record: the next pass
+    over that record skips both, because a record the summarizer could not shorten at all when
+    asked for a third will not be shortened when asked for more.
+    """
+    failing = {"harder2": True}
+
+    class _FailsOnHarder2(_RoutingSummarizer):
+        async def get_response(self, messages: list[Message], *, stream: bool = False, **kwargs: Any) -> ChatResponse:
+            if messages[0].text == harder_record_prompt(2) and failing["harder2"]:
+                self.log.append("harder2")
+                raise RuntimeError("the summarizer is unavailable")
+            return await super().get_response(messages, stream=stream, **kwargs)
+
+    summarizer = _FailsOnHarder2()
+    strategy = _chain_composed(summarizer, harder_attempts=2)
+    await strategy(_chain_conversation())
+    failing["harder2"] = False
+    await _idle_passes(strategy)
+    del summarizer.log[:]
+    await strategy(_chain_conversation())
+
+    assert [kind for kind in summarizer.log if kind.startswith("harder")] == ["harder2"], "one skipped, two asked"
+    assert strategy.record_rewrites_skipped == 1
+
+    kept = _RoutingSummarizer(
+        merge=_longer,
+        fold=_longer,
+        harder=lambda attempt, body: body[: len(body) // 2] if attempt == 1 else _longer(body),
+    )
+    strategy = _chain_composed(kept)
+    messages = _chain_conversation()
+    await strategy(messages)
+    assert [kind for kind in kept.log if kind.startswith("harder")] == ["harder1", "harder2"]
+    assert (strategy.record_rewrites, strategy.record_rewrites_rejected) == (2, 1), "one kept, two refused"
+    await _idle_passes(strategy)
+    del kept.log[:]
+    await strategy(messages)
+
+    assert [kind for kind in kept.log if kind.startswith("harder")] == [], "the milder attempt foreclosed too"
+    assert strategy.record_rewrites_skipped == 2
 
 
 async def test_a_summarizer_that_fails_a_merge_leaves_the_records_and_moves_on() -> None:

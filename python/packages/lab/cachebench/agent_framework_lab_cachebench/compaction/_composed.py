@@ -161,6 +161,23 @@ the chain remembers its record requests for one pass beyond the one they were ma
 user half's builder for this row keeps its last two requests, because a pass over the budget
 may ask it for both a band and a fold.
 
+**A refused request is not asked again while what it would rewrite is unchanged.** The replay
+memo lasts one pass beyond its last use, and the chain does not run on a pass under the budget,
+so a record refused as no smaller used to be asked for again -- and paid for again -- whenever
+the prompt went back over the budget with the record as it was. Run 61 measured the refusals: of
+98 to 194 harder rewrites a seed, 57 to 164 were refused, a record dense with codes being one that
+cannot shrink while keeping them. So a refusal is remembered for as long as the run lasts, keyed
+by the request's transcript -- the numbered record bodies, which are the records' content and
+the one thing both lists present identically, since the replay memo already depends on it --
+and a step whose transcript was refused is skipped rather than asked. A record that changes,
+because a merge folded new material in or a rewrite was kept, has a new transcript and is
+eligible again, so nothing needs forgetting. See
+:meth:`ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy._rewrite_records` for how this
+meets the escalation, and :meth:`ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy._merge_records`
+for step a. Step b needs none of it: the user half keeps a refused fold among its remembered
+requests, and only a new band summary -- which changes the summaries a fold would read, and so
+the fold's request -- can push it out, so a fold over unchanged summaries is always replayed.
+
 **Counters.** Every counter of both halves is readable off this object, so the flags column --
 built by duck typing -- says which half did what. The chain adds one per step:
 :attr:`ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy.records_merged` and
@@ -169,6 +186,9 @@ built by duck typing -- says which half did what. The chain adds one per step:
 :attr:`ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy.user_merges_rejected`,
 :attr:`ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy.record_rewrites` and
 :attr:`ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy.record_rewrites_rejected`,
+the requests skipped as already refused --
+:attr:`ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy.record_merges_skipped` and
+:attr:`ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy.record_rewrites_skipped` --
 and :attr:`ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy.last_resort_fallbacks`
 -- so a row says how far down the chain it went.
 """
@@ -224,8 +244,8 @@ _Consolidation = Literal["accepted", "rejected", "failed"]
 #: values themselves set on a record written to carry them; beyond that point attempts are
 #: rejected as no smaller, or kept by dropping what the instruction says to keep, and neither is
 #: worth a call. Zero switches the step off. The bound is per pass: a prompt that stays over the
-#: budget meets the chain again on the next one, where a request identical to one already refused
-#: is answered from memory rather than paid for again.
+#: budget meets the chain again on the next one, where an attempt already refused on the same
+#: record is skipped rather than asked again -- see ``_rewrite_records``.
 DEFAULT_HARDER_ATTEMPTS: Final[int] = 2
 
 #: How much shorter each successive rewrite is asked to be, as a share of the record's length.
@@ -340,6 +360,17 @@ def _newest_record_identity(messages: list[Message]) -> str:
     return f"text:{message.text}"
 
 
+def _transcript(messages: list[Message], groups: list[dict[str, Any]]) -> str:
+    """Return the numbered record bodies a merge or rewrite of ``groups`` hands the summarizer.
+
+    Also the key a refusal is remembered by. It is the records' content and nothing else -- no
+    position, no object, no pass -- so the copies sent on a call and the store after it, which
+    hold the same records at different positions in different objects, give the same key, as
+    they must for the replay memo to work at all.
+    """
+    return "\n".join(f"{number}. {record_body(messages, group)}" for number, group in enumerate(groups, start=1))
+
+
 class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
     """Run the record strategy, then the user-turn strategy, then a last-resort chain.
 
@@ -416,6 +447,8 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
         self._user_merges_rejected = 0
         self._record_rewrites = 0
         self._record_rewrites_rejected = 0
+        self._record_merges_skipped = 0
+        self._record_rewrites_skipped = 0
         self._record_summary_failures = 0
         self._last_resort_fallbacks = 0
         # The user half's wait for the record half; see ``_holds_for_record``. All of it is read
@@ -436,6 +469,11 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
         # pass that asked; see ``_ask``.
         self._answers: dict[tuple[str, str], str] = {}
         self._previous_answers: dict[tuple[str, str], str] = {}
+        # Refusals, kept for the whole run and keyed by the request's transcript, which is the
+        # records' content: the transcripts a merge was refused on, and the harshest rewrite
+        # attempt refused on each. See ``_merge_records`` and ``_rewrite_records``.
+        self._refused_merges: set[str] = set()
+        self._refused_rewrites: dict[str, int] = {}
 
     @property
     def strategies(self) -> tuple[_Phase, ...]:
@@ -594,9 +632,9 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
     def record_merges_rejected(self) -> int:
         """Merges of the records that came back no smaller than the records, and were discarded.
 
-        Step a refused on the generic rule: the old records stayed and the chain moved on. A
-        replay of a refused merge on the other list is refused again and counted again, since it
-        is the same decision taken on the second view of the conversation. ``RECMERGEREJ``.
+        Step a refused on the generic rule: the old records stayed and the chain moved on. Counted
+        once per refusal: the same records met again, on the other list or on a later pass, are
+        skipped and counted under :attr:`record_merges_skipped`. ``RECMERGEREJ``.
         """
         return self._record_merges_rejected
 
@@ -626,8 +664,34 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
 
     @property
     def record_rewrites_rejected(self) -> int:
-        """Of :attr:`record_rewrites`, the ones that came back no smaller. ``RECHARDERREJ``."""
+        """Of :attr:`record_rewrites`, the ones that came back no smaller. ``RECHARDERREJ``.
+
+        Counted once per refusal, as :attr:`record_merges_rejected` is: the attempt met again on
+        the same record is skipped, under :attr:`record_rewrites_skipped`.
+        """
         return self._record_rewrites_rejected
+
+    @property
+    def record_merges_skipped(self) -> int:
+        """Merges of the records not asked for, because a merge of the same records was refused.
+
+        Step a skipped for :meth:`_merge_records`'s reason, per pass. On the live path the store
+        pass skips what the copies pass refused, where it used to replay the refusal, so
+        :attr:`record_merges_rejected` now counts each refusal once. ``RECMERGESKIP`` in the flags.
+        """
+        return self._record_merges_skipped
+
+    @property
+    def record_rewrites_skipped(self) -> int:
+        """Harder rewrite attempts not made, because the same record was already refused at them.
+
+        Step c, per attempt, as :attr:`record_rewrites` is: an attempt skipped here is neither
+        tried nor refused, and costs nothing. See :meth:`_rewrite_records` for which attempts a
+        refusal forecloses. The live path's store pass skips what its copies pass refused, where
+        it used to replay the refusal and count it again under both :attr:`record_rewrites` and
+        :attr:`record_rewrites_rejected`. ``RECHARDERSKIP`` in the flags.
+        """
+        return self._record_rewrites_skipped
 
     @property
     def record_summary_failures(self) -> int:
@@ -825,16 +889,27 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
         Only records :func:`~._toolsummary.consolidatable_record_groups` offers: a record whose
         result this model call carried in waits for the next pass, and is not counted towards the
         two.
+
+        **Not asked again on records it was refused on.** A refused merge leaves the records as
+        they were, and if step c is refused too they are still as they were when the prompt next
+        goes over the budget -- possibly passes later, when the replay memo has let the request
+        go. The same records give the same transcript, and a merge refused on it is skipped. A new
+        record, or a kept rewrite, changes the transcript and the merge is asked for again.
         """
         groups = consolidatable_record_groups(messages)
         if len(groups) < 2:
             return False
-        outcome = await self._consolidate(messages, groups, prompt=self.merge_prompt)
+        transcript = _transcript(messages, groups)
+        if transcript in self._refused_merges:
+            self._record_merges_skipped += 1
+            return False
+        outcome = await self._consolidate(messages, groups, prompt=self.merge_prompt, transcript=transcript)
         if outcome == "accepted":
             self._records_merged += 1
             return True
         if outcome == "rejected":
             self._record_merges_rejected += 1
+            self._refused_merges.add(transcript)
         return False
 
     async def _merge_user_summaries(self, messages: list[Message]) -> bool:
@@ -855,6 +930,27 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
         harder merge, and the prompt says so. Each attempt is judged against the records as they
         stand when it is made, so a kept attempt raises the bar for the next. A record whose
         result this model call carried in is not handed over, as step a does not merge it.
+
+        **A refusal forecloses its own attempt and every milder one, on that record, for the
+        run.** Remembered by transcript -- the records' content -- as the harshest attempt refused
+        on it; an attempt at or below that is skipped rather than asked, and the loop goes on to
+        the next attempt, and the chain to step d, exactly as after a refusal. The two directions
+        are decided apart:
+
+        - *Milder refused, harsher still open.* The pass that refuses attempt one goes straight on
+          to attempt two, which is the escalation this step exists for, so a record is never
+          written off on its milder refusal alone. It leaves a pass with one refused and two
+          unanswered only when the summarizer failed on two, and a failure is not remembered: two
+          is asked on the next pass, one is skipped.
+        - *Harsher refused, milder foreclosed.* A refusal means the answer was not smaller at all:
+          told to keep every value and cut the rest to about a third, the summarizer cut nothing.
+          Asking it to cut less is weaker pressure towards the same outcome. The case is common --
+          attempt one kept, attempt two refused on the kept record -- and without this every such
+          record would buy one more refusal on the next pass.
+
+        A record refused at attempt ``harder_attempts`` is therefore incompressible until it
+        changes; a merge folding new material in, or a kept rewrite, gives it a new transcript and
+        every attempt back.
         """
         changed = False
         for attempt in range(1, self.harder_attempts + 1):
@@ -863,16 +959,23 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
             groups = consolidatable_record_groups(messages)
             if not groups:
                 break
+            transcript = _transcript(messages, groups)
+            if self._refused_rewrites.get(transcript, 0) >= attempt:
+                self._record_rewrites_skipped += 1
+                continue
             self._record_rewrites += 1
-            outcome = await self._consolidate(messages, groups, prompt=harder_record_prompt(attempt))
+            outcome = await self._consolidate(
+                messages, groups, prompt=harder_record_prompt(attempt), transcript=transcript
+            )
             if outcome == "accepted":
                 changed = True
             elif outcome == "rejected":
                 self._record_rewrites_rejected += 1
+                self._refused_rewrites[transcript] = max(self._refused_rewrites.get(transcript, 0), attempt)
         return changed
 
     async def _consolidate(
-        self, messages: list[Message], groups: list[dict[str, Any]], *, prompt: str
+        self, messages: list[Message], groups: list[dict[str, Any]], *, prompt: str, transcript: str
     ) -> _Consolidation:
         """Ask for one record in place of ``groups``, and put it there if it is smaller.
 
@@ -891,13 +994,11 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
 
         Keyword Args:
             prompt: What the summarizer is asked.
+            transcript: ``groups`` as :func:`_transcript` numbers them.
 
         Returns:
             Whether the replacement was kept, refused as no smaller, or never arrived.
         """
-        transcript = "\n".join(
-            f"{number}. {record_body(messages, group)}" for number, group in enumerate(groups, start=1)
-        )
         text = await self._ask(prompt=prompt, transcript=transcript)
         if text is None:
             return "failed"
@@ -915,9 +1016,10 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
 
         Remembered for this pass and the next, so the second list the live path runs on replays
         the text the first list was given -- the model is sent one merged record, the store holds
-        the same one, and :func:`_newest_record_identity` reads the same name off both -- and a
-        request refused as no smaller is not paid for again while it keeps being asked. A failure
-        is not remembered, for the reason the user half gives: the next view should ask again.
+        the same one, and :func:`_newest_record_identity` reads the same name off both. A request
+        refused as no smaller does not reach here again: its caller skips it, on a memory that
+        outlasts this one (see :meth:`_rewrite_records`). A failure is not remembered, for the
+        reason the user half gives: the next view should ask again.
 
         Keyword Args:
             prompt: The system prompt.

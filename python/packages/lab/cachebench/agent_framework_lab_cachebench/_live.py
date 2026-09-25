@@ -703,6 +703,12 @@ class LiveOutcome:
     """Harder rewrites of the record the chain tried, kept or not: step c. ``RECHARDER``."""
     record_rewrites_rejected: int = 0
     """Of those, the rewrites discarded because they came back no smaller. ``RECHARDERREJ``."""
+    record_rewrites_skipped: int = 0
+    """Rewrite attempts not made, because the same record had already been refused at them.
+
+    Step c skipped rather than paid for: a record refused as no smaller is not asked for again
+    until it changes. Neither tried nor refused, so not in ``record_rewrites``. ``RECHARDERSKIP``.
+    """
     last_resort_fallbacks: int = 0
     """Passes on which the chain reached its fallback, step d, having tried everything above it.
 
@@ -1041,6 +1047,8 @@ def _strategy_notes(strategy: Any) -> tuple[str, ...]:
         ("user_merges_rejected", "USERMERGEREJ"),
         ("record_rewrites", "RECHARDER"),
         ("record_rewrites_rejected", "RECHARDERREJ"),
+        ("record_rewrites_skipped", "RECHARDERSKIP"),
+        ("record_merges_skipped", "RECMERGESKIP"),
         ("record_summary_failures", "RECSUMMFAIL"),
         ("last_resort_fallbacks", "LASTFALLBACK"),
     ):
@@ -2160,6 +2168,7 @@ async def run_live(
         user_merges_rejected=_count(strategy, "user_merges_rejected"),
         record_rewrites=_count(strategy, "record_rewrites"),
         record_rewrites_rejected=_count(strategy, "record_rewrites_rejected"),
+        record_rewrites_skipped=_count(strategy, "record_rewrites_skipped"),
         last_resort_fallbacks=_count(strategy, "last_resort_fallbacks"),
         user_passes_waited=_count(strategy, "user_passes_waited"),
         # Taken from the snapshot rather than from the live session, so it is the record the
