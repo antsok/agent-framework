@@ -270,9 +270,17 @@ class StubChatClient(FunctionInvocationLayer[Any], ChatMiddlewareLayer[Any], Bas
         synthesised itself. A stub that took any history it was handed let that pass the whole
         suite, so this one refuses the same way, loudly, and records the ids of the calls it
         answers with on the way out.
+
+        **And it pairs them with each other, in both directions.** Every function call in a
+        request must have its output in the same request, and every output its call. Run 60 was
+        refused with ``No tool output found for function call`` when the composed row sent a
+        record's call whose result it had excluded; the check above let that through, because
+        both halves were ids the model had issued.
         """
 
         def checked(*, messages: Sequence[Message], stream: bool, options: Mapping[str, Any], **kwargs: Any) -> Any:
+            calls: set[str | None] = set()
+            results: set[str | None] = set()
             for message in messages:
                 for content in message.contents:
                     if content.type not in ("function_call", "function_result"):
@@ -282,6 +290,13 @@ class StubChatClient(FunctionInvocationLayer[Any], ChatMiddlewareLayer[Any], Bas
                             f"the request carries a {content.type} with call id {content.call_id!r}, "
                             "which this model never issued; a provider refuses such a request"
                         )
+                    (calls if content.type == "function_call" else results).add(content.call_id)
+            if calls != results:
+                raise AssertionError(
+                    f"the request carries function calls without their output {sorted(map(str, calls - results))} "
+                    f"and outputs without their call {sorted(map(str, results - calls))}; a provider refuses "
+                    "such a request"
+                )
             answer = script(messages=messages, stream=stream, options=options, **kwargs)
 
             async def _noted() -> Any:
@@ -2415,6 +2430,61 @@ async def test_a_merge_through_the_live_path_sends_the_model_no_call_it_never_ma
     }
     assert stored_ids <= run.client.issued_call_ids, "every call in the store is one the model made"
     assert recall_record_text(run.agent, run.session.state) == record.text, "the dump reads the merged record"
+
+
+async def test_the_stub_refuses_a_request_carrying_a_call_without_its_output_or_the_reverse() -> None:
+    """The pairing half of the stub's check, shown biting on its own in both directions.
+
+    Every id here is one the stub issued, so the check that predates this one passes them all;
+    what is refused is a call sent without its output and an output sent without its call.
+    """
+    client = StubChatClient()
+    client.issued_call_ids.add("call_0")
+    call = Message(role="assistant", contents=[Content.from_function_call(call_id="call_0", name="lookup_a")])
+    result = Message(role="tool", contents=[Content.from_function_result(call_id="call_0", result="done")])
+    turn = Message(role="user", contents=["go"])
+
+    with pytest.raises(AssertionError, match=r"calls without their output \['call_0'\]"):
+        client._inner_get_response(messages=[turn, call], stream=False, options={})
+    with pytest.raises(AssertionError, match=r"outputs without their call \['call_0'\]"):
+        client._inner_get_response(messages=[turn, result], stream=False, options={})
+    assert client.seen == [], "refused before the script ran"
+
+    response = await client._inner_get_response(messages=[turn, call, result], stream=False, options={})
+    assert response.text, "the pair together is accepted"
+
+
+async def test_a_merge_through_the_live_path_leaves_no_call_without_its_output() -> None:
+    """Run 60's crash, offline: a merge on the call that carried the newest record's result in.
+
+    On the harness each model call is compacted over copies of the stored history plus what the
+    call carries in, and after the pinned call that is the record's result -- the very object the
+    history stores next. The merge fixture's second record arrives over the budget, so the chain's
+    step a runs on that call. Merging the record there flagged its call on a copy, where the flag
+    is dropped, and its result on the carried-in object, where it is stored; every later request
+    then carried the call without its output, which Foundry refused with ``No tool output found
+    for function call`` and the stub now refuses the same way. The merge is taken one call later
+    instead, and the history holds every call and its output in the same state.
+    """
+    run = await _run_wait_fixture(record_padding=12_000, later_lookups=("d", "e"), later_filler_turns=6)
+
+    assert run.strategy.records_merged >= 1, "the premise: the chain reached step a"
+    recall_ids = {
+        content.call_id
+        for message in run.stored
+        for content in message.contents
+        if content.type == "function_call" and content.name == RECALL_TOOL_NAME
+    }
+    records = [message for message in run.stored if any(content.call_id in recall_ids for content in message.contents)]
+    assert len(recall_ids) >= 2 and len(records) == 2 * len(recall_ids), "the premise: records the model made"
+    assert all(message.additional_properties.get(EXCLUDED_KEY) for message in records), "each merged, whole"
+    states: dict[str, set[bool]] = {}
+    for message in run.stored:
+        for content in message.contents:
+            if content.type in ("function_call", "function_result"):
+                excluded = bool(message.additional_properties.get(EXCLUDED_KEY, False))
+                states.setdefault(str(content.call_id), set()).add(excluded)
+    assert all(len(seen) == 1 for seen in states.values()), "every call is stored in its output's state"
 
 
 @pytest.mark.parametrize("strategy_name", ["tool_summary_anchored", "user_summary_anchored"])
