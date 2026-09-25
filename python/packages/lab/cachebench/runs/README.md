@@ -207,6 +207,36 @@ What it shows, and what it is void for:
 No `.sh` is kept: the script that produced it is the same one run 47 uses, and re-running it
 against this tree produces the repaired rows rather than these.
 
+Run 64 is `tool_summary_anchored` with **record repeats on** -- the new default, `d3aca3450` --
+against the control, at fills 1.5 and 3.0 on both models, five seeds, $15.80, in
+`run-64-record-repeats/`. Settings otherwise as run 63, so it reads directly against that run's
+repeats-off row. No row failed: the retry fix held through up to eight minutes of throttling on
+the fill 3.0 controls.
+
+    tool_summary_anchored, off (run 63) -> on (run 64)
+                            seed$              peak (K)          DQ seeds   facts
+    gpt-6-luna   fill 1.5   0.0485 -> 0.0526   99-108 -> 84-92   0 -> 0     53/53
+    gpt-5.6-luna fill 1.5   0.2343 -> 0.3015   102-167 -> 91-169 1 -> 2     53/53
+    gpt-6-luna   fill 3.0   1.291  -> 0.3071   262-298 -> 156-158 5 -> 5    53/53
+    gpt-5.6-luna fill 3.0   2.508  -> 0.7875   262-334 -> 155-193 5 -> 5    53/53
+
+- **Repeats stop the growth and cut fill 3.0's cost by 69-76%, but the row still disqualifies on
+  every seed -- and not because of tool output.** The simulator reproduces the live plateau
+  (153,581 against 156,536 live) and its peak prompt is 113,931 tokens of user turns, one 35,977
+  tool result not yet recorded, and 2.6K of everything else. At fill 3.0 the workload is 69
+  filler turns of ~1,636 tokens, and this row -- like every anchored row -- keeps every user
+  turn, so user text alone nearly fills the 120K window. That is the part of the conversation
+  the user-summary half exists for, and why `anchored`, `anchored_min_gain` and
+  `anchored_no_assistant` also disqualified on every seed of run 63 at fill 3.0 (153-174K). This
+  row compacts tool results; it cannot hold a conversation whose non-tool text outgrows the
+  window, and no setting of it will.
+- The two gpt-5.6-luna seeds at 192-193K are one further 36K result kept whole, uncovered by an
+  incomplete record (`UNCOVERED:1`). At fill 1.5 the two gpt-5.6-luna disqualifications are the
+  same failure the composed row met at 3.0: a record that left five groups out (`UNCOVERED:5`,
+  `REFORCED:2`), preserved whole, 168K.
+- Where one record is already complete -- gpt-6-luna at fill 1.5 -- repeats cost 8% for nothing,
+  as run 40 predicted. That is the price of the default.
+
 Run 63 is **the final grid**, in `run-63-final-grid/`: all twenty strategies at 120,000 tokens,
 fills 0.9, 1.5 and 3.0, five seeds, on gpt-5.6-luna (Foundry project endpoint, $0.20 / $0.02 /
 $1.20) and gpt-6-luna ($0.10 / $0.01 / $0.50, cache writes $0.125 via `--price-cache-write`).
