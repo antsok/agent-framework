@@ -188,8 +188,8 @@ from agent_framework._compaction import (
 from ._toolsummary import (
     RECORD_MARKER,
     ToolResultAnchoredSummarizationCompactionStrategy,
-    active_record_groups,
     build_record_message,
+    consolidatable_record_groups,
     find_record_index,
     record_body,
 )
@@ -820,8 +820,13 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
         return included_token_count(messages) > self.max_input_tokens
 
     async def _merge_records(self, messages: list[Message]) -> bool:
-        """Step a: merge the active records into one, when there are at least two."""
-        groups = active_record_groups(messages)
+        """Step a: merge the active records into one, when there are at least two.
+
+        Only records :func:`~._toolsummary.consolidatable_record_groups` offers: a record whose
+        result this model call carried in waits for the next pass, and is not counted towards the
+        two.
+        """
+        groups = consolidatable_record_groups(messages)
         if len(groups) < 2:
             return False
         outcome = await self._consolidate(messages, groups, prompt=self.merge_prompt)
@@ -848,13 +853,14 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
         Every active record is handed over, which is one record whenever step a succeeded or
         there was only one, and several when a merge was refused -- in which case a rewrite is a
         harder merge, and the prompt says so. Each attempt is judged against the records as they
-        stand when it is made, so a kept attempt raises the bar for the next.
+        stand when it is made, so a kept attempt raises the bar for the next. A record whose
+        result this model call carried in is not handed over, as step a does not merge it.
         """
         changed = False
         for attempt in range(1, self.harder_attempts + 1):
             if attempt > 1 and not self._over(messages):
                 break
-            groups = active_record_groups(messages)
+            groups = consolidatable_record_groups(messages)
             if not groups:
                 break
             self._record_rewrites += 1

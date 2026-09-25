@@ -64,7 +64,7 @@ from agent_framework._compaction import (
     set_excluded,
 )
 
-from ._preserve import any_preserved, is_preserved
+from ._preserve import any_preserved, is_preserved, removable_whole
 
 if TYPE_CHECKING:
     from agent_framework import TokenizerProtocol
@@ -525,7 +525,8 @@ class AnchoredCompactionStrategy:
         Returns:
             True if any group was dropped.
         """
-        band = self._middle_band(messages, group_messages(messages))
+        spans = group_messages(messages)
+        band = self._middle_band(messages, spans)
         dropped: list[dict[str, Any]] = []
         for group in band:
             if group.get("kind") != kind:
@@ -548,6 +549,11 @@ class AnchoredCompactionStrategy:
             # shed available. A group skipped here still counts toward the ceiling, which is
             # why the caller's loop can end over budget; see :meth:`__call__`.
             if any_preserved(members):
+                continue
+            # The same rule from the other side: a group whose call and result would not leave
+            # together is kept whole, as a preserved one is. See
+            # :func:`~._preserve.removable_whole`.
+            if not removable_whole(messages, spans, group):
                 continue
             for message in members:
                 set_excluded(message, excluded=True, reason=EXCLUDE_REASON)

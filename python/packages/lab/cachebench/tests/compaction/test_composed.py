@@ -48,12 +48,13 @@ from collections.abc import Callable
 from typing import Any
 
 import pytest
-from agent_framework import CharacterEstimatorTokenizer, ChatResponse, Message
+from agent_framework import CharacterEstimatorTokenizer, ChatResponse, Message, SessionContext
 from agent_framework._compaction import (
     EXCLUDE_REASON_KEY,
     EXCLUDED_KEY,
     annotate_message_groups,
     annotate_token_counts,
+    group_messages,
     included_token_count,
     project_included_messages,
 )
@@ -66,7 +67,7 @@ from agent_framework_lab_cachebench.compaction._composed import (
     _responses,
     harder_record_prompt,
 )
-from agent_framework_lab_cachebench.compaction._preserve import PRESERVE_REASON_KEY, is_preserved
+from agent_framework_lab_cachebench.compaction._preserve import PRESERVE_REASON_KEY, is_preserved, removable_whole
 from agent_framework_lab_cachebench.compaction._toolsummary import (
     CONSOLIDATE_EXCLUDE_REASON,
     DEFAULT_TRIGGER_FRACTION,
@@ -83,6 +84,7 @@ from agent_framework_lab_cachebench.compaction._toolsummary import (
     _record_text,
     active_record_groups,
     build_record_message,
+    consolidatable_record_groups,
     find_record_index,
     make_recall_tool,
     record_body,
@@ -1364,11 +1366,13 @@ class _RoutingSummarizer:
         self.harder = harder or (lambda attempt, body: _longer(body))
         self.log = log if log is not None else []
         self.prompts: list[str] = []
+        self.bodies: list[str] = []
 
     async def get_response(self, messages: list[Message], *, stream: bool = False, **kwargs: Any) -> ChatResponse:
         prompt = messages[0].text or ""
         body = messages[-1].text or ""
         self.prompts.append(prompt)
+        self.bodies.append(body)
         if prompt == DEFAULT_USER_SUMMARY_PROMPT:
             self.log.append("band")
             text = "The user asked for the earlier things, in order."
@@ -1481,9 +1485,15 @@ def _chain_composed(
     )
 
 
-async def _post_record_size(**fixture: bool) -> int:
-    """Return the chain fixture's size once the record phase has dropped what its records cover."""
+async def _post_record_size(*, at_arrival: bool = False, **fixture: bool) -> int:
+    """Return the chain fixture's size once the record phase has dropped what its records cover.
+
+    ``at_arrival`` measures the fixture stopped where its second record's result arrives, before
+    the turn after it.
+    """
     messages = _chain_conversation(**fixture)
+    if at_arrival:
+        messages = messages[:-2]
     record_phase = _record_phase(_CHAIN_CEILING, trigger_fraction=0.01, fallback_fraction=0.99)
     entry = _size(messages)
     await record_phase.compact_against(messages, prompt_tokens=entry, trigger_tokens=1, fallback_after_record=False)
@@ -2137,3 +2147,173 @@ async def test_the_wait_reads_a_written_record_arriving_the_same_way_on_both_lis
     assert rewritten.startswith("text:") and rewritten != merged, "a written record replacing a written one"
     await strategy(next_copies)
     assert strategy._anchor == rewritten
+
+
+# A call and its output leave together, as the history stores them and the model is sent them.
+#
+# On the harness's live path a model call is compacted over copies of the stored history, which
+# ``SessionContext.extend_messages`` stamps with ``_attribution``, plus the messages the call
+# carries in -- after a tool call, its result -- which are the objects the history stores next.
+# A flag on a copy lasts for the call; a flag on a carried-in message is stored with it. The
+# tests below build that shape with the framework's own ``SessionContext`` and read the verdict
+# off the objects the history would store, because the list a pass is handed stays paired either
+# way: what breaks is what the next call loads.
+
+
+def _as_the_harness_hands_them(stored: list[Message], *, carried_in: int = 1) -> list[Message]:
+    """Return ``stored`` as a model call's pass sees it: the history loaded as copies, the rest carried in.
+
+    Args:
+        stored: The conversation, as the history will hold it after the call.
+
+    Keyword Args:
+        carried_in: How many messages at the end the call carried in rather than loaded.
+
+    Returns:
+        The working list: attributed copies of all but the last ``carried_in``, then those as
+        the very objects in ``stored``.
+    """
+    context = SessionContext(input_messages=stored[len(stored) - carried_in :])
+    context.extend_messages("history", stored[: len(stored) - carried_in])
+    return context.get_messages(include_input=True)
+
+
+def _straddling(stored: list[Message], result_id: str) -> list[Message]:
+    """Return ``stored`` loaded as copies, except the message ``result_id``, which stays the stored object.
+
+    The shape of a group whose call was loaded and whose result was carried in, put anywhere in
+    the conversation so a site that only ever meets it at the end can be shown refusing it too.
+    """
+    context = SessionContext(input_messages=[])
+    context.extend_messages("history", stored)
+    messages = context.get_messages()
+    position = next(index for index, message in enumerate(stored) if message.message_id == result_id)
+    messages[position] = stored[position]
+    return messages
+
+
+def _stored_orphans(stored: list[Message]) -> set[str]:
+    """Return the call ids whose call and output the history would send in different states.
+
+    A flag reaches the history only on a carried-in message, so ``stored`` -- the originals --
+    holds exactly what the next call will load. A call id is an orphan when its call is included
+    and its output excluded, or the reverse.
+    """
+    states: dict[str, set[bool]] = {}
+    for message in stored:
+        excluded = bool(message.additional_properties.get(EXCLUDED_KEY, False))
+        for content in message.contents:
+            if content.type in ("function_call", "function_result"):
+                states.setdefault(str(content.call_id), set()).add(excluded)
+    return {call_id for call_id, seen in states.items() if len(seen) > 1}
+
+
+def _excluded_ids(messages: list[Message]) -> set[str]:
+    """Return the ids of the messages not being sent."""
+    return {str(message.message_id) for message in messages if message.additional_properties.get(EXCLUDED_KEY)}
+
+
+async def test_a_record_is_not_merged_on_the_call_that_carries_its_result_in() -> None:
+    """Run 60's crash at the site that caused it: step a merging a record the call carried in.
+
+    The chain fixture's two records, stopped where the second one's result arrives -- the call
+    right after the one that wrote it. A merge there excludes the record's call on a copy of the
+    history, whose flag is dropped after the call, and its result on the carried-in object, whose
+    flag is stored: the history then holds the call without its output, and the next request is
+    refused. So the newest record is left out of the merge on this pass -- one record is not two,
+    and step a does not run -- and stays in the prompt whole.
+    """
+    summarizer = _RoutingSummarizer(merge=_short_record)
+    stored = _chain_conversation()[:-2]
+    strategy = _chain_composed(summarizer, ceiling=await _post_record_size(at_arrival=True) - 500)
+    messages = _as_the_harness_hands_them(stored)
+
+    await strategy(messages)
+
+    assert strategy.last_resort_fallbacks == 1, "the premise: the chain ran to its end, over the budget throughout"
+    assert "merge" not in summarizer.log, "the record the call carried in is not merged on it"
+    assert strategy.records_merged == 0
+    assert strategy.record_rewrites == DEFAULT_HARDER_ATTEMPTS, "step c ran, on the other record"
+    harder = {harder_record_prompt(attempt) for attempt in range(1, DEFAULT_HARDER_ATTEMPTS + 1)}
+    rewrites = [body for prompt, body in zip(summarizer.prompts, summarizer.bodies, strict=True) if prompt in harder]
+    assert rewrites, "the premise: rewrites were asked for"
+    assert all(body.startswith("1. ") and "\n2. " not in body for body in rewrites), "each handed one record"
+    assert "rec2_res" in _active_record_ids(messages), "it is still a record, and still sent"
+    assert _stored_orphans(stored) == set(), "the history holds no call without its output"
+
+
+async def test_the_same_record_is_merged_on_the_next_call_with_its_call_and_result_together() -> None:
+    """The deferred merge, one call later, once the record's result has been stored and loads like the rest."""
+    summarizer = _RoutingSummarizer(merge=_short_record, fold=_short_summary)
+    stored = _chain_conversation()
+    strategy = _chain_composed(summarizer, ceiling=await _post_record_size() - 500)
+    messages = _as_the_harness_hands_them(stored)
+
+    await strategy(messages)
+
+    assert summarizer.log[0] == "merge"
+    assert strategy.records_merged == 1
+    assert {"rec2_call", "rec2_res"} <= _excluded_ids(messages), "call and result replaced together"
+    assert _stored_orphans(stored) == set()
+
+
+def test_consolidate_records_refuses_a_record_whose_result_the_call_carried_in() -> None:
+    """The exclusion site refuses the half-removal itself, whoever picked the groups."""
+    stored = _chain_conversation()[:-2]
+    messages = _as_the_harness_hands_them(stored)
+    annotate_message_groups(messages)
+    record_phase = _record_phase(_CHAIN_CEILING)
+
+    offered = [str(messages[group["end_index"]].message_id) for group in consolidatable_record_groups(messages)]
+    assert offered == ["rec1_res"], "the record the call carried in is not offered"
+    with pytest.raises(ValueError, match="call and result"):
+        record_phase.consolidate_records(messages, active_record_groups(messages), _SHORT_RECORD)
+    assert _excluded_ids(messages) == set(), "refused before anything was flagged"
+
+
+async def test_the_anchored_shed_keeps_a_group_whose_call_and_result_would_not_leave_together() -> None:
+    """Removal paths two and three: a straddling tool group is kept whole, as a preserved one is."""
+    stored = [Message(role="system", contents=["You are an assistant."], message_id="sys")]
+    for index in range(1, 9):
+        stored.append(Message(role="user", contents=[f"Turn {index}"], message_id=f"u{index}"))
+        stored += _tool_group(index)
+    messages = _straddling(stored, "r4")
+
+    assert await AnchoredCompactionStrategy(max_input_tokens=200, tokenizer=TOKENIZER)(messages) is True
+
+    excluded = _excluded_ids(messages)
+    assert {"c3", "r3", "c5", "r5"} <= excluded, "its neighbours in the band were shed"
+    assert not {"c4", "r4"} & excluded, "and it was kept whole"
+    assert _stored_orphans(stored) == set()
+
+
+async def test_the_records_drop_keeps_a_covered_group_whose_call_and_result_would_not_leave_together() -> None:
+    """``_drop_before``: a group the record covers, but whose halves would not leave together, stays."""
+    stored = [Message(role="system", contents=["You are an assistant."], message_id="sys")]
+    for index in range(1, 5):
+        stored.append(Message(role="user", contents=[f"Turn {index}"], message_id=f"u{index}"))
+        stored += _tool_group(index)
+    stored += _record_messages(_covering_record(4))
+    stored.append(Message(role="user", contents=["Turn 5"], message_id="u5"))
+    messages = _straddling(stored, "r3")
+    annotate_message_groups(messages)
+    anchor = find_record_index(messages)
+    assert anchor is not None
+
+    assert _record_phase(_CHAIN_CEILING, keep_head_groups=0)._drop_before(messages, anchor) is True  # pyright: ignore[reportPrivateUsage]
+
+    excluded = _excluded_ids(messages)
+    assert {"c1", "r1", "c2", "r2", "c4", "r4"} <= excluded, "the covered groups were dropped"
+    assert not {"c3", "r3"} & excluded, "and the straddling one kept whole"
+    assert _stored_orphans(stored) == set()
+
+
+def test_a_call_and_an_output_split_across_two_spans_are_not_removable_on_either() -> None:
+    """The other way a span can hold half a pair: the framework links a call and a non-adjacent output."""
+    call, result = _tool_group(1)
+    messages = [call, Message(role="assistant", contents=["narration"], message_id="n1"), result]
+    spans = group_messages(messages)
+
+    assert [span["group_id"] for span in spans if span["kind"] == "tool_call"] == ["group_c1", "group_c1"]
+    assert not any(removable_whole(messages, spans, span) for span in spans if span["kind"] == "tool_call")
+    assert removable_whole(messages, spans, spans[1]), "the narration between them is a group of its own"

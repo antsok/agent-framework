@@ -201,7 +201,7 @@ from agent_framework._compaction import (
 )
 
 from ._anchored import AnchoredCompactionStrategy
-from ._preserve import PRESERVE_REASON_KEY, any_preserved, is_preserved, set_preserved
+from ._preserve import PRESERVE_REASON_KEY, any_preserved, is_preserved, removable_whole, set_preserved
 
 if TYPE_CHECKING:
     from agent_framework import CompactionStrategy, TokenizerProtocol
@@ -222,6 +222,7 @@ __all__ = [
     "ToolResultRecallMiddleware",
     "active_record_groups",
     "build_record_message",
+    "consolidatable_record_groups",
     "find_record_index",
     "make_recall_tool",
     "record_body",
@@ -788,6 +789,28 @@ def active_record_groups(messages: list[Message]) -> list[dict[str, Any]]:
         if _is_recall_group(messages, group)
         and any(_record_text(message) for message in messages[group["start_index"] : group["end_index"] + 1])
     ]
+
+
+def consolidatable_record_groups(messages: list[Message]) -> list[dict[str, Any]]:
+    """Return the active records a consolidation may replace on this pass, oldest first.
+
+    :func:`active_record_groups`, less any record whose call and result would not both keep the
+    exclusion -- :func:`~._preserve.removable_whole`. On the live path that is the record whose
+    result the current model call carried in: the record the model has just written, on the call
+    right after the one that wrote it. Replacing it there would store its result as excluded and
+    leave its call standing, which is how run 60 was refused. It stays out of this pass's merge
+    or rewrite and is in the next one's, once its result has been stored. It remains a record to
+    everything else -- preserved, counted, and the anchor if it is the newest.
+
+    Args:
+        messages: The conversation, already grouped.
+
+    Returns:
+        The spans :meth:`ToolResultAnchoredSummarizationCompactionStrategy.consolidate_records`
+        may be handed.
+    """
+    spans = group_messages(messages)
+    return [group for group in active_record_groups(messages) if removable_whole(messages, spans, group)]
 
 
 def record_body(messages: list[Message], group: dict[str, Any]) -> str:
@@ -1546,9 +1569,19 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
 
         Args:
             messages: The conversation, mutated in place. Already grouped.
-            groups: The records being replaced, from :func:`active_record_groups`, oldest first.
+            groups: The records being replaced, from :func:`consolidatable_record_groups`, oldest
+                first.
             text: The replacement's own text, without marker or preamble.
+
+        Raises:
+            ValueError: When a group is not :func:`~._preserve.removable_whole`: excluding it would
+                leave a call standing without its result, or the reverse, which the provider
+                refuses. Refused here as well as by the walk that picks the groups, so no caller
+                can reach the half-removal by handing over a list of its own.
         """
+        spans = group_messages(messages)
+        if not all(removable_whole(messages, spans, group) for group in groups):
+            raise ValueError("A record handed to consolidate_records cannot be removed with its call and result.")
         for group in groups:
             for message in messages[group["start_index"] : group["end_index"] + 1]:
                 # Released before the exclusion, as ``_drop_before`` releases a hold: the promise
@@ -1673,6 +1706,11 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
                 # An older record. Deleting it would destroy the only surviving account of the
                 # groups behind *it* -- the same loss this strategy exists to prevent, one
                 # level removed, and quieter, because the newer record looks like coverage.
+                continue
+            if not removable_whole(messages, groups, group):
+                # Its call and its result would not leave together -- see
+                # :func:`~._preserve.removable_whole` -- so it is not a candidate on this pass, and
+                # not reported as uncovered either: the record may cover it perfectly well.
                 continue
             if _claimed_elsewhere(messages[group["start_index"] : group["end_index"] + 1]):
                 # Something else has already declared this group irreplaceable. Not counted as

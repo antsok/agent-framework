@@ -48,15 +48,16 @@ freshly loaded conversation on every turn and ``additional_properties`` set by a
 is not there when the next one starts -- which is why the framework's own exclusion flags are
 re-derived each time too. Whoever owns a message that must be protected therefore re-marks it
 on every pass, as ``_toolsummary`` does when it observes a record, rather than marking it once
-and trusting it to persist.
+and trusting it to persist. The one exception is a message a model call carries in rather than
+loads, whose flags are stored with it; :func:`removable_whole` is what that costs an exclusion.
 """
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING, Final
+from typing import TYPE_CHECKING, Any, Final
 
 if TYPE_CHECKING:
-    from collections.abc import Iterable
+    from collections.abc import Iterable, Mapping, Sequence
 
     from agent_framework import Message
 
@@ -65,8 +66,14 @@ __all__ = [
     "PRESERVE_REASON_KEY",
     "any_preserved",
     "is_preserved",
+    "removable_whole",
     "set_preserved",
 ]
+
+#: The key ``SessionContext.extend_messages`` stamps on the copy of every message a history
+#: provider loads. Read here, and only here, to tell a message loaded for this call from one the
+#: call itself carries; see :func:`removable_whole`.
+_ATTRIBUTION_KEY: Final[str] = "_attribution"
 
 #: Marks a message no strategy may shorten, drop or shed. Named after ``EXCLUDED_KEY``, and
 #: read the same way: absent means false, so an unannotated conversation behaves exactly as it
@@ -130,3 +137,46 @@ def any_preserved(messages: Iterable[Message]) -> bool:
         True when at least one is protected.
     """
     return any(is_preserved(message) for message in messages)
+
+
+def removable_whole(messages: Sequence[Message], spans: Sequence[Mapping[str, Any]], span: Mapping[str, Any]) -> bool:
+    """Return whether excluding ``span`` removes its function calls and their outputs together, everywhere.
+
+    The rule every exclusion site in this package answers to: a function call and its output are
+    removed together or not at all. Excluding a group's whole span keeps them together in the
+    list the strategy is given, and that is not enough, for two reasons -- in each the removal
+    would reach one half and not the other, and the provider refuses the call left without its
+    output (``No tool output found for function call``) or the output left without its call.
+
+    **A span whose members will not all keep the flag.** On the harness's live path each model
+    call is compacted over a list built from two sources: the history provider's messages, which
+    ``SessionContext.extend_messages`` loads as copies carrying ``_attribution``, and the messages
+    the call itself carries in -- after a tool call, its result -- which are the very objects the
+    history stores once the call returns. An exclusion flag set on a copy lasts for that call; one
+    set on a carried-in message is stored with it. A group whose call was loaded and whose result
+    was carried in therefore loses only its result for good, and the next call sends the call
+    alone. Run 60 was refused exactly so, on gpt-5.6-luna, when the composed row merged a record
+    on the call that carried the record's result in. Such a group is not removable on that call;
+    on the next one its result has been stored and is loaded like the rest, and the group is
+    removable whole again. The mark in :mod:`agent_framework._sessions` is read rather than any
+    position, because it is what decides whether a flag lasts.
+
+    **A span linked to another.** ``group_messages`` gives a call and an output that are not
+    adjacent one ``group_id`` over two spans; excluding one span leaves the other. Nothing in this
+    package separates a call from its output -- every insertion lands on a group boundary -- so
+    this is refused rather than handled, and a caller that meets it keeps the group.
+
+    Args:
+        messages: The conversation ``spans`` index into.
+        spans: Every span of the conversation, from ``group_messages``.
+        span: The span a caller means to exclude.
+
+    Returns:
+        True when excluding the span's messages removes each call with its output, in the list
+        the call is sent and in the stored history alike.
+    """
+    if any(other["group_id"] == span["group_id"] and other["start_index"] != span["start_index"] for other in spans):
+        return False
+    members = messages[span["start_index"] : span["end_index"] + 1]
+    loaded = [_ATTRIBUTION_KEY in message.additional_properties for message in members]
+    return all(loaded) or not any(loaded)
