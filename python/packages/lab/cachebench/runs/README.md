@@ -207,6 +207,54 @@ What it shows, and what it is void for:
 No `.sh` is kept: the script that produced it is the same one run 47 uses, and re-running it
 against this tree produces the repaired rows rather than these.
 
+Run 63 is **the final grid**, in `run-63-final-grid/`: all twenty strategies at 120,000 tokens,
+fills 0.9, 1.5 and 3.0, five seeds, on gpt-5.6-luna (Foundry project endpoint, $0.20 / $0.02 /
+$1.20) and gpt-6-luna ($0.10 / $0.01 / $0.50, cache writes $0.125 via `--price-cache-write`).
+Shape as runs 53-55: six tool turns, reply 384, output 2,048, answer reservation 12,000. $140.56
+in all. gpt-6-luna ran through the `azure-responses` provider, because the project endpoint
+returned HTTP 500 for it on every request; the request path is the same Responses client.
+
+`records/` holds one file per model, fill and seed, twenty rows each. **17 gpt-6-luna rows were
+re-run**: in the cells started before `d85540c12` six attempts at a one-second `Retry-After` ran
+out in 5-14 seconds and failed the row mid-conversation (4 controls, 13 compacting rows, fills
+1.5 and 3.0). Each failed record was replaced by its re-run, taken later with three streams
+instead of ten; the failed records, and two extra controls whose originals had succeeded, are in
+`set-aside/`. `reports/` is the rendered table per cell and across all six.
+
+Seed$ per row that kept at least 90% of the control's acc1, with the control for reference:
+
+    seed$ (DQ seeds of 5)            5.6 f0.9   5.6 f1.5   5.6 f3.0   6 f0.9    6 f1.5    6 f3.0
+    none (control)                    0.0671    0.1474 DQ  0.4665 DQ  0.0348    0.0749 DQ  0.2258 DQ
+    tool_and_user_summary_anchored    0.0747    0.1199     0.4384 (1) 0.0353    0.0578     0.2051 (1)
+    tool_summary_anchored             0.0735    0.2343 (1) 2.508 (5)  0.0347    0.0485     1.291 (5)
+    user_summary_anchored             0.0875    0.2186 (4) 0.6008 (5) 0.0456    0.1145 (5) 0.3011 (5)
+    anchored_min_gain                 0.0775    -          -          0.0345    -          -
+
+- **Inside the window (0.9) not compacting is the right default**, as runs 54-55 found: the best
+  full retainers sit 10-15% above it on gpt-5.6-luna, inside its 29% seed spread, and within 1%
+  of it on gpt-6-luna.
+- **At 1.5 the composed row is the only one that is both clean and complete on gpt-5.6-luna**:
+  53/53, 100%, no DQ on any seed, seed$ 19% under the unlimited control (a reference -- it
+  disqualified). On gpt-6-luna `tool_summary_anchored` is cheapest (-35%) and also clean;
+  the composed row is -23%. Every other row either loses facts or disqualifies.
+- **At 3.0 no row qualifies on either model.** The composed row disqualified on one seed of
+  five on each model, and nothing else keeps the facts inside the window at all. On the other
+  four seeds it kept 53/53 at seed$ 0.17-0.43 (5.6) and 0.10-0.13 (6) against the control's
+  0.47 and 0.23.
+- **The composed row's failed seed is the same on both models**: the record did not name three
+  tool groups (`UNCOVERED:3`, `REFORCED:2`), which are preserved whole by design, and at fill
+  3.0 each result is ~36K tokens -- ~107K of raw tool output the chain has no step to shed. It
+  fell short 77-82 times and ended at 153-162K with all 53 facts: the loud failure, not a quiet
+  loss. The chain needs a step for preserved uncovered groups (or the record half needs to
+  cover them) before this row holds at 3.0.
+- **`tool_summary_anchored` disqualifies on every seed at 3.0** (peak 270-292K), confirming the
+  withdrawn "caps the prompt" note: it compacts once and then grows.
+- gpt-6-luna costs about half as much as gpt-5.6-luna on every row, with a similar seeding
+  cache hit. It answered the uncompacted 360K control at acc1 87% (5.6: 85%), so at 3.0 the
+  bar is that lower reading.
+- The benchmark does not model either model's 2x rate above 272K input tokens; only the
+  control and the rows that disqualify at 3.0 exceed it, so their real bills are higher.
+
 Run 62 is the long cell again on `f615f3dcf`: refused merges and rewrites are no longer re-asked
 (`fe600c0a8`), the chain's decisions are kept across the live path's two lists, and the chain,
 once started, works down to a target below the budget (`--chain-gain-fraction`, default 0.29)
