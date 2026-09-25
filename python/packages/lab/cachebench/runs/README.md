@@ -207,6 +207,15 @@ What it shows, and what it is void for:
 No `.sh` is kept: the script that produced it is the same one run 47 uses, and re-running it
 against this tree produces the repaired rows rather than these.
 
+Run 60a is the long cell again on `d60c44e51`, where merged and rewritten records became
+assistant messages instead of synthetic tool calls. **Aborted after two seeds, kept as evidence.**
+That fix held -- no `invalid_payload` -- and **the last-resort chain ran live for the first time**:
+seed 0 reached `RECMERGE:10 RECHARDER:14 (4 refused) USERMERGE:6 LASTFALLBACK:7` before failing.
+It then crashed on a different error, at turn 25 on seed 0 and 29 on seed 1: Foundry's `400 No
+tool output found for function call call_...` -- a model-made call left in the request without its
+output, so some step removed a tool result and kept its call. The control disqualified on both
+(197/197); `truncation` kept 8 of 197.
+
 Run 59a is the **aborted** first attempt at the long cell, kept as evidence. A 30,000-token window
 under a conversation sized to 6.5x it (195K), 24 tool turns (197 facts), tool share 0.4, trigger
 0.7, output and answer reservation 6,000 -- settings chosen by an offline simulation through
