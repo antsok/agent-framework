@@ -149,6 +149,7 @@ from agent_framework_lab_cachebench.compaction import (
     find_record_index,
     make_recall_tool,
 )
+from agent_framework_lab_cachebench.compaction._composed import DEFAULT_RECORD_MERGE_PROMPT
 from agent_framework_lab_cachebench.compaction._preserve import is_preserved
 from agent_framework_lab_cachebench.compaction._usersummary import (
     SUMMARY_ID_PREFIX,
@@ -2179,12 +2180,14 @@ async def _run_wait_fixture(
     record_padding: int = 0,
     later_lookups: Sequence[str] = (),
     later_filler_turns: int = 0,
+    summarizer: Any = None,
 ) -> SimpleNamespace:
     """Drive a strategy through the harness's real session, wired the way ``run_live`` wires it.
 
     Two filler turns of about 830 tokens, the lookups, then ``filler_turns`` more, then
     ``later_lookups`` and ``later_filler_turns`` -- a second batch of tool work, for a test that
-    needs a second record. The user
+    needs a second record. ``summarizer`` replaces the stub one that answers every request with
+    one short line. The user
     half's ``compact_against`` is wrapped on the instance, so every pass that reached it is
     logged as whether a record stood in the conversation at that moment and whether the pass
     compacted.
@@ -2197,7 +2200,7 @@ async def _run_wait_fixture(
         tokenizer=TOKENIZER,
         max_context_window_tokens=_WAIT_WINDOW,
         max_output_tokens=2_000,
-        summarizer=_StubSummarizer(),
+        summarizer=summarizer if summarizer is not None else _StubSummarizer(),
         **({} if user_trigger_fraction is None else {"user_trigger_fraction": user_trigger_fraction}),
     )
     strategy = build_strategy(strategy_name, options)
@@ -2365,6 +2368,8 @@ async def test_the_standalone_rows_do_not_wait(strategy_name: str) -> None:
     run = await _run_wait_fixture(strategy_name, user_trigger_fraction=0.6)
 
     assert not hasattr(run.strategy, "user_passes_waited")
+    assert not hasattr(run.strategy, "record_rewrites_skipped"), "nor the chain's refusal memory"
+    assert not [note for note in _strategy_notes(run.strategy) if note.endswith("SKIP") or "SKIP:" in note]
     if run.recording is not None:
         assert (run.client.pinned_calls, run.recording.records_in_conversation) == (1, 1)
         assert all(message.additional_properties.get(EXCLUDED_KEY) for message in _lookup_results(run.stored))
@@ -2512,6 +2517,114 @@ async def test_the_standalone_rows_write_no_record_of_their_own_on_the_merge_fix
             for content in message.contents
             if content.type == "function_call"
         )
+
+
+class _RefusingRecordSummarizer:
+    """A summarizer that answers every record merge and rewrite with more than it was sent.
+
+    So the chain refuses every one of them, as it refused most of run 61's rewrites of records
+    dense with codes. User summaries get one short line. Every request is kept, whole, so a test
+    can count identical ones.
+    """
+
+    def __init__(self) -> None:
+        self.requests: list[tuple[str, str]] = []
+
+    async def get_response(self, messages: Any, *, stream: bool = False, **kwargs: Any) -> Any:
+        prompt, body = messages[0].text or "", messages[-1].text or ""
+        self.requests.append((prompt, body))
+        record = prompt == DEFAULT_RECORD_MERGE_PROMPT or prompt.startswith("Rewrite the compaction record")
+        text = f"{body} {body}" if record else "The user asked for several things, in order."
+        return ChatResponse(messages=[Message(role="assistant", contents=[text])])
+
+
+async def test_a_refused_rewrite_is_asked_once_through_the_live_paths_two_lists() -> None:
+    """The refusal memory is keyed by content, so the store pass and every later call read it.
+
+    The live path runs the chain over the copies sent on each call and then over the store, which
+    are different objects with the records at different positions. Three records arrive, every
+    merge and rewrite is refused, and the prompt stays over the budget. Each distinct request is
+    paid for once; each refusal is counted once, where the store pass used to replay it and count
+    it again; the later passes skip what was refused; and the chain still reaches its fallback on
+    them. The requests that were paid for are on more than one set of records, because a record
+    arriving changes what a merge or rewrite would read, and makes it eligible again.
+    """
+    summarizer = _RefusingRecordSummarizer()
+    run = await _run_wait_fixture(
+        record_padding=12_000, later_lookups=("d", "e"), later_filler_turns=6, summarizer=summarizer
+    )
+    strategy = run.strategy
+    rewrites = [request for request in summarizer.requests if request[0].startswith("Rewrite the compaction record")]
+    merges = [request for request in summarizer.requests if request[0] == DEFAULT_RECORD_MERGE_PROMPT]
+
+    assert rewrites and merges, "the premise: the chain reached steps a and c"
+    assert len(set(summarizer.requests)) == len(summarizer.requests), "no request paid for twice"
+    assert strategy.record_rewrites == strategy.record_rewrites_rejected == len(rewrites), "each refusal counted once"
+    assert strategy.record_merges_rejected == len(merges)
+    assert strategy.record_rewrites_skipped > 0 and strategy.record_merges_skipped > 0
+    assert len({body for _, body in rewrites}) > 1, "asked again once the records changed"
+    assert strategy.last_resort_fallbacks * DEFAULT_HARDER_ATTEMPTS > strategy.record_rewrites, (
+        "the chain reached step d on passes whose step c asked nothing"
+    )
+    notes = _strategy_notes(strategy)
+    assert f"RECHARDERSKIP:{strategy.record_rewrites_skipped}" in notes
+    assert f"RECMERGESKIP:{strategy.record_merges_skipped}" in notes
+
+
+async def test_the_rewrite_skip_count_reaches_the_seed_record_and_the_flags_column() -> None:
+    """``RECHARDERSKIP`` through the four handoffs, and a record written before schema 18 reads it as zero."""
+    strategy = _composed_over()
+    strategy._record_rewrites_skipped = 9
+
+    notes = _strategy_notes(strategy)
+    assert "RECHARDERSKIP:9" in notes
+
+    outcome, scenario = await _probed(StubChatClient(usage=UsageDetails(input_token_count=1_000)), repeats=1)
+    record = _record(
+        replace(outcome, strategy_notes=notes, record_rewrites_skipped=strategy.record_rewrites_skipped),
+        scenario,
+        strategy="tool_and_user_summary_anchored",
+    )
+
+    assert record.record_rewrites_skipped == 9
+    assert SeedRecord.from_dict(record.to_dict()).record_rewrites_skipped == 9
+    older = record.to_dict()
+    older["schema"] = 17
+    del older["record_rewrites_skipped"]
+    assert SeedRecord.from_dict(older).record_rewrites_skipped == 0, "nothing was skipped before 18"
+    cell = _aggregate("tool_and_user_summary_anchored", [record])
+    assert "RECHARDERSKIP:9" in _flags(cell, None)
+    assert "RECHARDERSKIP:9" in _render(None, [cell], set(), show_answers=False)
+    assert any("RECHARDERSKIP:<n>" in line for line in _LEGEND), "and the legend says what it means"
+
+
+async def test_run_live_reads_the_rewrite_skip_count_off_the_composed_row(monkeypatch: pytest.MonkeyPatch) -> None:
+    """``run_live`` reads the count off the outermost strategy, where the chain lives."""
+
+    class _Skipped(ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy):
+        @property
+        def record_rewrites_skipped(self) -> int:
+            return 6
+
+    composed = _Skipped(
+        tokenizer=TOKENIZER,
+        tool_results=ToolResultAnchoredSummarizationCompactionStrategy(max_input_tokens=29_952, tokenizer=TOKENIZER),
+        user_turns=UserTurnAnchoredSummarizationCompactionStrategy(
+            max_input_tokens=29_952, tokenizer=TOKENIZER, client=_StubSummarizer()
+        ),
+    )
+    monkeypatch.setattr("agent_framework_lab_cachebench._live.build_strategy", lambda name, options: composed)
+    scenario = build_live_scenario(salt="skip", filler_turns=2, filler_tokens=50, tool_turns=2)
+
+    outcome = await run_live(
+        ProviderRuntime(client=StubChatClient(), model="stub"),
+        strategy_name="tool_and_user_summary_anchored",
+        options=_options(summarizer=_StubSummarizer()),
+        scenario=scenario,
+    )
+
+    assert outcome.record_rewrites_skipped == 6
+    assert "RECHARDERSKIP:6" in outcome.strategy_notes
 
 
 async def test_the_wait_count_reaches_the_seed_record_and_the_flags_column() -> None:
@@ -5515,6 +5628,7 @@ def test_the_two_accuracy_measures_are_named_acc1_and_acc2() -> None:
         user_merges_rejected=0,
         record_rewrites=0,
         record_rewrites_rejected=0,
+        record_rewrites_skipped=0,
         last_resort_fallbacks=0,
         user_passes_waited=0,
         strategy_notes=(),
@@ -5734,6 +5848,7 @@ def _control_cell(seeded: int) -> dict[str, CellStats]:
         user_merges_rejected=0,
         record_rewrites=0,
         record_rewrites_rejected=0,
+        record_rewrites_skipped=0,
         last_resort_fallbacks=0,
         user_passes_waited=0,
         strategy_notes=(),
@@ -7298,6 +7413,7 @@ def test_a_progress_line_shows_what_a_watcher_needs() -> None:
         user_merges_rejected=0,
         record_rewrites=0,
         record_rewrites_rejected=0,
+        record_rewrites_skipped=0,
         last_resort_fallbacks=0,
         user_passes_waited=0,
         strategy_notes=(),

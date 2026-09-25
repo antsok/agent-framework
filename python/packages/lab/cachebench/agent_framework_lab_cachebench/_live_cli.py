@@ -552,7 +552,9 @@ def build_parser() -> argparse.ArgumentParser:
             "Each costs a summarizer call, and a kept one rewrites a preserved message the cached "
             "prefix runs through, so the default is small -- one attempt, and one more at a "
             "harder target in case the first was kept and was not enough. RECHARDER counts "
-            "attempts and RECHARDERREJ the ones refused. 0 switches the step off. "
+            "attempts and RECHARDERREJ the ones refused; an attempt refused on a record is not made "
+            "again, nor any milder one, until the record changes, and RECHARDERSKIP counts those. "
+            "0 switches the step off. "
             "Default %(default)s."
         ),
     )
@@ -988,6 +990,7 @@ def _seed_record(
         user_merges_rejected=outcome.user_merges_rejected,
         record_rewrites=outcome.record_rewrites,
         record_rewrites_rejected=outcome.record_rewrites_rejected,
+        record_rewrites_skipped=outcome.record_rewrites_skipped,
         last_resort_fallbacks=outcome.last_resort_fallbacks,
         user_passes_waited=outcome.user_passes_waited,
         strategy_notes=outcome.strategy_notes,
@@ -2309,6 +2312,9 @@ _LEGEND: Final[tuple[str, ...]] = (
     "            folded the user summaries into one, and USERMERGEREJ:<n> folds refused;",
     "            RECHARDER:<n> harder rewrites of the record tried, up to",
     "            --record-harder-attempts per pass, and RECHARDERREJ:<n> of them refused;",
+    "            RECHARDERSKIP:<n> attempts not made because the same record was already",
+    "            refused at them, and RECMERGESKIP:<n> merges not asked for on records a merge",
+    "            was refused on: a refusal stands until the record changes, from schema 18;",
     "            RECSUMMFAIL:<n> merges or rewrites the summarizer did not answer;",
     "            LASTFALLBACK:<n> passes that reached the record half's fallback, which on",
     "            this row runs there and nowhere else and may drop narration only. Every",
