@@ -1519,6 +1519,58 @@ below the accuracy bar.
 - The other fifteen strategies lose facts past the window (truncation, sliding-window and the
   token-budget rows keep 8-22 of 53) or disqualify.
 
+### All twenty strategies
+
+Run 63, record repeats off for `tool_summary_anchored` (its repeats-on row is above). Each cell reads facts kept (mean of 53) / acc1 / disqualified seeds of 5.
+
+| Strategy | 5.6 / 0.9 | 5.6 / 1.5 | 5.6 / 3.0 | 6 / 0.9 | 6 / 1.5 | 6 / 3.0 |
+| --- | --- | --- | --- | --- | --- | --- |
+| none | 53 / 100% / 0 | 53 / 97% / 5 | 53 / 85% / 5 | 53 / 100% / 0 | 53 / 99% / 5 | 53 / 87% / 5 |
+| tool_and_user_summary_anchored | 53 / 100% / 0 | 53 / 100% / 0 | 53 / 90% / 1 | 53 / 100% / 0 | 53 / 100% / 0 | 53 / 100% / 1 |
+| tool_summary_anchored | 53 / 100% / 0 | 53 / 94% / 1 | 53 / 87% / 5 | 53 / 100% / 0 | 53 / 100% / 0 | 53 / 84% / 5 |
+| user_summary_anchored | 53 / 97% / 0 | 53 / 100% / 4 | 53 / 90% / 5 | 53 / 100% / 0 | 53 / 100% / 5 | 53 / 85% / 5 |
+| anchored | 50 / 92% / 0 | 36 / 66% / 0 | 13 / 26% / 5 | 46 / 87% / 0 | 26 / 50% / 0 | 13 / 26% / 5 |
+| anchored_min_gain | 53 / 98% / 0 | 43 / 81% / 0 | 13 / 26% / 5 | 53 / 100% / 0 | 25 / 47% / 0 | 13 / 26% / 5 |
+| anchored_no_assistant | 50 / 94% / 0 | 32 / 61% / 0 | 40 / 73% / 5 | 49 / 91% / 0 | 35 / 67% / 0 | 21 / 39% / 5 |
+| tool_result | 50 / 90% / 0 | 45 / 84% / 5 | 47 / 81% / 5 | 45 / 84% / 0 | 45 / 84% / 5 | 42 / 72% / 5 |
+| selective_tool_call | 50 / 94% / 0 | 43 / 82% / 5 | 45 / 73% / 5 | 39 / 74% / 0 | 40 / 75% / 5 | 41 / 75% / 5 |
+| context_window | 43 / 80% / 0 | 19 / 37% / 0 | 17 / 34% / 0 | 43 / 82% / 0 | 21 / 41% / 0 | 17 / 34% / 0 |
+| context_window_lazy | 53 / 100% / 0 | 25 / 47% / 0 | 11 / 23% / 0 | 42 / 83% / 0 | 26 / 50% / 0 | 14 / 29% / 0 |
+| context_window_aggressive | 22 / 43% / 0 | 15 / 30% / 0 | 3 / 8% / 1 | 20 / 39% / 0 | 9 / 19% / 0 | 0 / 2% / 4 |
+| truncation | 35 / 67% / 0 | 17 / 33% / 0 | 17 / 34% / 0 | 31 / 60% / 0 | 20 / 39% / 0 | 14 / 29% / 0 |
+| sliding_window | 8 / 17% / 0 | 8 / 17% / 0 | 8 / 17% / 0 | 8 / 17% / 0 | 8 / 17% / 0 | 8 / 17% / 0 |
+| summarization | 18 / 36% / 0 | 18 / 31% / 0 | 17 / 31% / 0 | 29 / 53% / 0 | 25 / 43% / 0 | 30 / 50% / 0 |
+| token_budget_fallback | 22 / 42% / 0 | 17 / 34% / 0 | 10 / 20% / 0 | 23 / 44% / 0 | 18 / 35% / 0 | 8 / 17% / 0 |
+| token_budget_tools_first | 18 / 36% / 0 | 19 / 36% / 0 | 9 / 18% / 0 | 19 / 36% / 0 | 15 / 29% / 0 | 8 / 17% / 0 |
+| token_budget_truncate_first | 19 / 36% / 0 | 17 / 34% / 0 | 9 / 19% / 0 | 19 / 36% / 0 | 15 / 31% / 0 | 8 / 17% / 0 |
+| token_budget_window_first | 11 / 23% / 0 | 10 / 19% / 0 | 9 / 18% / 0 | 13 / 25% / 0 | 10 / 20% / 0 | 8 / 17% / 0 |
+| token_budget_summarize | 32 / 61% / 0 | 22 / 42% / 0 | 10 / 20% / 0 | 34 / 64% / 0 | 16 / 32% / 0 | 9 / 19% / 0 |
+
+Seed$ per cell for the same rows, mean of five seeds. A cheap row that lost facts or disqualified is not a saving.
+
+| Strategy | 5.6 / 0.9 | 5.6 / 1.5 | 5.6 / 3.0 | 6 / 0.9 | 6 / 1.5 | 6 / 3.0 |
+| --- | --- | --- | --- | --- | --- | --- |
+| none | 0.0671 | 0.1474 | 0.4665 | 0.0348 | 0.0749 | 0.2258 |
+| tool_and_user_summary_anchored | 0.0747 | 0.1199 | 0.4384 | 0.0353 | 0.0578 | 0.2051 |
+| tool_summary_anchored | 0.0735 | 0.2343 | 2.5080 | 0.0347 | 0.0485 | 1.2905 |
+| user_summary_anchored | 0.0875 | 0.2186 | 0.6008 | 0.0456 | 0.1145 | 0.3011 |
+| anchored | 0.0784 | 0.1699 | 0.5198 | 0.0375 | 0.0958 | 0.3178 |
+| anchored_min_gain | 0.0775 | 0.1888 | 0.5795 | 0.0345 | 0.0935 | 0.3135 |
+| anchored_no_assistant | 0.0782 | 0.1955 | 0.3470 | 0.0369 | 0.0961 | 0.1925 |
+| tool_result | 0.0926 | 0.1957 | 0.5416 | 0.0491 | 0.1037 | 0.2696 |
+| selective_tool_call | 0.0932 | 0.1854 | 0.5487 | 0.0495 | 0.0980 | 0.2651 |
+| context_window | 0.0924 | 0.1361 | 0.2428 | 0.0492 | 0.0642 | 0.1215 |
+| context_window_lazy | 0.0900 | 0.1515 | 0.3190 | 0.0498 | 0.0781 | 0.1667 |
+| context_window_aggressive | 0.0670 | 0.0997 | 0.1339 | 0.0340 | 0.0515 | 0.0977 |
+| truncation | 0.0765 | 0.1361 | 0.2401 | 0.0396 | 0.0644 | 0.1178 |
+| sliding_window | 0.0762 | 0.1232 | 0.2425 | 0.0448 | 0.0719 | 0.1402 |
+| summarization | 0.1146 | 0.1763 | 0.3337 | 0.0713 | 0.1051 | 0.2028 |
+| token_budget_fallback | 0.1428 | 0.2578 | 0.4362 | 0.0800 | 0.1341 | 0.2451 |
+| token_budget_tools_first | 0.0975 | 0.1392 | 0.1861 | 0.0474 | 0.0679 | 0.0999 |
+| token_budget_truncate_first | 0.0896 | 0.1299 | 0.1892 | 0.0479 | 0.0662 | 0.1017 |
+| token_budget_window_first | 0.0569 | 0.0899 | 0.1360 | 0.0270 | 0.0454 | 0.0749 |
+| token_budget_summarize | 0.0771 | 0.1985 | 0.3540 | 0.0371 | 0.0964 | 0.1833 |
+
 ### Why strategies fail
 
 1. **User text outgrows the window (3x only).** Fill 3.0 carries 69 filler user turns of ~1,636
