@@ -269,7 +269,12 @@ __all__ = [
 #:
 #: 20 adds ``price_cache_write`` to the cell, on the version 5 argument: before it no run charged
 #: a write premium, so the field reads back as ``None``, the rate those runs used.
-SCHEMA_VERSION: Final[int] = 20
+#:
+#: 21 adds a long-context tier: the threshold and four rates on the cell, and on each record the
+#: tokens of the calls billed above it, for the run and for its probes. On the version 5
+#: argument: before it no run priced a tier, so the cell fields read back as ``None`` and the
+#: token counts as zero -- every call was billed at the one rate, which is what those say.
+SCHEMA_VERSION: Final[int] = 21
 
 #: Versions this reader accepts, which is not only the current one.
 #:
@@ -357,7 +362,10 @@ SCHEMA_VERSION: Final[int] = 20
 #:
 #: Version 19 joins on the same argument: it charged no write premium, so ``price_cache_write``
 #: reads back as the ``None`` those runs used.
-_READABLE_SCHEMAS: Final[frozenset[int]] = frozenset({*range(2, 20), SCHEMA_VERSION})
+#:
+#: Version 20 joins on the same argument: it priced no long-context tier, so the tier reads back
+#: as absent and its token counts as zero.
+_READABLE_SCHEMAS: Final[frozenset[int]] = frozenset({*range(2, 21), SCHEMA_VERSION})
 
 #: The parameters that make two records the same cell, and so aggregable into one row.
 #:
@@ -416,6 +424,11 @@ _CELL_KEY_FIELDS: Final[tuple[str, ...]] = (
     "price_cached",
     "price_output",
     "price_cache_write",
+    "long_context_threshold",
+    "price_long_input",
+    "price_long_cached",
+    "price_long_output",
+    "price_long_cache_write",
     "workload",
     "settings",
 )
@@ -435,6 +448,11 @@ _MODEL_KEY_FIELDS: Final[tuple[str, ...]] = (
     "price_cached",
     "price_output",
     "price_cache_write",
+    "long_context_threshold",
+    "price_long_input",
+    "price_long_cached",
+    "price_long_output",
+    "price_long_cache_write",
 )
 
 
@@ -848,6 +866,16 @@ class CellParams:
     the key, like the other rates, so a cell priced with a write premium never pools with one
     priced without.
     """
+    long_context_threshold: int | None = None
+    """Input tokens above which a request was billed at the ``price_long_*`` rates, or ``None``.
+
+    ``None`` on a record written before schema 21, and on a cell priced at one rate: either way
+    every call was billed at ``price_input`` and its siblings. In the key with the rates.
+    """
+    price_long_input: float | None = None
+    price_long_cached: float | None = None
+    price_long_output: float | None = None
+    price_long_cache_write: float | None = None
     min_correctness: float = DEFAULT_MIN_CORRECTNESS
     """The correctness bar the verdict applied.
 
@@ -891,6 +919,21 @@ class CellParams:
             cached_read_per_million=self.price_cached,
             output_per_million=self.price_output,
             cache_write_per_million=self.price_cache_write,
+            long_context_threshold=self.long_context_threshold,
+            long_context=(
+                None
+                if self.price_long_input is None
+                else ModelPricing(
+                    input_per_million=self.price_long_input,
+                    cached_read_per_million=(
+                        self.price_long_cached if self.price_long_cached is not None else self.price_long_input
+                    ),
+                    output_per_million=(
+                        self.price_long_output if self.price_long_output is not None else self.price_output
+                    ),
+                    cache_write_per_million=self.price_long_cache_write,
+                )
+            ),
         )
 
     @property
@@ -1343,6 +1386,19 @@ class SeedRecord:
     strategy_notes: tuple[str, ...]
     dropped_options: tuple[str, ...]
     answer: str
+    long_input_tokens: int = 0
+    """Input tokens of the calls billed at the long-context rates, the probes' included.
+
+    Zero on a cell with no long-context tier, and on a record written before schema 21: every
+    call of those runs was billed at the one rate, which is what zero says. The live path always
+    sets these, so a tiered cell never reads its default.
+    """
+    long_cached_tokens: int = 0
+    long_output_tokens: int = 0
+    probe_long_input_tokens: int = 0
+    """The same three counts for the probe phase alone, so the seeding half can be priced apart."""
+    probe_long_cached_tokens: int = 0
+    probe_long_output_tokens: int = 0
     error: str | None = None
     schema: int = SCHEMA_VERSION
 
@@ -1453,7 +1509,12 @@ class SeedRecord:
         does not move: the tokens and the rates are both here, and the arithmetic is the same
         one ``cost`` uses for its input half.
         """
-        return self.cell.pricing.input_cost(self.input_tokens, self.cached_tokens)
+        return self.cell.pricing.tiered_input_cost(
+            self.input_tokens,
+            self.cached_tokens,
+            long_input_tokens=self.long_input_tokens,
+            long_cached_tokens=self.long_cached_tokens,
+        )
 
     @property
     def probe_cost(self) -> float | None:
@@ -1465,10 +1526,13 @@ class SeedRecord:
         """
         if self.probe_input_tokens is None or self.probe_cached_tokens is None or self.probe_output_tokens is None:
             return None
-        pricing = self.cell.pricing
-        return (
-            pricing.input_cost(self.probe_input_tokens, self.probe_cached_tokens)
-            + self.probe_output_tokens * pricing.output_per_million / 1_000_000
+        return self.cell.pricing.tiered_cost(
+            self.probe_input_tokens,
+            self.probe_cached_tokens,
+            self.probe_output_tokens,
+            long_input_tokens=self.probe_long_input_tokens,
+            long_cached_tokens=self.probe_long_cached_tokens,
+            long_output_tokens=self.probe_long_output_tokens,
         )
 
     @property
@@ -1501,9 +1565,11 @@ class SeedRecord:
         """
         if self.probe_input_tokens is None or self.probe_cached_tokens is None:
             return None
-        return self.cell.pricing.input_cost(
+        return self.cell.pricing.tiered_input_cost(
             max(self.input_tokens - self.probe_input_tokens, 0),
             max(self.cached_tokens - self.probe_cached_tokens, 0),
+            long_input_tokens=max(self.long_input_tokens - self.probe_long_input_tokens, 0),
+            long_cached_tokens=max(self.long_cached_tokens - self.probe_long_cached_tokens, 0),
         )
 
     def to_dict(self) -> dict[str, Any]:

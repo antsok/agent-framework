@@ -3592,6 +3592,134 @@ def test_the_cache_write_rate_is_refused_without_stated_prices() -> None:
         _resolve_pricing(args, "openrouter", "some/model")
 
 
+#: gpt-6-luna's Global rates, short and long context, with the 272K line between them.
+LONG_TIER = ModelPricing(
+    input_per_million=0.10,
+    cached_read_per_million=0.01,
+    output_per_million=0.50,
+    cache_write_per_million=0.125,
+    long_context_threshold=272_000,
+    long_context=ModelPricing(
+        input_per_million=0.20, cached_read_per_million=0.02, output_per_million=0.75, cache_write_per_million=0.25
+    ),
+)
+
+
+def test_a_request_over_the_long_context_line_is_billed_whole_at_the_long_rates() -> None:
+    """The tier is decided per request and applies to every token of it, cached reads included.
+
+    So a run is charged call by call: the calls under the line at the ordinary rates and the
+    ones over it entirely at the long rates, not the long rates on the excess alone.
+    """
+    under = _call(1, 1, inp=200_000, cached=190_000, out=1_000)
+    over = _call(1, 1, inp=300_000, cached=290_000, out=1_000)
+    outcome = LiveOutcome(
+        strategy="none",
+        calls=(under, over),
+        answer="",
+        snapshot_prompt="",
+        tool_calls_made=0,
+        turns_completed=2,
+        turns_total=2,
+    )
+
+    under_cost = (10_000 * 0.125 + 190_000 * 0.01 + 1_000 * 0.50) / 1_000_000
+    over_cost = (10_000 * 0.25 + 290_000 * 0.02 + 1_000 * 0.75) / 1_000_000
+    assert LONG_TIER.tier(272_000) is LONG_TIER, "the line itself is still short context"
+    assert LONG_TIER.tier(272_001) is LONG_TIER.long_context
+    assert _cost(outcome, LONG_TIER) == pytest.approx(under_cost + over_cost)
+    assert _cost(outcome, replace(LONG_TIER, long_context=None, long_context_threshold=None)) == pytest.approx(
+        under_cost + (10_000 * 0.125 + 290_000 * 0.01 + 1_000 * 0.50) / 1_000_000
+    ), "without a tier both calls bill at the one rate"
+    assert "bills whole at $0.20/M in" in LONG_TIER.describe()
+
+
+async def test_a_record_keeps_the_long_context_split_so_its_costs_reprice_from_the_file() -> None:
+    """A table rebuilt from the file must charge the same calls the long rates the run did.
+
+    The record carries the long-context calls' tokens for the run and for its probes, and every
+    cost it derives -- the probes, the seeding half, the prompt side -- splits on them. A record
+    written before schema 21 has none, which is what a run priced at one rate means.
+    """
+    outcome, scenario = await _probed(StubChatClient(usage=UsageDetails(input_token_count=1_000)), repeats=1)
+    cell = _cell_params(
+        price_input=0.10,
+        price_cached=0.01,
+        price_output=0.50,
+        price_cache_write=0.125,
+        long_context_threshold=272_000,
+        price_long_input=0.20,
+        price_long_cached=0.02,
+        price_long_output=0.75,
+        price_long_cache_write=0.25,
+    )
+    record = replace(
+        _seed_record(outcome, scenario, cell.pricing, cell, 1),
+        input_tokens=1_000_000,
+        cached_tokens=900_000,
+        output_tokens=10_000,
+        probe_input_tokens=400_000,
+        probe_cached_tokens=390_000,
+        probe_output_tokens=2_000,
+        long_input_tokens=600_000,
+        long_cached_tokens=580_000,
+        long_output_tokens=3_000,
+        probe_long_input_tokens=300_000,
+        probe_long_cached_tokens=295_000,
+        probe_long_output_tokens=1_000,
+    )
+
+    read_back = SeedRecord.from_dict(record.to_dict())
+    assert read_back.cell.pricing == LONG_TIER
+    short_probe = (5_000 * 0.125 + 95_000 * 0.01 + 1_000 * 0.50) / 1e6
+    long_probe = (5_000 * 0.25 + 295_000 * 0.02 + 1_000 * 0.75) / 1e6
+    assert read_back.probe_cost == pytest.approx(short_probe + long_probe)
+    # Seeding is the run less the probes: 600K in, 510K cached, of which 300K / 285K long.
+    assert read_back.seeding_input_cost == pytest.approx(
+        (75_000 * 0.125 + 225_000 * 0.01) / 1e6 + (15_000 * 0.25 + 285_000 * 0.02) / 1e6
+    )
+    assert cell.key != _cell_params(price_input=0.10, price_cached=0.01, price_output=0.50, price_cache_write=0.125).key
+
+    older = _cell_params().to_dict()
+    for name in ("long_context_threshold", "price_long_input", "price_long_cached", "price_long_output"):
+        del older[name]
+    assert CellParams.from_dict(older).pricing.long_context is None, "no run before 21 priced a tier"
+    flat = record.to_dict()
+    for name in ("long_input_tokens", "long_cached_tokens", "long_output_tokens"):
+        del flat[name]
+    assert SeedRecord.from_dict(flat).long_input_tokens == 0
+
+
+def test_the_long_context_flags_are_parsed_and_refused_apart() -> None:
+    """A threshold with no long rate, or a long rate with no threshold, prices nothing it says."""
+    args = build_parser().parse_args([
+        "foundry:gpt-6-luna",
+        "--price-input",
+        "0.10",
+        "--price-cached",
+        "0.01",
+        "--price-output",
+        "0.50",
+        "--price-cache-write",
+        "0.125",
+        "--long-context-threshold",
+        "272000",
+        "--price-long-input",
+        "0.20",
+        "--price-long-cached",
+        "0.02",
+        "--price-long-output",
+        "0.75",
+        "--price-long-cache-write",
+        "0.25",
+    ])
+    assert _resolve_pricing(args, "foundry", "gpt-6-luna") == LONG_TIER
+
+    alone = build_parser().parse_args(["foundry:gpt-6-luna", "--price-input", "0.10", "--long-context-threshold", "1"])
+    with pytest.raises(SystemExit, match="go together"):
+        _resolve_pricing(alone, "foundry", "gpt-6-luna")
+
+
 def _priced(strategy: str, inp: int) -> LiveOutcome:
     return LiveOutcome(
         strategy=strategy,

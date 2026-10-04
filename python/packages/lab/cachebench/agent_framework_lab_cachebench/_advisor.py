@@ -62,6 +62,15 @@ class ModelPricing:
     token is taken as written, which is what the provider bills when the prefix is long enough to
     cache at all; a prompt too short to cache is billed at the input rate instead and is
     over-charged here by the premium, which on this benchmark's prompts does not arise."""
+    long_context_threshold: int | None = None
+    """Input tokens above which a whole request is billed at :attr:`long_context`'s rates.
+
+    Some models price by request size: gpt-6-luna bills a request with more than 272,000 input
+    tokens at its long-context rates for every token of it, cached reads, cache writes and
+    output included, not only for the tokens past the line. ``None`` for a model with one rate.
+    """
+    long_context: ModelPricing | None = None
+    """The rates a request above :attr:`long_context_threshold` is billed at, ``None`` for none."""
 
     @property
     def cache_discount(self) -> float:
@@ -87,6 +96,71 @@ class ModelPricing:
         fresh = max(input_tokens - cached_tokens, 0)
         return (fresh * self.fresh_per_million + cached_tokens * self.cached_read_per_million) / 1_000_000
 
+    def tier(self, input_tokens: int) -> ModelPricing:
+        """Return the rates one request of this many input tokens is billed at."""
+        if (
+            self.long_context is not None
+            and self.long_context_threshold is not None
+            and input_tokens > self.long_context_threshold
+        ):
+            return self.long_context
+        return self
+
+    def tiered_input_cost(
+        self, input_tokens: int, cached_tokens: int, *, long_input_tokens: int = 0, long_cached_tokens: int = 0
+    ) -> float:
+        """Return what a run's prompt side cost, when some of its requests were long-context.
+
+        Args:
+            input_tokens: Every input token the run billed, long-context requests included.
+            cached_tokens: How many of those were served from cache.
+
+        Keyword Args:
+            long_input_tokens: The input tokens of the requests above the threshold.
+            long_cached_tokens: How many of those were served from cache.
+
+        Returns:
+            Cost in the pricing's currency units.
+        """
+        rates = self.long_context or self
+        return self.input_cost(input_tokens - long_input_tokens, cached_tokens - long_cached_tokens) + (
+            rates.input_cost(long_input_tokens, long_cached_tokens)
+        )
+
+    def tiered_cost(
+        self,
+        input_tokens: int,
+        cached_tokens: int,
+        output_tokens: int,
+        *,
+        long_input_tokens: int = 0,
+        long_cached_tokens: int = 0,
+        long_output_tokens: int = 0,
+    ) -> float:
+        """Return what a run cost, prompt and output, splitting its long-context requests out.
+
+        Args:
+            input_tokens: Every input token billed.
+            cached_tokens: How many of those were served from cache.
+            output_tokens: Every output token billed.
+
+        Keyword Args:
+            long_input_tokens: Input tokens of the requests above the threshold.
+            long_cached_tokens: How many of those were served from cache.
+            long_output_tokens: Output tokens of those requests.
+
+        Returns:
+            Cost in the pricing's currency units.
+        """
+        rates = self.long_context or self
+        return (
+            self.tiered_input_cost(
+                input_tokens, cached_tokens, long_input_tokens=long_input_tokens, long_cached_tokens=long_cached_tokens
+            )
+            + (output_tokens - long_output_tokens) * self.output_per_million / 1_000_000
+            + long_output_tokens * rates.output_per_million / 1_000_000
+        )
+
     @property
     def fresh_per_million(self) -> float:
         """Return the rate an uncached prompt token is billed at: the cache-write rate when set."""
@@ -100,6 +174,11 @@ class ModelPricing:
         )
         if self.cache_write_per_million is not None:
             text += f", ${self.cache_write_per_million:.3f}/M cache write (charged on every uncached input token)"
+        if self.long_context is not None and self.long_context_threshold is not None:
+            text += (
+                f"; a request over {self.long_context_threshold:,} input tokens bills whole at "
+                f"{self.long_context.describe()}"
+            )
         return text
 
 

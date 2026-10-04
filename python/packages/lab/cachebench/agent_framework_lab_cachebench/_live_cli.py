@@ -22,6 +22,7 @@ from ._live import (
     DEFAULT_TOOL_RESULT_TOKENS,
     LiveOutcome,
     MeteredClient,
+    ModelCall,
     build_live_scenario,
     probe_count,
     run_live,
@@ -758,6 +759,24 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--price-cached", type=float, default=None, help="Cached-read price per million tokens.")
     parser.add_argument("--price-output", type=float, default=None, help="Output price per million tokens.")
     parser.add_argument(
+        "--long-context-threshold",
+        type=int,
+        default=None,
+        help=(
+            "Input tokens above which a model bills a whole request at its long-context rates "
+            "(gpt-6-luna: 272000). Each call is priced by its own size, so a run is charged the "
+            "long rates only on the calls that crossed. Needs --price-long-input."
+        ),
+    )
+    parser.add_argument("--price-long-input", type=float, default=None, help="Long-context input price per million.")
+    parser.add_argument(
+        "--price-long-cached", type=float, default=None, help="Long-context cached-read price per million."
+    )
+    parser.add_argument("--price-long-output", type=float, default=None, help="Long-context output price per million.")
+    parser.add_argument(
+        "--price-long-cache-write", type=float, default=None, help="Long-context cache-write price per million."
+    )
+    parser.add_argument(
         "--price-cache-write",
         type=float,
         default=None,
@@ -845,13 +864,30 @@ def _resolve_pricing(args: argparse.Namespace, provider: str, model: str) -> Mod
     Raises:
         SystemExit: If prices are neither supplied nor discoverable.
     """
+    if (args.long_context_threshold is None) != (args.price_long_input is None):
+        raise SystemExit("--long-context-threshold and --price-long-input go together; set both or neither.")
     if args.price_input is not None:
+        output = args.price_output if args.price_output is not None else args.price_input
+        long_context = None
+        if args.price_long_input is not None:
+            long_context = ModelPricing(
+                input_per_million=args.price_long_input,
+                cached_read_per_million=(
+                    args.price_long_cached if args.price_long_cached is not None else args.price_long_input
+                ),
+                output_per_million=args.price_long_output if args.price_long_output is not None else output,
+                cache_write_per_million=args.price_long_cache_write,
+            )
         return ModelPricing(
             input_per_million=args.price_input,
             cached_read_per_million=args.price_cached if args.price_cached is not None else args.price_input,
-            output_per_million=args.price_output if args.price_output is not None else args.price_input,
+            output_per_million=output,
             cache_write_per_million=args.price_cache_write,
+            long_context_threshold=args.long_context_threshold,
+            long_context=long_context,
         )
+    if args.long_context_threshold is not None:
+        raise SystemExit("--long-context-threshold needs --price-input: catalogue rates carry no long-context tier.")
     if args.price_cache_write is not None:
         raise SystemExit("--price-cache-write needs --price-input: the catalogue rates carry no cache-write price.")
     if provider == "openrouter":
@@ -878,11 +914,31 @@ def _cost(outcome: LiveOutcome, pricing: ModelPricing) -> float:
     the strategy which spends money to preserve information is not scored as though preserving
     it were free.
     """
-    agent_cost = (
-        pricing.input_cost(outcome.input_tokens, outcome.cached_tokens)
-        + outcome.output_tokens * pricing.output_per_million / 1_000_000
+    long_input, long_cached, long_output = _long_totals(outcome.calls, pricing)
+    agent_cost = pricing.tiered_cost(
+        outcome.input_tokens,
+        outcome.cached_tokens,
+        outcome.output_tokens,
+        long_input_tokens=long_input,
+        long_cached_tokens=long_cached,
+        long_output_tokens=long_output,
     )
     return agent_cost + _summarizer_cost(outcome, pricing)
+
+
+def _long_totals(calls: Sequence[ModelCall], pricing: ModelPricing) -> tuple[int, int, int]:
+    """Return the input, cached and output tokens of the calls billed at the long-context rates.
+
+    Per call, because the tier is decided per request: a run whose last ten calls crossed the
+    threshold pays the long rates on those ten and the ordinary ones on the rest. All zero for
+    a model with one rate.
+    """
+    long_calls = [call for call in calls if pricing.tier(call.input_tokens) is not pricing]
+    return (
+        sum(call.input_tokens for call in long_calls),
+        sum(call.cached_tokens for call in long_calls),
+        sum(call.output_tokens for call in long_calls),
+    )
 
 
 def _summarizer_cost(outcome: LiveOutcome, pricing: ModelPricing) -> float:
@@ -965,6 +1021,10 @@ def _seed_record(
     facts_total = len(scores[0].outcomes) if scores else 0
     facts_left = scores[0].facts_left if scores else 0
     nofetch = len(unretrieved_facts(outcome, scenario))
+    long_input, long_cached, long_output = _long_totals(outcome.calls, pricing)
+    probe_long_input, probe_long_cached, probe_long_output = _long_totals(
+        [call for probe in outcome.probes for call in probe.calls], pricing
+    )
     return SeedRecord(
         cell=cell,
         strategy=outcome.strategy,
@@ -979,6 +1039,12 @@ def _seed_record(
         probe_output_tokens=outcome.probe_output_tokens,
         probe_input_samples=outcome.probe_input_samples,
         probe_cached_samples=outcome.probe_cached_samples,
+        long_input_tokens=long_input,
+        long_cached_tokens=long_cached,
+        long_output_tokens=long_output,
+        probe_long_input_tokens=probe_long_input,
+        probe_long_cached_tokens=probe_long_cached,
+        probe_long_output_tokens=probe_long_output,
         calls=len(outcome.calls),
         messages_left=outcome.messages_left,
         messages_peak=outcome.messages_peak,
@@ -3864,6 +3930,11 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
         price_cached=pricing.cached_read_per_million,
         price_output=pricing.output_per_million,
         price_cache_write=pricing.cache_write_per_million,
+        long_context_threshold=pricing.long_context_threshold,
+        price_long_input=None if pricing.long_context is None else pricing.long_context.input_per_million,
+        price_long_cached=None if pricing.long_context is None else pricing.long_context.cached_read_per_million,
+        price_long_output=None if pricing.long_context is None else pricing.long_context.output_per_million,
+        price_long_cache_write=None if pricing.long_context is None else pricing.long_context.cache_write_per_million,
         min_correctness=min_correctness,
         plan=plan,
         workload=workload,
