@@ -207,6 +207,32 @@ What it shows, and what it is void for:
 No `.sh` is kept: the script that produced it is the same one run 47 uses, and re-running it
 against this tree produces the repaired rows rather than these.
 
+Run 65 asks whether compacting below gpt-6-luna's **272K long-context line** pays, in
+`run-65-long-context-line/`. Above 272,000 input tokens the model bills a whole request at its
+long-context rates -- $0.20 in, $0.02 cached, $0.25 cache write, $0.75 out, against $0.10 / $0.01
+/ $0.125 / $0.50 -- and from `a910c1809` the benchmark prices each call by its own size. A 1M window,
+fill 0.4 (a ~400K conversation: six ~40K lookups, ~125K of user turns), `--trigger-fraction 0.2`
+(~200K), the control against the two strategies that held past the window, five seeds, $6.91, on
+the 002 resource endpoint through `azure-responses`. Five rows failed on 429s when five seeds sent
+~400K prompts at once and were re-run on two streams; the failed records and two duplicate
+controls are in `set-aside/`.
+
+    seed$ per conversation    tiered    one rate   peak     input at long rate   facts   acc1
+    none                      0.3838    0.2708     385K     54%                  53/53   83%
+    tool_and_user_summary     0.2363    0.2363     204K     0%                   53/53   92%
+    tool_summary_anchored     0.2085    0.2085     211K     0%                   53/53   96%
+
+- **Yes: both strategies stayed under the line on every call and cost 38% and 46% less than the
+  control, and every one of their seeds was cheaper than every control seed** ($0.197-0.266
+  against $0.368-0.399). Most of it is the tier: repriced at the short rates throughout, the
+  control costs $0.271, so the saving without the line would be 13% and 23%.
+- `tool_summary_anchored` is cheapest here because its records covered every lookup and user
+  text alone (~125K) fits under the trigger -- the case where it cannot meet the 3x failure.
+- The control answered worse on its first reading (83% against 92-96%), as at 3x in run 63.
+- The rendered report leaves the control out of the printed verdict (`EXCL`, `MSGS:-6`): its
+  conversation came out six messages different from the compacting rows'. The comparison above
+  uses its cost directly.
+
 Run 64 is `tool_summary_anchored` with **record repeats on** -- the new default, `d3aca3450` --
 against the control, at fills 1.5 and 3.0 on both models, five seeds, $15.80, in
 `run-64-record-repeats/`. Settings otherwise as run 63, so it reads directly against that run's
