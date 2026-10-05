@@ -39,17 +39,30 @@ def _blob(size: int = 1200, *, seed: int = 1) -> str:
     return base64.b64encode(rng.randbytes(size)).decode()
 
 
-def _reasoning_message(*blobs: str | None, stamps: dict[int, Any] | None = None) -> Message:
+def _reasoning_message(
+    *blobs: str | None, stamps: dict[int, Any] | None = None, replay: dict[int, str] | None = None
+) -> Message:
     """Return an assistant message with one reasoning content per entry, then visible text.
 
     A ``None`` entry is a reasoning content without a payload; ``stamps`` maps a content index
-    to a value for :data:`REASONING_TOKENS_KEY`.
+    to a value for :data:`REASONING_TOKENS_KEY`; ``replay`` maps one to the encrypted payload
+    of a replayed reasoning item kept whole under ``additional_properties``, the way the
+    Foundry client keeps it.
     """
     contents = [
         Content.from_text_reasoning(id=f"rs_{index}", text="", protected_data=blob) for index, blob in enumerate(blobs)
     ]
     for index, value in (stamps or {}).items():
         contents[index].additional_properties[REASONING_TOKENS_KEY] = value
+    for index, blob in (replay or {}).items():
+        contents[index].additional_properties["__foundry_reasoning_replay_item__"] = {
+            "type": "reasoning",
+            "id": f"rs_{index}",
+            "response_id": "resp_1",
+            "summary": [{"type": "summary_text", "text": "Weighed the two options."}],
+            "content": [],
+            "encrypted_content": blob,
+        }
     # Non-ASCII on purpose: a re-serialization that escaped it would count the escapes.
     contents.append(Content.from_text(text="Réponse: the pipeline keeps the streaming group — 日本語 too."))
     return Message("assistant", contents, message_id="m-1")
@@ -223,3 +236,37 @@ def test_build_tokenizer_wraps_every_name_and_keeps_the_names() -> None:
         assert isinstance(tokenizer.base, CharacterEstimatorTokenizer if name == "estimator" else TiktokenTokenizer)
     with pytest.raises(KeyError):
         build_tokenizer("bpe")
+
+
+@pytest.mark.parametrize("base", _bases(), ids=lambda base: type(base).__name__)
+def test_a_replayed_items_nested_payload_is_not_counted_but_its_summary_is(base: Any) -> None:
+    """The Foundry client keeps the whole replayed reasoning item under additional_properties.
+
+    The framework strips ``encrypted_content`` at the top level of those properties and nothing
+    below, so the payload inside the kept item is counted as prompt text: 1,128 tokens for a
+    reply billed at about 110. The wrapper drops the member at any depth and leaves the item's
+    clear-text summary, which the provider does send, counted as the framework counts it.
+    """
+    blob = _blob()
+    with_replay = _serialize_message(_reasoning_message(blob, replay={0: blob}))
+    assert blob in with_replay, "the framework counts the nested payload; the premise of this test"
+    twin = _reasoning_message(blob, replay={0: blob})
+    del twin.contents[0].additional_properties["__foundry_reasoning_replay_item__"]["encrypted_content"]
+    expected = base.count_tokens(_serialize_message(twin))
+
+    counted = ReasoningStampTokenizer(base).count_tokens(with_replay)
+
+    assert counted == expected
+    assert counted < base.count_tokens(blob)
+    assert "Weighed the two options." in _serialize_message(twin)
+
+
+def test_a_stamp_and_a_nested_payload_settle_together() -> None:
+    blob = _blob()
+    message = _reasoning_message(blob, stamps={0: 300}, replay={0: blob})
+    twin = _reasoning_message(blob, replay={0: blob})
+    del twin.contents[0].additional_properties["__foundry_reasoning_replay_item__"]["encrypted_content"]
+
+    assert ReasoningStampTokenizer(ESTIMATOR).count_tokens(_serialize_message(message)) == (
+        ESTIMATOR.count_tokens(_serialize_message(twin)) + 300
+    )

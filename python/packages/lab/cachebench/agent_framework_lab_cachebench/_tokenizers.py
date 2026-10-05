@@ -38,6 +38,12 @@ REASONING_TOKENS_KEY: Final[str] = "reasoning_output_token_count"
 
 _STAMP_MARKER: Final[str] = f'"{REASONING_TOKENS_KEY}"'
 
+#: The member a provider's replayed reasoning item keeps its encrypted payload under. The
+#: framework drops it from the top level of a content's ``additional_properties``; this
+#: wrapper drops it at any depth below, where the Foundry client keeps a copy of the item.
+_OPAQUE_KEY: Final[str] = "encrypted_content"
+_OPAQUE_MARKER: Final[str] = f'"{_OPAQUE_KEY}"'
+
 
 class TiktokenTokenizer:
     """Exact BPE token counts, so budgets and reuse are measured in real tokens."""
@@ -91,6 +97,21 @@ class ReasoningStampTokenizer:
     that does not reason, and every user, tool and plain assistant message on one that does,
     counts exactly as the framework would count it alone.
 
+    **The payload the framework misses.** The framework excludes ``protected_data`` and the
+    ``encrypted_content`` member at the top level of a content's ``additional_properties``, and
+    nothing below that. The Foundry client keeps a copy of the whole replayed reasoning item
+    under one key of those properties, ``__foundry_reasoning_replay_item__``, with the encrypted
+    payload inside it, so on gpt-5.6-luna every assistant message is counted with its base64
+    payload again: a reply of 416 visible characters serialized to 2,214 and counted at 1,128
+    o200k tokens against about 110 billed, measured 5 October 2026 on agent-framework-core
+    1.20.0 and agent-framework-foundry 1.14.0. Every compaction threshold in this package is a
+    fraction of that count, so the anchored rows shed assistant turns one after another on a
+    prompt a fifth under the window. This wrapper therefore also drops every ``encrypted_content``
+    member at any depth under a content's ``additional_properties`` before counting, which is
+    the framework's own rule applied where the framework does not apply it. Clear-text members
+    of the replayed item -- its summary and content lists -- stay counted, as the framework
+    counts them.
+
     **Cost.** A message without a stamp pays one substring scan and the wrapped count of the
     original string object. A message with one pays a ``json.loads`` and a ``json.dumps`` on
     top, a few microseconds beside tiktoken's hundreds for the same string.
@@ -114,26 +135,26 @@ class ReasoningStampTokenizer:
             The wrapped tokenizer's count of the re-serialized message plus the stamped
             reasoning token counts; or its count of ``text`` itself when there is no stamp.
         """
-        if _STAMP_MARKER not in text:
+        if _STAMP_MARKER not in text and _OPAQUE_MARKER not in text:
             return self.base.count_tokens(text)
-        stripped, declared = _take_stamps(text)
-        if stripped is None:
+        settled, declared = _settle_for_count(text)
+        if settled is None:
             return self.base.count_tokens(text)
-        return self.base.count_tokens(stripped) + declared
+        return self.base.count_tokens(settled) + declared
 
 
-def _take_stamps(text: str) -> tuple[str | None, int]:
-    """Return ``text`` re-serialized without its reasoning stamps, and the stamps' total.
+def _settle_for_count(text: str) -> tuple[str | None, int]:
+    """Return ``text`` re-serialized without stamps or nested opaque payloads, and the stamps' total.
 
     Args:
-        text: A string that contains the stamp key.
+        text: A string that contains the stamp key or the opaque payload key.
 
     Returns:
         ``(None, 0)`` when ``text`` is not a serialized message with a ``contents`` list, or
-        when no entry of that list carries a stamp in its ``additional_properties``, so the
-        caller counts ``text`` unchanged. Otherwise the re-serialized message and the sum of
-        the stamps that are positive integers; a stamp of any other shape is removed and
-        counts nothing.
+        when no entry of that list carries a stamp or an opaque payload in its
+        ``additional_properties``, so the caller counts ``text`` unchanged. Otherwise the
+        re-serialized message and the sum of the stamps that are positive integers; a stamp of
+        any other shape is removed and counts nothing.
     """
     try:
         payload: Any = json.loads(text)
@@ -144,21 +165,41 @@ def _take_stamps(text: str) -> tuple[str | None, int]:
     contents: Any = cast("dict[str, Any]", payload).get("contents")
     if not isinstance(contents, list):
         return None, 0
-    stamped = False
+    changed = False
     declared = 0
     for entry in cast("list[Any]", contents):
         if not isinstance(entry, dict):
             continue
         properties = cast("dict[str, Any]", entry).get("additional_properties")
-        if not isinstance(properties, dict) or REASONING_TOKENS_KEY not in properties:
+        if not isinstance(properties, dict):
             continue
-        stamp = cast("dict[str, Any]", properties).pop(REASONING_TOKENS_KEY)
-        stamped = True
-        if isinstance(stamp, int) and not isinstance(stamp, bool):
-            declared += max(stamp, 0)
-    if not stamped:
+        typed = cast("dict[str, Any]", properties)
+        if REASONING_TOKENS_KEY in typed:
+            stamp = typed.pop(REASONING_TOKENS_KEY)
+            changed = True
+            if isinstance(stamp, int) and not isinstance(stamp, bool):
+                declared += max(stamp, 0)
+        if _drop_opaque(typed):
+            changed = True
+    if not changed:
         return None, 0
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str), declared
+
+
+def _drop_opaque(value: Any) -> bool:
+    """Remove every ``encrypted_content`` member below ``value`` in place; return whether any went."""
+    dropped = False
+    if isinstance(value, dict):
+        entries = cast("dict[str, Any]", value)
+        if _OPAQUE_KEY in entries:
+            del entries[_OPAQUE_KEY]
+            dropped = True
+        for item in entries.values():
+            dropped = _drop_opaque(item) or dropped
+    elif isinstance(value, list):
+        for item in cast("list[Any]", value):
+            dropped = _drop_opaque(item) or dropped
+    return dropped
 
 
 def stamp_reasoning_tokens(messages: Iterable[Message], reasoning_tokens: int) -> bool:
