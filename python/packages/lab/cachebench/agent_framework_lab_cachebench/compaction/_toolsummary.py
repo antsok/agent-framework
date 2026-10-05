@@ -168,10 +168,11 @@ documented as measuring the fallback strategy rather than this one, and ``FALLBA
 mechanism alone.** The brief was the archive: across the 58 records of ``tool_summary_anchored``
 in runs 41 to 48, the four that lost a fact all carried ``UNCOVERED`` beside ``RECFALLBACK``,
 and none of the 21 carrying either flag alone had lost one. That reading was right about the
-pair and wrong about the cause. The framework's compaction counter tokenises the encrypted
-reasoning payload gpt-5.6-luna returns on every call -- ``_serialize_content`` in
-``agent_framework._compaction`` drops ``raw_representation`` but not ``protected_data`` -- and
-base64 counts at about three times the rate of prose, so luna's local count ran 1.2 to 1.45
+pair and wrong about the cause. The framework's compaction counter of the time tokenised the
+encrypted reasoning payload gpt-5.6-luna returns on every call -- ``_serialize_content`` in
+``agent_framework._compaction`` dropped ``raw_representation`` but not ``protected_data``,
+which core 1.19 excludes -- and base64 counts at about three times the rate of prose, so
+luna's local count ran 1.2 to 1.45
 times what the provider billed and the fallback fired at 0.61 to 0.64 of the billed ceiling
 where gpt-5.4-mini, which returns no such payload, fires at 0.93 to 0.95. On all four of those
 seeds the true prompt was at or under the ceiling and the fallback should not have run at all.

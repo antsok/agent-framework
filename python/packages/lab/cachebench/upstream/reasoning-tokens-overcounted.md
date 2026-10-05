@@ -236,3 +236,7 @@ def test_serialize_message_excludes_protected_data_from_token_count() -> None:
 ```
 
 A companion test asserting that `items` is excluded from the count would close the same gap for the existing exclusion.
+
+---
+
+Status: fixed upstream in agent-framework-core 1.19.0 (#8354, "exclude encrypted reasoning payloads from compaction token counts"). The lab wrapper now does the stamp accounting only; see `ReasoningStampTokenizer`.

@@ -5,12 +5,12 @@
 The default ``CharacterEstimatorTokenizer`` assumes 4 chars/token over serialized JSON,
 which runs roughly 2x a real BPE count for this benchmark's content. That is harmless when
 comparing strategies at small sizes, but at 100k-plus prompts it moves a compaction
-threshold by six figures — so large runs should count real tokens.
+threshold by six figures -- so large runs should count real tokens.
 
 Whichever counter a run selects, :func:`build_tokenizer` hands it back inside
-:class:`ProtectedDataStrippingTokenizer`, so that encrypted reasoning payloads the client
-replays are not charged as if they were prompt text. That class documents the upstream
-defect it compensates for and the accounting it settles on.
+:class:`ReasoningStampTokenizer`, so that the reasoning a provider bills on every replay of
+an encrypted payload is counted at the size the provider reports rather than at zero. That
+class documents the accounting.
 """
 
 from __future__ import annotations
@@ -24,7 +24,7 @@ from agent_framework import CharacterEstimatorTokenizer, Message, TokenizerProto
 __all__ = [
     "REASONING_TOKENS_KEY",
     "TOKENIZER_NAMES",
-    "ProtectedDataStrippingTokenizer",
+    "ReasoningStampTokenizer",
     "TiktokenTokenizer",
     "build_tokenizer",
     "stamp_reasoning_tokens",
@@ -32,17 +32,11 @@ __all__ = [
 
 TOKENIZER_NAMES: Final[tuple[str, ...]] = ("estimator", "tiktoken")
 
-#: ``additional_properties`` key on a content that a run may stamp with the reasoning token
-#: count the provider reported for the response whose ``protected_data`` the content carries
-#: (``UsageDetails["reasoning_output_token_count"]``). :class:`ProtectedDataStrippingTokenizer`
-#: counts that many tokens in the payload's place; :func:`stamp_reasoning_tokens` writes it.
+#: ``additional_properties`` key under which a response's billed reasoning token count is
+#: recorded on the content that carries its encrypted payload. See :func:`stamp_reasoning_tokens`.
 REASONING_TOKENS_KEY: Final[str] = "reasoning_output_token_count"
 
-#: The field as the framework's serializer emits it, quotes included. JSON escapes the quotes
-#: of any occurrence inside a string value, so a serialized message contains this sequence
-#: only where a ``protected_data`` key is present. Its absence, one substring scan, is what
-#: lets every message without a payload skip the parse entirely.
-_PROTECTED_DATA_MARKER: Final[str] = '"protected_data"'
+_STAMP_MARKER: Final[str] = f'"{REASONING_TOKENS_KEY}"'
 
 
 class TiktokenTokenizer:
@@ -69,97 +63,77 @@ class TiktokenTokenizer:
         return len(self._encoding.encode(text))
 
 
-class ProtectedDataStrippingTokenizer:
-    """Count a serialized message as the provider bills it, without its encrypted reasoning.
+class ReasoningStampTokenizer:
+    """Count a serialized message as the provider bills it, replayed reasoning included.
 
-    **The defect this compensates for, upstream.** ``Content.to_dict`` captures
-    ``protected_data``, and ``agent_framework._compaction._serialize_content`` pops
-    ``raw_representation`` and ``items`` from that dict but not ``protected_data``, so
-    ``agent_framework._compaction._serialize_message`` hands the tokenizer a string that still
-    carries every encrypted reasoning payload the client will replay. Base64 tokenizes at
-    about 0.68 o200k tokens per character against about 0.2 for prose, so a reasoning trace
-    the provider bills at roughly 300 tokens is counted locally at 900 to 1,200. Measured
-    across the archive that put gpt-5.6-luna's local count at 1.2 to 1.45 times its billed
-    prompt, and every threshold in this package is a fraction of that count: on the same cell
-    and code, gpt-5.4-mini (which does not reason) trips the anchored fallback at 0.93-0.95
-    of the billed ceiling while luna trips it at 0.61-0.64. Remove this wrapper when upstream
-    drops ``protected_data`` from the serialization; nothing else in the package depends on it.
+    **What the framework counts.** ``agent_framework._compaction._serialize_message`` is what
+    every compaction strategy hands the tokenizer, and it excludes the opaque reasoning payload
+    a provider returns with ``protected_data`` (an encrypted Responses item, an Anthropic
+    signature) while keeping any clear-text reasoning the provider replays as text. So a
+    replayed encrypted reasoning item counts as zero. The provider does not bill it at zero:
+    it bills the decrypted reasoning, about 300 tokens per assistant call on gpt-5.6-luna.
+    Nothing on the message says how many that is -- the count arrives on the response's usage
+    as ``reasoning_output_token_count``, not on the content -- so on a conversation with ~38
+    assistant calls in the prompt the framework's count runs about 11k tokens, roughly 19%,
+    under what the provider bills, and every threshold in this package is a fraction of that
+    count: a trigger labelled 0.80 fires near 0.99 of billed.
 
-    **What it does.** The framework calls ``count_tokens`` with the serialized string, so the
-    wrapper can only change what is counted, never what is sent. When the string contains a
-    ``protected_data`` field it is parsed once, the field is removed from every entry of the
-    ``contents`` list, the result is re-serialized with the same call ``_serialize_message``
-    makes (``ensure_ascii=False, sort_keys=True, default=str``), and that string is what the
-    wrapped tokenizer counts. A string with no such field, or one that does not parse as a
-    message with a ``contents`` list, is passed to the wrapped tokenizer unchanged, so every
-    message without a payload -- every message on a model that does not reason, and every
-    user, tool and plain assistant message on one that does -- counts exactly as before and
-    existing cells stay comparable.
+    **What this does.** A run stamps each response's reasoning count on the content carrying
+    its payload (:func:`stamp_reasoning_tokens`). The framework keeps ``additional_properties``
+    in the string it counts, so the stamp travels with the message. When the string carries a
+    stamp this wrapper parses it once, removes every stamp from the ``contents`` entries, counts
+    the re-serialized message with the wrapped tokenizer -- the same call ``_serialize_message``
+    makes (``ensure_ascii=False, sort_keys=True, default=str``) -- and adds the stamps' total.
+    The stamp itself is never counted and the replayed reasoning is counted at what the provider
+    reports; the residual is the framing the provider puts around a replayed item, a few tokens
+    per call. A string with no stamp, or one that is not a serialized message with a
+    ``contents`` list, goes to the wrapped tokenizer unchanged, so every message on a model
+    that does not reason, and every user, tool and plain assistant message on one that does,
+    counts exactly as the framework would count it alone.
 
-    **The accounting.** Dropping the payload counts replayed reasoning at zero, and the
-    provider does not bill it at zero: it bills the decrypted reasoning, about 300 tokens per
-    assistant call on luna. Nothing on the message says how many that is. The OpenAI and
-    Foundry clients put ``reasoning_output_token_count`` on the response's usage, not on the
-    content, and a reasoning content's ``additional_properties`` carry only ``reasoning_text``
-    and ``summary``. So the wrapper trades the over-count for an under-count. The residual is
-    the sum of the decrypted reasoning sizes in the prompt, and its direction is low: on the
-    fixed-payload 60k cell with ~38 assistant calls in the prompt that is ~11k tokens, about
-    19% of the prompt, so a trigger labelled 0.80 fires near 0.99 of billed. Zero is still the
-    better of the two numbers the instrument can produce on its own: the error is a third of
-    the one it replaces (the over-count was 45% on that cell) and it is bounded by what the
-    provider actually bills rather than by the length of a base64 encoding of it. It is not
-    small, which is why :data:`REASONING_TOKENS_KEY` exists. A run that stamps the response's
-    reasoning token count on the content carrying the payload (:func:`stamp_reasoning_tokens`)
-    has that many tokens counted in the payload's place, the stamp itself is not counted, and
-    the residual falls to the framing the provider puts around a replayed reasoning item, a
-    few tokens per call. Until a run stamps, the wrapper counts zero and says so here.
-
-    **Cost.** A message without a payload pays one substring scan and the wrapped count of
-    the original string object: 1.5 microseconds on a 14k-char tool result, invisible next to
-    tiktoken's 600 for the same string. A message with a payload pays a ``json.loads``, a
-    ``json.dumps`` and the wrapped count of a shorter string: on a 4.5k-char assistant message
-    carrying a 1.6k-char payload that is 17 microseconds on top of the estimator, and under
-    tiktoken a net saving of about 200, because encoding the base64 cost more than parsing it
-    away. Nothing is parsed twice.
+    **Cost.** A message without a stamp pays one substring scan and the wrapped count of the
+    original string object. A message with one pays a ``json.loads`` and a ``json.dumps`` on
+    top, a few microseconds beside tiktoken's hundreds for the same string.
     """
 
     def __init__(self, base: TokenizerProtocol) -> None:
         """Wrap a token counter.
 
         Args:
-            base: The counter that measures the stripped string; whichever the run selected.
+            base: The counter that measures the message text; whichever the run selected.
         """
         self.base = base
 
     def count_tokens(self, text: str) -> int:
-        """Return the wrapped count of ``text`` less its ``protected_data`` fields.
+        """Return the wrapped count of ``text`` without its stamps, plus what the stamps declare.
 
         Args:
             text: The string to count, normally a message as ``_serialize_message`` emits it.
 
         Returns:
-            The wrapped tokenizer's count of the re-serialized message, plus any stamped
-            reasoning token counts; or its count of ``text`` itself when nothing was stripped.
+            The wrapped tokenizer's count of the re-serialized message plus the stamped
+            reasoning token counts; or its count of ``text`` itself when there is no stamp.
         """
-        if _PROTECTED_DATA_MARKER not in text:
+        if _STAMP_MARKER not in text:
             return self.base.count_tokens(text)
-        stripped, declared = _strip_protected_data(text)
+        stripped, declared = _take_stamps(text)
         if stripped is None:
             return self.base.count_tokens(text)
         return self.base.count_tokens(stripped) + declared
 
 
-def _strip_protected_data(text: str) -> tuple[str | None, int]:
-    """Return ``text`` re-serialized without its ``protected_data`` fields, and the stamps' total.
+def _take_stamps(text: str) -> tuple[str | None, int]:
+    """Return ``text`` re-serialized without its reasoning stamps, and the stamps' total.
 
     Args:
-        text: A string that contains the ``protected_data`` marker.
+        text: A string that contains the stamp key.
 
     Returns:
         ``(None, 0)`` when ``text`` is not a serialized message with a ``contents`` list, or
-        when no entry of that list carries the field, so the caller counts ``text`` unchanged.
-        Otherwise the re-serialized message and the sum of :data:`REASONING_TOKENS_KEY`
-        stamps found beside the removed fields, which are removed with them.
+        when no entry of that list carries a stamp in its ``additional_properties``, so the
+        caller counts ``text`` unchanged. Otherwise the re-serialized message and the sum of
+        the stamps that are positive integers; a stamp of any other shape is removed and
+        counts nothing.
     """
     try:
         payload: Any = json.loads(text)
@@ -170,23 +144,20 @@ def _strip_protected_data(text: str) -> tuple[str | None, int]:
     contents: Any = cast("dict[str, Any]", payload).get("contents")
     if not isinstance(contents, list):
         return None, 0
-    stripped = False
+    stamped = False
     declared = 0
     for entry in cast("list[Any]", contents):
-        if not isinstance(entry, dict) or "protected_data" not in entry:
+        if not isinstance(entry, dict):
             continue
-        content = cast("dict[str, Any]", entry)
-        del content["protected_data"]
-        stripped = True
-        properties = content.get("additional_properties")
-        if isinstance(properties, dict):
-            stamp = cast("dict[str, Any]", properties).pop(REASONING_TOKENS_KEY, None)
-            if isinstance(stamp, int) and not isinstance(stamp, bool):
-                declared += max(stamp, 0)
-    if not stripped:
+        properties = cast("dict[str, Any]", entry).get("additional_properties")
+        if not isinstance(properties, dict) or REASONING_TOKENS_KEY not in properties:
+            continue
+        stamp = cast("dict[str, Any]", properties).pop(REASONING_TOKENS_KEY)
+        stamped = True
+        if isinstance(stamp, int) and not isinstance(stamp, bool):
+            declared += max(stamp, 0)
+    if not stamped:
         return None, 0
-    # The call ``_serialize_message`` makes, so this is the string the framework would have
-    # produced for a message that never carried the payload.
     return json.dumps(payload, ensure_ascii=False, sort_keys=True, default=str), declared
 
 
@@ -196,7 +167,7 @@ def stamp_reasoning_tokens(messages: Iterable[Message], reasoning_tokens: int) -
     The count goes under :data:`REASONING_TOKENS_KEY` in the ``additional_properties`` of the
     first content in ``messages`` whose ``protected_data`` is set. A response normally carries
     one payload; when it carries several the total sits on the first, which is what
-    :class:`ProtectedDataStrippingTokenizer` counts, since it sums stamps across contents.
+    :class:`ReasoningStampTokenizer` counts, since it sums stamps across contents.
 
     This changes the message but not what is sent: the OpenAI and Foundry reasoning
     conversion reads ``status``, ``reasoning_text`` and ``encrypted_content`` from those
@@ -231,7 +202,7 @@ def build_tokenizer(name: str) -> TokenizerProtocol:
         name: One of :data:`TOKENIZER_NAMES`.
 
     Returns:
-        The token counter, wrapped in :class:`ProtectedDataStrippingTokenizer`.
+        The token counter, wrapped in :class:`ReasoningStampTokenizer`.
 
     Raises:
         KeyError: If ``name`` is not a known tokenizer.
@@ -243,4 +214,4 @@ def build_tokenizer(name: str) -> TokenizerProtocol:
         base = TiktokenTokenizer()
     else:
         raise KeyError(f"Unknown tokenizer {name!r}. Known tokenizers: {list(TOKENIZER_NAMES)}")
-    return ProtectedDataStrippingTokenizer(base)
+    return ReasoningStampTokenizer(base)

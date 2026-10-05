@@ -1128,6 +1128,19 @@ async def test_manual_sizing_does_not_have_to_switch_the_default_share_off_by_ha
 # region strategies
 
 
+_CALL_OCCURRENCE_ID = re.compile(r"af-call-[0-9a-f]{32}")
+
+
+def _stable(serialized: str) -> str:
+    """Return ``serialized`` with the framework's per-run function-call occurrence ids masked.
+
+    The framework stamps every function call it sees with a fresh ``af-call-<uuid>`` content id,
+    so two runs of one fixture serialize the same conversation with different ids. A comparison
+    across runs is about what the conversation holds, not about which run minted it.
+    """
+    return _CALL_OCCURRENCE_ID.sub("af-call-*", serialized)
+
+
 def _options(**kwargs: Any) -> StrategyOptions:
     return StrategyOptions(tokenizer=TOKENIZER, max_context_window_tokens=32_000, max_output_tokens=2_048, **kwargs)
 
@@ -1702,11 +1715,10 @@ async def test_the_harness_store_keeps_the_reasoning_stamp_the_replay_is_charged
     exactly the history the second model call was about to send.
 
     The second call's pass is the one handed three messages -- the first question, the stamped
-    reply and the second question -- and its charge is compared against all three numbers the
-    instrument could have produced: the stamped count (what the provider bills), the stripped
-    count without the stamp (zero for the payload, the ~19% under-count), and the unwrapped
-    count of the base64 as prompt text (the ~45% over-count the fix replaced). Only the first
-    is a measurement; the other two are what the label would have lied by.
+    reply and the second question -- and its charge is compared against the two numbers the
+    instrument could have produced: the stamped count (what the provider bills) and the count
+    without the stamp (zero for the payload, the framework's own count, the ~19% under-count).
+    Only the first is a measurement; the second is what the label would have lied by.
     """
     payload = base64.b64encode(bytes(range(256)) * 8).decode()  # 2728 chars of base64
     reasoning = 300
@@ -1757,8 +1769,9 @@ async def test_the_harness_store_keeps_the_reasoning_stamp_the_replay_is_charged
     assert second_call == charge(unstamped, wrapped) + reasoning, "the payload is charged what it costs"
     # Exactly the stamped history, byte for byte: no annotation or framing moved the number.
     assert second_call == charge(stored()[:3], wrapped), "the replay is charged the history the store holds"
-    # Not the base64 rate: the unwrapped counter charges the encrypted payload as prompt text.
-    assert second_call < charge(stored()[:3], TOKENIZER), "the payload is not charged at its base64 length"
+    # The unwrapped counter charges the replayed payload nothing: the framework leaves it out,
+    # and the stamp is the only thing that puts the provider's bill for it back.
+    assert second_call > charge(stored()[:3], TOKENIZER), "the replayed reasoning was charged nothing"
 
 
 def _composed_strategy(options: StrategyOptions) -> Any:
@@ -2725,8 +2738,8 @@ async def test_the_chain_gain_fraction_moves_no_standalone_row(strategy_name: st
     ]
 
     assert not hasattr(runs[0].strategy, "chain_gain_fraction")
-    assert [_serialize_message(message) for message in runs[0].stored] == [
-        _serialize_message(message) for message in runs[1].stored
+    assert [_stable(_serialize_message(message)) for message in runs[0].stored] == [
+        _stable(_serialize_message(message)) for message in runs[1].stored
     ]
     assert _strategy_notes(runs[0].strategy) == _strategy_notes(runs[1].strategy)
     assert not [note for note in _strategy_notes(runs[0].strategy) if note.startswith("CHAIN")]
@@ -4288,7 +4301,7 @@ async def test_a_retried_turn_leaves_the_history_a_clean_attempt_would_have_left
     assert throttled.rate_limit_retries == 1
     assert clean.rate_limit_retries == 0
     assert clean.snapshot_prompt, "the control seeded nothing, so matching it proves nothing"
-    assert throttled.snapshot_prompt == clean.snapshot_prompt
+    assert _stable(throttled.snapshot_prompt) == _stable(clean.snapshot_prompt)
 
 
 async def test_dropping_an_option_inside_the_tool_loop_also_re_sends_from_the_start() -> None:
@@ -4482,7 +4495,7 @@ async def test_a_turn_disconnected_inside_the_tool_loop_is_re_sent_from_where_it
     assert clean.connection_retries == 0
     assert [request for request in client.requests if _dangling_calls(request)] == []
     assert clean.snapshot_prompt, "the control seeded nothing, so matching it proves nothing"
-    assert outcome.snapshot_prompt == clean.snapshot_prompt
+    assert _stable(outcome.snapshot_prompt) == _stable(clean.snapshot_prompt)
 
 
 async def test_a_lost_connection_and_a_rate_limit_keep_their_own_budgets() -> None:
@@ -7028,7 +7041,10 @@ async def test_a_shortfall_the_re_force_cannot_clear_ends_in_a_disqualified_row_
     crossed that line first would be measuring the pre-record fallback -- and so that the held
     groups plus the anchors exceed the window on their own. The two lookups whose pins the two
     record calls took are scored as never fetched, which is the price of a pinned call and not
-    compaction damage.
+    compaction damage. Repeats are off because the fixture is about the re-force chain: with
+    them on, the tool work that arrives after the second record is asked for again on its own
+    terms, and whether that ask lands inside the seeding or on its last call turns on a few
+    tokens of serialization, which is the framework's business and not this test's.
     """
     window = 12_000
     scenario = build_live_scenario(salt="dq", filler_turns=6, filler_tokens=50, tool_turns=6)
@@ -7041,6 +7057,7 @@ async def test_a_shortfall_the_re_force_cannot_clear_ends_in_a_disqualified_row_
         scenario=scenario,
         tool_result_tokens=800,
         probe_repeats=1,
+        repeat_records=False,
     )
 
     assert outcome.error is None

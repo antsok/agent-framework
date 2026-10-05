@@ -1,18 +1,19 @@
 # Copyright (c) Microsoft. All rights reserved.
 
-"""Unit tests for the token counters, chiefly the encrypted-reasoning correction.
+"""The reasoning stamp counter.
 
-The oracle throughout is the framework's own serializer: a message that carries a
-``protected_data`` payload must count exactly as the same message built without one, so the
-expected value is ``_serialize_message`` of the payload-free twin, counted by the unwrapped
-tokenizer. That pins the re-serialization to the framework's, not merely to "smaller".
+The framework's ``_serialize_message`` excludes an opaque reasoning payload itself, so a
+message carrying one counts as its visible text and nothing else. What the wrapper adds is
+the stamp: the reasoning token count a run records on the content carrying the payload is
+counted in the payload's place and the stamp itself is not. Every expected value is pinned to
+``_serialize_message`` of a twin message, counted by the unwrapped tokenizer, so the tests
+hold the wrapper to the framework's own serialization rather than to "smaller" or "larger".
 """
 
 from __future__ import annotations
 
 import base64
 import contextlib
-import json
 import random
 from typing import Any
 
@@ -23,7 +24,7 @@ from agent_framework_lab_cachebench import _tokenizers
 from agent_framework_lab_cachebench._tokenizers import (
     REASONING_TOKENS_KEY,
     TOKENIZER_NAMES,
-    ProtectedDataStrippingTokenizer,
+    ReasoningStampTokenizer,
     TiktokenTokenizer,
     build_tokenizer,
     stamp_reasoning_tokens,
@@ -75,27 +76,26 @@ def _bases() -> list[Any]:
 
 @pytest.mark.parametrize("base", _bases(), ids=lambda base: type(base).__name__)
 def test_a_payload_counts_at_the_visible_text_size_not_the_payloads(base: Any, monkeypatch: pytest.MonkeyPatch) -> None:
+    """The framework leaves the opaque payload out of what it hands the tokenizer; the wrapper adds nothing back."""
     blob = _blob()
-    with_blobs = _reasoning_message(blob, _blob(seed=2))
-    without_blobs = _reasoning_message(None, None)
-    parses: list[str] = []
-    real_loads = json.loads
-    monkeypatch.setattr(_tokenizers.json, "loads", lambda text: parses.append(text) or real_loads(text))
+    text = _serialize_message(_reasoning_message(blob, _blob(seed=2)))
+    without_blobs = _serialize_message(_reasoning_message(None, None))
+    assert blob not in text
+    # Not parsed: without a stamp there is nothing in the string for the wrapper to do.
+    monkeypatch.setattr(_tokenizers.json, "loads", lambda _: pytest.fail("parsed a message with no stamp"))
 
-    counted = ProtectedDataStrippingTokenizer(base).count_tokens(_serialize_message(with_blobs))
+    counted = ReasoningStampTokenizer(base).count_tokens(text)
 
-    assert counted == base.count_tokens(_serialize_message(without_blobs))
+    assert counted == base.count_tokens(without_blobs)
     # Both payloads went, not only the first: one payload alone costs more than the whole message now.
     assert counted < base.count_tokens(blob)
-    # Parsed once, and only because a payload was there.
-    assert len(parses) == 1
 
 
 def test_counting_leaves_the_message_and_what_is_sent_untouched() -> None:
     blob = _blob()
     message = _reasoning_message(blob)
     before = _serialize_message(message)
-    wrapped = ProtectedDataStrippingTokenizer(ESTIMATOR)
+    wrapped = ReasoningStampTokenizer(ESTIMATOR)
 
     annotate_token_counts([message], tokenizer=wrapped)
 
@@ -108,20 +108,21 @@ def test_counting_leaves_the_message_and_what_is_sent_untouched() -> None:
 @pytest.mark.parametrize(
     "text",
     [
-        pytest.param('"protected_data" is a phrase here, not a field', id="prose"),
-        pytest.param('["protected_data", 1]', id="json-list"),
-        pytest.param('{"protected_data": "QUJD"}', id="json-without-contents"),
-        pytest.param('{"contents": {"protected_data": "QUJD"}}', id="contents-not-a-list"),
+        pytest.param('"reasoning_output_token_count" is a phrase here, not a field', id="prose"),
+        pytest.param('["reasoning_output_token_count", 1]', id="json-list"),
+        pytest.param('{"reasoning_output_token_count": 300}', id="json-without-contents"),
+        pytest.param('{"contents": {"reasoning_output_token_count": 300}}', id="contents-not-a-list"),
         pytest.param(
-            '{"contents": [{"arguments": {"protected_data": "QUJD"}, "type": "function_call"}], "role": "assistant"}',
+            '{"contents": [{"arguments": {"reasoning_output_token_count": 300}, "type": "function_call"}], '
+            '"role": "assistant"}',
             id="nested-in-arguments",
         ),
     ],
 )
-def test_strings_that_are_not_a_message_with_a_payload_count_unchanged(text: str) -> None:
+def test_strings_that_are_not_a_message_with_a_stamp_count_unchanged(text: str) -> None:
     spy = _SpyTokenizer()
 
-    assert ProtectedDataStrippingTokenizer(spy).count_tokens(text) == ESTIMATOR.count_tokens(text)
+    assert ReasoningStampTokenizer(spy).count_tokens(text) == ESTIMATOR.count_tokens(text)
     assert spy.seen == [text]
 
 
@@ -136,43 +137,51 @@ def test_strings_that_are_not_a_message_with_a_payload_count_unchanged(text: str
             id="tool-result",
         ),
         pytest.param(
-            Message("assistant", [Content.from_text(text='It said "protected_data" in the doc.')], message_id="a"),
+            Message(
+                "assistant",
+                [Content.from_text(text='It said "reasoning_output_token_count" in the doc.')],
+                message_id="a",
+            ),
             id="assistant-quoting-the-field-name",
         ),
         pytest.param(_reasoning_message(None), id="reasoning-without-payload"),
+        pytest.param(_reasoning_message(_blob()), id="payload-without-stamp"),
     ],
 )
-def test_a_message_without_a_payload_counts_exactly_as_before(
-    message: Message, monkeypatch: pytest.MonkeyPatch
-) -> None:
+def test_a_message_without_a_stamp_counts_exactly_as_before(message: Message, monkeypatch: pytest.MonkeyPatch) -> None:
     text = _serialize_message(message)
     spy = _SpyTokenizer()
-    monkeypatch.setattr(_tokenizers.json, "loads", lambda _: pytest.fail("parsed a message with no payload"))
+    monkeypatch.setattr(_tokenizers.json, "loads", lambda _: pytest.fail("parsed a message with no stamp"))
 
-    assert ProtectedDataStrippingTokenizer(spy).count_tokens(text) == ESTIMATOR.count_tokens(text)
+    assert ReasoningStampTokenizer(spy).count_tokens(text) == ESTIMATOR.count_tokens(text)
     # The very same string object reached the wrapped tokenizer: no re-serialization happened.
     assert spy.seen[0] is text
 
 
-def test_base64_costs_what_the_fix_says_it_costs() -> None:
+def test_the_framework_charges_nothing_for_the_payload_and_the_wrapper_charges_the_stamp() -> None:
+    """An opaque payload costs zero under the framework's own count; only a stamp changes that.
+
+    Base64 tokenizes at about 0.68 o200k tokens per character, three to four times what the
+    provider bills for the reasoning it encrypts, which is what counting the payload as text
+    would charge. The framework excludes it, and the stamp is what repays the provider's
+    actual bill in its place.
+    """
     pytest.importorskip("tiktoken", reason="tiktoken not installed")
     raw = TiktokenTokenizer()
-    wrapped = ProtectedDataStrippingTokenizer(raw)
+    wrapped = ReasoningStampTokenizer(raw)
     blob = _blob()
     with_blob = _serialize_message(_reasoning_message(blob))
     without_blob = _serialize_message(_reasoning_message(None))
+    stamped = _serialize_message(_reasoning_message(blob, stamps={0: 300}))
 
-    old_charge = raw.count_tokens(with_blob) - raw.count_tokens(without_blob)
-    new_charge = wrapped.count_tokens(with_blob) - wrapped.count_tokens(without_blob)
-
-    # What the old counting charged for the payload: ~0.68 o200k tokens per base64 character,
-    # three to four times what the provider bills for the reasoning it encrypts.
-    assert 0.6 * len(blob) <= old_charge <= 0.75 * len(blob)
-    assert new_charge == 0
+    assert raw.count_tokens(with_blob) == raw.count_tokens(without_blob)
+    assert wrapped.count_tokens(with_blob) == raw.count_tokens(without_blob)
+    assert wrapped.count_tokens(stamped) == raw.count_tokens(without_blob) + 300
+    assert raw.count_tokens(blob) > 0.6 * len(blob)
 
 
 def test_a_stamped_reasoning_count_is_counted_in_the_payloads_place() -> None:
-    wrapped = ProtectedDataStrippingTokenizer(ESTIMATOR)
+    wrapped = ReasoningStampTokenizer(ESTIMATOR)
     plain = ESTIMATOR.count_tokens(_serialize_message(_reasoning_message(None, None)))
 
     stamped = _serialize_message(_reasoning_message(_blob(), _blob(seed=2), stamps={0: 300}))
@@ -210,7 +219,7 @@ def test_build_tokenizer_wraps_every_name_and_keeps_the_names() -> None:
         if name == "tiktoken":
             pytest.importorskip("tiktoken", reason="tiktoken not installed")
         tokenizer = build_tokenizer(name)
-        assert isinstance(tokenizer, ProtectedDataStrippingTokenizer)
+        assert isinstance(tokenizer, ReasoningStampTokenizer)
         assert isinstance(tokenizer.base, CharacterEstimatorTokenizer if name == "estimator" else TiktokenTokenizer)
     with pytest.raises(KeyError):
         build_tokenizer("bpe")

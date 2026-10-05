@@ -410,11 +410,12 @@ class UsageRecorder(ChatMiddleware):
         usage: dict[str, Any] = dict(getattr(context.result, "usage_details", None) or {})
         # The provider reports the reasoning it billed on the response's usage, and the content
         # that carries the encrypted payload says nothing about its size. Stamping the count
-        # here is what lets ProtectedDataStrippingTokenizer charge the replayed reasoning what
-        # the provider charges for it rather than zero: without it the local count is low by
-        # the decrypted reasoning in the prompt, which on a reasoning model is not a rounding
-        # error. Stamped after the call, on the messages the session goes on to persist, so
-        # the next pass over this conversation sees it.
+        # here is what lets ReasoningStampTokenizer charge the replayed reasoning what the
+        # provider charges for it rather than the zero the framework counts an opaque payload
+        # at: without it the local count is low by the decrypted reasoning in the prompt,
+        # which on a reasoning model is not a rounding error.
+        # Stamped after the call, on the messages the session goes on to persist, so the next pass
+        # over this conversation sees it.
         if (reasoning_tokens := usage.get("reasoning_output_token_count")) and context.result is not None:
             stamp_reasoning_tokens(context.result.messages, int(reasoning_tokens))
         self.calls.append(
