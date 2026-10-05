@@ -504,6 +504,15 @@ def _build_selective_tool_call(options: StrategyOptions) -> CompactionStrategy:
 def _build_summarization(options: StrategyOptions) -> CompactionStrategy:
     """Return LLM summarization of older turns.
 
+    The summarizer's input is bounded by the cell's own input budget rather than the
+    framework's default of 8,000 tokens. The framework selects whole message groups until the
+    next one would exceed the bound and skips any single group that cannot fit, and its
+    transcript carries each tool result in full. Under the default a benchmark cell whose tool
+    results run to tens of thousands of tokens therefore never has them summarized: the strategy
+    spends a summarizer call per turn on the small groups around them and the prompt never
+    leaves the window. The summarizer is the model under test, so its window is the bound that
+    applies.
+
     Raises:
         ValueError: If no summarizer client was configured.
     """
@@ -515,6 +524,7 @@ def _build_summarization(options: StrategyOptions) -> CompactionStrategy:
     return SummarizationStrategy(
         client=options.summarizer,
         target_count=options.keep_last_groups,
+        max_summary_input_tokens=options.input_budget_tokens,
         tokenizer=options.tokenizer,
     )
 
@@ -609,6 +619,7 @@ def _build_token_budget_summarize(options: StrategyOptions) -> CompactionStrateg
             SummarizationStrategy(
                 client=options.summarizer,
                 target_count=options.keep_last_groups,
+                max_summary_input_tokens=options.input_budget_tokens,
                 tokenizer=options.tokenizer,
             ),
         ],

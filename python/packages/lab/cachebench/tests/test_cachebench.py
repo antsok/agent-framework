@@ -14,7 +14,7 @@ from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
-from agent_framework import CharacterEstimatorTokenizer, Content, Message, SlidingWindowStrategy
+from agent_framework import CharacterEstimatorTokenizer, Content, Message, SlidingWindowStrategy, SummarizationStrategy
 from agent_framework_lab_cachebench import (
     DEFAULT_SYSTEM_TOKENS,
     CallOutcome,
@@ -39,6 +39,7 @@ from agent_framework_lab_cachebench import (
     write_records_jsonl,
     write_summary_csv,
 )
+from agent_framework_lab_cachebench._live import find_nested_strategy
 from agent_framework_lab_cachebench._runner import (
     is_connection_error,
     is_rate_limited,
@@ -391,6 +392,25 @@ def test_summarizing_strategies_require_a_client(name: str) -> None:
     options = StrategyOptions(tokenizer=TOKENIZER, max_context_window_tokens=8000, max_output_tokens=512)
     with pytest.raises(ValueError, match="summarizer client"):
         build_strategy(name, options)
+
+
+@pytest.mark.parametrize("name", ["summarization", "token_budget_summarize"])
+def test_the_summarizer_input_is_bounded_by_the_cells_input_budget(name: str) -> None:
+    """Core's default bound skips every tool result larger than 8,000 tokens, for good.
+
+    The framework's summarizer transcript carries each tool result in full and its group
+    selection skips any single group over the bound, so under the default a cell whose tool
+    results run to tens of thousands of tokens is never compacted by this row: the summarizer
+    is called once a turn on the small groups and the prompt never leaves the window. The
+    bound has to be the cell's own, which is the window less the output reservation.
+    """
+    options = StrategyOptions(
+        tokenizer=TOKENIZER, max_context_window_tokens=128_000, max_output_tokens=2_048, summarizer=object()
+    )
+    strategy = build_strategy(name, options)
+    nested = find_nested_strategy(strategy, SummarizationStrategy)
+    assert nested is not None
+    assert nested.max_summary_input_tokens == 128_000 - 2_048
 
 
 def test_unknown_strategy_rejected() -> None:

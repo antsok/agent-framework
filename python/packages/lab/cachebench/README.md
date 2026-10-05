@@ -285,7 +285,7 @@ of any of them moves that half of it exactly as it moves the single row.
 
 | flag | default | |
 | --- | --- | --- |
-| `--keep-last-groups` | 6 | groups `sliding_window` keeps, and the target `summarization` compacts to. Unreachable before this flag existed, which fixed the worst-performing row in the table at one setting |
+| `--keep-last-groups` | 6 | groups `sliding_window` keeps, and the target `summarization` compacts to. Unreachable before this flag existed, which fixed the worst-performing row in the table at one setting. The summarizer's input is bounded by the cell's input budget (window minus output reservation), not the framework's 8,000-token default, which skips every tool result larger than itself and leaves the row unable to compact a cell of this shape |
 | `--keep-last-tool-groups` | 4 | tool-call groups the tool-oriented strategies retain verbatim. The framework's own default; with fewer groups than this in the scenario they collapse nothing at all |
 | `--budget-fraction` | 0.5 | fraction of the input budget the `token_budget_*` family compacts down to |
 | `--summarizer-provider` | — | required by `summarization`, `token_budget_summarize`, `user_summary_anchored` and `tool_and_user_summary_anchored`. Prefer the same model as the one under test: summarizer tokens are priced at the tested model's rates, so a cheaper summarizer is billed at the wrong price. Those calls never reach the agent's middleware, and charging them at zero would score the one strategy that spends money to preserve information as though preserving it were free |
