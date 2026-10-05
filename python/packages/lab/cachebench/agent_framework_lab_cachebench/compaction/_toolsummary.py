@@ -186,7 +186,7 @@ from __future__ import annotations
 import string
 from collections import Counter
 from collections.abc import Awaitable, Callable, Collection, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from math import ceil
 from typing import TYPE_CHECKING, Any, Final
 
@@ -974,6 +974,26 @@ class _Reforce:
     taken: bool = False
 
 
+@dataclass(frozen=True, slots=True)
+class RecordDecisions:
+    """What the record strategy has decided so far, taken as a value so it can be put back.
+
+    The strategy carries its decisions across calls on the instance, not in the conversation:
+    which groups it found uncovered, which of those it has stopped asking for and preserves, and
+    the ask for another record that is still outstanding. A harness that re-enters a
+    conversation from a snapshot -- a probe asked several times from one state, a turn re-sent
+    after a disconnect -- restores the conversation and must restore these with it, or the
+    decision the first re-entry advanced governs every later one and the re-entries are not
+    repeats of each other. ``reforce`` is copied, so a restored ask starts with the passes it
+    had and not the passes a discarded re-entry added.
+    """
+
+    uncovered: frozenset[str]
+    settled: frozenset[str]
+    preserved: frozenset[str]
+    reforce: _Reforce | None
+
+
 def _droppable_groups_after(messages: list[Message], record_index: int | None) -> int:
     """Count the tool-call groups a record would be asked to cover.
 
@@ -1179,6 +1199,22 @@ class ToolResultAnchoredSummarizationCompactionStrategy:
         # The uncovered groups the most recent pass preserved for good, rebuilt every pass like
         # ``_uncovered``. See :attr:`groups_preserved_uncovered`.
         self._preserved: set[str] = set()
+
+    def decision_state(self) -> RecordDecisions:
+        """Return the decisions carried on this instance, as a value independent of it."""
+        return RecordDecisions(
+            uncovered=frozenset(self._uncovered),
+            settled=frozenset(self._settled),
+            preserved=frozenset(self._preserved),
+            reforce=None if self._reforce is None else replace(self._reforce),
+        )
+
+    def restore_decisions(self, decisions: RecordDecisions) -> None:
+        """Put back decisions taken with :meth:`decision_state`, discarding those made since."""
+        self._uncovered = set(decisions.uncovered)
+        self._settled = set(decisions.settled)
+        self._preserved = set(decisions.preserved)
+        self._reforce = None if decisions.reforce is None else replace(decisions.reforce)
 
     @property
     def fallbacks_used(self) -> int:

@@ -241,6 +241,7 @@ from agent_framework._compaction import (
 from ._anchored import DEFAULT_MIN_GAIN_FRACTION, EXCLUDE_REASON, MARKER_ID_PREFIX
 from ._toolsummary import (
     RECORD_MARKER,
+    RecordDecisions,
     ToolResultAnchoredSummarizationCompactionStrategy,
     _is_written_record,  # pyright: ignore[reportPrivateUsage]
     build_record_message,
@@ -512,6 +513,24 @@ class _ChainStart:
         return None if len(messages) == len(self.messages) else self.behind[len(messages)]
 
 
+@dataclass(frozen=True, slots=True)
+class ChainDecisions:
+    """The composed chain's carried decisions, with the record half's, as one restorable value.
+
+    The user half's wait is clocked on the conversation but kept on the instance: when it
+    started, which record it is keyed to, the response it is quiet through, and the record it
+    declined to wait behind. Re-entering a conversation from a snapshot without putting these
+    back lets the wait expire on the first re-entry and act on every one after, which is a
+    different prompt from the first re-entry's -- the drift the harness counts.
+    """
+
+    wait_since: int | None
+    anchor: str
+    quiet_through: int
+    declined_behind: str | None
+    records: RecordDecisions
+
+
 class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
     """Run the record strategy, then the user-turn strategy, then a last-resort chain.
 
@@ -745,6 +764,24 @@ class ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy:
     def user_passes_declined(self) -> int:
         """:attr:`~._usersummary.UserTurnAnchoredSummarizationCompactionStrategy.user_passes_declined`."""
         return self.user_turns.user_passes_declined
+
+    def decision_state(self) -> ChainDecisions:
+        """Return the chain's carried decisions and the record half's, independent of both."""
+        return ChainDecisions(
+            wait_since=self._wait_since,
+            anchor=self._anchor,
+            quiet_through=self._quiet_through,
+            declined_behind=self._declined_behind,
+            records=self.tool_results.decision_state(),
+        )
+
+    def restore_decisions(self, decisions: ChainDecisions) -> None:
+        """Put back decisions taken with :meth:`decision_state`, on the chain and the record half."""
+        self._wait_since = decisions.wait_since
+        self._anchor = decisions.anchor
+        self._quiet_through = decisions.quiet_through
+        self._declined_behind = decisions.declined_behind
+        self.tool_results.restore_decisions(decisions.records)
 
     @property
     def user_passes_waited(self) -> int:

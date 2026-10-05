@@ -82,6 +82,7 @@ from ._anchored import (
 from ._composed import (
     DEFAULT_CHAIN_GAIN_FRACTION,
     DEFAULT_HARDER_ATTEMPTS,
+    ChainDecisions,
     ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy,
 )
 from ._preserve import (
@@ -102,6 +103,7 @@ from ._toolsummary import (
     RECALL_TOOL_NAME,
     RECORD_MARKER,
     RecallGate,
+    RecordDecisions,
     ToolResultAnchoredSummarizationCompactionStrategy,
     ToolResultRecallMiddleware,
     find_record_index,
@@ -159,8 +161,10 @@ __all__ = [
     "SUMMARY_MODE_RECOMPACT",
     "USER_SUMMARY_MARKER",
     "AnchoredCompactionStrategy",
+    "ChainDecisions",
     "MinimumGainAnchoredCompactionStrategy",
     "RecallGate",
+    "RecordDecisions",
     "ToolResultAnchoredSummarizationCompactionStrategy",
     "ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy",
     "ToolResultRecallMiddleware",

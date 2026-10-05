@@ -63,6 +63,7 @@ from agent_framework_lab_cachebench.compaction._composed import (
     _MAX_FALLBACK_ROUNDS,
     DEFAULT_HARDER_ATTEMPTS,
     DEFAULT_RECORD_MERGE_PROMPT,
+    ChainDecisions,
     ToolResultAndUserTurnAnchoredSummarizationCompactionStrategy,
     _newest_record_identity,
     _responses,
@@ -2679,3 +2680,33 @@ async def test_a_new_record_reading_as_one_already_rewritten_takes_the_rewrite_w
 
     assert summarizer.log[3:] == ["merge"], "the rewrite taken, not asked for again"
     assert _active_record_ids(changed) == ["written:lookup_1: CODE-1."]
+
+
+def test_the_chains_wait_is_taken_and_put_back_with_the_record_halfs_decisions() -> None:
+    """The wait for a record is kept on the instance, and a snapshot re-entry has to restore it.
+
+    Measured live: a seeding that ended inside the wait had the wait expire on the first probe,
+    which saw the full prompt, and act on every probe after, which saw the compacted one -- eleven
+    of twelve probes drifting from the snapshot on a row whose facts and cost were otherwise fine.
+    """
+    chain = _composed()
+    chain._wait_since = 7
+    chain._anchor = "record-a"
+    chain._quiet_through = 9
+    chain._declined_behind = None
+    chain.tool_results._settled = {"g1"}
+
+    taken = chain.decision_state()
+    assert isinstance(taken, ChainDecisions)
+    assert taken.records.settled == frozenset({"g1"})
+
+    chain._wait_since = None
+    chain._anchor = "record-b"
+    chain._quiet_through = 12
+    chain._declined_behind = "record-a"
+    chain.tool_results._settled.add("g2")
+
+    chain.restore_decisions(taken)
+
+    assert (chain._wait_since, chain._anchor, chain._quiet_through, chain._declined_behind) == (7, "record-a", 9, None)
+    assert chain.tool_results._settled == {"g1"}

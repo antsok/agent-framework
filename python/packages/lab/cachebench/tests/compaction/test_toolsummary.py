@@ -33,9 +33,11 @@ from agent_framework_lab_cachebench.compaction._toolsummary import (
     RECALL_TOOL_NAME,
     RECORD_MARKER,
     RecallGate,
+    RecordDecisions,
     ToolResultAnchoredSummarizationCompactionStrategy,
     ToolResultRecallMiddleware,
     _distinctive_tokens,
+    _Reforce,
     find_record_index,
     make_recall_tool,
 )
@@ -2219,3 +2221,41 @@ def test_the_default_thresholds_leave_a_whole_turn_for_the_record_to_arrive_in()
     assert (DEFAULT_TRIGGER_FRACTION, DEFAULT_FALLBACK_FRACTION) == (0.6, 0.9), "runs 26-39 were taken at 0.6/0.9"
     assert middleware.trigger_fraction == strategy.trigger_fraction, "the ask and the wait must be one number"
     assert strategy.fallback_fraction - strategy.trigger_fraction >= 0.1, "no room for the record to land in"
+
+
+def test_decisions_taken_as_a_value_put_the_strategy_back_and_share_nothing_with_it() -> None:
+    """A re-entry from a snapshot must start from the decisions standing then, not those made since.
+
+    The settled groups, the preserved ones and the outstanding ask live on the instance and
+    survive a session restore on their own. A value taken before the first re-entry and put back
+    before each later one is what makes the re-entries repeats of each other; a value that
+    aliased the instance's own sets would be rewritten by the re-entry it was meant to undo.
+    """
+    strategy = _strategy(max_input_tokens=10_000)
+    strategy._uncovered = {"g1", "g2"}
+    strategy._settled = {"g1"}
+    strategy._preserved = {"g1"}
+    strategy._reforce = _Reforce(targets=frozenset({"g2"}), records=1, passes=1)
+
+    taken = strategy.decision_state()
+    assert isinstance(taken, RecordDecisions)
+
+    strategy._uncovered.add("g3")
+    strategy._settled |= {"g2", "g3"}
+    strategy._preserved = set(strategy._settled)
+    assert strategy._reforce is not None
+    strategy._reforce.passes += 1
+    strategy._reforce = None
+
+    assert taken.settled == frozenset({"g1"}), "the value shared a set with the instance"
+    assert taken.reforce is not None and taken.reforce.passes == 1, "the value shared the ask with the instance"
+
+    strategy.restore_decisions(taken)
+
+    assert strategy._uncovered == {"g1", "g2"}
+    assert strategy._settled == {"g1"}
+    assert strategy._preserved == {"g1"}
+    assert strategy._reforce == _Reforce(targets=frozenset({"g2"}), records=1, passes=1)
+    assert strategy._reforce is not taken.reforce, "restoring handed the instance the value's own ask"
+    strategy._settled.add("g2")
+    assert taken.settled == frozenset({"g1"}), "the value can be put back more than once"

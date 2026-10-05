@@ -1542,10 +1542,31 @@ def snapshot_state(session: AgentSession) -> dict[str, Any]:
     return deepcopy(session.state)
 
 
+def snapshot_decisions(strategy: Any) -> Any | None:
+    """Take the decisions a strategy carries on its instance, to be put back with the session.
+
+    A strategy's decisions are conversation state that the session does not hold: the
+    composed chain's wait for a record, the record half's outstanding ask and the groups it
+    has settled. Restoring the session without them re-enters the conversation with the
+    decisions a discarded re-entry advanced -- measured as a probe that saw the snapshot once
+    and a compacted conversation eleven times, on the same row.
+
+    Args:
+        strategy: The strategy under test, or None for the control.
+
+    Returns:
+        An opaque value for :func:`restore_state`, or None when the strategy carries nothing.
+    """
+    take = getattr(strategy, "decision_state", None)
+    return take() if callable(take) else None
+
+
 def restore_state(
     session: AgentSession,
     snapshot: Mapping[str, Any],
     recall_middleware: ToolResultRecallMiddleware | None = None,
+    strategy: Any = None,
+    decisions: Any | None = None,
 ) -> None:
     """Put a session back to a snapshot, before the next probe is asked or a turn re-sent.
 
@@ -1565,10 +1586,14 @@ def restore_state(
         session: The session to restore.
         snapshot: The state to restore it to.
         recall_middleware: The middleware to clear, when the strategy under test installs one.
+        strategy: The strategy whose decisions ``decisions`` were taken from.
+        decisions: What :func:`snapshot_decisions` returned beside ``snapshot``, or None.
     """
     session.state = deepcopy(dict(snapshot))
     if recall_middleware is not None:
         recall_middleware.forget_pending()
+    if decisions is not None:
+        strategy.restore_decisions(decisions)
 
 
 def _retry_delay(attempt: int, requested: float | None, *, base: float, maximum: float) -> float:
@@ -1927,7 +1952,9 @@ async def run_live(
     reconnects = 0
     reconnected_seconds = 0.0
 
-    async def _attempt(text: str, turn_options: dict[str, Any], before: Mapping[str, Any]) -> Any:
+    async def _attempt(
+        text: str, turn_options: dict[str, Any], before: Mapping[str, Any], before_decisions: Any | None
+    ) -> Any:
         """Send one turn, waiting out throttling and dropped connections while the bounds allow.
 
         Two failures, one loop, separate budgets. They are alike in what they need -- a wait, a
@@ -1940,6 +1967,7 @@ async def run_live(
             text: The user turn.
             turn_options: Per-call request options.
             before: The session state this turn started from, restored before each re-send.
+            before_decisions: The strategy's decisions at that point, restored with it.
 
         Returns:
             The agent response.
@@ -1987,7 +2015,7 @@ async def run_live(
                     if delay is None:
                         raise
                     await sleep(delay)
-                    restore_state(session, before, recall_middleware)
+                    restore_state(session, before, recall_middleware, strategy, before_decisions)
         finally:
             # In a ``finally`` because the turn's spend is the turn's spend either way: a seed
             # that failed after four re-sends has to report them, and that is exactly the row
@@ -2023,6 +2051,7 @@ async def run_live(
         # occurrences in one cell, every one on a throttled row and including the uncompacted
         # control, so the retry that exists to save seeds was destroying them instead.
         before = snapshot_state(session)
+        before_decisions = snapshot_decisions(strategy)
         # Two attempts. Providers differ in which request options they accept, and one that
         # rejects an option names it. Dropping that option and retrying is what lets a model
         # with an unusual surface be measured at all instead of returning an empty run:
@@ -2063,7 +2092,7 @@ async def run_live(
                     # against the 6 asked for, on one repeat in three.
                     turn_options["tool_choice"] = "none"
             try:
-                return await _attempt(text, turn_options, before)
+                return await _attempt(text, turn_options, before, before_decisions)
             except Exception as exc:
                 option = unsupported_option(exc)
                 if option is None or option in dropped:
@@ -2072,7 +2101,7 @@ async def run_live(
                 dropped.append(option)
                 if option == "tool_choice":
                     forced = {}
-                restore_state(session, before, recall_middleware)
+                restore_state(session, before, recall_middleware, strategy, before_decisions)
         return None
 
     seeded = 0
@@ -2087,6 +2116,7 @@ async def run_live(
 
     seed_prompt_tokens = recorder.calls[-1].input_tokens if recorder.calls else 0
     snapshot = snapshot_state(session)
+    decided = snapshot_decisions(strategy)
     snapshot_prompt = serialize_history(agent, snapshot)
 
     probes: list[ProbeOutcome] = []
@@ -2104,7 +2134,7 @@ async def run_live(
             wanted = _repeats_for_scope(scope, probe_repeats=probe_repeats, combined_repeats=combined_repeats)
             answered = 0
             for repeat in range(1, wanted + 1):
-                restore_state(session, snapshot, recall_middleware)
+                restore_state(session, snapshot, recall_middleware, strategy, decided)
                 mark = len(recorder.calls)
                 response = await _send(
                     question,

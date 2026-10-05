@@ -14,6 +14,7 @@ from __future__ import annotations
 import base64
 import contextlib
 import json
+import logging
 import re
 from collections.abc import Callable, Mapping, Sequence
 from copy import deepcopy
@@ -118,6 +119,7 @@ from agent_framework_lab_cachebench._live_cli import (
     _to_joint,
     _workload_settings,
     build_parser,
+    mute_unrooted_summary_warnings,
     run_live_comparison,
 )
 from agent_framework_lab_cachebench._providers import _base_options
@@ -8947,3 +8949,90 @@ async def test_the_single_seed_warning_counts_seeds_not_the_flag() -> None:
 
     assert all(len(cell.records) == 3 for cell in cells)
     assert "Single seed" not in table, "three seeds were reported as one"
+
+
+def test_the_unrooted_summary_warning_is_muted_and_nothing_else_is() -> None:
+    """The framework warns once per call that a harness summary is not rooted in the caller's list.
+
+    Under the harness that is every summary of the conversation, because the agent passes
+    only the new turn and the history is loaded further in. The warning says nothing about
+    the row and buries the row lines, so the live CLI filters it on the framework's logger --
+    and only it, or a real warning from the same logger would go missing with it.
+    """
+    logger = logging.getLogger("agent_framework")
+    seen: list[str] = []
+    handler = logging.Handler()
+    handler.emit = lambda record: seen.append(record.getMessage())  # type: ignore[method-assign]
+    logger.addHandler(handler)
+    try:
+        mute_unrooted_summary_warnings()
+        mute_unrooted_summary_warnings()
+        logger.warning(
+            "Rejected %d compaction summary message(s) because their dependencies were not fully rooted in "
+            "caller-owned messages or registered middleware replacements.",
+            2,
+        )
+        logger.warning("Skipping summarization compaction: summary generation failed (%s).", "boom")
+    finally:
+        logger.removeHandler(handler)
+        for installed in list(logger.filters):
+            if getattr(installed, "__name__", None) == "_is_not_unrooted_summary_warning":
+                logger.removeFilter(installed)
+
+    assert seen == ["Skipping summarization compaction: summary generation failed (boom)."]
+    assert not any(getattr(f, "__name__", None) == "_is_not_unrooted_summary_warning" for f in logger.filters)
+
+
+async def test_a_strategys_carried_decisions_are_restored_before_every_probe(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Every probe must start from the decisions standing at the snapshot, not from the last probe's.
+
+    The session is restored before each probe, but a strategy's decisions live on its instance:
+    the composed chain's wait for a record, the record half's outstanding ask. Left alone, the
+    first probe advances them and every later probe acts on what the first decided -- measured
+    live as one probe sent the snapshot and eleven sent a compacted conversation, on one row.
+    A strategy that exposes its decisions as a value gets them put back with the session.
+    """
+    scenario = _probe_scenario()
+    closing = _closing_questions(scenario)
+
+    class Deciding:
+        """Evicts on the way into a probe once a decision has been carried over from an earlier one."""
+
+        def __init__(self) -> None:
+            self.probes_seen = 0
+            self.restored = 0
+
+        def decision_state(self) -> int:
+            return self.probes_seen
+
+        def restore_decisions(self, decisions: int) -> None:
+            self.restored += 1
+            self.probes_seen = decisions
+
+        async def __call__(self, messages: list[Message]) -> bool:
+            asked = _turn_text(messages[-1:]) if messages else ""
+            if not any(question in asked for question in closing):
+                return False
+            self.probes_seen += 1
+            if self.probes_seen < 2:
+                return False
+            for message in messages:
+                if not message.additional_properties.get("_excluded"):
+                    message.additional_properties["_excluded"] = True
+                    return True
+            return False
+
+    deciding = Deciding()
+    monkeypatch.setattr("agent_framework_lab_cachebench._live.build_strategy", lambda name, options: deciding)
+    outcome = await run_live(
+        ProviderRuntime(client=StubChatClient(), model="stub"),
+        strategy_name="truncation",
+        options=_options(),
+        scenario=scenario,
+        probe_repeats=2,
+    )
+
+    assert outcome.error is None
+    assert outcome.context_drift == 0, "a decision carried over from the first probe acted on the ones after it"
+    assert deciding.restored == len(outcome.probes)
+    assert len({probe.prompt_text.rsplit(chr(10), 1)[0] for probe in outcome.probes}) == 1

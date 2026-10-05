@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import logging
 import time
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
@@ -3668,6 +3669,32 @@ def _render_from_records(args: argparse.Namespace) -> int:
     return 0
 
 
+#: Opening of the framework's warning for a compaction summary it will not merge into the
+#: caller's message list. Matched on the format string, which is what a logging filter sees.
+_UNROOTED_SUMMARY_WARNING: Final = "Rejected %d compaction summary message(s)"
+
+
+def _is_not_unrooted_summary_warning(record: logging.LogRecord) -> bool:
+    return not str(record.msg).startswith(_UNROOTED_SUMMARY_WARNING)
+
+
+def mute_unrooted_summary_warnings() -> None:
+    """Keep the framework's per-call "Rejected ... not fully rooted" warning out of the run log.
+
+    The framework reconciles compaction summaries at its chat-middleware boundary and warns
+    about every summary whose sources are not among the messages the caller passed in. Under
+    the harness that is every summary: the agent passes only the new turn, and the conversation
+    is loaded further in, by the per-service-call history middleware, so no summary of it can be
+    rooted there. The warning says nothing about the row -- the history provider persists the
+    compacted conversation regardless -- and it fires once per call, which in a cell of this
+    size puts tens of identical lines between the row lines that are the log. Installed on the
+    framework's logger as a filter, so every other warning it raises still reaches the log.
+    """
+    logger = logging.getLogger("agent_framework")
+    if _is_not_unrooted_summary_warning not in logger.filters:
+        logger.addFilter(_is_not_unrooted_summary_warning)
+
+
 async def run_live_comparison(args: argparse.Namespace) -> int:
     """Run every selected strategy against a live agent and print the comparison.
 
@@ -3690,6 +3717,7 @@ async def run_live_comparison(args: argparse.Namespace) -> int:
     strategies = [entry.strip() for entry in args.strategies.split(",") if entry.strip()]
     if "none" not in strategies:
         raise SystemExit("The 'none' control must be included; every comparison is relative to it.")
+    mute_unrooted_summary_warnings()
 
     min_correctness = DEFAULT_MIN_CORRECTNESS if args.min_correctness is None else args.min_correctness
     tokenizer = build_tokenizer(args.tokenizer)
