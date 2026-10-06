@@ -1470,7 +1470,179 @@ So luna writes at great length about the first two lookups and never reaches the
 is a property of the model's writing, not of a setting, and no bound reachable from the CLI moved
 it.
 
+## Final report on agent-framework-core 1.20.0: run 67, 6 October
+
+**Inside the context window, don't compact. Past it, `tool_and_user_summary_anchored` is the only
+row that keeps every fact inside a 120K window on both models: on gpt-6-luna 22% below an
+unlimited model at 1.5x the window and 65% below at 3x on every seed; on gpt-5.6-luna 18-35%
+below on four seeds of five at 1.5x, and at 3x it holds on four seeds and fails loudly on the
+fifth. What decides the row on gpt-5.6-luna is the quality of the record the model writes.**
+This section supersedes the run 63 report for every number; the archived records and per-run
+notes are in [`runs/run-67-core-1.20-grid/`](runs/run-67-core-1.20-grid/) and
+[`runs/README.md`](runs/README.md), and
+[`reports/run67-vs-run63.md`](runs/run-67-core-1.20-grid/reports/run67-vs-run63.md) puts every
+row of every cell beside its run 63 counterpart.
+
+### Setup
+
+The run 63 cell, unchanged: all twenty strategies, the MAF harness agent, a simulated
+120,000-token window, five seeds per cell, six tool lookups carrying 60% of the tokens and 53
+planted facts, filler user turns carrying the rest, reservations of 2,048 output tokens and
+12,000 for the closing answers.
+
+| Setting | Value |
+| --- | --- |
+| Framework | agent-framework-core 1.20.0, agent-framework-foundry 1.14.0, agent-framework-openai 1.15.0 |
+| Lab | `14ded49cb` |
+| Models | gpt-5.6-luna (Foundry project endpoint); gpt-6-luna (Azure resource endpoint via `azure-responses`) |
+| Prices per 1M tokens | 5.6-luna $0.20 in / $0.02 cached / $1.20 out; 6-luna $0.10 / $0.01 / $0.50, cache writes $0.125, and above 272K input per request $0.20 / $0.02 / $0.75, cache writes $0.25 |
+| Fills | 0.9, 1.5, 3.0 |
+| Spend | $126.85 including probes |
+
+`seed$` is what the conversation cost, summarizer included, probes excluded. `DQ` is a prompt
+over 120K at any point. The control disqualifies at 1.5 and 3.0 and is a price reference, not a
+baseline. A row keeps the facts when its acc1 is at least 90% of the control's. gpt-6-luna's
+fill-3.0 control is priced at its long-context rates for the calls above 272K, which run 63 did
+not do; that is the one pricing difference between the two reports.
+
+### Results
+
+Every row kept 53/53 on every seed where it is shown; `-` is below the accuracy bar.
+Seed$ against the control, mean of five seeds, disqualified seeds in brackets.
+
+| Strategy | 5.6 / 0.9 | 5.6 / 1.5 | 5.6 / 3.0 | 6 / 0.9 | 6 / 1.5 | 6 / 3.0 |
+| --- | --- | --- | --- | --- | --- | --- |
+| none (control) | $0.068 | $0.150 (5) | $0.443 (5) | $0.036 | $0.075 (5) | $0.313 (5) |
+| tool_and_user_summary_anchored | $0.073 | $0.143 | $0.792 (1) | $0.035 | **$0.059** | **$0.109** |
+| tool_summary_anchored | $0.070 | $0.308 (2) | $0.942 (5) | $0.036 | $0.051 | $0.310 (5) |
+| user_summary_anchored | $0.085 | $0.221 (5) | $0.590 (5) | $0.044 | $0.111 (5) | $0.301 (5) |
+| anchored_min_gain | $0.079 | - | - | $0.034 | - | - |
+
+- **0.9:** the best complete rows cost within 8% of not compacting on gpt-5.6-luna and within 3%
+  on gpt-6-luna, inside the seed spread. Not compacting stays the default inside the window.
+- **1.5, gpt-6-luna:** `tool_summary_anchored` is cheapest at -32% and the composed row -22%,
+  both complete on every seed. **1.5, gpt-5.6-luna:** the composed row is the only complete row
+  with no disqualification; it ran 18-35% under the control on four seeds and 93% over it on the
+  fifth, whose records left five tool groups uncovered, so its mean is -4%. The record row
+  disqualified on two seeds for the same reason.
+- **3.0, gpt-6-luna:** the composed row kept 53/53 inside the window on every seed at 63-68%
+  under the control. **3.0, gpt-5.6-luna:** three seeds 30-56% under, one 13% over, one
+  disqualified at $2.74 with every fact after 172 fallbacks: the loud failure, not a quiet loss,
+  and the mean it drags to +79% is that one seed.
+- The other sixteen strategies lose facts past the window or disqualify. Core's `summarization`,
+  bounded to the cell, is the best of them on gpt-6-luna at 47 / 38 / 30 facts, for 18-20% more
+  than the control at 0.9 and 1.5 and an 11% cache share.
+
+### All twenty strategies
+
+Each cell reads facts kept (mean of 53) / acc1 / disqualified seeds of 5.
+
+| Strategy | 5.6 / 0.9 | 5.6 / 1.5 | 5.6 / 3.0 | 6 / 0.9 | 6 / 1.5 | 6 / 3.0 |
+| --- | --- | --- | --- | --- | --- | --- |
+| none | 53 / 100% / 0 | 53 / 97% / 5 | 53 / 90% / 5 | 53 / 100% / 0 | 53 / 100% / 5 | 53 / 84% / 5 |
+| tool_and_user_summary_anchored | 53 / 100% / 0 | 53 / 94% / 0 | 53 / 94% / 1 | 53 / 100% / 0 | 53 / 98% / 0 | 53 / 100% / 0 |
+| tool_summary_anchored | 53 / 100% / 0 | 53 / 100% / 2 | 53 / 97% / 5 | 53 / 100% / 0 | 53 / 97% / 0 | 53 / 97% / 5 |
+| user_summary_anchored | 53 / 100% / 0 | 53 / 97% / 5 | 53 / 92% / 5 | 53 / 99% / 0 | 53 / 96% / 5 | 53 / 89% / 5 |
+| anchored_min_gain | 53 / 94% / 0 | 46 / 87% / 0 | 13 / 26% / 5 | 53 / 100% / 0 | 28 / 54% / 0 | 13 / 26% / 5 |
+| anchored | 53 / 96% / 0 | 40 / 75% / 0 | 13 / 26% / 5 | 47 / 88% / 0 | 31 / 59% / 0 | 13 / 26% / 5 |
+| anchored_no_assistant | 52 / 97% / 0 | 28 / 53% / 0 | 25 / 46% / 5 | 47 / 89% / 0 | 29 / 55% / 0 | 25 / 52% / 5 |
+| summarization | 20 / 38% / 0 | 17 / 25% / 0 | 17 / 26% / 0 | 47 / 75% / 0 | 38 / 74% / 0 | 30 / 31% / 0 |
+| token_budget_summarize | 29 / 46% / 0 | 24 / 47% / 0 | 20 / 36% / 0 | 28 / 46% / 0 | 34 / 61% / 0 | 44 / 74% / 0 |
+| context_window | 27 / 52% / 0 | 15 / 29% / 0 | 16 / 32% / 0 | 42 / 80% / 0 | 22 / 42% / 0 | 13 / 30% / 0 |
+| context_window_lazy | 53 / 95% / 0 | 22 / 43% / 0 | 14 / 28% / 0 | 42 / 79% / 0 | 22 / 41% / 0 | 15 / 30% / 0 |
+| context_window_aggressive | 20 / 39% / 0 | 14 / 28% / 0 | 3 / 8% / 3 | 24 / 46% / 0 | 10 / 20% / 0 | 0 / 2% / 1 |
+| tool_result | 50 / 90% / 0 | 47 / 87% / 5 | 43 / 76% / 5 | 39 / 74% / 0 | 39 / 71% / 5 | 39 / 71% / 5 |
+| selective_tool_call | 50 / 94% / 0 | 47 / 89% / 5 | 44 / 70% / 5 | 44 / 84% / 0 | 40 / 76% / 5 | 41 / 70% / 5 |
+| truncation | 35 / 66% / 0 | 18 / 35% / 0 | 17 / 33% / 0 | 31 / 59% / 0 | 19 / 36% / 0 | 15 / 30% / 0 |
+| sliding_window | 8 / 17% / 0 | 8 / 17% / 0 | 8 / 17% / 0 | 8 / 17% / 0 | 8 / 17% / 0 | 8 / 17% / 0 |
+| token_budget_fallback | 21 / 41% / 0 | 18 / 36% / 0 | 9 / 19% / 0 | 23 / 45% / 0 | 17 / 34% / 0 | 9 / 18% / 0 |
+| token_budget_tools_first | 19 / 37% / 0 | 18 / 34% / 0 | 8 / 17% / 0 | 19 / 36% / 0 | 14 / 27% / 0 | 8 / 17% / 0 |
+| token_budget_truncate_first | 20 / 39% / 0 | 17 / 34% / 0 | 10 / 20% / 0 | 18 / 35% / 0 | 16 / 32% / 0 | 8 / 17% / 0 |
+| token_budget_window_first | 10 / 20% / 0 | 11 / 22% / 0 | 8 / 17% / 0 | 16 / 31% / 0 | 10 / 20% / 0 | 8 / 17% / 0 |
+
+Seed$ per cell for the same rows, mean of five seeds. A cheap row that lost facts or
+disqualified is not a saving.
+
+| Strategy | 5.6 / 0.9 | 5.6 / 1.5 | 5.6 / 3.0 | 6 / 0.9 | 6 / 1.5 | 6 / 3.0 |
+| --- | --- | --- | --- | --- | --- | --- |
+| none | 0.0676 | 0.1499 (5) | 0.4429 (5) | 0.0364 | 0.0746 (5) | 0.3134 (5) |
+| tool_and_user_summary_anchored | 0.0733 | 0.1434 | 0.7916 (1) | 0.0353 | 0.0585 | 0.1088 |
+| tool_summary_anchored | 0.0700 | 0.3078 (2) | 0.9415 (5) | 0.0357 | 0.0511 | 0.3101 (5) |
+| user_summary_anchored | 0.0850 | 0.2213 (5) | 0.5898 (5) | 0.0436 | 0.1109 (5) | 0.3012 (5) |
+| anchored_min_gain | 0.0785 | 0.1916 | 0.5946 (5) | 0.0343 | 0.0915 | 0.3487 (5) |
+| anchored | 0.0754 | 0.1847 | 0.6082 (5) | 0.0374 | 0.0937 | 0.3259 (5) |
+| anchored_no_assistant | 0.0760 | 0.2114 | 0.3600 (5) | 0.0375 | 0.0933 | 0.3095 (5) |
+| summarization | 0.1379 | 0.2131 | 0.4077 | 0.0896 | 0.1318 | 0.2535 |
+| token_budget_summarize | 0.0927 | 0.1527 | 0.3093 | 0.0440 | 0.0811 | 0.1673 |
+| context_window | 0.0904 | 0.1254 | 0.2667 | 0.0486 | 0.0641 | 0.1222 |
+| context_window_lazy | 0.0942 | 0.1608 | 0.3012 | 0.0483 | 0.0785 | 0.1654 |
+| context_window_aggressive | 0.0655 | 0.0994 | 0.1511 (3) | 0.0337 | 0.0496 | 0.0785 (1) |
+| tool_result | 0.0946 | 0.1784 (5) | 0.4934 (5) | 0.0488 | 0.0934 (5) | 0.3053 (5) |
+| selective_tool_call | 0.0998 | 0.1954 (5) | 0.5220 (5) | 0.0491 | 0.0978 (5) | 0.2897 (5) |
+| truncation | 0.0758 | 0.1365 | 0.2372 | 0.0397 | 0.0665 | 0.1210 |
+| sliding_window | 0.0756 | 0.1214 | 0.2358 | 0.0447 | 0.0719 | 0.1400 |
+| token_budget_fallback | 0.1286 | 0.2629 | 0.4296 | 0.0739 | 0.1276 | 0.2404 |
+| token_budget_tools_first | 0.0917 | 0.1408 | 0.1935 | 0.0467 | 0.0662 | 0.0949 |
+| token_budget_truncate_first | 0.0911 | 0.1241 | 0.1926 | 0.0473 | 0.0696 | 0.0935 |
+| token_budget_window_first | 0.0583 | 0.0834 | 0.1476 | 0.0268 | 0.0451 | 0.0746 |
+
+### What changed since run 63, and why
+
+Run 63 measured this grid on core 1.16.0. Between 1.16 and 1.20 four things moved the numbers,
+and one did not:
+
+1. **Core's summarizer sees tool text (1.18, #8087).** The framework's summarizer transcript
+   rendered a tool result as the bare word `function_result`, so the `summarization` and
+   `token_budget_summarize` rows summarised conversations whose facts were already gone. Since
+   1.18 the transcript carries the result text, and the framework's 8,000-token summarizer input
+   budget then skips any group larger than that, which on this cell is every tool result: the row
+   never compacts, re-summarises the small groups on every call and loses the cache (run 66:
+   $0.98 for a row the control ran at $0.11). The lab now bounds the summarizer input by the
+   cell's input budget, so the rows measure the strategy as it would be configured. On
+   gpt-6-luna that is 47 / 38 / 30 facts against 29 / 25 / 30; on gpt-5.6-luna no change.
+2. **The context-window strategy re-measures before it truncates (1.17, #7912).** The default
+   `context_window` row kept 27 / 15 / 16 facts on gpt-5.6-luna against 43 / 19 / 17; unchanged
+   on gpt-6-luna.
+3. **The Foundry client keeps a copy of the replayed reasoning item (1.20, #8670)**, encrypted
+   payload included, under the content's `additional_properties`, below where core strips it.
+   On gpt-5.6-luna every assistant message counted at about ten times its billed size and every
+   compacting row shed far too early; the first measurement of that half is set aside. The lab's
+   stamp wrapper now drops the nested payload before counting.
+4. **The harness restores a strategy's carried decisions with the session before every probe.**
+   The composed chain's wait for a record and the record half's outstanding ask lived on the
+   instance and survived the probe restore, so a wait that expired on the first probe acted on
+   every probe after it. Measured as context drift on 11 of 12 probes on one row; now zero.
+5. **Our strategies' code did not change**, and their gpt-6-luna rows reproduce run 63 to the
+   cent at 0.9 and 1.5. The composed row's 3.0 result on gpt-6-luna improved from four seeds to
+   five; its gpt-5.6-luna results moved with the model's record quality, which varies by seed.
+
+### Why strategies fail
+
+Unchanged from the run 63 report: user text outgrows the window at 3x and only a row that
+summarises user turns can fit; an incomplete record leaves its lookups whole rather than lost,
+and at 3x three missed lookups are ~107K nothing may shed, which is the composed row's loud
+failure on one gpt-5.6-luna seed and `tool_summary_anchored`'s disqualifications; and the
+built-in rows evict by age, re-decide the prefix, or never touch user text.
+
+### Measurement notes
+
+- The gpt-5.6-luna half ran alone, after gpt-6-luna's fill-3.0 cells had finished. Run beside
+  them, its control's cache share fell to 77-93% from 96% with no throttling of its own: the
+  shared prompt cache evicting under the neighbour's 360K prompts. Cost on one deployment is not
+  a measurement while another saturates the resource.
+- gpt-5.6-luna's fill-3.0 cells were throttled 900-1,600 seconds each on five streams, the
+  control's cache share at 98% throughout; 1,812 retries in the run, none exhausted.
+- One row failed, `tool_result` at gpt-5.6-luna fill 3.0 on seed 2, a Foundry service error at
+  turn 78; it was re-run with its control and the originals set aside.
+- Three rows had a summarizer call fail: one of fifteen on the composed row's fifth seed at
+  gpt-5.6-luna 1.5, two of about 98 on `summarization` at gpt-5.6-luna 3.0. The summarizer path
+  swallows a throttled call rather than retrying it; none changed a verdict.
+
 ## Final report: runs 63 and 64, 26 September
+
+**Superseded for its numbers by the run 67 section above, which re-measured this grid on
+agent-framework-core 1.20.0.** The verdicts below were measured on core 1.16.0; where the two
+disagree, run 67 is current.
 
 **Inside the context window, don't compact. Past it, only `tool_and_user_summary_anchored` keeps
 every fact inside a 120K window: 19-23% below an unlimited model at 1.5x the window, and at 3x it

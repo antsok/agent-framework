@@ -207,6 +207,61 @@ What it shows, and what it is void for:
 No `.sh` is kept: the script that produced it is the same one run 47 uses, and re-running it
 against this tree produces the repaired rows rather than these.
 
+Run 67 is **the final grid re-measured on agent-framework-core 1.20.0**, in
+`run-67-core-1.20-grid/`: the run 63 cell, unchanged -- all twenty strategies at 120,000 tokens,
+fills 0.9, 1.5 and 3.0, five seeds, gpt-5.6-luna on the Foundry project endpoint and gpt-6-luna
+through `azure-responses` -- on the lab at `14ded49cb`, which carries the core 1.20
+compatibility changes (`f86e07248`), the summarizer input bound (`75f6e9888`), the per-probe
+decision restore (`b464557ca`) and the Foundry replay-item fix (`14ded49cb`). gpt-5.6-luna is
+priced as in run 63; gpt-6-luna with its cache-write rate and the 272K long-context tier, as in
+runs 65 and 66, which moves only its fill-3.0 control (seed$ 0.313 against run 63's 0.226).
+$126.85 including probes, 1,812 rate-limit retries, one failed row. `records/` holds one file
+per model, fill and seed; `reports/` the rendered table per cell, across all six, and
+`run67-vs-run63.md`, every row of every cell beside run 63.
+
+Measured twice over before it was measured once. The first gpt-5.6-luna half was invalid:
+agent-framework-foundry 1.14.0 keeps a copy of each replayed reasoning item, encrypted payload
+included, under the reasoning content's `additional_properties`, where core's serializer strips
+`encrypted_content` only at the top level, so every assistant message on that model counted at
+about ten times its billed size and every compacting row shed far too early. Those cells are in
+`set-aside/invalid-counter-gpt-5.6-luna/` (fills 0.9 and 1.5 complete, 3.0 partial). The second
+half ran beside gpt-6-luna's fill-3.0 cells and was stopped after its fill-0.9 cells: the
+control's cache share fell to 77-93% from 96% with no throttling of its own, which is the shared
+prompt cache evicting under the neighbour's 360K prompts; `set-aside/concurrent-gpt-5.6-luna/`.
+The half that counts ran alone, after gpt-6-luna finished. **A cost measurement on one deployment
+is not valid while another saturates the same resource.** The failed row -- `tool_result`,
+gpt-5.6-luna, fill 3.0, seed 2, a Foundry service error at turn 78 -- was re-run with its
+control; the failed original and the extra control are in `set-aside/failed-rows/`. gpt-5.6-luna's
+fill-3.0 cells were throttled 900-1,600 seconds each on five streams, with the control's cache
+share at 98% throughout, so the retries cost time and not money.
+
+Findings, seed$ means of five seeds against run 63 (`reports/run67-vs-run63.md` has every row):
+
+- **Our rows reproduce on gpt-6-luna** to the cent at 0.9 and 1.5 (composed 0.0353 / 0.0585,
+  record 0.0357 / 0.0511, every fact, no disqualification). At 3.0 the composed row now holds on
+  all five seeds at 0.1088 against the control's 0.3134, where run 63 lost one seed; the record
+  row still disqualifies on every seed but at 0.3101 instead of 1.29, the effect of repeats.
+- **On gpt-5.6-luna the record quality decides the row.** At 1.5 the composed row kept 53/53 on
+  every seed with no disqualification, 18-35% under the control on four seeds and 93% over it on
+  the fifth, whose records left five tool groups uncovered (mean 0.1434, -4%; run 63: -19%). At
+  3.0 three seeds ran 30-56% under the control, one 13% over, and one disqualified loudly at
+  2.74 with every fact after 172 fallbacks (run 63: four under, one disqualified at 1.10).
+  `tool_summary_anchored` disqualified on two seeds at 1.5 and five at 3.0, as its incomplete
+  records predict. The run-63 claim that the composed row is the cheaper choice on this model
+  holds per seed and not on the mean.
+- **Core's `summarization` under the cell-sized bound** keeps 47 / 38 / 30 facts on gpt-6-luna
+  against 29 / 25 / 30, at 18-20% more seed$ and an 11% cache share, and is unchanged on
+  gpt-5.6-luna (17-20 facts). `token_budget_summarize` keeps 44 facts at gpt-6-luna fill 3.0
+  against 9. Neither reaches our rows on facts or cost.
+- **The default `context_window` row lost ground on gpt-5.6-luna**: 27 / 15 / 16 facts against
+  43 / 19 / 17, which is core 1.17's re-measure after tool eviction (#7912) deciding to truncate
+  where 1.16 did not; unchanged on gpt-6-luna. Its lazy variant, truncation, the sliding window
+  and the token-budget rows are within noise of run 63 on both models.
+
+Run 66 and 66b (5 October, not archived beyond these notes) were the smoke runs that found the
+core-1.20 effects this grid was re-measured for: the summarizer bound and the per-probe decision
+restore; their records are in the scratchpad only.
+
 Run 65 asks whether compacting below gpt-6-luna's **272K long-context line** pays, in
 `run-65-long-context-line/`. Above 272,000 input tokens the model bills a whole request at its
 long-context rates -- $0.20 in, $0.02 cached, $0.25 cache write, $0.75 out, against $0.10 / $0.01
