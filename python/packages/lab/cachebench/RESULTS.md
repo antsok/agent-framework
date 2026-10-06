@@ -1535,7 +1535,8 @@ Seed$ against the control, mean of five seeds, disqualified seeds in brackets.
 
 ### All twenty strategies
 
-Each cell reads facts kept (mean of 53) / acc1 / disqualified seeds of 5.
+Each cell reads facts kept (mean of 53) / acc1 / disqualified seeds of 5. The same rows laid out
+per fill with both models side by side are under run 67 in [`runs/README.md`](runs/README.md).
 
 | Strategy | 5.6 / 0.9 | 5.6 / 1.5 | 5.6 / 3.0 | 6 / 0.9 | 6 / 1.5 | 6 / 3.0 |
 | --- | --- | --- | --- | --- | --- | --- |

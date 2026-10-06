@@ -258,6 +258,85 @@ Findings, seed$ means of five seeds against run 63 (`reports/run67-vs-run63.md` 
   where 1.16 did not; unchanged on gpt-6-luna. Its lazy variant, truncation, the sliding window
   and the token-budget rows are within noise of run 63 on both models.
 
+All twenty strategies per fill, both models side by side. Facts is the mean kept of 53, acc1 the
+first-answer accuracy, DQ the seeds of five whose prompt went over the 120K window, seed$ the
+conversation cost including the summarizer and excluding probes, mean of five seeds.
+
+**Fill 0.9: a 108K conversation in a 120K window.**
+
+| Strategy | 5.6 facts | 5.6 acc1 | 5.6 DQ | 5.6 seed$ | 6 facts | 6 acc1 | 6 DQ | 6 seed$ |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| none | 53/53 | 100% | 0 | $0.068 | 53/53 | 100% | 0 | $0.036 |
+| tool_and_user_summary_anchored | 53/53 | 100% | 0 | $0.073 | 53/53 | 100% | 0 | $0.035 |
+| tool_summary_anchored | 53/53 | 100% | 0 | $0.070 | 53/53 | 100% | 0 | $0.036 |
+| user_summary_anchored | 53/53 | 100% | 0 | $0.085 | 53/53 | 99% | 0 | $0.044 |
+| anchored_min_gain | 53/53 | 94% | 0 | $0.078 | 53/53 | 100% | 0 | $0.034 |
+| anchored | 53/53 | 96% | 0 | $0.075 | 47/53 | 88% | 0 | $0.037 |
+| anchored_no_assistant | 52/53 | 97% | 0 | $0.076 | 47/53 | 89% | 0 | $0.037 |
+| summarization | 20/53 | 38% | 0 | $0.138 | 47/53 | 75% | 0 | $0.090 |
+| token_budget_summarize | 29/53 | 46% | 0 | $0.093 | 28/53 | 46% | 0 | $0.044 |
+| context_window | 27/53 | 52% | 0 | $0.090 | 42/53 | 80% | 0 | $0.049 |
+| context_window_lazy | 53/53 | 95% | 0 | $0.094 | 42/53 | 79% | 0 | $0.048 |
+| context_window_aggressive | 20/53 | 39% | 0 | $0.066 | 24/53 | 46% | 0 | $0.034 |
+| tool_result | 50/53 | 90% | 0 | $0.095 | 39/53 | 74% | 0 | $0.049 |
+| selective_tool_call | 50/53 | 94% | 0 | $0.100 | 44/53 | 84% | 0 | $0.049 |
+| truncation | 35/53 | 66% | 0 | $0.076 | 31/53 | 59% | 0 | $0.040 |
+| sliding_window | 8/53 | 17% | 0 | $0.076 | 8/53 | 17% | 0 | $0.045 |
+| token_budget_fallback | 21/53 | 41% | 0 | $0.129 | 23/53 | 45% | 0 | $0.074 |
+| token_budget_tools_first | 19/53 | 37% | 0 | $0.092 | 19/53 | 36% | 0 | $0.047 |
+| token_budget_truncate_first | 20/53 | 39% | 0 | $0.091 | 18/53 | 35% | 0 | $0.047 |
+| token_budget_window_first | 10/53 | 20% | 0 | $0.058 | 16/53 | 31% | 0 | $0.027 |
+
+**Fill 1.5: a 180K conversation in a 120K window.**
+
+| Strategy | 5.6 facts | 5.6 acc1 | 5.6 DQ | 5.6 seed$ | 6 facts | 6 acc1 | 6 DQ | 6 seed$ |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| none | 53/53 | 97% | 5 | $0.150 | 53/53 | 100% | 5 | $0.075 |
+| tool_and_user_summary_anchored | 53/53 | 94% | 0 | $0.143 | 53/53 | 98% | 0 | $0.058 |
+| tool_summary_anchored | 53/53 | 100% | 2 | $0.308 | 53/53 | 97% | 0 | $0.051 |
+| user_summary_anchored | 53/53 | 97% | 5 | $0.221 | 53/53 | 96% | 5 | $0.111 |
+| anchored_min_gain | 46/53 | 87% | 0 | $0.192 | 28/53 | 54% | 0 | $0.092 |
+| anchored | 40/53 | 75% | 0 | $0.185 | 31/53 | 59% | 0 | $0.094 |
+| anchored_no_assistant | 28/53 | 53% | 0 | $0.211 | 29/53 | 55% | 0 | $0.093 |
+| summarization | 17/53 | 25% | 0 | $0.213 | 38/53 | 74% | 0 | $0.132 |
+| token_budget_summarize | 24/53 | 47% | 0 | $0.153 | 34/53 | 61% | 0 | $0.081 |
+| context_window | 15/53 | 29% | 0 | $0.125 | 22/53 | 42% | 0 | $0.064 |
+| context_window_lazy | 22/53 | 43% | 0 | $0.161 | 22/53 | 41% | 0 | $0.078 |
+| context_window_aggressive | 14/53 | 28% | 0 | $0.099 | 10/53 | 20% | 0 | $0.050 |
+| tool_result | 47/53 | 87% | 5 | $0.178 | 39/53 | 71% | 5 | $0.093 |
+| selective_tool_call | 47/53 | 89% | 5 | $0.195 | 40/53 | 76% | 5 | $0.098 |
+| truncation | 18/53 | 35% | 0 | $0.137 | 19/53 | 36% | 0 | $0.067 |
+| sliding_window | 8/53 | 17% | 0 | $0.121 | 8/53 | 17% | 0 | $0.072 |
+| token_budget_fallback | 18/53 | 36% | 0 | $0.263 | 17/53 | 34% | 0 | $0.128 |
+| token_budget_tools_first | 18/53 | 34% | 0 | $0.141 | 14/53 | 27% | 0 | $0.066 |
+| token_budget_truncate_first | 17/53 | 34% | 0 | $0.124 | 16/53 | 32% | 0 | $0.070 |
+| token_budget_window_first | 11/53 | 22% | 0 | $0.083 | 10/53 | 20% | 0 | $0.045 |
+
+**Fill 3.0: a 360K conversation in a 120K window.**
+
+| Strategy | 5.6 facts | 5.6 acc1 | 5.6 DQ | 5.6 seed$ | 6 facts | 6 acc1 | 6 DQ | 6 seed$ |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| none | 53/53 | 90% | 5 | $0.443 | 53/53 | 84% | 5 | $0.313 |
+| tool_and_user_summary_anchored | 53/53 | 94% | 1 | $0.792 | 53/53 | 100% | 0 | $0.109 |
+| tool_summary_anchored | 53/53 | 97% | 5 | $0.941 | 53/53 | 97% | 5 | $0.310 |
+| user_summary_anchored | 53/53 | 92% | 5 | $0.590 | 53/53 | 89% | 5 | $0.301 |
+| anchored_min_gain | 13/53 | 26% | 5 | $0.595 | 13/53 | 26% | 5 | $0.349 |
+| anchored | 13/53 | 26% | 5 | $0.608 | 13/53 | 26% | 5 | $0.326 |
+| anchored_no_assistant | 25/53 | 46% | 5 | $0.360 | 25/53 | 52% | 5 | $0.309 |
+| summarization | 17/53 | 26% | 0 | $0.408 | 30/53 | 31% | 0 | $0.253 |
+| token_budget_summarize | 20/53 | 36% | 0 | $0.309 | 44/53 | 74% | 0 | $0.167 |
+| context_window | 16/53 | 32% | 0 | $0.267 | 13/53 | 30% | 0 | $0.122 |
+| context_window_lazy | 14/53 | 28% | 0 | $0.301 | 15/53 | 30% | 0 | $0.165 |
+| context_window_aggressive | 3/53 | 8% | 3 | $0.151 | 0/53 | 2% | 1 | $0.078 |
+| tool_result | 43/53 | 76% | 5 | $0.493 | 39/53 | 71% | 5 | $0.305 |
+| selective_tool_call | 44/53 | 70% | 5 | $0.522 | 41/53 | 70% | 5 | $0.290 |
+| truncation | 17/53 | 33% | 0 | $0.237 | 15/53 | 30% | 0 | $0.121 |
+| sliding_window | 8/53 | 17% | 0 | $0.236 | 8/53 | 17% | 0 | $0.140 |
+| token_budget_fallback | 9/53 | 19% | 0 | $0.430 | 9/53 | 18% | 0 | $0.240 |
+| token_budget_tools_first | 8/53 | 17% | 0 | $0.193 | 8/53 | 17% | 0 | $0.095 |
+| token_budget_truncate_first | 10/53 | 20% | 0 | $0.193 | 8/53 | 17% | 0 | $0.094 |
+| token_budget_window_first | 8/53 | 17% | 0 | $0.148 | 8/53 | 17% | 0 | $0.075 |
+
 Run 66 and 66b (5 October, not archived beyond these notes) were the smoke runs that found the
 core-1.20 effects this grid was re-measured for: the summarizer bound and the per-probe decision
 restore; their records are in the scratchpad only.
